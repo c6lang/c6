@@ -68,6 +68,25 @@ C6C_INLINE int tok_eq(const Tok *t, const char *s)
     return s[t->len] == 0;
 }
 
+/* 长度已知的比较。调用点九成九都是 `tok_eq(t, "int")` 这种固定字面量，
+ * 长度编译期就知道 —— 先比 t->len（一次 load 一次比较就否掉绝大多数），
+ * 循环里也不用再逐字节判 '\0'，GCC 还会把已知长度的循环整个展开成几条
+ * 定长比较。TOK_EQ(t, "lit") 由脚本统一换过来；tok_eq 留给动态字符串。 */
+C6C_INLINE int tok_eq_len(const Tok *t, const char *s, u32 n)
+{
+    const char *d = tok_data(t);
+    u32 i = 0;
+
+    if (t->len != n)
+        return 0;
+    for (i = 0; i < n; i++)
+        if ((u8)s[i] != (u8)d[i])
+            return 0;
+    return 1;
+}
+
+#define TOK_EQ(t, lit) tok_eq_len((t), (lit), (u32)(sizeof(lit) - 1))
+
 typedef struct Lex {
     SrcFile *f;
     char *data;      /* == f->data：热路径上省掉一次 load */

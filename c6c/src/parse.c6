@@ -848,6 +848,27 @@ C6C_INLINE int pa_is_ch(int ch)
     return (u8)d[0] == (u8)(ch & 0xFF);
 }
 
+/* 同上：名字是固定字面量，长度编译期已知，先比 t->len 再比字节。
+ * 调用点由脚本统一换成 PA_IS_IDENT / PA_ACCEPT_IDENT。 */
+C6C_INLINE int pa_is_ident_n(const char *s, u32 n)
+{
+    Tok *t = pa_cur();
+
+    return t->kind == TK_IDENT && tok_eq_len(t, s, n);
+}
+
+C6C_INLINE int pa_accept_ident_n(const char *s, u32 n)
+{
+    if (pa_is_ident_n(s, n)) {
+        pa_advance();
+        return 1;
+    }
+    return 0;
+}
+
+#define PA_IS_IDENT(lit) pa_is_ident_n((lit), (u32)(sizeof(lit) - 1))
+#define PA_ACCEPT_IDENT(lit) pa_accept_ident_n((lit), (u32)(sizeof(lit) - 1))
+
 C6C_INLINE int pa_accept_ch(int ch)
 {
     if (pa_is_ch(ch)) {
@@ -1386,7 +1407,7 @@ static int pa_at_tuple_type(void)
 
                 return comma && nx && nx->kind == TK_IDENT;
             }
-        } else if (depth == 1 && tok_eq(q, "...")) {
+        } else if (depth == 1 && TOK_EQ(q, "...")) {
             return 0;                /* 变参函数类型，不是元组 */
         } else if (depth == 1 && tok_eq(q, ",")) {
             comma = 1;
@@ -1522,9 +1543,9 @@ static u32 cm_read_arg(Tok *out, u32 cap)
         if (t->kind == TK_PUNCT) {
             if (depth == 0 && (tok_eq(t, ",") || tok_eq(t, ")")))
                 break;
-            if (tok_eq(t, "(") || tok_eq(t, "[") || tok_eq(t, "{"))
+            if (tok_eq(t, "(") || TOK_EQ(t, "[") || TOK_EQ(t, "{"))
                 depth++;
-            else if (tok_eq(t, ")") || tok_eq(t, "]") || tok_eq(t, "}"))
+            else if (tok_eq(t, ")") || TOK_EQ(t, "]") || TOK_EQ(t, "}"))
                 depth--;
         }
         if (n < cap)
@@ -1574,7 +1595,7 @@ static void cm_push_expansion(CMacro *m, Tok *args, const u32 *aoff, const u32 *
 
         if (b->kind == TK_EOF)
             continue;                    /* `__local` 的占位 */
-        if (b->kind == TK_PUNCT && tok_eq(b, "##")) {
+        if (b->kind == TK_PUNCT && TOK_EQ(b, "##")) {
             paste = 1;
             continue;
         }
@@ -1779,7 +1800,7 @@ static int cm_try_define(void)
      * 否则 `( a + 1 ; )` 就不是表达式了。 */
     if (m->role != CM_ROLE_STMT) {
         while (m->nbody > 0 && m->body[m->nbody - 1].kind == TK_PUNCT
-               && tok_eq(&m->body[m->nbody - 1], ";"))
+               && TOK_EQ(&m->body[m->nbody - 1], ";"))
             m->nbody--;
         /* `expr` 宏的体就是**一个表达式**：空的、或者中间还有分号（多条
          * 语句）都不是表达式（tests/errors/macro.c6 的 expr_empty /
@@ -1793,13 +1814,13 @@ static int cm_try_define(void)
             for (j2 = 0; j2 < m->nbody; j2++) {
                 if (m->body[j2].kind != TK_PUNCT)
                     continue;
-                if (tok_eq(&m->body[j2], "(") || tok_eq(&m->body[j2], "[")
-                    || tok_eq(&m->body[j2], "{"))
+                if (tok_eq(&m->body[j2], "(") || TOK_EQ(&m->body[j2], "[")
+                    || TOK_EQ(&m->body[j2], "{"))
                     d2++;
-                else if (tok_eq(&m->body[j2], ")") || tok_eq(&m->body[j2], "]")
-                         || tok_eq(&m->body[j2], "}"))
+                else if (tok_eq(&m->body[j2], ")") || TOK_EQ(&m->body[j2], "]")
+                         || TOK_EQ(&m->body[j2], "}"))
                     d2--;
-                else if (tok_eq(&m->body[j2], ";") && d2 == 0) {
+                else if (TOK_EQ(&m->body[j2], ";") && d2 == 0) {
                     pa_error("an 'expr' macro body is one expression: use a "
                              "'stmt' macro and '({ ... })' for statements");
                     break;
@@ -1814,7 +1835,7 @@ static int cm_try_define(void)
         for (j3 = 0; j3 + 1 < m->nbody; j3++) {
             if (m->body[j3].kind != TK_PUNCT)
                 continue;
-            if (!tok_eq(&m->body[j3], "#") && !tok_eq(&m->body[j3], "##"))
+            if (!TOK_EQ(&m->body[j3], "#") && !TOK_EQ(&m->body[j3], "##"))
                 continue;
             /* 运算符**两边**都查：`a ## b` 里 a 是左边那个 */
             if (j3 > 0 && m->body[j3 - 1].kind == TK_IDENT) {
@@ -1860,11 +1881,11 @@ static int cm_try_define(void)
         int decl = 0;
         u32 j = i + 1;
 
-        if (m->body[i].kind == TK_IDENT && tok_eq(&m->body[i], "__local"))
+        if (m->body[i].kind == TK_IDENT && TOK_EQ(&m->body[i], "__local"))
             continue;                /* 手动指定：后面的名字不重命名 */
         if (m->body[i].kind == TK_IDENT
-            && (tok_eq(&m->body[i], "typeof") || tok_eq(&m->body[i], "__typeof__")
-                || tok_eq(&m->body[i], "__typeof"))) {
+            && (TOK_EQ(&m->body[i], "typeof") || TOK_EQ(&m->body[i], "__typeof__")
+                || TOK_EQ(&m->body[i], "__typeof"))) {
             int d = 0;
 
             j = i + 1;
@@ -1887,7 +1908,7 @@ static int cm_try_define(void)
         if (!decl)
             continue;
         while (j < m->nbody && m->body[j].kind == TK_PUNCT
-               && (tok_eq(&m->body[j], "*") || tok_eq(&m->body[j], "const")))
+               && (TOK_EQ(&m->body[j], "*") || TOK_EQ(&m->body[j], "const")))
             j++;
         if (j >= m->nbody || m->body[j].kind != TK_IDENT)
             continue;
@@ -1944,7 +1965,7 @@ static const char *cm_ident_name(u32 *outlen)
 
         if (b->kind == TK_EOF)
             continue;
-        if (b->kind == TK_PUNCT && tok_eq(b, "##"))
+        if (b->kind == TK_PUNCT && TOK_EQ(b, "##"))
             continue;
         if (b->kind == TK_IDENT) {
             for (k = 0; k < m->np; k++)
@@ -2467,12 +2488,12 @@ static void skip_init_list(void)
     while (pa_cur()->kind != TK_EOF && n < 100000) {
         Tok *t = pa_cur();
 
-        if (depth == 0 && t->kind == TK_PUNCT && tok_eq(t, "}"))
+        if (depth == 0 && t->kind == TK_PUNCT && TOK_EQ(t, "}"))
             return;      /* 跳过剩下所有多余元素，停在收尾的 '}' 前 */
         if (t->kind == TK_PUNCT) {
-            if (tok_eq(t, "{"))
+            if (TOK_EQ(t, "{"))
                 depth++;
-            else if (tok_eq(t, "}"))
+            else if (TOK_EQ(t, "}"))
                 depth--;
         }
         pa_advance();
@@ -2632,7 +2653,7 @@ static i64 const_unary(void)
         }
         if (pa_is_ch('(') && (is_typename_tok(pa_peek(1))
             || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT
-                && tok_eq(pa_peek(2), "@")))) {
+                && TOK_EQ(pa_peek(2), "@")))) {
             pa_advance();
             ty = parse_typename();
             if (pa_is_ch(',')) {
@@ -2691,7 +2712,7 @@ static i64 const_unary(void)
     }
     /* `_Generic` 也要能出现在常量上下文（`_Static_assert(_Generic(...), "…")`）。
      * 控制表达式只取类型：发一条赋值再撤销，和表达式那条路是同一招。 */
-    if (pa_is_ident("_Generic") && pa_peek(1)->kind == TK_PUNCT
+    if (PA_IS_IDENT("_Generic") && pa_peek(1)->kind == TK_PUNCT
         && tok_eq(pa_peek(1), "(")) {
         u32 cty = 0;
         i64 hit = 0;
@@ -2710,7 +2731,7 @@ static i64 const_unary(void)
             PEND_LVAL = 0;
         }
         while (pa_accept_ch(',')) {
-            if (pa_is_ident("default")) {
+            if (PA_IS_IDENT("default")) {
                 pa_advance();
                 pa_expect_ch(':');
                 dflt = const_expr();
@@ -2735,9 +2756,9 @@ static i64 const_unary(void)
                             && (tok_eq(t, ",") || tok_eq(t, ")")))
                             break;
                         if (t->kind == TK_PUNCT) {
-                            if (tok_eq(t, "(") || tok_eq(t, "[") || tok_eq(t, "{"))
+                            if (tok_eq(t, "(") || TOK_EQ(t, "[") || TOK_EQ(t, "{"))
                                 depth++;
-                            else if (tok_eq(t, ")") || tok_eq(t, "]") || tok_eq(t, "}"))
+                            else if (tok_eq(t, ")") || TOK_EQ(t, "]") || TOK_EQ(t, "}"))
                                 depth--;
                         }
                         pa_advance();
@@ -2753,7 +2774,7 @@ static i64 const_unary(void)
         pa_error("_Generic 没有匹配的类型分支");
         return 0;
     }
-    if (pa_is_ident("__builtin_types_compatible_p") && pa_peek(1)->kind == TK_PUNCT
+    if (PA_IS_IDENT("__builtin_types_compatible_p") && pa_peek(1)->kind == TK_PUNCT
         && tok_eq(pa_peek(1), "(")) {
         /* 类型 id 是 hash-consing 的，兼容 == id 相同（限定符也算在 id 里） */
         u32 a = 0;
@@ -2767,20 +2788,20 @@ static i64 const_unary(void)
         pa_expect_ch(')');
         return a == b ? 1 : 0;
     }
-    if (pa_is_ident("sizeof") || pa_is_ident("__alignof__")
-        || pa_is_ident("_Alignof") || pa_is_ident("alignof")) {
+    if (PA_IS_IDENT("sizeof") || PA_IS_IDENT("__alignof__")
+        || PA_IS_IDENT("_Alignof") || PA_IS_IDENT("alignof")) {
         u32 ty = 0;
         int is_align = 0;
 
-        if (pa_accept_ident("sizeof")) {
+        if (PA_ACCEPT_IDENT("sizeof")) {
             is_align = 0;
         } else {
-            (void)pa_accept_ident("__alignof__");
-            (void)pa_accept_ident("_Alignof");
-            (void)pa_accept_ident("alignof");
+            (void)PA_ACCEPT_IDENT("__alignof__");
+            (void)PA_ACCEPT_IDENT("_Alignof");
+            (void)PA_ACCEPT_IDENT("alignof");
             is_align = 1;
         }
-        if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
+        if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && TOK_EQ(pa_peek(2), "@")))) {
             pa_advance();
             ty = parse_typename();
             pa_expect_ch(')');
@@ -2800,7 +2821,7 @@ static i64 const_unary(void)
             return (i64)(is_align ? (u32)ty_align_of(ty2) : ty_size(ty2));
         }
     }
-    if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
+    if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && TOK_EQ(pa_peek(2), "@")))) {
         u32 ty = 0;
 
         pa_advance();
@@ -2833,7 +2854,7 @@ static i64 const_unary(void)
          * （`int a[Color.BLUE]`、`(1u << Color.GREEN)`、`case Color.RED:`）。
          * 必须在裸名判断之前试：`Color` 自己也是类型名（枚举裸名当类型用），
          * 先看裸名就看走眼了。 */
-        if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ".")
+        if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ".")
             && pa_peek(2) && pa_peek(2)->kind == TK_IDENT
             && (!s || (s->kind != SC_ENUMC && s->kind != SC_GLOBAL))
             && pa_cur()->len + pa_peek(2)->len + 2 < 256) {
@@ -3174,7 +3195,7 @@ static u32 body_capture(Tok *out, u32 cap)
         if (t->kind == TK_EOF)
             break;
         if (t->kind == TK_PUNCT) {
-            if (tok_eq(t, "{")) {
+            if (TOK_EQ(t, "{")) {
                 if (depth == 1 && at_item) {
                     at_item = 0;
                     cur++;
@@ -3182,13 +3203,13 @@ static u32 body_capture(Tok *out, u32 cap)
                         bound = cur;
                 }
                 depth++;
-            } else if (tok_eq(t, "}")) {
+            } else if (TOK_EQ(t, "}")) {
                 depth--;
             } else if (depth == 1) {
                 if (in_desig) {
                     /* 设计符里的数字是 TK_NUM，不走这条标点分支（见下面非标点
                      * 那条）；这里只管收尾的 `]`。 */
-                    if (tok_eq(t, "]")) {
+                    if (TOK_EQ(t, "]")) {
                         in_desig = 0;
                         cur = desig_seen ? desig_last + 1 : cur + 1;
                         if (cur > bound)
@@ -3198,11 +3219,11 @@ static u32 body_capture(Tok *out, u32 cap)
                     at_item = 1;
                 } else if (at_item) {
                     at_item = 0;
-                    if (tok_eq(t, "[")) {
+                    if (TOK_EQ(t, "[")) {
                         in_desig = 1;
                         desig_seen = 0;
                         desig_last = 0;
-                    } else if (tok_eq(t, ".")) {
+                    } else if (TOK_EQ(t, ".")) {
                         /* 成员设计符 `.m = …`：不推进数组游标 */
                     } else {
                         cur++;
@@ -3298,7 +3319,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
             for (i2 = 0; i2 < e; i2++) {
                 Tok *q = &tmp[i2];
 
-                if (q->kind == TK_PUNCT && tok_eq(q, "{")) {
+                if (q->kind == TK_PUNCT && TOK_EQ(q, "{")) {
                     d2++;
                     if (d2 == 2) {
                         nested = 1;
@@ -3995,9 +4016,9 @@ static u32 tmpl_capture_body(void)
         Tok *q = &CAP_TOK[i];
 
         if (q->kind == TK_PUNCT) {
-            if (tok_eq(q, "{")) {
+            if (TOK_EQ(q, "{")) {
                 depth++;
-            } else if (tok_eq(q, "}")) {
+            } else if (TOK_EQ(q, "}")) {
                 depth--;
                 if (depth == 0) {
                     e = i + 1;
@@ -4458,8 +4479,8 @@ static Sym *fnlit_parse_sym(void)
                     Tok *t = &CAP_TOK[ti];
 
                     if (t->kind == TK_IDENT
-                        && (tok_eq(t, "struct") || tok_eq(t, "union")
-                            || tok_eq(t, "enum"))) {
+                        && (TOK_EQ(t, "struct") || TOK_EQ(t, "union")
+                            || TOK_EQ(t, "enum"))) {
                         ti++;
                         decl = 1;
                         continue;
@@ -4468,7 +4489,7 @@ static Sym *fnlit_parse_sym(void)
                         decl = 1;
                         continue;
                     }
-                    if (decl && t->kind == TK_PUNCT && tok_eq(t, "*"))
+                    if (decl && t->kind == TK_PUNCT && TOK_EQ(t, "*"))
                         continue;
                     if (decl && t->kind == TK_IDENT) {
                         skip[nskip] = tok_data(t);
@@ -4483,15 +4504,15 @@ static Sym *fnlit_parse_sym(void)
             for (ti = 0; ti < ntok; ti++) {
                 Tok *t = &CAP_TOK[ti];
                 int isdot = (t->kind == TK_PUNCT
-                             && (tok_eq(t, ".") || tok_eq(t, "->")));
+                             && (TOK_EQ(t, ".") || TOK_EQ(t, "->")));
 
                 /* `sizeof(a)` / `typeof(a)` 里的名字**不求值**：数组、`own` 引用
                  * 这些"不能拷进环境"的东西出现在里面是合法的，不能当捕获
                  * （tests/closure.c6 的"sizeof 捕获：数组只做类型检查"）。 */
                 if (t->kind == TK_IDENT
-                    && (tok_eq(t, "sizeof") || tok_eq(t, "typeof")
-                        || tok_eq(t, "__typeof__") || tok_eq(t, "__typeof")
-                        || tok_eq(t, "alignof") || tok_eq(t, "_Alignof"))) {
+                    && (TOK_EQ(t, "sizeof") || TOK_EQ(t, "typeof")
+                        || TOK_EQ(t, "__typeof__") || TOK_EQ(t, "__typeof")
+                        || TOK_EQ(t, "alignof") || TOK_EQ(t, "_Alignof"))) {
                     if (ti + 1 < ntok && CAP_TOK[ti + 1].kind == TK_PUNCT
                         && tok_eq(&CAP_TOK[ti + 1], "(")) {
                         int sd = 0;
@@ -4742,7 +4763,7 @@ static u32 parse_agg_spec(int is_union)
         nx2 = pa_peek(lq);
         /* `{` = 定义、`;` = 模板的前置声明（`struct Fwd@T;`），两者都不是实例 */
         if (nx2 && !(nx2->kind == TK_PUNCT
-                     && (tok_eq(nx2, "{") || tok_eq(nx2, ";"))))
+                     && (TOK_EQ(nx2, "{") || TOK_EQ(nx2, ";"))))
             pa_error("an instance drops 'struct': write the instance name on its own");
     }
     if (tn && pa_is_ch('@')) {
@@ -4779,7 +4800,7 @@ static u32 parse_agg_spec(int is_union)
                         if (depth == 0) {
                             Tok *nx = pa_peek(k + 1);
 
-                            is_def = (nx->kind == TK_PUNCT && tok_eq(nx, "{"));
+                            is_def = (nx->kind == TK_PUNCT && TOK_EQ(nx, "{"));
                             break;
                         }
                     }
@@ -4789,7 +4810,7 @@ static u32 parse_agg_spec(int is_union)
                 Tok *p2 = pa_peek(1);
 
                 is_def = (p1->kind == TK_IDENT && p2->kind == TK_PUNCT
-                          && tok_eq(p2, "{"));
+                          && TOK_EQ(p2, "{"));
             }
             if (!is_def) {
                 u32 args[TMPL_NPARAM] = {0};
@@ -5266,21 +5287,21 @@ static int pa_bracket_is_vla(void)
         if (!t || t->kind == TK_EOF)
             return 0;
         if (t->kind == TK_PUNCT) {
-            if (tok_eq(t, "[")) {
+            if (TOK_EQ(t, "[")) {
                 depth++;
-            } else if (tok_eq(t, "]")) {
+            } else if (TOK_EQ(t, "]")) {
                 depth--;
                 if (depth == 0)
                     return 0;
-            } else if (tok_eq(t, ";") || tok_eq(t, "{") || tok_eq(t, "}")) {
+            } else if (TOK_EQ(t, ";") || TOK_EQ(t, "{") || TOK_EQ(t, "}")) {
                 return 0;
             }
             continue;
         }
         if (t->kind != TK_IDENT || depth != 1)
             continue;
-        if (tok_eq(t, "sizeof") || tok_eq(t, "alignof")
-            || tok_eq(t, "_Alignof") || tok_eq(t, "__alignof__")) {
+        if (TOK_EQ(t, "sizeof") || TOK_EQ(t, "alignof")
+            || TOK_EQ(t, "_Alignof") || TOK_EQ(t, "__alignof__")) {
             /* 跳过 sizeof(...)：括号里的局部变量是合法的常量表达式 */
             Tok *n1 = pa_peek(i + 1);
 
@@ -5315,7 +5336,7 @@ static int pa_bracket_is_vla(void)
                 Tok *n2 = pa_peek(i + 1);
                 Tok *n3 = pa_peek(i + 2);
 
-                if (n2 && n2->kind == TK_PUNCT && tok_eq(n2, ".") && n3
+                if (n2 && n2->kind == TK_PUNCT && TOK_EQ(n2, ".") && n3
                     && n3->kind == TK_IDENT && t->len + n3->len + 2 < 256) {
                     char qn[256] = {0};
                     u32 qk = t->len;
@@ -5385,25 +5406,25 @@ static u32 parse_typespec(void)
     int saw_int = 0;
 
     /* typeof(expr) / __typeof__(type)：类型取自表达式（不求值） */
-    if (pa_is_ident("typeof") || pa_is_ident("__typeof__") || pa_is_ident("__typeof"))
+    if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof"))
         return parse_typeof();
     /* `closure RET(params)`：闭包类型，单字（指向 {代码指针, 捕获…} 的堆对象） */
-    if (pa_is_ident("closure"))
+    if (PA_IS_IDENT("closure"))
         return parse_closure_type();
     /* `thread` 是**软**关键字：`thread h = spawn f();` 里是类型，
      * `static int thread = 1;` 里就是普通标识符（tests/errors/thread_handle.c6
      * 的正常路径要求这一点）。判据：后面紧跟一个标识符。 */
     if (pa_cur()->kind == TK_IDENT && tok_data(pa_cur())[0] == 't'
-        && (pa_is_ident("thread") || pa_is_ident("task"))
+        && (PA_IS_IDENT("thread") || PA_IS_IDENT("task"))
         && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
         /* `task` 是 async 句柄（wait/done/kind/val），`thread` 是线程句柄
          * （join/done/value）。两者都是单字，但方法不同，所以类型也分开。 */
-        PA_TASK_KW = pa_is_ident("task") ? 1 : 2;
+        PA_TASK_KW = PA_IS_IDENT("task") ? 1 : 2;
         pa_advance();
         return PA_TASK_KW == 1 ? ty_task() : ty_thread();
     }
     /* 声明位置上的 _Alignas(...) 直接忽略 */
-    while (pa_is_ident("_Alignas") || pa_is_ident("alignas")) {
+    while (PA_IS_IDENT("_Alignas") || PA_IS_IDENT("alignas")) {
         pa_advance();
         if (pa_is_ch('('))
             skip_paren_group();
@@ -5419,12 +5440,12 @@ static u32 parse_typespec(void)
         pa_advance();
         /* `error` 不是一等类型：`(int, error)` 这里要直接点出来，否则它会被
          * 当成"隐式 int 的元素名"悄悄放过（tests/errors/tuple.c6）。 */
-        if (pa_is_ident("error"))
+        if (PA_IS_IDENT("error"))
             pa_error("'error' can only be a return type, not a tuple element");
         tys[tn++] = parse_typename();
         if (pa_is_ch(',')) {
             while (tn < TUPLE_MAXN && pa_accept_ch(',')) {
-                if (pa_is_ident("error"))
+                if (PA_IS_IDENT("error"))
                     pa_error("'error' can only be a return type, not a tuple element");
                 tys[tn++] = parse_typename();
             }
@@ -5443,10 +5464,10 @@ static u32 parse_typespec(void)
     /* 托管引用 `@T`：表示上和 `T *` 一样（对象头 + 引用计数还没做，
      * 见 docs/manual/gc.md 与 todo 的 P6-6）。`shared`/`weak`/`own` 是
      * 所有权修饰符，先按普通强引用处理。 */
-    while (pa_is_ident("shared") || pa_is_ident("weak") || pa_is_ident("own")) {
-        if (pa_is_ident("weak"))
+    while (PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own")) {
+        if (PA_IS_IDENT("weak"))
             PA_MGD_KIND = 1;
-        else if (pa_is_ident("own"))
+        else if (PA_IS_IDENT("own"))
             PA_MGD_KIND = 2;
         else
             PA_MGD_SHARED = 1;
@@ -5469,12 +5490,12 @@ static u32 parse_typespec(void)
         return it;
     }
     for (;;) {
-        if (pa_accept_ident("unsigned")) { uns = 1; saw_int = 1; continue; }
-        if (pa_accept_ident("signed")) { nsigned = 1; saw_int = 1; continue; }
-        if (pa_accept_ident("long")) { nlong++; saw_int = 1; continue; }
-        if (pa_accept_ident("short")) { nshort++; saw_int = 1; continue; }
-        if (pa_is_ident("typeof") || pa_is_ident("__typeof__")
-            || pa_is_ident("__typeof")) {
+        if (PA_ACCEPT_IDENT("unsigned")) { uns = 1; saw_int = 1; continue; }
+        if (PA_ACCEPT_IDENT("signed")) { nsigned = 1; saw_int = 1; continue; }
+        if (PA_ACCEPT_IDENT("long")) { nlong++; saw_int = 1; continue; }
+        if (PA_ACCEPT_IDENT("short")) { nshort++; saw_int = 1; continue; }
+        if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__")
+            || PA_IS_IDENT("__typeof")) {
             base = parse_typeof();
             continue;
         }
@@ -5492,7 +5513,7 @@ static u32 parse_typespec(void)
          * 不看 PA_TYPE_ATOM：类型位置上的 `[` 只可能是切片后缀，而函数字面量
          * 解析返回类型时正是 PA_TYPE_ATOM 状态（`int[:](int[:] s) { … }`）。 */
         if (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)
-            && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ":")) {
+            && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ":")) {
             pa_advance();
             pa_advance();
             pa_expect_ch(']');
@@ -5501,15 +5522,15 @@ static u32 parse_typespec(void)
             base = ty_slice_chk(base ? base : ty_int());
             continue;
         }
-        if (pa_accept_ident("struct")) { base = parse_agg_spec(0);
+        if (PA_ACCEPT_IDENT("struct")) { base = parse_agg_spec(0);
             continue; }
-        if (pa_accept_ident("union")) { base = parse_agg_spec(1); continue; }
-        if (pa_accept_ident("enum")) { base = parse_enum_spec(); continue; }
-        if (pa_accept_ident("void")) { base = ty_void(); continue; }
-        if (pa_accept_ident("_Bool")) { base = ty_bool(); continue; }
-        if (pa_accept_ident("_Complex")) { continue; }   /* 复数：当实数处理 */
-        if (pa_accept_ident("_Noreturn")) { continue; }
-        if (pa_is_ident("_Atomic") && pa_peek(1)->kind == TK_PUNCT
+        if (PA_ACCEPT_IDENT("union")) { base = parse_agg_spec(1); continue; }
+        if (PA_ACCEPT_IDENT("enum")) { base = parse_enum_spec(); continue; }
+        if (PA_ACCEPT_IDENT("void")) { base = ty_void(); continue; }
+        if (PA_ACCEPT_IDENT("_Bool")) { base = ty_bool(); continue; }
+        if (PA_ACCEPT_IDENT("_Complex")) { continue; }   /* 复数：当实数处理 */
+        if (PA_ACCEPT_IDENT("_Noreturn")) { continue; }
+        if (PA_IS_IDENT("_Atomic") && pa_peek(1)->kind == TK_PUNCT
             && tok_eq(pa_peek(1), "(")) {
             pa_advance();
             pa_advance();
@@ -5517,28 +5538,28 @@ static u32 parse_typespec(void)
             pa_expect_ch(')');
             continue;
         }
-        if (pa_accept_ident("_Atomic")) { continue; }    /* 限定符位置 */
-        if (pa_accept_ident("int")) { saw_int = 1; continue; }
-        if (pa_accept_ident("char")) { base = uns ? ty_uchar() : (nsigned ? ty_schar() : ty_char()); continue; }
-        if (pa_accept_ident("float")) { base = ty_float(); continue; }
-        if (pa_accept_ident("double")) { base = ty_double(); continue; }
-        if (pa_is_ident("__attribute__") || pa_is_ident("__attribute")) {
+        if (PA_ACCEPT_IDENT("_Atomic")) { continue; }    /* 限定符位置 */
+        if (PA_ACCEPT_IDENT("int")) { saw_int = 1; continue; }
+        if (PA_ACCEPT_IDENT("char")) { base = uns ? ty_uchar() : (nsigned ? ty_schar() : ty_char()); continue; }
+        if (PA_ACCEPT_IDENT("float")) { base = ty_float(); continue; }
+        if (PA_ACCEPT_IDENT("double")) { base = ty_double(); continue; }
+        if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
             skip_attributes();
             continue;
         }
-        if (pa_is_ident("_Alignas") || pa_is_ident("alignas")) {
+        if (PA_IS_IDENT("_Alignas") || PA_IS_IDENT("alignas")) {
             /* `int _Alignas(16) i2;`：对齐说明符可以出现在类型说明符中间 */
             pa_advance();
             if (pa_is_ch('('))
                 skip_paren_group();
             continue;
         }
-        if (pa_accept_ident("static")) { PA_STATIC = 1; continue; }
+        if (PA_ACCEPT_IDENT("static")) { PA_STATIC = 1; continue; }
         /* 所有权修饰符也可能出现在 `static` 之后（`static weak @T g;`） */
-        if (pa_is_ident("weak") || pa_is_ident("own") || pa_is_ident("shared")) {
-            if (pa_is_ident("weak"))
+        if (PA_IS_IDENT("weak") || PA_IS_IDENT("own") || PA_IS_IDENT("shared")) {
+            if (PA_IS_IDENT("weak"))
                 PA_MGD_KIND = 1;
-            else if (pa_is_ident("own"))
+            else if (PA_IS_IDENT("own"))
                 PA_MGD_KIND = 2;
             else
                 PA_MGD_SHARED = 1;
@@ -5547,15 +5568,15 @@ static u32 parse_typespec(void)
         }
         /* `static inline int f(…)`：c6c 不做内联，`inline` 只是个装饰——
          * 但和 `async` 撞在一起要报（协程不能被就地展开）。 */
-        if (pa_accept_ident("inline") || pa_accept_ident("__inline")
-            || pa_accept_ident("__inline__")) {
+        if (PA_ACCEPT_IDENT("inline") || PA_ACCEPT_IDENT("__inline")
+            || PA_ACCEPT_IDENT("__inline__")) {
             PA_INLINE_SEEN = 1;
             continue;
         }
         /* `async T f(…)`：c6c 没有协程调度器，async 函数就是普通函数（和
          * rt.c6 里那组 __c6_co_* 桩一个口径）。这里只把 async 吃掉。 */
         /* `async (int, int) f()`：返回类型也可以是元组，所以后面跟 `(` 也算。 */
-        if (pa_is_ident("async") && pa_peek(1)
+        if (PA_IS_IDENT("async") && pa_peek(1)
             && (pa_peek(1)->kind == TK_IDENT
                 || (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")))) {
             pa_advance();
@@ -5597,23 +5618,23 @@ static u32 parse_typespec(void)
         if (pa_cur()->kind == TK_IDENT) {
             char c0 = tok_data(pa_cur())[0];
 
-            if ((c0 == 'w' && pa_is_ident("weak"))
-                || (c0 == 's' && pa_is_ident("shared"))
-                || (c0 == 'o' && pa_is_ident("own"))) {
+            if ((c0 == 'w' && PA_IS_IDENT("weak"))
+                || (c0 == 's' && PA_IS_IDENT("shared"))
+                || (c0 == 'o' && PA_IS_IDENT("own"))) {
                 if (c0 == 's')
                     PA_MGD_SHARED = 1;
                 pa_advance();
                 continue;
             }
         }
-        if (pa_is_ident("closure")) { base = parse_closure_type(); continue; }
+        if (PA_IS_IDENT("closure")) { base = parse_closure_type(); continue; }
         if (pa_cur()->kind == TK_IDENT && tok_data(pa_cur())[0] == 't'
-            && pa_is_ident("thread") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
+            && PA_IS_IDENT("thread") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
             base = ty_thread();
             pa_advance();
             continue;
         }
-        if (pa_accept_ident("extern")) {
+        if (PA_ACCEPT_IDENT("extern")) {
             PA_EXTERN = 1;
             continue;
         }
@@ -5621,18 +5642,18 @@ static u32 parse_typespec(void)
          * 只是躺在关键字表里没人处理，顶层靠"把 `__thread` 当成隐式 int 的
          * 声明符名字"侥幸编过去——位域/声明形状一变就报错，而且语义上它们
          * 完全被忽略（tests2/144_tls 就是这么挂的）。 */
-        if (pa_accept_ident("__thread") || pa_accept_ident("_Thread_local")) {
+        if (PA_ACCEPT_IDENT("__thread") || PA_ACCEPT_IDENT("_Thread_local")) {
             PA_TLS = 1;
             continue;
         }
-        if (pa_accept_ident("const") || pa_accept_ident("volatile") ||
-            pa_accept_ident("register") || pa_accept_ident("inline") ||
-            pa_accept_ident("auto")) {
+        if (PA_ACCEPT_IDENT("const") || PA_ACCEPT_IDENT("volatile") ||
+            PA_ACCEPT_IDENT("register") || PA_ACCEPT_IDENT("inline") ||
+            PA_ACCEPT_IDENT("auto")) {
             SAW_TYPE_QUAL = 1;
             continue;
         }
-        if (pa_accept_ident("restrict") || pa_accept_ident("__restrict")
-            || pa_accept_ident("__restrict__") || pa_accept_ident("__extension__")) {
+        if (PA_ACCEPT_IDENT("restrict") || PA_ACCEPT_IDENT("__restrict")
+            || PA_ACCEPT_IDENT("__restrict__") || PA_ACCEPT_IDENT("__extension__")) {
             SAW_TYPE_QUAL = 1;
             continue;
         }
@@ -5663,7 +5684,7 @@ static u32 parse_typespec(void)
 
         /* 模板实例可以直接写在类型位置：`Vect@int v;`（不带 `struct`） */
         if (t->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-            && tok_eq(pa_peek(1), "@")) {
+            && TOK_EQ(pa_peek(1), "@")) {
             Tmpl *tp = tmpl_find(tok_data(t), t->len);
 
             if (tp && !tp->is_func) {
@@ -5678,7 +5699,7 @@ static u32 parse_typespec(void)
                 base = tmpl_inst(tp, args);
                 /* 实例后面还可能跟切片后缀：`Vect@int[:] s = arr;` */
                 while (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)->kind == TK_PUNCT
-                       && tok_eq(pa_peek(1), ":")) {
+                       && TOK_EQ(pa_peek(1), ":")) {
                     pa_advance();
                     pa_advance();
                     pa_expect_ch(']');
@@ -5695,11 +5716,11 @@ static u32 parse_typespec(void)
             /* 模块限定的类型名 `tu.module.Point`：前缀是命名空间装饰，跳到
              * 最后一段（只在第一段不是 typedef 时才退）。 */
             if ((!s || s->kind != SC_TYPEDEF) && pa_peek(1)
-                && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ".")) {
+                && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ".")) {
                 u32 qk2 = 1;
 
                 while (pa_peek(qk2) && pa_peek(qk2)->kind == TK_PUNCT
-                       && tok_eq(pa_peek(qk2), ".") && pa_peek(qk2 + 1)
+                       && TOK_EQ(pa_peek(qk2), ".") && pa_peek(qk2 + 1)
                        && pa_peek(qk2 + 1)->kind == TK_IDENT)
                     qk2 += 2;
                 if (qk2 > 1) {
@@ -5751,7 +5772,7 @@ static u32 parse_typespec(void)
                  * 把 `[:]` 写在类型位置）。循环里那个检查走不到这里，因为
                  * typedef 名是在循环**之后**才认的。 */
                 while (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)->kind == TK_PUNCT
-                       && tok_eq(pa_peek(1), ":")) {
+                       && TOK_EQ(pa_peek(1), ":")) {
                     pa_advance();
                     pa_advance();
                     pa_expect_ch(']');
@@ -5777,9 +5798,9 @@ typespec_done:
      * const/volatile 在说明符循环里吃掉了，写在类型名**后面**的这一份
      * 以前没人管，`Vec const` 就被当成"声明符名字是 const"。
      * 语义上 qualifier 对 c6c 只是标记，吃掉即可。 */
-    while (pa_is_ident("const") || pa_is_ident("volatile") || pa_is_ident("restrict")
-           || pa_is_ident("__const") || pa_is_ident("__volatile__")
-           || pa_is_ident("__restrict") || pa_is_ident("__restrict__"))
+    while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
+           || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")
+           || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__"))
         pa_advance();
     /* 注意：`*` 归声明符管，不在这里吃。parse_typespec 是**每个声明语句**
      * 调一次的，而 `int *a, *b;` 里每个声明符都要自己再吃一遍 `*`——
@@ -5853,7 +5874,7 @@ static void skip_attributes(void)
         return;
 
     for (;;) {
-        if (pa_is_ident("__attribute__") || pa_is_ident("__attribute")) {
+        if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
             u32 save = FN.n;
             Tok *t1 = pa_peek(1);
             int is_ctor = 0;
@@ -5881,10 +5902,10 @@ static void skip_attributes(void)
                             break;
                         continue;
                     }
-                    if (c->kind == TK_IDENT && tok_eq(c, "constructor"))
+                    if (c->kind == TK_IDENT && TOK_EQ(c, "constructor"))
                         is_ctor = 1;
                     if (c->kind == TK_IDENT
-                        && (tok_eq(c, "cleanup") || tok_eq(c, "__cleanup__"))) {
+                        && (TOK_EQ(c, "cleanup") || TOK_EQ(c, "__cleanup__"))) {
                         Tok *nx = pa_peek(1);
                         Tok *ny = pa_peek(2);
 
@@ -5894,14 +5915,14 @@ static void skip_attributes(void)
                             SAW_CLEANUP_LEN = ny->len;
                         }
                     }
-                    if (c->kind == TK_IDENT && tok_eq(c, "destructor"))
+                    if (c->kind == TK_IDENT && TOK_EQ(c, "destructor"))
                         SAW_DTOR = 1;
                     /* `__attribute__((packed))`：布局按 pack(1) 走 */
-                    if (c->kind == TK_IDENT && tok_eq(c, "packed"))
+                    if (c->kind == TK_IDENT && TOK_EQ(c, "packed"))
                         SAW_PACKED = 1;
                     /* `__attribute__((aligned(N)))` / `__declspec(align(N))` */
                     if (c->kind == TK_IDENT
-                        && (tok_eq(c, "aligned") || tok_eq(c, "align"))) {
+                        && (TOK_EQ(c, "aligned") || TOK_EQ(c, "align"))) {
                         Tok *nx2 = pa_peek(1);
                         Tok *ny2 = pa_peek(2);
 
@@ -5923,14 +5944,14 @@ static void skip_attributes(void)
             FN.n = save;
             if (is_ctor)
                 SAW_CTOR = 1;
-        } else if (pa_is_ident("__extension__") || pa_is_ident("__restrict")
-                   || pa_is_ident("__restrict__") || pa_is_ident("restrict")
-                   || pa_is_ident("__inline") || pa_is_ident("__inline__")
-                   || pa_is_ident("inline") || pa_is_ident("__signed__")
-                   || pa_is_ident("_Nonnull") || pa_is_ident("_Nullable")
-                   || pa_is_ident("__const") || pa_is_ident("__volatile__")) {
+        } else if (PA_IS_IDENT("__extension__") || PA_IS_IDENT("__restrict")
+                   || PA_IS_IDENT("__restrict__") || PA_IS_IDENT("restrict")
+                   || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")
+                   || PA_IS_IDENT("inline") || PA_IS_IDENT("__signed__")
+                   || PA_IS_IDENT("_Nonnull") || PA_IS_IDENT("_Nullable")
+                   || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
             pa_advance();
-        } else if (pa_is_ident("__asm__") || pa_is_ident("__asm") || pa_is_ident("asm")) {
+        } else if (PA_IS_IDENT("__asm__") || PA_IS_IDENT("__asm") || PA_IS_IDENT("asm")) {
             pa_advance();
             skip_paren_group();
         } else {
@@ -5953,7 +5974,7 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
         d->knr = 1;
     if (pa_accept_ch(')'))
         return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
-    if (pa_is_ident("void") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ")")) {
+    if (PA_IS_IDENT("void") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ")")) {
         pa_advance();
         pa_advance();
         return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
@@ -6032,9 +6053,9 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                 continue;
             }
             /* C99 数组形参：`int x[const 5]`、`int x[static 5]`、`int x[volatile 5]` */
-            while (pa_is_ident("const") || pa_is_ident("volatile") || pa_is_ident("restrict")
-                   || pa_is_ident("static") || pa_is_ident("__restrict")
-                   || pa_is_ident("__restrict__"))
+            while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
+                   || PA_IS_IDENT("static") || PA_IS_IDENT("__restrict")
+                   || PA_IS_IDENT("__restrict__"))
                 pa_advance();
             if (pa_is_ch(']')) {
                 cnt = 0;
@@ -6177,10 +6198,10 @@ static u32 parse_declarator(u32 base, Declarator *d)
          * 循环结束时留下的是最外层的。tests2/149_parameter_qualifier_errors.c。 */
         d->obj_const = 0;
 
-        while (pa_is_ident("const") || pa_is_ident("volatile") || pa_is_ident("restrict")
-               || pa_is_ident("__restrict") || pa_is_ident("__restrict__")
-               || pa_is_ident("__const") || pa_is_ident("__volatile__")) {
-            if (pa_is_ident("const") || pa_is_ident("__const"))
+        while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
+               || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__")
+               || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
+            if (PA_IS_IDENT("const") || PA_IS_IDENT("__const"))
                 d->obj_const = 1;
             pa_advance();
         }
@@ -6188,7 +6209,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
         skip_attributes();
     }
     if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT
-        && (tok_eq(pa_peek(1), "*") || tok_eq(pa_peek(1), "("))) {
+        && (TOK_EQ(pa_peek(1), "*") || tok_eq(pa_peek(1), "("))) {
         /* 嵌套声明符 (*name)(…)：括号里的 `*` 比外面的后缀更"紧"，
          * 而**外层**的指针反而套在最里面（贴着 base）。
          *
@@ -7884,7 +7905,7 @@ static u32 gen_postfix_ops(u32 v)
         /* `t->val`：`task` 句柄（TY_TASK）。手写 `struct X_task *` 的成员访问
          * 走下面的通用路径，只有成员是托管引用时才需要在这里接管。 */
         if (pa_is_punct("->") && ty_is_taskh(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && tok_eq(pa_peek(1), "val")) {
+            && TOK_EQ(pa_peek(1), "val")) {
             u32 ao = 0;
             u32 av3 = 0;
             u32 vv3 = 0;
@@ -7904,20 +7925,20 @@ static u32 gen_postfix_ops(u32 v)
         if (pa_is_punct("->")
             && (ty_is_task(GEN_TY) || ty_is_taskh(GEN_TY))
             && pa_peek(1)->kind == TK_IDENT
-            && (tok_eq(pa_peek(1), "wait") || tok_eq(pa_peek(1), "done")
-                || tok_eq(pa_peek(1), "kind") || tok_eq(pa_peek(1), "cancel")
-                || tok_eq(pa_peek(1), "start"))) {
+            && (TOK_EQ(pa_peek(1), "wait") || TOK_EQ(pa_peek(1), "done")
+                || TOK_EQ(pa_peek(1), "kind") || TOK_EQ(pa_peek(1), "cancel")
+                || TOK_EQ(pa_peek(1), "start"))) {
             int m = 0;
             u32 tv = 0;
             u32 dv = 0;
 
-            if (tok_eq(pa_peek(1), "done"))
+            if (TOK_EQ(pa_peek(1), "done"))
                 m = 1;
-            else if (tok_eq(pa_peek(1), "start"))
+            else if (TOK_EQ(pa_peek(1), "start"))
                 m = 4;
-            else if (tok_eq(pa_peek(1), "kind"))
+            else if (TOK_EQ(pa_peek(1), "kind"))
                 m = 2;
-            else if (tok_eq(pa_peek(1), "cancel"))
+            else if (TOK_EQ(pa_peek(1), "cancel"))
                 m = 3;
             pa_advance();
             pa_advance();
@@ -7966,7 +7987,7 @@ static u32 gen_postfix_ops(u32 v)
          * `done` 恒为 1；线程函数的返回值目前丢掉，`value()` 给 0（真做线程时
          * 在 __c6_thr_start 里把它存进句柄即可）。 */
         if (pa_is_punct("->") && ty_is_thread(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && (tok_eq(pa_peek(1), "wait") || tok_eq(pa_peek(1), "kind"))) {
+            && (TOK_EQ(pa_peek(1), "wait") || TOK_EQ(pa_peek(1), "kind"))) {
             u32 wv = irfn_vreg(&FN);
 
             pa_advance();
@@ -7982,7 +8003,7 @@ static u32 gen_postfix_ops(u32 v)
             continue;
         }
         if (pa_is_punct("->") && ty_is_thread(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && tok_eq(pa_peek(1), "val")) {
+            && TOK_EQ(pa_peek(1), "val")) {
             u32 vv2 = irfn_vreg(&FN);
 
             pa_advance();
@@ -7998,8 +8019,8 @@ static u32 gen_postfix_ops(u32 v)
             continue;
         }
         if (pa_is_punct("->") && ty_is_thread(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && (tok_eq(pa_peek(1), "done") || tok_eq(pa_peek(1), "value"))) {
-            int is_done = tok_eq(pa_peek(1), "done");
+            && (TOK_EQ(pa_peek(1), "done") || TOK_EQ(pa_peek(1), "value"))) {
+            int is_done = TOK_EQ(pa_peek(1), "done");
             u32 hv2 = value_of(v);
             u32 hp2 = irfn_vreg(&FN);
             u32 dv2 = irfn_vreg(&FN);
@@ -8021,7 +8042,7 @@ static u32 gen_postfix_ops(u32 v)
             continue;
         }
         if (pa_is_punct("->") && ty_is_thread(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && tok_eq(pa_peek(1), "value") && pa_peek(2)->kind == TK_PUNCT
+            && TOK_EQ(pa_peek(1), "value") && pa_peek(2)->kind == TK_PUNCT
             && tok_eq(pa_peek(2), "(")) {
             u32 dv3 = irfn_vreg(&FN);
 
@@ -8037,7 +8058,7 @@ static u32 gen_postfix_ops(u32 v)
         }
         /* `h->join()`：thread 句柄的 join 走 pthread_join */
         if (pa_is_punct("->") && ty_is_thread(GEN_TY) && pa_peek(1)->kind == TK_IDENT
-            && tok_eq(pa_peek(1), "join") && pa_peek(2)->kind == TK_PUNCT
+            && TOK_EQ(pa_peek(1), "join") && pa_peek(2)->kind == TK_PUNCT
             && tok_eq(pa_peek(2), "(")) {
             u32 hv = value_of(v);
             u32 pj = x64_sym(&X64, "pthread_join");
@@ -8598,10 +8619,10 @@ static u32 gen_postfix(void)
      * catch、or 默认值）还没做，这里先当"值 = id"的 int 表达式，测试块能跑。 */
     /* `c6_io(fd, ev)` 只有在 `await` 的操作数位置才合法：挂起点必须写成
      * `await c6_io(…)`，别的地方调用它等于"要看一眼就绪、不用挂起"。 */
-    if (t->kind == TK_IDENT && tok_eq(t, "c6_io") && pa_peek(1)
+    if (t->kind == TK_IDENT && TOK_EQ(t, "c6_io") && pa_peek(1)
         && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(") && !PA_AWAIT_IO)
         pa_error("c6_io 只能写成 'await c6_io(fd, ev)'");
-    if (t->kind == TK_IDENT && tok_eq(t, "err") && pa_peek(1)
+    if (t->kind == TK_IDENT && TOK_EQ(t, "err") && pa_peek(1)
         && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")) {
         u32 d = 0;
 
@@ -8652,7 +8673,7 @@ static u32 gen_postfix(void)
     /* `move(x)`：c6 的"交出所有权"。值原样给出（不加计数），但**源槽必须
      * 清零**——不然源槽退出作用域时会再放一次，被交出去的对象就到 0 又被
      * 摘掉（踩过：own 树测试里 gc_live 一路减到 -2）。 */
-    if (t->kind == TK_IDENT && tok_eq(t, "move") && pa_peek(1)
+    if (t->kind == TK_IDENT && TOK_EQ(t, "move") && pa_peek(1)
         && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")) {
         u32 mv2 = 0;
         u32 mty2 = 0;
@@ -8701,7 +8722,7 @@ static u32 gen_postfix(void)
         PEND_MGD_SYM = NULL;
         return gen_postfix_ops(mv2);
     }
-    if (t->kind == TK_IDENT && (tok_eq(t, "alloca") || tok_eq(t, "__builtin_alloca"))) {
+    if (t->kind == TK_IDENT && (TOK_EQ(t, "alloca") || TOK_EQ(t, "__builtin_alloca"))) {
         if (CUR_TASK_TY)
             pa_error("async 函数里不能用 alloca");
         /* alloca/__builtin_alloca：大小是编译期常量时直接开一个栈槽（帧里预留），
@@ -8722,7 +8743,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(addr);
     }
-    if (tok_eq(t, "__builtin_syscall")) {
+    if (TOK_EQ(t, "__builtin_syscall")) {
         /* __builtin_syscall(nr, a1..a6)：FreeBSD 风格，最多 6 个参数 */
         u32 d = 0;
         u32 k = 0;
@@ -8744,10 +8765,10 @@ static u32 gen_postfix(void)
         return d;
     }
     if (t->kind == TK_IDENT &&
-        (tok_eq(t, "__builtin_va_start") || tok_eq(t, "__builtin_va_arg") ||
-         tok_eq(t, "__builtin_va_end"))) {
-        int kind = tok_eq(t, "__builtin_va_start") ? 0
-                   : tok_eq(t, "__builtin_va_arg") ? 1 : 2;
+        (TOK_EQ(t, "__builtin_va_start") || TOK_EQ(t, "__builtin_va_arg") ||
+         TOK_EQ(t, "__builtin_va_end"))) {
+        int kind = TOK_EQ(t, "__builtin_va_start") ? 0
+                   : TOK_EQ(t, "__builtin_va_arg") ? 1 : 2;
         u32 ap = 0;
         u32 ty = 0;
         u32 d = 0;
@@ -8788,7 +8809,7 @@ static u32 gen_postfix(void)
     /* _Generic(控制表达式, 类型: 表达式, …, default: 表达式)
      * 每个分支都照常生成 IR，记下各自的区间；选中的那一段搬到结果位置，
      * 其余丢掉。vreg 编号互不冲突，搬动是安全的。 */
-    if (tok_eq(t, "_Generic")) {
+    if (TOK_EQ(t, "_Generic")) {
         u32 cty = 0;
         u32 sel = 0;
         u32 k = 0;
@@ -8819,7 +8840,7 @@ static u32 gen_postfix(void)
             u32 v2 = 0;
 
             skip_attributes();
-            if (pa_is_ident("default")) {
+            if (PA_IS_IDENT("default")) {
                 pa_advance();
                 at = 0;
             } else {
@@ -8874,8 +8895,8 @@ static u32 gen_postfix(void)
      * 单线程看不出问题，16 个真线程并发就丢更新（tests2/124_atomic_counter）。
      * 注意 tcc 的 stdatomic.h 用的是**泛型**形式（第二个参数是 &值），
      * 不是 _n 形式，两种都要认。 */
-    if (tok_eq(t, "__atomic_load_n") || tok_eq(t, "__atomic_load")) {
-        int generic = tok_eq(t, "__atomic_load");
+    if (TOK_EQ(t, "__atomic_load_n") || TOK_EQ(t, "__atomic_load")) {
+        int generic = TOK_EQ(t, "__atomic_load");
         u32 p = 0;
         u32 pty = 0;
         u32 d = 0;
@@ -8898,8 +8919,8 @@ static u32 gen_postfix(void)
         GEN_TY = pty;
         return gen_postfix_ops(d);
     }
-    if (tok_eq(t, "__atomic_store_n") || tok_eq(t, "__atomic_store")) {
-        int generic = tok_eq(t, "__atomic_store");
+    if (TOK_EQ(t, "__atomic_store_n") || TOK_EQ(t, "__atomic_store")) {
+        int generic = TOK_EQ(t, "__atomic_store");
         u32 p = 0;
         u32 pty = 0;
         u32 v2 = 0;
@@ -8919,8 +8940,8 @@ static u32 gen_postfix(void)
         GEN_TY = ty_void();
         return 0;
     }
-    if (tok_eq(t, "__atomic_thread_fence") || tok_eq(t, "__atomic_signal_fence")
-        || tok_eq(t, "__sync_synchronize")) {
+    if (TOK_EQ(t, "__atomic_thread_fence") || TOK_EQ(t, "__atomic_signal_fence")
+        || TOK_EQ(t, "__sync_synchronize")) {
         pa_advance();
         if (pa_accept_ch('(')) {
             while (!pa_is_ch(')') && pa_cur()->kind != TK_EOF)
@@ -8930,11 +8951,11 @@ static u32 gen_postfix(void)
         GEN_TY = ty_void();
         return 0;
     }
-    if (tok_eq(t, "__atomic_exchange_n") || tok_eq(t, "__atomic_exchange")
-        || tok_eq(t, "__atomic_fetch_add")
-        || tok_eq(t, "__atomic_fetch_sub") || tok_eq(t, "__atomic_fetch_and")
-        || tok_eq(t, "__atomic_fetch_or") || tok_eq(t, "__atomic_fetch_xor")
-        || tok_eq(t, "__atomic_add_fetch") || tok_eq(t, "__atomic_sub_fetch")) {
+    if (TOK_EQ(t, "__atomic_exchange_n") || TOK_EQ(t, "__atomic_exchange")
+        || TOK_EQ(t, "__atomic_fetch_add")
+        || TOK_EQ(t, "__atomic_fetch_sub") || TOK_EQ(t, "__atomic_fetch_and")
+        || TOK_EQ(t, "__atomic_fetch_or") || TOK_EQ(t, "__atomic_fetch_xor")
+        || TOK_EQ(t, "__atomic_add_fetch") || TOK_EQ(t, "__atomic_sub_fetch")) {
         int xchg = 0;
         int generic = 0;         /* 泛型形式：值/返回值都是指针 */
         int aop = 0;             /* 0=加 1=减 2=与 3=或 4=异或（和 rt.c6 对齐） */
@@ -8947,13 +8968,13 @@ static u32 gen_postfix(void)
         u32 nv = 0;
         u32 fn = 0;
 
-        xchg = tok_eq(t, "__atomic_exchange_n") || tok_eq(t, "__atomic_exchange");
-        generic = tok_eq(t, "__atomic_exchange");
-        aop = tok_eq(t, "__atomic_fetch_add") || tok_eq(t, "__atomic_add_fetch") ? 0
-            : tok_eq(t, "__atomic_fetch_sub") || tok_eq(t, "__atomic_sub_fetch") ? 1
-            : tok_eq(t, "__atomic_fetch_and") ? 2
-            : tok_eq(t, "__atomic_fetch_or") ? 3 : 4;
-        ret_new = tok_eq(t, "__atomic_add_fetch") || tok_eq(t, "__atomic_sub_fetch");
+        xchg = TOK_EQ(t, "__atomic_exchange_n") || TOK_EQ(t, "__atomic_exchange");
+        generic = TOK_EQ(t, "__atomic_exchange");
+        aop = TOK_EQ(t, "__atomic_fetch_add") || TOK_EQ(t, "__atomic_add_fetch") ? 0
+            : TOK_EQ(t, "__atomic_fetch_sub") || TOK_EQ(t, "__atomic_sub_fetch") ? 1
+            : TOK_EQ(t, "__atomic_fetch_and") ? 2
+            : TOK_EQ(t, "__atomic_fetch_or") ? 3 : 4;
+        ret_new = TOK_EQ(t, "__atomic_add_fetch") || TOK_EQ(t, "__atomic_sub_fetch");
         pa_advance();
         pa_expect_ch('(');
         p = value_of(gen_assign());
@@ -9014,8 +9035,8 @@ static u32 gen_postfix(void)
         GEN_TY = pty;
         return gen_postfix_ops(nv);
     }
-    if (tok_eq(t, "__atomic_compare_exchange_n") || tok_eq(t, "__atomic_compare_exchange")) {
-        int generic = tok_eq(t, "__atomic_compare_exchange");
+    if (TOK_EQ(t, "__atomic_compare_exchange_n") || TOK_EQ(t, "__atomic_compare_exchange")) {
+        int generic = TOK_EQ(t, "__atomic_compare_exchange");
         u32 p = 0;
         u32 pty = 0;
         u32 pe = 0;
@@ -9050,8 +9071,8 @@ static u32 gen_postfix(void)
         GEN_TY = ty_int();
         return gen_postfix_ops(r);
     }
-    if (tok_eq(t, "__builtin_expect") || tok_eq(t, "__builtin_expect_with_probability")
-        || tok_eq(t, "__builtin_assume_aligned")) {
+    if (TOK_EQ(t, "__builtin_expect") || TOK_EQ(t, "__builtin_expect_with_probability")
+        || TOK_EQ(t, "__builtin_assume_aligned")) {
         u32 v = 0;
 
         pa_advance();
@@ -9062,7 +9083,7 @@ static u32 gen_postfix(void)
         pa_expect_ch(')');
         return gen_postfix_ops(v);
     }
-    if (tok_eq(t, "__builtin_constant_p")) {
+    if (TOK_EQ(t, "__builtin_constant_p")) {
         u32 d = 0;
 
         pa_advance();
@@ -9080,7 +9101,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_int();
         return gen_postfix_ops(d);
     }
-    if (tok_eq(t, "__builtin_offsetof")) {
+    if (TOK_EQ(t, "__builtin_offsetof")) {
         u32 ty = 0;
         u32 off = 0;
         u32 d = 0;
@@ -9115,7 +9136,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_ulong();
         return gen_postfix_ops(d);
     }
-    if (tok_eq(t, "__builtin_abort") || tok_eq(t, "__builtin_trap")) {
+    if (TOK_EQ(t, "__builtin_abort") || TOK_EQ(t, "__builtin_trap")) {
         u32 d = 0;
 
         pa_advance();
@@ -9132,7 +9153,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_void();
         return 0;
     }
-    if (tok_eq(t, "__FUNCTION__") || tok_eq(t, "__func__") || tok_eq(t, "__PRETTY_FUNCTION__")) {
+    if (TOK_EQ(t, "__FUNCTION__") || TOK_EQ(t, "__func__") || TOK_EQ(t, "__PRETTY_FUNCTION__")) {
         u32 v = 0;
 
         pa_advance();
@@ -9148,7 +9169,7 @@ static u32 gen_postfix(void)
          * 所以先按 "Tag.成员" 整串查一次——**要在 `!s` 之前查**，
          * 因为 `enum Color` 会自动给 `Color` 建一个 typedef，`s` 非空，
          * 否则就会退到"取最后一段"，把 `Fruit.RED` 认成 `Color.RED`。 */
-        if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ".")
+        if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ".")
             && pa_peek(2) && pa_peek(2)->kind == TK_IDENT) {
             char qn[256] = {0};
             u32 qk = t->len;
@@ -9190,7 +9211,7 @@ static u32 gen_postfix(void)
         /* c6 的模块限定名 `std.core.err.msg(rc)`：单 TU 文本导入下前缀只是
          * 命名空间装饰，真正要找的是最后一段。只在第一段没声明时才这么退，
          * 所以 `s.field` 之类照旧走成员访问。 */
-        if (!s && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ".")
+        if (!s && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ".")
             && pa_peek(2) && pa_peek(2)->kind == TK_IDENT) {
             {
                 char qn[256] = {0};
@@ -9241,7 +9262,7 @@ static u32 gen_postfix(void)
                         Tok *d2 = pa_peek((int)(k2 * 2 + 2));
                         Sym *hit = NULL;
 
-                        if (!(d1 && d1->kind == TK_PUNCT && tok_eq(d1, ".")
+                        if (!(d1 && d1->kind == TK_PUNCT && TOK_EQ(d1, ".")
                               && d2 && d2->kind == TK_IDENT))
                             break;
                         if (dn + d2->len + 2 >= sizeof(qd) || mn + d2->len + 3 >= sizeof(qm))
@@ -9272,7 +9293,7 @@ static u32 gen_postfix(void)
                 }
             }
             while (!s && break_qualified && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
-                   && tok_eq(pa_peek(1), ".")
+                   && TOK_EQ(pa_peek(1), ".")
                    && pa_peek(2) && pa_peek(2)->kind == TK_IDENT) {
                 pa_advance();
                 pa_advance();
@@ -9410,7 +9431,7 @@ static u32 gen_postfix(void)
         /* 函数模板调用：`f@int(…)` / 模板体内的 `f@T(…)`。
          * 名字**已经声明过**（同文件里还有普通函数同名、或者前面实例化过一次
          * 登记了符号）时也得走这条路——判据是"有同名函数模板"，不是"名字未声明"。 */
-        if (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "@")) {
+        if (pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "@")) {
             Tmpl *t0 = tmpl_find(tok_data(t), t->len);
 
             if (t0 && t0->is_func) {
@@ -9504,7 +9525,7 @@ static u32 gen_postfix(void)
             /* `move(a)` 之后槽是空的：读它（解引用、比较、传参、再 move）
              * 拿到的是空值，编译期就报。赋值目标（`a = …`）不算读。 */
             int is_store = pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
-                && tok_eq(pa_peek(1), "=");
+                && TOK_EQ(pa_peek(1), "=");
 
             if (s->is_mgd == 1 && !is_store && !PA_MOVE_OPERAND && !PA_UNEVAL
                 && mv_has(s->slot))
@@ -9528,7 +9549,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_int();
         return 0;
     }
-    if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "{")) {
+    if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "{")) {
         /* GNU 语句表达式 ({ ... })：值取块里最后一条表达式语句的值 */
         u32 v = 0;
         u32 vt = 0;
@@ -9983,9 +10004,9 @@ static u32 gen_unary(void)
      * 就是 `char *`，所以两者一样：把字面量拼成 printf 格式串、把 `{名字}`
      * 换成实参，调一次 snprintf 进栈上缓冲。**只支持 `{标识符}` 形式的洞**
      * （表达式要能重入词法器，那是另一件事），够 tests/ 里的用法了。 */
-    if ((pa_is_ident("f") && pa_peek(1) && pa_peek(1)->kind == TK_STR)
+    if ((PA_IS_IDENT("f") && pa_peek(1) && pa_peek(1)->kind == TK_STR)
         || (pa_is_ch('@') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
-            && tok_eq(pa_peek(1), "f") && pa_peek(2) && pa_peek(2)->kind == TK_STR)) {
+            && TOK_EQ(pa_peek(1), "f") && pa_peek(2) && pa_peek(2)->kind == TK_STR)) {
         char fmt[512] = {0};
         u32 fl = 0;
         u32 av[8] = {0};
@@ -10365,11 +10386,11 @@ static u32 gen_unary(void)
     }
     /* `await expr`：任务都同步跑完了，await 就是取它的值（和 __c6_co_wait
      * 那组桩一致）。软关键字：后面跟 `=`/`;`/`)` 之类时是普通标识符。 */
-    if (pa_is_ident("await") && pa_peek(1)
+    if (PA_IS_IDENT("await") && pa_peek(1)
         && !(pa_peek(1)->kind == TK_PUNCT
-             && (tok_eq(pa_peek(1), "=") || tok_eq(pa_peek(1), ";")
+             && (TOK_EQ(pa_peek(1), "=") || TOK_EQ(pa_peek(1), ";")
                  || tok_eq(pa_peek(1), ")") || tok_eq(pa_peek(1), ",")
-                 || tok_eq(pa_peek(1), ".") || tok_eq(pa_peek(1), "[")))) {
+                 || TOK_EQ(pa_peek(1), ".") || TOK_EQ(pa_peek(1), "[")))) {
         u32 av = 0;
         u32 aty = 0;
 
@@ -10385,7 +10406,7 @@ static u32 gen_unary(void)
         else if (PA_UNEVAL)
             pa_error("'await' 不能出现在 sizeof/typeof 这种不求值上下文里");
         /* `await c6_io(fd, ev)` 是合法形态；c6_io 单独调用见标识符那边。 */
-        was_io = (pa_cur()->kind == TK_IDENT && tok_eq(pa_cur(), "c6_io")) ? 1 : 0;
+        was_io = (pa_cur()->kind == TK_IDENT && TOK_EQ(pa_cur(), "c6_io")) ? 1 : 0;
         {
             int io_save = PA_AWAIT_IO;
 
@@ -10440,11 +10461,11 @@ static u32 gen_unary(void)
     /* c6 的 `try expr`：出错就当场从当前函数返回那个错误码（错误槽保持置位，
      * 由调用方的 catch 接手），成功则原样给出表达式的值。软关键字——后面跟
      * `=` / `;` / `)` / `,` / `.` / `[` 的时候它是普通标识符。 */
-    if (pa_is_ident("try") && pa_peek(1)
+    if (PA_IS_IDENT("try") && pa_peek(1)
         && !(pa_peek(1)->kind == TK_PUNCT
-             && (tok_eq(pa_peek(1), "=") || tok_eq(pa_peek(1), ";")
+             && (TOK_EQ(pa_peek(1), "=") || TOK_EQ(pa_peek(1), ";")
                  || tok_eq(pa_peek(1), ")") || tok_eq(pa_peek(1), ",")
-                 || tok_eq(pa_peek(1), ".") || tok_eq(pa_peek(1), "[")))) {
+                 || TOK_EQ(pa_peek(1), ".") || TOK_EQ(pa_peek(1), "[")))) {
         u32 tv = 0;
         u32 tty = 0;
         u32 tfl = 0;
@@ -10466,11 +10487,11 @@ static u32 gen_unary(void)
                 shaped = 0;
                 if (pa_cur()->kind == TK_IDENT && pa_peek(1)
                     && pa_peek(1)->kind == TK_PUNCT
-                    && (tok_eq(pa_peek(1), "->") || tok_eq(pa_peek(1), ".")
-                        || tok_eq(pa_peek(1), "[")))
+                    && (TOK_EQ(pa_peek(1), "->") || TOK_EQ(pa_peek(1), ".")
+                        || TOK_EQ(pa_peek(1), "[")))
                     shaped = 2;    /* 方法/下标调用：可失败性查不出来 */
                 else if (pa_cur()->kind == TK_PUNCT
-                         && (tok_eq(pa_cur(), "(") || tok_eq(pa_cur(), "*")))
+                         && (tok_eq(pa_cur(), "(") || TOK_EQ(pa_cur(), "*")))
                     shaped = 2;
             }
             if (shaped == 0) {
@@ -10511,9 +10532,9 @@ static u32 gen_unary(void)
         return gen_postfix_ops(d);
     }
     /* `spawn f(a, b)`：软关键字——后面是 标识符 + `(` 才算 */
-    if (pa_is_ident("spawn") && pa_peek(1)->kind == TK_IDENT
+    if (PA_IS_IDENT("spawn") && pa_peek(1)->kind == TK_IDENT
         && pa_peek(2)->kind == TK_PUNCT
-        && (tok_eq(pa_peek(2), "(") || tok_eq(pa_peek(2), "@"))) {
+        && (tok_eq(pa_peek(2), "(") || TOK_EQ(pa_peek(2), "@"))) {
         if (PA_IN_DROP)
             pa_error("'drop' 不能挂起：它在对象释放时跑");
         Sym *ss = NULL;
@@ -10537,7 +10558,7 @@ static u32 gen_unary(void)
         pa_advance();                        /* spawn */
         /* `spawn vsum@int(&v)`：函数模板的实例也是普通函数，先实例化再取符号 */
         if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-            && tok_eq(pa_peek(1), "@")) {
+            && TOK_EQ(pa_peek(1), "@")) {
             Tmpl *st = tmpl_find(tok_data(pa_cur()), pa_cur()->len);
 
             if (st && st->is_func) {
@@ -10688,7 +10709,7 @@ static u32 gen_unary(void)
      * 所以不要求紧跟 `(`——`struct Point(int v){…}` 这种多 token 的返回类型
      * 也要能认出来。形状还是要扫一遍确认。 */
     if (pa_at_typename() && !(pa_peek(1)->kind == TK_PUNCT
-                               && tok_eq(pa_peek(1), "."))) {
+                               && TOK_EQ(pa_peek(1), "."))) {
         int depth = 0;
         int q = 0;
         int is_lit = 0;
@@ -10705,7 +10726,7 @@ static u32 gen_unary(void)
                 if (depth == 0) {
                     Tok *nx = pa_peek(q + 1);
 
-                    is_lit = (nx->kind == TK_PUNCT && tok_eq(nx, "{"));
+                    is_lit = (nx->kind == TK_PUNCT && TOK_EQ(nx, "{"));
                     break;
                 }
             }
@@ -10761,9 +10782,9 @@ static u32 gen_unary(void)
     }
     /* `new T`：分配一块零初始化的 T（`@T` 的表示就是 `T *`，对象头与引用
      * 计数还没做，所以现在是"只分配不回收"，见 docs/manual/gc.md）。 */
-    if (pa_is_ident("new") && !(pa_peek(1)->kind == TK_PUNCT
-        && (tok_eq(pa_peek(1), "=") || tok_eq(pa_peek(1), "(")
-            || tok_eq(pa_peek(1), ";") || tok_eq(pa_peek(1), ".")))) {
+    if (PA_IS_IDENT("new") && !(pa_peek(1)->kind == TK_PUNCT
+        && (TOK_EQ(pa_peek(1), "=") || tok_eq(pa_peek(1), "(")
+            || TOK_EQ(pa_peek(1), ";") || TOK_EQ(pa_peek(1), ".")))) {
         u32 ty = 0;
         u32 esz = 0;
         u32 d = 0;
@@ -10829,7 +10850,7 @@ static u32 gen_unary(void)
     /* c6 的 `try f(...)`：在 `T!error` 函数里转发错误。错误 id 就是返回值
      * （0 = 成功），所以非 0 时直接 `return 那个 id`，成功时值就是 0。
      * 语句形式 `try reserve(n + 1);` 是丢弃这个值，同一条路径。 */
-    if (pa_is_ident("try")) {
+    if (PA_IS_IDENT("try")) {
         u32 l_bad = irfn_label(&FN);
         u32 l_ok = irfn_label(&FN);
         u32 v = 0;
@@ -10972,28 +10993,28 @@ static u32 gen_unary(void)
         GEN_TY = ty;
         return nv;
     }
-    if (pa_is_ident("sizeof") || pa_is_ident("__alignof__")
-        || pa_is_ident("_Alignof") || pa_is_ident("alignof")) {
+    if (PA_IS_IDENT("sizeof") || PA_IS_IDENT("__alignof__")
+        || PA_IS_IDENT("_Alignof") || PA_IS_IDENT("alignof")) {
         u32 ty = 0;
         u32 d = 0;
         int is_align = 0;
 
-        if (pa_accept_ident("sizeof")) {
+        if (PA_ACCEPT_IDENT("sizeof")) {
             is_align = 0;
         } else {
-            (void)pa_accept_ident("__alignof__");
-            (void)pa_accept_ident("_Alignof");
-            (void)pa_accept_ident("alignof");
+            (void)PA_ACCEPT_IDENT("__alignof__");
+            (void)PA_ACCEPT_IDENT("_Alignof");
+            (void)PA_ACCEPT_IDENT("alignof");
             is_align = 1;
         }
         if (pa_is_ch('(') && (is_typename_tok(pa_peek(1))
             || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT
-                && tok_eq(pa_peek(2), "@"))
+                && TOK_EQ(pa_peek(2), "@"))
             /* `sizeof(@Node)` / `sizeof(weak @Node)`：托管类型的写法 */
-            || (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "@"))
+            || (pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "@"))
             || (pa_peek(1)->kind == TK_IDENT
-                && (tok_eq(pa_peek(1), "weak") || tok_eq(pa_peek(1), "shared")
-                    || tok_eq(pa_peek(1), "own"))
+                && (TOK_EQ(pa_peek(1), "weak") || TOK_EQ(pa_peek(1), "shared")
+                    || TOK_EQ(pa_peek(1), "own"))
                 && (pa_peek(2)->kind == TK_IDENT || pa_peek(2)->kind == TK_PUNCT))
             /* `sizeof((int, int))`：内层括号是类型，而且它的闭括号后面
              * 紧跟 sizeof 自己的 `)`——否则就是复合字面量 `(t){…}` */
@@ -11050,12 +11071,12 @@ static u32 gen_unary(void)
         return d;
     }
     if (pa_is_ch('(')
-        && (is_typename_tok(pa_peek(1)) || tok_eq(pa_peek(1), "typeof")
+        && (is_typename_tok(pa_peek(1)) || TOK_EQ(pa_peek(1), "typeof")
             || (NIFACE > 0 && pa_peek(1)->kind == TK_IDENT
                 && iface_find(tok_data(pa_peek(1)), pa_peek(1)->len) < IFACE_MAX)
             || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT
-                && tok_eq(pa_peek(2), "@"))
-            || tok_eq(pa_peek(1), "__typeof") || tok_eq(pa_peek(1), "__typeof__"))) {
+                && TOK_EQ(pa_peek(2), "@"))
+            || TOK_EQ(pa_peek(1), "__typeof") || TOK_EQ(pa_peek(1), "__typeof__"))) {
         u32 ty = 0;
         u32 v = 0;
 
@@ -11778,17 +11799,17 @@ static u32 gen_cond(void)
 
     /* c6 的错误处理后缀：`expr catch [e] { … }`。expr 给的是错误 id（0 = 成功）；
      * 非 0 时把 id 绑到 `e.id` 再跑块。块的语义是"就地处理"，整体值仍是 id。 */
-    if (PA_IN_DROP && pa_is_ident("catch") && pa_peek(1))
+    if (PA_IN_DROP && PA_IS_IDENT("catch") && pa_peek(1))
         pa_error("'drop' 不能失败：它在对象释放时跑，错误没处去");
-    if (PA_IN_DEFER && pa_is_ident("catch") && pa_peek(1))
+    if (PA_IN_DEFER && PA_IS_IDENT("catch") && pa_peek(1))
         pa_error("'catch' 不能出现在 defer 体里");
-    if (pa_is_ident("catch") && pa_peek(1) && E_CALL_FALLIBLE == 2)
+    if (PA_IS_IDENT("catch") && pa_peek(1) && E_CALL_FALLIBLE == 2)
         pa_error("'catch' requires a call to a function returning 'T!error'");
-    while (pa_is_ident("catch") && pa_peek(1)
-           && (pa_peek(1)->kind == TK_IDENT || tok_eq(pa_peek(1), "{")
+    while (PA_IS_IDENT("catch") && pa_peek(1)
+           && (pa_peek(1)->kind == TK_IDENT || TOK_EQ(pa_peek(1), "{")
                || tok_eq(pa_peek(1), "("))
            && (pa_peek(1)->kind != TK_IDENT || pa_peek(2))
-           && (pa_peek(1)->kind != TK_IDENT || tok_eq(pa_peek(2), "{"))) {
+           && (pa_peek(1)->kind != TK_IDENT || TOK_EQ(pa_peek(2), "{"))) {
         u32 v0 = value_of(c);
         u32 vty = GEN_TY;              /* catch 不影响表达式的类型（可能是 double） */
         u32 lbody = irfn_label(&FN);
@@ -11942,27 +11963,27 @@ static u32 gen_assign(void)
         u32 lv_bits = PEND_BITS;
         u32 lv_bo = PEND_BITOFF;
 
-        if (tok_eq(t, "="))
+        if (TOK_EQ(t, "="))
             op = 0;
-        else if (tok_eq(t, "+="))
+        else if (TOK_EQ(t, "+="))
             op = IR_ADD;
-        else if (tok_eq(t, "-="))
+        else if (TOK_EQ(t, "-="))
             op = IR_SUB;
-        else if (tok_eq(t, "*="))
+        else if (TOK_EQ(t, "*="))
             op = IR_MUL;
-        else if (tok_eq(t, "/="))
+        else if (TOK_EQ(t, "/="))
             op = IR_DIV;
-        else if (tok_eq(t, "%="))
+        else if (TOK_EQ(t, "%="))
             op = IR_MOD;
-        else if (tok_eq(t, "&="))
+        else if (TOK_EQ(t, "&="))
             op = IR_AND;
-        else if (tok_eq(t, "|="))
+        else if (TOK_EQ(t, "|="))
             op = IR_OR;
-        else if (tok_eq(t, "^="))
+        else if (TOK_EQ(t, "^="))
             op = IR_XOR;
-        else if (tok_eq(t, "<<="))
+        else if (TOK_EQ(t, "<<="))
             op = IR_SHL;
-        else if (tok_eq(t, ">>="))
+        else if (TOK_EQ(t, ">>="))
             op = IR_SAR;
         if (op >= 0) {
             u32 r = 0;
@@ -12405,8 +12426,8 @@ static void gen_glob_braced(u32 goff, u32 ty, u32 off)
 static int tykw_is_qual(Tok *t)
 {
     return t->kind == TK_IDENT
-        && (tok_eq(t, "const") || tok_eq(t, "volatile") || tok_eq(t, "restrict")
-            || tok_eq(t, "__const") || tok_eq(t, "__volatile__") || tok_eq(t, "__restrict"));
+        && (TOK_EQ(t, "const") || TOK_EQ(t, "volatile") || TOK_EQ(t, "restrict")
+            || TOK_EQ(t, "__const") || TOK_EQ(t, "__volatile__") || TOK_EQ(t, "__restrict"));
 }
 
 /* 当前位置是不是一个类型名（关键字 / typedef / **模板实例** `Vect@int`） */
@@ -12415,7 +12436,7 @@ static int pa_at_typename(void)
     if (is_typename_tok(pa_cur()))
         return 1;
     if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-        && tok_eq(pa_peek(1), "@")) {
+        && TOK_EQ(pa_peek(1), "@")) {
         /* `Vect@int v;` 是声明，但**函数模板**的 `vget@int(v, i)` 是调用——
          * 中间那个 `@` 只是显式实参。 */
         Tmpl *tq = tmpl_find(tok_data(pa_cur()), pa_cur()->len);
@@ -12423,17 +12444,17 @@ static int pa_at_typename(void)
         return !(tq && tq->is_func);
     }
     /* `async (int, int) f()` / `async T f()`：async 是说明符，后面跟类型 */
-    if (pa_cur()->kind == TK_IDENT && tok_eq(pa_cur(), "async") && pa_peek(1)
+    if (pa_cur()->kind == TK_IDENT && TOK_EQ(pa_cur(), "async") && pa_peek(1)
         && (pa_peek(1)->kind == TK_IDENT
             || (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "("))))
         return 1;
     /* 模块限定的类型名 `tu.module.Point p;`：单 TU 文本导入下前缀只是命名空间
      * 装饰，看最后一段是不是类型即可。 */
     if (pa_cur()->kind == TK_IDENT && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
-        && tok_eq(pa_peek(1), ".")) {
+        && TOK_EQ(pa_peek(1), ".")) {
         u32 kq = 1;
 
-        while (pa_peek(kq) && pa_peek(kq)->kind == TK_PUNCT && tok_eq(pa_peek(kq), ".")
+        while (pa_peek(kq) && pa_peek(kq)->kind == TK_PUNCT && TOK_EQ(pa_peek(kq), ".")
                && pa_peek(kq + 1) && pa_peek(kq + 1)->kind == TK_IDENT)
             kq += 2;
         if (kq > 1) {
@@ -12450,7 +12471,7 @@ static int pa_at_typename(void)
     if (pa_is_ch('@'))
         return 1;
     if (pa_cur()->kind == TK_IDENT
-        && (pa_is_ident("weak") || pa_is_ident("shared") || pa_is_ident("own"))
+        && (PA_IS_IDENT("weak") || PA_IS_IDENT("shared") || PA_IS_IDENT("own"))
         && (pa_peek(1)->kind == TK_IDENT || pa_peek(1)->kind == TK_PUNCT))
         return 1;
     return 0;
@@ -12506,7 +12527,7 @@ static int pa_is_compound_lit(void)
                 if (depth == 0) {
                     Tok *nx = pa_peek(q + 1);
 
-                    return nx->kind == TK_PUNCT && tok_eq(nx, "{");
+                    return nx->kind == TK_PUNCT && TOK_EQ(nx, "{");
                 }
             }
         }
@@ -12516,8 +12537,8 @@ static int pa_is_compound_lit(void)
     while (i < 5 && tykw_is_qual(pa_peek(i)))
         i++;
     /* `(__typeof(expr)*){0}`：typeof 自己带一层括号，先把它整段跳过去 */
-    if (tok_eq(pa_peek(i), "typeof") || tok_eq(pa_peek(i), "__typeof")
-        || tok_eq(pa_peek(i), "__typeof__")) {
+    if (TOK_EQ(pa_peek(i), "typeof") || TOK_EQ(pa_peek(i), "__typeof")
+        || TOK_EQ(pa_peek(i), "__typeof__")) {
         int depth = 0;
 
         i++;
@@ -12536,20 +12557,20 @@ static int pa_is_compound_lit(void)
     } else if (!is_typename_tok(pa_peek(i))) {
         return 0;
     } else {
-        if (tok_eq(pa_peek(i), "struct") || tok_eq(pa_peek(i), "union")
-            || tok_eq(pa_peek(i), "enum"))
+        if (TOK_EQ(pa_peek(i), "struct") || TOK_EQ(pa_peek(i), "union")
+            || TOK_EQ(pa_peek(i), "enum"))
             i += 2;
         else
             i += 1;
     }
-    while (i < 12 && pa_peek(i)->kind == TK_PUNCT && tok_eq(pa_peek(i), "*"))
+    while (i < 12 && pa_peek(i)->kind == TK_PUNCT && TOK_EQ(pa_peek(i), "*"))
         i++;
     if (!(pa_peek(i)->kind == TK_PUNCT && tok_eq(pa_peek(i), ")")))
         return 0;
     i++;
     while (i < 14 && pa_peek(i)->kind == TK_PUNCT && tok_eq(pa_peek(i), ")"))
         i++;
-    return pa_peek(i)->kind == TK_PUNCT && tok_eq(pa_peek(i), "{");
+    return pa_peek(i)->kind == TK_PUNCT && TOK_EQ(pa_peek(i), "{");
 }
 
 /* 吃掉 `(T)` 前缀，停在 `{` 上；返回多出来的左括号个数（收尾要补上 `)`） */
@@ -12600,7 +12621,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 
         if (!(t0 && ((t0->kind == TK_NUM && tok_data(t0)[0] == '0')
                      || (t0->kind == TK_IDENT
-                         && (tok_eq(t0, "NULL") || tok_eq(t0, "nullptr"))))))
+                         && (TOK_EQ(t0, "NULL") || TOK_EQ(t0, "nullptr"))))))
             pa_error("a closure is not a constant expression: initialize it at run "
                      "time ('NULL' is fine at file scope)");
     }
@@ -12997,7 +13018,7 @@ static u32 init_bound_count(Tok *t, u32 n)
             }
             continue;
         }
-        if (tok_eq(q, "{")) {
+        if (TOK_EQ(q, "{")) {
             if (depth == 1 && at_item) {
                 /* `{…}` 也是条目：`{{1,2},{3,4}}` 里每个内层花括号一个元素 */
                 at_item = 0;
@@ -13008,7 +13029,7 @@ static u32 init_bound_count(Tok *t, u32 n)
             depth++;
             continue;
         }
-        if (tok_eq(q, "}")) {
+        if (TOK_EQ(q, "}")) {
             depth--;
             continue;
         }
@@ -13021,7 +13042,7 @@ static u32 init_bound_count(Tok *t, u32 n)
         if (!at_item)
             continue;
         at_item = 0;
-        if (tok_eq(q, "[")) {
+        if (TOK_EQ(q, "[")) {
             /* 设计符：`[N]` / `[a ... b]`，游标移到 b + 1 */
             u32 k = i + 1;
             u32 mx = 0;
@@ -13033,7 +13054,7 @@ static u32 init_bound_count(Tok *t, u32 n)
                 u64 v = 0;
                 int ok = 1;
 
-                if (d->kind == TK_PUNCT && tok_eq(d, "]"))
+                if (d->kind == TK_PUNCT && TOK_EQ(d, "]"))
                     break;
                 if (d->kind != TK_NUM)
                     continue;
@@ -13053,7 +13074,7 @@ static u32 init_bound_count(Tok *t, u32 n)
             }
             cur = seen ? mx + 1 : cur + 1;
             i = k;
-        } else if (tok_eq(q, ".")) {
+        } else if (TOK_EQ(q, ".")) {
             /* 成员设计符 `.m = …`：不推进数组游标 */
             continue;
         } else {
@@ -13278,7 +13299,7 @@ static int init_desig(u32 *ty, u32 *off)
     for (;;) {
         /* 上古 GNU 写法：`{ a: 1, b: 2 }`（成员名 + 冒号） */
         if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-            && tok_eq(pa_peek(1), ":")) {
+            && TOK_EQ(pa_peek(1), ":")) {
             const char *nm = tok_data(pa_cur());
             u32 nl = pa_cur()->len;
             u32 mty = 0;
@@ -13370,12 +13391,12 @@ static void init_skip_value(void)
     while (pa_cur()->kind != TK_EOF && n < 100000) {
         Tok *t = pa_cur();
 
-        if (depth == 0 && t->kind == TK_PUNCT && (tok_eq(t, ",") || tok_eq(t, "}")))
+        if (depth == 0 && t->kind == TK_PUNCT && (tok_eq(t, ",") || TOK_EQ(t, "}")))
             return;
         if (t->kind == TK_PUNCT) {
-            if (tok_eq(t, "{") || tok_eq(t, "(") || tok_eq(t, "["))
+            if (TOK_EQ(t, "{") || tok_eq(t, "(") || TOK_EQ(t, "["))
                 depth++;
-            else if (tok_eq(t, "}") || tok_eq(t, ")") || tok_eq(t, "]"))
+            else if (TOK_EQ(t, "}") || tok_eq(t, ")") || TOK_EQ(t, "]"))
                 depth--;
         }
         pa_advance();
@@ -13401,13 +13422,13 @@ static void init_body(u32 top)
         if (INIT_CUR >= LF_N
             && !(pa_is_ch('[') || pa_is_ch('.')
                  || (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-                     && tok_eq(pa_peek(1), ":")))) {
+                     && TOK_EQ(pa_peek(1), ":")))) {
             skip_init_list();
             break;
         }
         /* 区间设计符 `[lo ... hi] = v` */
         if (pa_is_ch('[') && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT
-            && tok_eq(pa_peek(2), "...")) {
+            && TOK_EQ(pa_peek(2), "...")) {
             u32 bty = LV_TY[top];
             u32 boff = LV_OFF[top];
             u32 lo = 0;
@@ -13511,7 +13532,7 @@ static void init_body(u32 top)
         }
         if (pa_is_ch('[') || pa_is_ch('.')
             || (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-                && tok_eq(pa_peek(1), ":"))) {
+                && TOK_EQ(pa_peek(1), ":"))) {
             u32 dty = LV_TY[top];
             u32 doff = LV_OFF[top];
             u32 li = 0;
@@ -14112,7 +14133,7 @@ static void gen_one_local(u32 ty, Declarator *d)
         u32 nbody = 0;
 
         if (pa_is_ch('=') && pa_peek(1)->kind == TK_PUNCT
-            && tok_eq(pa_peek(1), "{")) {
+            && TOK_EQ(pa_peek(1), "{")) {
             body = arena_alloc(&A_main, (size_t)CAP_MAX * sizeof(Tok));
             pa_advance();                  /* 吃掉 `=`，游标停到 `{` */
             nbody = body_capture(body, CAP_MAX);
@@ -14204,14 +14225,14 @@ static void gen_one_local(u32 ty, Declarator *d)
                 if (i0 && i0->kind == TK_NUM && tok_data(i0)[0] == '0')
                     is_null = 1;
                 if (i0 && i0->kind == TK_IDENT
-                    && (tok_eq(i0, "NULL") || tok_eq(i0, "nullptr")))
+                    && (TOK_EQ(i0, "NULL") || TOK_EQ(i0, "nullptr")))
                     is_null = 1;
                 /* 初始化器开头就写 `static` / `async`：这是函数字面量的存储类
                  * / 协程修饰，字面量两样都不允许（tests/errors/fn_lit.c6）。 */
                 if (i0 && i0->kind == TK_IDENT && in_c6_tu()) {
-                    if (tok_eq(i0, "static") || tok_eq(i0, "extern"))
+                    if (TOK_EQ(i0, "static") || TOK_EQ(i0, "extern"))
                         pa_error("a function literal cannot have a storage class");
-                    else if (tok_eq(i0, "async"))
+                    else if (TOK_EQ(i0, "async"))
                         pa_error("a function literal cannot be 'async'");
                 }
                 if (decl_static && !is_null && in_c6_tu()
@@ -14311,7 +14332,7 @@ static void gen_local_decl(int need_semi)
         fprintf(stderr, "[dbgL] 声明起点 %.*s\n", (int)pa_cur()->len, tok_data(pa_cur()));
     u32 base = 0;
 
-    if (pa_accept_ident("typedef")) {
+    if (PA_ACCEPT_IDENT("typedef")) {
         /* 块作用域的 typedef（`typedef enum { e, f } h;` 写在函数里很常见）。 */
         Declarator d2 = {0};
         u32 b2 = parse_typespec();
@@ -15248,13 +15269,13 @@ static int try_stmt_asm(void)
     int ok = 1;
     int isn = 0;
 
-    if (!(pa_is_ident("asm") || pa_is_ident("__asm") || pa_is_ident("__asm__")))
+    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")))
         return 0;
     pa_advance();
-    while (pa_is_ident("volatile") || pa_is_ident("__volatile__")
-           || pa_is_ident("__volatile") || pa_is_ident("inline")
-           || pa_is_ident("__inline__") || pa_is_ident("goto")) {
-        if (pa_is_ident("goto"))
+    while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
+           || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
+           || PA_IS_IDENT("__inline__") || PA_IS_IDENT("goto")) {
+        if (PA_IS_IDENT("goto"))
             isn = 1;
         pa_advance();
     }
@@ -15316,12 +15337,12 @@ static int try_toplevel_asm(void)
     u32 tlen = 0;
     u32 idx = 0;
 
-    if (!(pa_is_ident("asm") || pa_is_ident("__asm") || pa_is_ident("__asm__")))
+    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")))
         return 0;
     pa_advance();
-    while (pa_is_ident("volatile") || pa_is_ident("__volatile__")
-           || pa_is_ident("__volatile") || pa_is_ident("inline")
-           || pa_is_ident("__inline__")) {
+    while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
+           || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
+           || PA_IS_IDENT("__inline__")) {
         pa_advance();
     }
     if (!pa_is_ch('(')) {
@@ -15352,7 +15373,7 @@ static int try_pack_directive(void)
 {
     long v = 0;
 
-    if (!PACK_SEEN || !pa_is_ident("__c6_pack"))
+    if (!PACK_SEEN || !PA_IS_IDENT("__c6_pack"))
         return 0;
     pa_advance();
     pa_expect_ch('(');
@@ -15447,14 +15468,14 @@ static void gen_stmt(void)
      * 再从流里撤掉；出口处由 defer_run() 插回去。软关键字——后面不是
      * `= ; ( . , )` 才算。 */
     {
-        int is_def = (pa_is_ident("defer") || pa_is_ident("errdefer"));
+        int is_def = (PA_IS_IDENT("defer") || PA_IS_IDENT("errdefer"));
         int bad = 0;
 
         if (is_def && pa_peek(1)->kind == TK_PUNCT) {
             Tok *p1 = pa_peek(1);
 
-            if (tok_eq(p1, "=") || tok_eq(p1, ";") || tok_eq(p1, ".")
-                || tok_eq(p1, ",") || tok_eq(p1, ")") || tok_eq(p1, "["))
+            if (TOK_EQ(p1, "=") || TOK_EQ(p1, ";") || TOK_EQ(p1, ".")
+                || tok_eq(p1, ",") || tok_eq(p1, ")") || TOK_EQ(p1, "["))
                 bad = 1;
             if (tok_eq(p1, "(")) {
                 /* `defer (…);` 是调用；`defer (a, b) = f();` 是元组解构 */
@@ -15467,7 +15488,7 @@ static void gen_stmt(void)
             }
         }
         if (is_def && !bad) {
-        int is_err = pa_is_ident("errdefer");
+        int is_err = PA_IS_IDENT("errdefer");
         u32 start = 0;
         u32 nops = 0;
 
@@ -15513,7 +15534,7 @@ static void gen_stmt(void)
         return;
         }
     }
-    if (pa_accept_ident("goto")) {
+    if (PA_ACCEPT_IDENT("goto")) {
         if (PA_IN_DEFER)
             pa_error("'goto' is not allowed in a defer body");
         PA_LAST_TERM = 1;
@@ -15566,14 +15587,14 @@ static void gen_stmt(void)
         }
         return;
     }
-    if (pa_accept_ident("_Static_assert") || pa_accept_ident("static_assert")) {
+    if (PA_ACCEPT_IDENT("_Static_assert") || PA_ACCEPT_IDENT("static_assert")) {
         parse_static_assert_rest();
         return;
     }
     /* `co f(args);`：起一个游离任务（不等它）。c6c 的任务都是同步跑完的，
      * 所以这里就是"调一次、丢掉返回值"。软关键字：只有后面跟
      * `标识符 (` 时才算，`co = 1;` / `co(x)` 之类照旧。 */
-    if (pa_is_ident("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+    if (PA_IS_IDENT("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
         && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "(")) {
         pa_advance();
         {
@@ -15596,8 +15617,8 @@ static void gen_stmt(void)
         return;
     }
     /* 名字标号：IDENT ':' */
-    if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ":")
-        && !pa_is_ident("default")) {
+    if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), ":")
+        && !PA_IS_IDENT("default")) {
         u32 l = goto_label(tok_data(pa_cur()), pa_cur()->len);
         int gi = 0;
 
@@ -15618,7 +15639,7 @@ static void gen_stmt(void)
             gen_stmt();
         return;
     }
-    if (pa_accept_ident("case")) {
+    if (PA_ACCEPT_IDENT("case")) {
         i64 lo = 0;
         i64 hi = 0;
         int is_range = 0;
@@ -15645,7 +15666,7 @@ static void gen_stmt(void)
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbl, 0, 0, 0);
         return;
     }
-    if (pa_accept_ident("default")) {
+    if (PA_ACCEPT_IDENT("default")) {
         pa_expect_ch(':');
         if (NSW > 0) {
             SW[NSW - 1].has_def = 1;
@@ -15655,7 +15676,7 @@ static void gen_stmt(void)
         }
         return;
     }
-    if (pa_accept_ident("switch")) {
+    if (PA_ACCEPT_IDENT("switch")) {
         gen_switch();
         return;
     }
@@ -15665,7 +15686,7 @@ static void gen_stmt(void)
     }
     if (pa_accept_ch(';'))
         return;
-    if (pa_accept_ident("return")) {
+    if (PA_ACCEPT_IDENT("return")) {
         if (PA_IN_DEFER)
             pa_error("'return' is not allowed in a defer body");
         PA_RET_EXPR = 1;
@@ -15674,7 +15695,7 @@ static void gen_stmt(void)
         int on_err = 0;
 
         /* `return err(...)` 是错误路径：errdefer 也要跑。其余正常路径只跑 defer。 */
-        if (pa_is_ident("err") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "("))
+        if (PA_IS_IDENT("err") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "("))
             on_err = 1;
         if (pa_is_ch(';')) {
             pa_advance();
@@ -15874,7 +15895,7 @@ static void gen_stmt(void)
         }
         return;
     }
-    if (pa_accept_ident("if")) {
+    if (PA_ACCEPT_IDENT("if")) {
         u32 lthen = irfn_label(&FN);
         mv_push();
         u32 lelse = irfn_label(&FN);
@@ -15889,7 +15910,7 @@ static void gen_stmt(void)
         gen_stmt();
         mv_save_tmp();          /* then 分支的状态 */
         mv_restore();           /* else 从"进来时"的状态开始 */
-        if (pa_accept_ident("else")) {
+        if (PA_ACCEPT_IDENT("else")) {
             irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lend, 0, 0, 0);
             irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lelse, 0, 0, 0);
             gen_stmt();
@@ -15904,7 +15925,7 @@ static void gen_stmt(void)
     /* c6 `foreach (T v = it)` / `foreach ((T i, T v) = it)`：数组与切片。
      * 语法：foreach ( ['('] T1 n1 [, T2 n2] [')'] = expr ) stmt
      * 展开成"快照 ptr/len + 普通循环"。 */
-    if (pa_accept_ident("foreach")) {
+    if (PA_ACCEPT_IDENT("foreach")) {
         u32 bty[2] = {0};
         u32 bsl[2] = {0};
         int bnamed[2] = {0};
@@ -15947,8 +15968,8 @@ static void gen_stmt(void)
             {
                 int head_ty = is_typename_tok(pa_cur());
 
-                if (pa_is_ch('@') || pa_is_ident("shared") || pa_is_ident("weak")
-                    || pa_is_ident("own"))
+                if (pa_is_ch('@') || PA_IS_IDENT("shared") || PA_IS_IDENT("weak")
+                    || PA_IS_IDENT("own"))
                     head_ty = 1;      /* `@T` / `shared @T` 也是类型写法 */
                 if (!head_ty && pa_cur()->kind == TK_IDENT) {
                     Sym *hs = sym_find(tok_data(pa_cur()), pa_cur()->len);
@@ -15959,7 +15980,7 @@ static void gen_stmt(void)
                         head_ty = 1;
                     /* 模板实例 `Vect@int` 也是类型 */
                     if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
-                        && tok_eq(pa_peek(1), "@"))
+                        && TOK_EQ(pa_peek(1), "@"))
                         head_ty = 1;
                 }
                 if (!head_ty)
@@ -16433,7 +16454,7 @@ static void gen_stmt(void)
         (void)two;
         return;
     }
-    if (pa_accept_ident("while")) {
+    if (PA_ACCEPT_IDENT("while")) {
         u32 ltop = irfn_label(&FN);
         u32 lbodY = irfn_label(&FN);
         u32 lend = irfn_label(&FN);
@@ -16460,7 +16481,7 @@ static void gen_stmt(void)
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
         return;
     }
-    if (pa_accept_ident("for")) {
+    if (PA_ACCEPT_IDENT("for")) {
         u32 ltop = irfn_label(&FN);
         u32 lcont = irfn_label(&FN);
         u32 lbody = irfn_label(&FN);
@@ -16551,7 +16572,7 @@ static void gen_stmt(void)
         scope_leave();
         return;
     }
-    if (pa_accept_ident("do")) {
+    if (PA_ACCEPT_IDENT("do")) {
         u32 ltop = irfn_label(&FN);
         u32 lcont = irfn_label(&FN);
         u32 lend = irfn_label(&FN);
@@ -16568,7 +16589,7 @@ static void gen_stmt(void)
         mv_loop_leave();
         NLOOP--;
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
-        if (!pa_accept_ident("while")) {
+        if (!PA_ACCEPT_IDENT("while")) {
             pa_error("do 后面要 while");
             return;
         }
@@ -16580,7 +16601,7 @@ static void gen_stmt(void)
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
         return;
     }
-    if (pa_accept_ident("break")) {
+    if (PA_ACCEPT_IDENT("break")) {
         if (PA_IN_DEFER)
             pa_error("'break' is not allowed in a defer body");
         pa_expect_ch(';');
@@ -16595,7 +16616,7 @@ static void gen_stmt(void)
         }
         return;
     }
-    if (pa_accept_ident("continue")) {
+    if (PA_ACCEPT_IDENT("continue")) {
         if (PA_IN_DEFER)
             pa_error("'continue' is not allowed in a defer body");
         pa_expect_ch(';');
@@ -16640,7 +16661,7 @@ static void gen_stmt(void)
                 if (depth == 0) {
                     Tok *nx = pa_peek(q + 1);
 
-                    if (has_comma && nx->kind == TK_PUNCT && tok_eq(nx, "="))
+                    if (has_comma && nx->kind == TK_PUNCT && TOK_EQ(nx, "="))
                         is_des = 1;
                     else if (has_comma && nx->kind == TK_IDENT)
                         is_decl = 1;
@@ -16659,7 +16680,7 @@ static void gen_stmt(void)
     }
     /* `thread h = spawn f();` / `task t = twice(5);`：软关键字，后面跟标识符
      * 才是声明 */
-    if ((pa_is_ident("thread") || pa_is_ident("task"))
+    if ((PA_IS_IDENT("thread") || PA_IS_IDENT("task"))
         && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
         && pa_peek(2) && (pa_peek(2)->kind == TK_PUNCT)) {
         gen_local_decl(1);
@@ -16674,7 +16695,7 @@ static void gen_stmt(void)
     /* 模板实例开头的局部声明：`Vect@int v;`——`Vect` 是标识符不是类型关键字，
      * 但后面跟 `@` 就说明这是类型位置。 */
     if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-        && tok_eq(pa_peek(1), "@")) {
+        && TOK_EQ(pa_peek(1), "@")) {
         Tmpl *tp = tmpl_find(tok_data(pa_cur()), pa_cur()->len);
 
         if (tp && !tp->is_func) {
@@ -16685,8 +16706,8 @@ static void gen_stmt(void)
     /* 托管引用/所有权修饰符开头的局部声明：`@T p = new T;`、
      * `shared @T q = …;` */
     if (pa_is_ch('@')
-        || ((pa_is_ident("shared") || pa_is_ident("weak") || pa_is_ident("own"))
-            && (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "@")))) {
+        || ((PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own"))
+            && (pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "@")))) {
         gen_local_decl(1);
         return;
     }
@@ -16710,7 +16731,7 @@ static void gen_stmt(void)
                 if (ld == 0) {
                     Tok *nx = pa_peek(lq + 1);
 
-                    lit = (nx->kind == TK_PUNCT && tok_eq(nx, "{"));
+                    lit = (nx->kind == TK_PUNCT && TOK_EQ(nx, "{"));
                     break;
                 }
             }
@@ -16729,7 +16750,7 @@ static void gen_stmt(void)
     }
     /* c6 的推断声明：`f = <表达式>;` —— f 还没声明过，就按右值的类型就地声明 */
     if (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
-        && tok_eq(pa_peek(1), "=")
+        && TOK_EQ(pa_peek(1), "=")
         && !sym_find(tok_data(pa_cur()), pa_cur()->len)
         && !sym_find_tag(tok_data(pa_cur()), pa_cur()->len)
         /* 方法体里的 `x = …` 是给接收者的成员赋值，不是"推断声明"——
@@ -17359,7 +17380,7 @@ static void gen_one_global(u32 ty, Declarator *d)
 
         if (nx->kind == TK_STR)
             ty = ty_array(ty_target(ty), (u32)(nx->len > 1 ? nx->len - 1 : 1));
-        else if (nx->kind == TK_PUNCT && tok_eq(nx, "{")) {
+        else if (nx->kind == TK_PUNCT && TOK_EQ(nx, "{")) {
             u32 esz = ty_size(ty_target(ty)) ? ty_size(ty_target(ty)) : 1;
             /* 以设计符开头的初始化器可能直接用很大的下标（`{[127] = …}`、
              * `{[0 ... 255] = …}`），按 1 KB 留地方会不够——够不着元素就只能
@@ -17367,7 +17388,7 @@ static void gen_one_global(u32 ty, Declarator *d)
              * 填完再把尾巴收回去（见下面 was_inc 那段）。 */
             Tok *a2 = pa_peek(2);
 
-            if (a2 && a2->kind == TK_PUNCT && (tok_eq(a2, "[") || tok_eq(a2, "."))) {
+            if (a2 && a2->kind == TK_PUNCT && (TOK_EQ(a2, "[") || TOK_EQ(a2, "."))) {
                 /* 8 KB 的余量：够 `{[0 ... 255] = …}` 这种（指针 2 KB、char 256 B），
                  * 又不至于把叶子数顶过 INIT_LF_MAX（16384）——顶过去会整块退回旧
                  * 实现，那边不认设计符，长度会算成 0。 */
@@ -17509,7 +17530,7 @@ static void gen_one_global(u32 ty, Declarator *d)
                 if (ldep == 0) {
                     Tok *nx = pa_peek(lq + 1);
 
-                    lhit = (nx->kind == TK_PUNCT && tok_eq(nx, "{"));
+                    lhit = (nx->kind == TK_PUNCT && TOK_EQ(nx, "{"));
                     break;
                 }
             }
@@ -17571,7 +17592,7 @@ static void gen_one_global(u32 ty, Declarator *d)
         if (c0 && c0->kind == TK_NUM && tok_data(c0)[0] == '0')
             cnull = 1;
         if (c0 && c0->kind == TK_IDENT
-            && (tok_eq(c0, "NULL") || tok_eq(c0, "nullptr")))
+            && (TOK_EQ(c0, "NULL") || TOK_EQ(c0, "nullptr")))
             cnull = 1;
         /* `((void *)0)` 这种（NULL 的展开）也算空值 */
         if (c0 && c0->kind == TK_PUNCT && tok_eq(c0, "("))
@@ -17790,7 +17811,7 @@ static void pa_parse_tu(void)
          * 那边 skip_attributes 会把 `asm` 当属性关键字默默吃掉。 */
         if (try_toplevel_asm())
             continue;
-        if (pa_is_ident("foreach"))
+        if (PA_IS_IDENT("foreach"))
             pa_error("'foreach' can only be used inside a function");
         /* 模块声明（改写阶段把 `module a.b;` 换成了这条）：
          *   - 必须是本文件里的第一个声明；
@@ -17798,7 +17819,7 @@ static void pa_parse_tu(void)
          *   - 模块里不许有 `main`（见下面定义处）。
          * 判定放在这儿才看得见 `#if` 之后剩下的那份文本
          * （tests/errors/module.c6）。 */
-        if (pa_is_ident("__c6_module_decl") && pa_peek(1)
+        if (PA_IS_IDENT("__c6_module_decl") && pa_peek(1)
             && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")) {
             char mnm[200] = {0};
             u32 ml = 0;
@@ -17836,7 +17857,7 @@ static void pa_parse_tu(void)
         any_decl = 1;
         /* `co f();` 是语句，文件作用域上没有意义（软关键字：后面跟
          * `标识符 (` 才算，`co` 自己也还能是普通名字）。 */
-        if (pa_is_ident("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+        if (PA_IS_IDENT("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "(")
             && !sym_find(tok_data(pa_cur()), pa_cur()->len))
             pa_error("'co' 只能在函数里用");
@@ -17847,7 +17868,7 @@ static void pa_parse_tu(void)
         if (cm_expand(-1))
             continue;
         /* c6 的 `test "名字" { … }` 块：当函数编，失败返回非 0 */
-        if (pa_is_ident("test") && (pa_peek(1)->kind == TK_STR || tok_eq(pa_peek(1), "{"))) {
+        if (PA_IS_IDENT("test") && (pa_peek(1)->kind == TK_STR || TOK_EQ(pa_peek(1), "{"))) {
             char nm[128] = {0};
             Declarator td = {0};
 
@@ -17890,8 +17911,8 @@ static void pa_parse_tu(void)
         /* c6 的模块头：`module a.b.c;` / `import a.b.c;`（可能带 `as x`）。
          * c6c 是 C 前端，模块/导入暂不作语义处理——先把它们当"声明"吃掉，
          * 这样一个模块文件本身就能按 C 编译（c6 的扩展语法另算）。 */
-        if (pa_is_ident("module") || pa_is_ident("import")) {
-            int is_mod = pa_is_ident("module");
+        if (PA_IS_IDENT("module") || PA_IS_IDENT("import")) {
+            int is_mod = PA_IS_IDENT("module");
             char path[256] = {0};
             int pn = 0;
 
@@ -17928,11 +17949,11 @@ static void pa_parse_tu(void)
         }
         if (try_pack_directive())
             continue;
-        if (pa_accept_ident("_Static_assert") || pa_accept_ident("static_assert")) {
+        if (PA_ACCEPT_IDENT("_Static_assert") || PA_ACCEPT_IDENT("static_assert")) {
             parse_static_assert_rest();
             continue;
         }
-        if (pa_accept_ident("interface")) {
+        if (PA_ACCEPT_IDENT("interface")) {
             const char *inm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : "";
             u32 iln = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
             u32 idx = NIFACE;
@@ -17980,8 +18001,8 @@ static void pa_parse_tu(void)
                             int new_tag = 0;
                             u32 pt2 = 0;
 
-                            if ((pa_is_ident("struct") || pa_is_ident("union")
-                                 || pa_is_ident("enum"))
+                            if ((PA_IS_IDENT("struct") || PA_IS_IDENT("union")
+                                 || PA_IS_IDENT("enum"))
                                 && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
                                 && !sym_find_tag(tok_data(pa_peek(1)), pa_peek(1)->len))
                                 new_tag = 1;
@@ -18013,7 +18034,7 @@ static void pa_parse_tu(void)
             }
             continue;
         }
-        if (pa_accept_ident("typedef")) {
+        if (PA_ACCEPT_IDENT("typedef")) {
             Declarator d2 = {0};
             u32 b2 = parse_typespec();
             u32 t2 = parse_declarator(b2, &d2);
@@ -18091,19 +18112,19 @@ static void pa_parse_tu(void)
             /* `|T| typedef <spec> <名字>;`：typedef 模板。体里没有 `{`，
              * 实例化时按 `typedef` 后面那段重新解析一遍。 */
             if (ntok >= 3 && CAP_TOK[0].kind == TK_IDENT
-                && tok_eq(&CAP_TOK[0], "typedef")) {
+                && TOK_EQ(&CAP_TOK[0], "typedef")) {
                 u32 lastid = ntok;
                 u32 q3 = 0;
                 int has_brace = 0;
 
                 for (q3 = 0; q3 < ntok; q3++)
-                    if (CAP_TOK[q3].kind == TK_PUNCT && tok_eq(&CAP_TOK[q3], "{"))
+                    if (CAP_TOK[q3].kind == TK_PUNCT && TOK_EQ(&CAP_TOK[q3], "{"))
                         has_brace = 1;
                 if (!has_brace) {
                     /* `|T| typedef T *Ptr;`：体里没有花括号，`tmpl_capture_body`
                      * 一直吃到了文件尾，这里截到第一个 `;`。 */
                     for (q3 = 0; q3 < ntok; q3++)
-                        if (CAP_TOK[q3].kind == TK_PUNCT && tok_eq(&CAP_TOK[q3], ";")) {
+                        if (CAP_TOK[q3].kind == TK_PUNCT && TOK_EQ(&CAP_TOK[q3], ";")) {
                             ntok = q3 + 1;
                             break;
                         }
@@ -18121,7 +18142,7 @@ static void pa_parse_tu(void)
                 }
                 for (q3 = ntok; q3 > 0; q3--)
                     if (CAP_TOK[q3 - 1].kind == TK_IDENT
-                        && !tok_eq(&CAP_TOK[q3 - 1], "typedef")) {
+                        && !TOK_EQ(&CAP_TOK[q3 - 1], "typedef")) {
                         lastid = q3 - 1;
                         break;
                     }
@@ -18150,7 +18171,7 @@ static void pa_parse_tu(void)
             for (i2 = 0; i2 < ntok; i2++) {
                 Tok *q = &CAP_TOK[i2];
 
-                if (!found_body && q->kind == TK_PUNCT && tok_eq(q, "{")) {
+                if (!found_body && q->kind == TK_PUNCT && TOK_EQ(q, "{")) {
                     body_i = i2;
                     found_body = 1;
                 }

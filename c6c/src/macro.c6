@@ -237,7 +237,7 @@ static int macro_defined(const Tok *t)
 {
     /* __has_include 是内建的运算符，但 `#ifdef __has_include` 必须为真 */
     if (t->kind == TK_IDENT
-        && (tok_eq(t, "__has_include") || tok_eq(t, "__has_include_next")))
+        && (TOK_EQ(t, "__has_include") || TOK_EQ(t, "__has_include_next")))
         return 1;
     return macro_find(t) != NULL;
 }
