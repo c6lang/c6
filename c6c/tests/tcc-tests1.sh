@@ -59,7 +59,7 @@ for src in "$DIR"/*.c; do
         fi
         continue
     fi
-    ( cd "$TMP" && timeout 30 "./$base" >"$TMP/$base.out" 2>&1 )
+    ( cd "$TMP" && timeout -k 5 30 "./$base" >"$TMP/$base.out" 2>&1 )
     rc=$?
     if [ "$rc" -eq 0 ]; then
         pass=$((pass + 1))

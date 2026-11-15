@@ -11,12 +11,17 @@ C6C=${C6C:-./build/c6c}
 LLC=${LLC:-llc}
 CC=${CC:-gcc}
 CORPUS=${CORPUS:-tests/c}
+# 上限（秒）：TMO 管"编一遍"（c6c / llc / 宿主 cc），RUN_TMO 管"跑一下"。
+# 一条用例卡死不该把整轮验收挂住；`timeout -k` 保证不理 SIGTERM 的也收得掉。
+TMO=${TMO:-120}
+RUN_TMO=${RUN_TMO:-60}
 TMP=${TMPDIR:-/tmp}/c6c-llvmdiff.$$
 mkdir -p "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 ok=0
 bad=0
+skip=0
 badlist=""
 # 只有 native 后端能跑的用例（`native-only.txt` 一行一个文件名）：
 # 目前是 `__thread`——C99/LLVM 后端还没发"构造函数里调 c6c_tls_setup()"那条，
@@ -30,20 +35,20 @@ for f in "$CORPUS"/*.c; do
     if [ -f "$CORPUS/native-only.txt" ] && grep -qx "$name" "$CORPUS/native-only.txt"; then
         continue
     fi
-    if ! "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(native-cc)"; continue
     fi
-    if ! "$C6C" --emit-llvm "$f" -o "$TMP/$name.ll" >"$TMP/$name.llog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$C6C" --emit-llvm "$f" -o "$TMP/$name.ll" >"$TMP/$name.llog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(llvm-emit)"; continue
     fi
-    if ! "$LLC" -O0 -filetype=obj -o "$TMP/$name.o" "$TMP/$name.ll" >>"$TMP/$name.llog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$LLC" -O0 -filetype=obj -o "$TMP/$name.o" "$TMP/$name.ll" >>"$TMP/$name.llog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(llc)"; continue
     fi
-    if ! "$CC" -no-pie -o "$TMP/$name.x" "$TMP/$name.o" >>"$TMP/$name.llog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$CC" -no-pie -o "$TMP/$name.x" "$TMP/$name.o" >>"$TMP/$name.llog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(link)"; continue
     fi
-    "$TMP/$name.n" >"$TMP/$name.nout" 2>&1; nrc=$?
-    "$TMP/$name.x" >"$TMP/$name.xout" 2>&1; xrc=$?
+    timeout -k 5 "$RUN_TMO" "$TMP/$name.n" >"$TMP/$name.nout" 2>&1; nrc=$?
+    timeout -k 5 "$RUN_TMO" "$TMP/$name.x" >"$TMP/$name.xout" 2>&1; xrc=$?
     if [ "$nrc" -ne "$xrc" ]; then
         bad=$((bad + 1)); badlist="$badlist $name(rc $nrc!=$xrc)"; continue
     fi
@@ -54,6 +59,12 @@ for f in "$CORPUS"/*.c; do
 done
 
 echo "c6c: LLVM IR 后端 vs native 后端（$CORPUS）：一致 $ok / 不一致 $bad"
+if [ "$skip" -ne 0 ]; then
+    # `llvm-only.txt` 里登记的是"LLVM 后端暂时不跑"的用例。以前这里直接写
+    # `skip=$((skip+1))` 但 skip 从没初始化——`set -u` 下只要那份清单非空，
+    # 脚本就在第一条上以 "skip: unbound variable" 死掉。
+    echo "c6c: LLVM 后端跳过 $skip 条（tests/c/llvm-only.txt）"
+fi
 if [ "$bad" -ne 0 ]; then
     echo "c6c: 不一致项：$badlist"
     # 失败原因都在每例的 .llog 里（llc / cc 的 stderr）。以前只在临时目录里
