@@ -3697,3 +3697,72 @@ make -C c6c fast                   # 全绿（embedcheck + pkgcheck 都在里面
 ②的另一半（**动态链接**：`DT_NEEDED` + `.plt`/`.got.plt` + `PT_INTERP`，
 让 `rt.o` 那 23 个 libc 名字从 libc.so.6 解析、不用 `--allow-undefined`）、
 ③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。
+
+## 第 200 轮：动态链接（`-Wl,--dynamic`）
+
+硬缺口②的另一半。静态链接那一版把 libc 的名字按 0 处理（或者逼用户加
+`-Wl,--allow-undefined`）；这一轮把它变成真的：出 ELF 动态可执行文件，让
+ld.so 把 libc.so.6 映射进来，`rt.o` 里那 22 个函数（`vsprintf`、`openat`、
+`feof`……）从 libc 解析。
+
+### 做出来的东西
+
+```
+PT_INTERP                     /lib64/ld-linux-x86-64.so.2
+.dynstr/.dynsym/.hash         导入符号的名字与表项（SysV 哈希）
+.rela.plt + .plt + .got.plt   每个导入函数一条 R_X86_64_JUMP_SLOT
+.dynamic                      DT_NEEDED libc.so.6 / DT_PLTGOT / DT_JMPREL /
+                              DT_FLAGS = BIND_NOW（非惰性绑定）
+```
+
+PLT 桩子只有 6 字节（`ff 25 <rel32>`）：非惰性绑定下 ld.so 启动时就把所有
+JUMP_SLOT 解完，不需要 plt0 那套 push/jmp 协商，也就少一处可能对不齐的地方。
+`.got.plt` 保留 3 个 ld.so 自用槽（`_DYNAMIC` / `link_map` / 解析器）。
+
+文件布局沿用"VA = 0x400000 + 文件偏移"这条老规矩，所以两个 `PT_LOAD` 的
+`p_offset % 0x1000 == p_vaddr % 0x1000` 自动成立：
+
+```
+[头+5 个程序头][.interp][.text][.rodata][.dynstr][.dynsym][.hash][.rela.plt][.plt]
+--- 翻页 ---
+[.got.plt][.data][.init_array][.fini_array][.dynamic][.bss（只算 memsz）]
+```
+
+### 踩的坑
+
+1. **`.dynamic` 落进了 `.data` 中间**：`ld_dyn_plan()` 的局部量用 `LD_NIMP`
+   初始化，但 `ld_dyn_collect()` 在**后面**才跑——尺寸全是按 0 个导入算的，
+   写文件时又按 22 个导入写，于是后面每一段都往前顶，`.dynamic` 的偏移落在
+   `.data` 内。readelf 一句"1 entry (NULL)"就是这个症状。先收集、再算尺寸。
+2. **PT_DYNAMIC 的 filesz 比实际写出的字节多 16**：leaving 尾巴不在文件里，
+   readelf 直接报"动态段越过了文件尾"。写完整块（补 0）才对。
+3. **`-Wl,--dynamic` 拼错会被静默忽略**：原来 `-W*` 是个兜底（吞掉所有告警
+   开关），`-Wl,` 开头的链接器选项也落进去了——症状是"我明明开了动态链接"
+   却报未定义符号。现在 `-Wl,` 前缀单独一类，不认识就报错。
+4. **`environ` 被当成函数**：链接器靠 `.o` 符号表的 `st_info` 区分函数/数据，
+   而 `extern char **environ;` 这条纯引用在出 `.o` 时被标成了 `NOTYPE`。
+   给 `x64.c6` 加了 `x64_data_ref()`（只标 `is_data`、不定义），`obj.c6`
+   把未定义的数据符号写成 `STT_OBJECT`。链接器这才知道"这个不能发 PLT 桩子"。
+5. **数据符号不能硬报错**：动态链接下遇到 `OBJECT` 类未定义符号要按 0 处理并
+   点名警告，不能掉进"未定义的符号"那条错误里——否则 `rt.o` 永远链不上。
+
+### 实测
+
+```
+c6c -c app.c6 -o app.o
+c6c -Wl,--dynamic -o app app.o rt.o
+  → c6c: app（动态链接 libc.so.6：导入 22 个函数 / 代码 285400 字节 / …）
+./app → "dyn pid=2743716 ppid_ok=1 len=7 cwd=/tmp/p9d"，退出码 7（= main 返回值）
+readelf -d → DT_NEEDED libc.so.6、PLTGOT、PLTRELSZ 528、JMPREL、FLAGS BIND_NOW
+readelf -l → ET_EXEC、2 个 PT_LOAD（0x400000 R+E / 0x447000 R+W）、PT_INTERP、PT_DYNAMIC
+readelf -r --use-dynamic → 22 条 R_X86_64_JUMP_SLOT（= 导入个数）
+ldd → linux-vdso.so.1 / libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
+make -C c6c dyncheck   # 14/14
+make -C c6c selfhost   # fixpoint 逐字节相同（3646295 字节 / 5174 符号）
+make -C c6c fast       # 全绿
+```
+
+**还差的**：`environ` 那类数据符号的 COPY 重定位；`-shared`/`-fPIC` 产物；
+符号版本与 `.rela.dyn` 的 `R_X86_64_RELATIVE`；`.a` 静态库与 `--gc-sections`
+（硬缺口①的尾巴）。硬缺口③（x86-64 之外的 native 后端）、④（`-g` / 独立
+`.s` / `-b`）仍未动。

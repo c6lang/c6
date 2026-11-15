@@ -56,6 +56,9 @@ typedef struct Opts {
      * 过渡手段——把带 libc 名字的 .o（比如 rt.o）先链成静态程序；真正的解法
      * 是动态链接（DT_NEEDED + PLT/GOT），见 c6c/docs/todo.md。 */
     int allow_undef;
+    /* -Wl,--dynamic：链接出动态可执行文件（DT_NEEDED libc.so.6 + PLT/GOT），
+     * 未定义的**函数**从 libc 解析，不再按 0 处理。 */
+    int dyn_link;
 } Opts;
 
 static Opts O;
@@ -569,6 +572,16 @@ static int parse_args(int argc, char **argv)
         } else if (strcmp(a, "-Wl,--allow-undefined") == 0) {
             /* 必须在下面那条"吞掉所有 -W*"之前，否则会被静默忽略 */
             O.allow_undef = 1;
+        } else if (strcmp(a, "-Wl,--dynamic") == 0) {
+            O.dyn_link = 1;
+        } else if (strncmp(a, "-Wl,", 4) == 0) {
+            /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
+             * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
+             * 会被静默忽略，链接还是静态的，症状是"我明明开了动态链接"却
+             * 报未定义符号。 */
+            diag_error_plain("不认识的链接器选项 '%s'（支持 -Wl,--allow-undefined"
+                             " / -Wl,--dynamic）", a);
+            return -1;
         } else if (a[0] == '-' && (a[1] == 'W' || a[1] == 'w')) {
             /* 告警开关：接受并记下来，目前没有告警子系统，静默忽略。
              * tests/errors/*.c6 的 `// FLAGS -Wgeneric-depth` 靠它才不吃错。 */
@@ -836,6 +849,7 @@ int main(int argc, char **argv)
         /* 只做链接：所有输入都是 ET_REL 目标文件，产出静态可执行文件。
          * 退出码 0 = 成功，2 = 链接失败（ld.c6 里已经把原因写到 stderr 了）。 */
         ld_set_allow_undef(O.allow_undef);
+        ld_set_dynamic(O.dyn_link);
         return ld_link(O.files, O.nfiles, O.out ? O.out : "a.out");
     }
     case M_OBJ:

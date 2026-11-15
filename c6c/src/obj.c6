@@ -396,6 +396,11 @@ static void obj_write(const char *path)
         } else if (s->defined) {
             type = OBJ_STT_FUNC;
             shndx = OBJ_SHN_TEXT;
+        } else if (s->is_data) {
+            /* **未定义**的数据符号也要标成 OBJECT：链接器靠这个区分
+             * "能动态导入的函数"和"要做 COPY 重定位的数据"（environ 这类）。
+             * 全标 NOTYPE 的话链接器只能瞎猜。 */
+            type = OBJ_STT_OBJECT;
         }
         ob_sym_add(local ? &loc : &glob, ob_str(&str, s->name),
                    (u8)((bind << 4) | type), shndx, ob_sym_value(s));

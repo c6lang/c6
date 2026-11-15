@@ -506,6 +506,18 @@ static u32 x64_data_sym(X64State *st, const char *name, u32 img_off)
     return i;
 }
 
+/* 只登记"这是个数据符号"的引用（**不**定义它）：出 .o 时用来把 extern 数据
+ * （`extern char **environ;`）标成 STT_OBJECT——链接器靠这个区分"能动态导入
+ * 的函数"和"要做 COPY 重定位的数据"。标成代码符号会让链接器把它当函数，
+ * 发一条 PLT 桩子，取到的地址就不是那个变量了。 */
+static u32 x64_data_ref(X64State *st, const char *name)
+{
+    u32 i = x64_sym(st, name);
+
+    st->sym[i].is_data = 1;
+    return i;
+}
+
 /* lea reg, [rip+rel32]，目标走重定位（位置无关，不需要可写代码段） */
 static void x64_lea_sym(X64State *st, int reg, u32 sym)
 {
