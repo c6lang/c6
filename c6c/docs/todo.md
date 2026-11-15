@@ -3066,6 +3066,8 @@ printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "h
 传进来的值。所以嫌疑落在"`va_start` 的调用点落在 `memset`/若干 `getelementptr`
 之后，llc 在 -O0 下把寄存器 save area 的处理放错了位置"这一类 ABI 细节上。
 
-下一步（留给以后）：把 `va_start` 提到函数第一条指令，或者干脆手写一块
-`@__c6l_ap` 缓冲区 + 自己按 SysV ABI 摆 `gp_offset/fp_offset/overflow_arg_area/
-reg_save_area`（native 后端在 `x64.c6` 里就是这么干的，照抄即可）。
+"把 `va_start` 提到函数第一条指令"这条**试过了、没用**（照样 `(null)|0`），所以
+不是指令顺序的问题。剩下最靠谱的改法是：跟 native 后端一样**自己摆 va_list**
+——`x64.c6` 里那块（`gp_offset / fp_offset / overflow_arg_area / reg_save_area`，
+`IR_VASTART` 的 case 就是）是能跑通的，LLVM 后端照抄成"手写一张 va_list 结构 +
+`va_arg` 也按那张结构取"，绕开 `llvm.va_start` 这个 intrinsic 就行。
