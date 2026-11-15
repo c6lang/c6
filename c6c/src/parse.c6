@@ -17614,7 +17614,7 @@ static void gen_one_global(u32 ty, Declarator *d)
         /* `struct P g = (struct P){ 1, 2 };` —— 数据段也吃复合字面量 */
         u32 ex = pa_take_paren_type();
 
-        gen_glob_braced_new(s->goff, ty, 0);
+        gen_glob_braced_new(goff, ty, 0);
         while (ex--)
             pa_expect_ch(')');
         return;
