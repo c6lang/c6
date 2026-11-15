@@ -19,7 +19,7 @@ RUNS   ?= 5
 SRCS := $(wildcard src/*.c6)
 
 .PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag tcc-tests bench bench-c6c lint selfhost \
-        selftest stdtest test c99test llvmtest build-tcc check-all check-all-perf help
+        selftest stdtest test c99test c99suite llvmtest build-tcc check-all check-all-perf help
 
 all: build
 
@@ -176,6 +176,13 @@ tests2-check: $(BUILD)/c6c
 # 记分板，不进 check-all（多数要 tcc 自己的 libtcc1.a / tcc.h 内部头）。
 tests1-check: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/tcc-tests1.sh
+
+# 语言层 C99 的外部闸门：c-testsuite（third_party/c-testsuite/，scc 来源 150 条）。
+# 口径是"语言 100% 兼容 C99，库不管"：LANG（前端编不过）与 OUT（输出不符）必须为 0，
+# LIB（链接期缺符号，运行期没实现）单独计数、不挡闸门。等 LANG+OUT 清零之后
+# 再把它加进 check-all。
+c99suite: $(BUILD)/c6c
+	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/c99-suite.sh -j $(JOBS)
 
 llvmtest: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c LLC=$(LLVM_LLC) CC=$(CC) CORPUS=$(CURDIR)/tests/c ./tests/llvm-diff.sh
