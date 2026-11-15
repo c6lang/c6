@@ -34,7 +34,22 @@ one_case() {
     base=$(basename "$src" .c)
     : >"$vf"
 
-    if ! "$CC" "$src" -o "$TMP/$base" >"$TMP/$base.log" 2>"$TMP/$base.err"; then
+    # 有几个用例要多个翻译单元 / 编不止一遍，调用形状按上游
+    # tcc/tests/tests2/Makefile 的对应规则来：
+    #   120_alias        `FLAGS += $(subst 120,120+,$1)`：同一次编译里再带上
+    #                    120+_alias.c（那一半提供 inunit2，两边互相引用），
+    #                    上游也是这么避开"没有链接器"的。
+    #   146_tls_extern   上游是 `tcc -c` 两遍（一遍 -DDEFS）+ 系统链接器。c6c
+    #                    没有目标文件/链接器，但多 TU 一次成型；它的 -D 按位置
+    #                    生效（只作用于后面的源文件），所以 `f.c -DDEFS f.c`
+    #                    就是"同一个文件编两遍，一遍给 TLS 定义、一遍引用"。
+    srcs=$src
+    case "$base" in
+    120_alias) srcs="$src $TCCDIR/120+_alias.c" ;;
+    146_tls_extern) srcs="$src -DDEFS $src" ;;
+    esac
+
+    if ! "$CC" $srcs -o "$TMP/$base" >"$TMP/$base.log" 2>"$TMP/$base.err"; then
         if grep -q '未定义的符号' "$TMP/$base.err"; then
             echo "LINK $(grep -o "未定义的符号 '[^']*'" "$TMP/$base.err" | head -1)" >"$vf"
             grep -o "未定义的符号 '[^']*'" "$TMP/$base.err" | sed "s/.*'\(.*\)'/\1/" \
