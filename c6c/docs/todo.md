@@ -3017,3 +3017,18 @@ static int g = 42;
 它；`s->type = …` 那处先 `sym_find` 重新取一次。改完全绿（fixpoint 11092320 →
 11103840），但 LLVM 那条症状没变，说明成因在别处（`glob_store` 收到的 goff 仍然
 是 154620，说明 scalar 初值走的根本是 `gen_glob_braced_new → INIT_GOFF` 那条路）。
+
+**最新一次排查把范围缩到"IR 和数据都对、运行期还是 0"**：
+
+```
+static int g = 42;
+例：代码里 %t2 = getelementptr i8, ptr @__c6l_D, i64 154620；随后 load i32
+    D0 的第 154620 字节确实是 42；c6c_init_data() 跑完之后 D[154620] 也确实是 42
+    （gdb 里 x/8xb 直接看的内存），可 printf 出来仍是 0。
+```
+
+也就是说前端、IR、数据段初始化**三样都对**，问题在"读那个地址的时候拿到的不是
+那块内存"这个层面（怀疑点：`@__c6l_D` 的 `internal global` 与 `main` 里那次
+`c6c_init_data()` 调用之间被 llc 重排，或 `c6_main` 的 `inttoptr + load` 序列
+被别名分析挪到了 init 之前）。下一次直接用 gdb 在 `c6_main` 里断在 `%t7` 那条
+load 上看实际地址和内容，就能定性。**别再从"初值没写进去"这个方向查了。**
