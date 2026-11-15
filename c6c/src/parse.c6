@@ -11926,8 +11926,23 @@ static u32 gen_unary(void)
         return d;
         }
     }
-    if (pa_accept_ch('+'))
-        return gen_unary();
+    if (pa_accept_ch('+')) {
+        u32 v = gen_unary();
+        u32 ty = GEN_TY;
+
+        /* C99 6.5.3.3p2：一元 `+` 的结果是**整型提升**后的操作数。少了这一步，
+         * `sizeof(+c)`（c 是 signed char）给 1 而不是 4，`_Generic` 也会挑错
+         * 分支；`sizeof(-c)`、`c + 0` 两条路本来就有提升，只有这里漏了。 */
+        if ((ty_is_int(ty) || ty_kind(ty) == TY_BOOL) && ty_size(ty) < 4) {
+            /* `_Bool` 也参与整型提升（C99 6.3.1.1p2），`ty_is_int` 不含它，
+             * 所以单独判一下——`sizeof(+b)` 是 4 不是 1。 */
+            v = value_of(v);
+            v = gen_convert(v, ty, ty_int());
+            ty = ty_int();
+        }
+        GEN_TY = ty;
+        return v;
+    }
     if (pa_accept_ch('!')) {
         u32 a = value_of(gen_unary());
         u32 z = irfn_vreg(&FN);
