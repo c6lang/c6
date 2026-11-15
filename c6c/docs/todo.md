@@ -3075,7 +3075,14 @@ printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "h
 **又排除了两条**：`llc -O1` / `-O2` 编同一份 IR 结果一样（`(null)|0`），所以不是
 `-O0` 的寄存器 save-area 摆放问题；`va_start` 提到第一条指令也试过、同样无效。
 剩下大概率是 c6c 给变参函数生成的帧形状（一个巨大的 `alloca [frame x i8]` +
-`memset`）和 `llvm.va_start` 的 lowering 不兼容。真要修，建议**别用 intrinsic**：
-照 `x64.c6` 里 `IR_VASTART` 那段，自己按 SysV ABI 摆 `gp_offset / fp_offset /
-overflow_arg_area / reg_save_area`，`IR_VAARG` 也按同一张结构取——native 后端
-二十多行就干完了，LLVM 这边同样能这么干。
+`memset`）和 `llvm.va_start` 的 lowering 不兼容。
+
+**注意**：上一版这里写的"照抄 x64.c6 手写 va_list"在 LLVM 这边**行不通**——手写
+需要拿到调用者的 `reg_save_area`，而那东西只有 `llvm.va_start` 能提供（native
+后端能手写是因为它的 prologue 自己控制）。所以下一步该做的是**找出 `llvm.va_start`
+为什么在这份 IR 上失效**，方向有两个：
+1. 造一份最小复现（一个只有 `printf("%d", 1)` 的 .ll），手工删掉 `FR`/`memset`/
+   帧槽 GEP 这些"噪声"，看删到哪一步开始变好——能直接指认冲突点；
+2. 或者绕开 `%ap`：让 c6c 的变参函数**别用 va_list**，而是由调用点把实参先摊进
+   一个数组再传指针（相当于自己定一套变参 ABI，`lib/rt.c6` 里的 printf/scanf
+   族跟着改）。这条路更土但一定能通，代价是 c6c 编出的代码与 C 的 varargs 不互通。
