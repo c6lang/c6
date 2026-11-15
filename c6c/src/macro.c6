@@ -34,6 +34,27 @@ typedef struct Macro {
 static Macro *MACROS[MACRO_BUCKETS];
 static u32 MACRO_COUNT;
 
+/* 桶位图（512 字节 = 8 条 cache line）：宏总数只有两百来个，撒在 4096 个桶里，
+ * 所以绝大多数标识符的那一位是 0 —— 一次 L1 查表就否掉，不用去摸 32KB 的桶表，
+ * 也不用追链头指针（profiler 里 macro_find 的桶表访问 + 链表遍历占 pp_next
+ * 的两成）。只有 macro_add / pop_macro 复挂时置位，**undef 不清位**：
+ * 位为 1 只表示“可能有”，最多多做一次完整查找，永远不会漏。 */
+static u8 MACRO_BIT[MACRO_BUCKETS / 8];
+
+static void macro_bit_set(u32 hash)
+{
+    u32 b = hash % MACRO_BUCKETS;
+
+    MACRO_BIT[b >> 3] = (u8)(MACRO_BIT[b >> 3] | (1u << (b & 7)));
+}
+
+static int macro_bit_has(u32 hash)
+{
+    u32 b = hash % MACRO_BUCKETS;
+
+    return (MACRO_BIT[b >> 3] >> (b & 7)) & 1;
+}
+
 /* 由 pp.c6 提供：把一段 token 完整展开（实参展开、#if 求值都用它） */
 static void expand_array(Tok *in, u32 n, Tok **out, u32 *outn);
 
@@ -147,8 +168,13 @@ static Tok tok_syn(int kind, char *text, u32 len, SrcFile *at, u32 off)
 
 static Macro *macro_find(const Tok *t)
 {
-    Macro *m = MACROS[t->hash % MACRO_BUCKETS];
-    const char *d = tok_data(t);
+    Macro *m = NULL;
+    const char *d = NULL;
+
+    if (!macro_bit_has(t->hash))
+        return NULL;
+    m = MACROS[t->hash % MACRO_BUCKETS];
+    d = tok_data(t);
 
     for (; m; m = m->next)
         if (m->hash == t->hash && m->nlen == t->len
@@ -195,6 +221,7 @@ static void macro_save_pop(const char *name)
             if (s->m) {
                 u32 b = s->m->hash % MACRO_BUCKETS;
 
+                macro_bit_set(s->m->hash);
                 s->m->next = MACROS[b];
                 MACROS[b] = s->m;
                 MACRO_COUNT++;
@@ -235,6 +262,7 @@ static void macro_add(Macro *m)
 {
     u32 b = m->hash % MACRO_BUCKETS;
     macro_undef(m->name, m->nlen);
+    macro_bit_set(m->hash);
     m->next = MACROS[b];
     MACROS[b] = m;
     MACRO_COUNT++;
