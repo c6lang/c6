@@ -3101,3 +3101,32 @@ printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "h
 触发了 lowering 的问题。下一步最有价值的实验是**手工把 `c6_printf` 简化成一个
 只有 `va_start`/`va_arg`/`printf` 的等价函数**（保住它的形参个数与帧槽布局），
 逐次删东西直到恢复正确——能直接指认是哪一块触发的。
+### 根因找到了（LLVM 变参）：`IR_VASTART` / `IR_VAARG` 忽略了 IR 契约里的 `a`
+
+`design.md` 里这两个 op 的契约是 **`a` = va_list 的地址**（native 后端的
+`case IR_VAARG` 就是 `x_ld64(…, R_RBP, X64_SLOT(o.a))` 从槽里取出那个地址）。
+LLVM 后端不是这么干的：
+
+```c
+case IR_VASTART:  /* 空操作：va_start 在函数入口对私有的 %ap 发过一次 */ break;
+case IR_VAARG:
+    if (!f->is_variadic) { store i64 0, ptr %s<dst>; break; }   /* ← 直接写 0 */
+    %t = va_arg ptr %ap, i64                                     /* ← 用私有的 %ap */
+```
+
+而 c6c 运行时的形状是 `printf(fmt, ...) { va_list ap; va_start(ap, fmt);
+c6c_vfmt(..., ap); }`：`c6c_vfmt` **不是变参函数**，它拿到的是别人传进来的
+va_list。于是它的每个 `va_arg` 都走 `!is_variadic` 那条、直接写 0 —— LLVM 后端
+**所有**变参都读成 0 的原因就是这两行。
+
+修的方向（试过两条、都还差一点，留给以后）：
+
+1. `IR_VASTART` 里对 `a` 发 `llvm.va_start`：LLVM 要求 `va_start` 在入口块里，
+   而我们的 `IR_VASTART` 出现在语句位置上 ⇒ `llc` 不报错但运行期段错误（实测 139）；
+2. 入口抓 `%ap`、`IR_VASTART` 时 `memcpy` 24 字节到用户的 va_list，
+   `IR_VAARG` 用 `inttoptr(a)` 后 `va_arg`：能编过，但仍然段错误——差的是
+   `a` 那个 vreg 里到底放的是"va_list 的地址"还是"va_list 本身"，得对齐
+   native 后端 `IR_VAARG` 的读法（`x_ld64(…, X64_SLOT(o.a))` 是**取槽内容**）。
+
+结论：这是**一行契约没实现**的 bug，不是玄学；下次按第 2 条、把 `a` 的语义对齐
+native 就能通。**注意**它不影响四条验收（`llvmtest` 的 29 条不读变参，一直是绿的）。
