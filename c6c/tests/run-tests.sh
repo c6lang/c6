@@ -13,6 +13,8 @@ set -u
 C6C=${C6C:-./build/c6c}
 ROOT=${ROOT:-..}
 JOBS=${JOBS:-1}
+# 编译一条用例的上限（秒）：编译器要是卡死，这里出手，别把整轮验收挂住。
+C6C_TMO=${C6C_TMO:-120}
 # 用例运行时统一按 **Linux 默认栈**（8 MB）跑：开发机常见 64 MB，会把"深递归
 # 吃栈"这类问题藏到 CI（8~16 MB）才炸一次——gc_field 的 20001 节点长链释放、
 # defer_scope 的深递归都这么在 CI 上失败过。C6C_TEST_STACK=0 关掉这项限制；
@@ -52,7 +54,10 @@ one_file() {
     out="$TMP/v.$i"
 
     : >"$out"
-    if ! "$C6C" -fsyntax-only -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" "$f" >/dev/null 2>&1; then
+    # 编译器调用一律有上限：c6c 在某个用例上卡死时，这里 timeout 出手，
+    # 把这个用例判成失败，而不是让整个 check-all 挂住。
+    if ! timeout -k 5 "$C6C_TMO" "$C6C" -fsyntax-only \
+            -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" "$f" >/dev/null 2>&1; then
         echo "FBAD" >>"$out"
         echo "SKIP" >>"$out"
         return
@@ -79,25 +84,32 @@ one_file() {
     elif [ -f "$ROOT/tests/tu/$(basename "$f")" ] && [ "$f" != "$ROOT/tests/tu/$(basename "$f")" ]; then
         extra="$ROOT/tests/tu/$(basename "$f")"
     fi
-    if ! "$C6C" -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" "$f" $extra -o "$TMP/$n" >"$TMP/$n.log" 2>&1; then
-        if grep -q '没有 main' "$TMP/$n.log"; then
-            # 纯模块文件（只有 module/import 和导出函数）：上游也只编不跑
-            echo "NOLINK" >>"$out"
-            return
-        fi
+    timeout -k 5 "$C6C_TMO" "$C6C" -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" \
+        "$f" $extra -o "$TMP/$n" >"$TMP/$n.log" 2>&1
+    crc=$?
+    if [ "$crc" -eq 124 ] || [ "$crc" -eq 137 ]; then
+        echo "RBAD $(basename "$f" .c6)（编译超时 >${C6C_TMO}s）" >>"$out"
+        return
+    fi
+    if [ "$crc" -ne 0 ] && grep -q '没有 main' "$TMP/$n.log"; then
+        # 纯模块文件（只有 module/import 和导出函数）：上游也只编不跑
+        echo "NOLINK" >>"$out"
+        return
     fi
     if [ ! -x "$TMP/$n" ]; then
         echo "RBAD $(basename "$f" .c6)" >>"$out"
         return
     fi
-    # 超时保护：并发相关的用例在"同步线程桩"下可能死等，别把整个套件拖住
+    # 超时保护：并发相关的用例在"同步线程桩"下可能死等，别把整个套件拖住。
+    # `-k 5` 是必要的：只用 `timeout` 的话，谁要是接了/屏蔽了 SIGTERM，
+    # 宽限期过了也不会死，套件就永久挂在那里。
     if [ "$STACK_KB" -gt 0 ]; then
         # 见文件头：按 Linux 默认栈跑，别让开发机的大栈掩盖深递归问题
-        ( ulimit -s "$STACK_KB" 2>/dev/null; timeout "$tmo" "$TMP/$n" ) \
+        ( ulimit -s "$STACK_KB" 2>/dev/null; timeout -k 5 "$tmo" "$TMP/$n" ) \
             >>"$TMP/$n.log" 2>&1
         rc=$?
     else
-        timeout "$tmo" "$TMP/$n" >>"$TMP/$n.log" 2>&1
+        timeout -k 5 "$tmo" "$TMP/$n" >>"$TMP/$n.log" 2>&1
         rc=$?
     fi
     case "$f" in
@@ -131,6 +143,7 @@ is_serial() {
 }
 
 i=0
+nrun=0
 # ① 并行那一遍（跳过上面那类）
 for f in $(find "$ROOT/tests" -name '*.c6' | sort); do
     i=$((i + 1))
@@ -138,9 +151,14 @@ for f in $(find "$ROOT/tests" -name '*.c6' | sort); do
         continue
     fi
     one_file "$f" "$i" &
-    # 没有 `wait -n`（POSIX）：攒够一批就整批等，粗粒度但确定
-    if [ "$(jobs -p | wc -l)" -ge "$JOBS" ]; then
+    # 没有 `wait -n`（POSIX）：攒够一批就整批等，粗粒度但确定。
+    # 计数只能自己数：`$(jobs -p | wc -l)` 在 dash（Ubuntu 的 /bin/sh）里恒为
+    # 0——命令替换是子 shell，看不见父 shell 的作业表。那一版等于**没有限流**，
+    # `-j N` 形同虚设：一次把 130 多个 c6c 和它们的程序全起来，小机器直接拖死。
+    nrun=$((nrun + 1))
+    if [ "$nrun" -ge "$JOBS" ]; then
         wait
+        nrun=0
     fi
 done
 wait
@@ -169,11 +187,18 @@ rbad=0
 rfirst=""
 rlist=""
 ntu=0
+miss=0
 idx=0
 for f in $(find "$ROOT/tests" -name '*.c6' | sort); do
     idx=$((idx + 1))
     v="$TMP/v.$idx"
-    [ -f "$v" ] || continue
+    # 空文件 = 这一条没跑出结论（子进程被打死了）。以前直接 `continue`，
+    # 它就悄悄从总数里消失、验收反而更绿；现在算失败。
+    if [ ! -s "$v" ]; then
+        miss=$((miss + 1))
+        [ -z "$first" ] && first=$f
+        continue
+    fi
     fl=$(sed -n '1p' "$v")
     rl=$(sed -n '2p' "$v")
     if [ "$fl" = "FBAD" ]; then
@@ -193,10 +218,11 @@ done
 
 echo "c6c: tests 前端 通过 $ok / 失败 $bad"
 echo "c6c: tests 跑通 通过 $rok / 仅编译 $nolink / 失败 $rbad / 第二 TU $ntu"
+[ "$miss" -ne 0 ] && echo "c6c: 没有结论（子进程被打死？）$miss"
 if [ "$bad" -ne 0 ]; then
     echo "c6c: 第一个前端失败样例：$first"
 fi
 if [ "$rbad" -ne 0 ]; then
     echo "c6c: 跑不通的：$(echo "$rlist" | tr ' ' '\n' | sort | uniq | tr '\n' ' ')"
 fi
-[ "$bad" -eq 0 ] && [ "$rbad" -eq 0 ]
+[ "$bad" -eq 0 ] && [ "$rbad" -eq 0 ] && [ "$miss" -eq 0 ]

@@ -59,7 +59,7 @@ for src in "$TCCDIR"/*.c; do
         nolink=$((nolink + 1))
         continue
     fi
-    ( cd "$TMP" && timeout 20 "./$base" >"$TMP/$base.out" 2>&1 )
+    ( cd "$TMP" && timeout -k 5 20 "./$base" >"$TMP/$base.out" 2>&1 )
     if cmp -s "$TCCDIR/$base.expect" "$TMP/$base.out"; then
         pass=$((pass + 1))
         [ $VERBOSE = 1 ] && printf '通过     %s\n' "$base"
@@ -67,7 +67,7 @@ for src in "$TCCDIR"/*.c; do
         # expect 文件本身过旧的：gcc 编出来的输出也对不上（上游也这么判）
         if command -v gcc >/dev/null 2>&1 \
            && gcc -w -o "$TMP/$base.gcc" "$src" >/dev/null 2>&1 \
-           && ( cd "$TMP" && "./$base.gcc" >"$TMP/$base.gcc.out" 2>&1 ) \
+           && ( cd "$TMP" && timeout -k 5 20 "./$base.gcc" >"$TMP/$base.gcc.out" 2>&1 ) \
            && ! cmp -s "$TCCDIR/$base.expect" "$TMP/$base.gcc.out"; then
             cstale=$((cstale + 1))
             [ $VERBOSE = 1 ] && printf 'expect旧 %-24s gcc 输出也对不上 expect\n' "$base"
