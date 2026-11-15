@@ -447,6 +447,37 @@ C99 后端过 16 个，挂掉的 4 个和 native 后端挂的是同一批（rest
 符号同名，后一个把前一个覆盖了，所以一直没暴露；C99 后端按名字出 C 函数，
 才以"重定义"的形式暴露出来）。
 
+### 第 132 轮：有符号窄载入必须 sext（C99 / LLVM 两个后端的同一个 bug）
+
+三后端里只有 native 是对的：`IR_LOAD` 的 `type` 本来就**带符号**
+（`ir_ty_of()` 把 `signed char`/`short`/`int` 映射成 `IRT_I8/I16/I32`），
+native 后端照它发 `movsx`/`movsxd`。另两个后端读 1/2/4 字节时**一律零扩展**
+——C99 的 `c6_ld1/2/4` 全是 `uint64_t`，LLVM 的 `ll_load_ty` 固定 `zext`——
+于是 `int i = -1` 的槽（`0xFFFFFFFF`）读回来是 `4294967295`：
+
+```c
+int i = -1; long long li = i; int h = i / 2; int sh = i >> 1; double d = i;
+```
+
+native / gcc 给 `-1 0 -1 -1.0`；修之前的 C99 / LLVM 两个后端给
+`4294967295 2147483647 2147483647 4.29497e+09`。符号提升、除法、算术右移、
+`int→double` 全跟着错，而 native 后端是对的——所以这是翻译层的缺陷，
+不是前端把 signedness 丢了。
+
+修法：按 `ir_type_signed(o->type)` 分流。C99 后端新增 `c6_ld1s/2s/4s`
+（`return (uint64_t)(int32_t)v;` 这种"先按源宽度解释成有符号、再升到 64 位"），
+LLVM 后端把那条 `zext` 换成 `sext`。`IRT_U8/U16/U32`、指针、`IRT_F32/F64`
+（位模式）继续零扩；8 字节满载没有扩展可做。
+
+两个容易顺手写错的地方：① 别把 `-1 / 2` 的期望值写成 -1——C 的除法**向零
+截断**，正确答案是 0，算术右移 `-1 >> 1` 才是 -1；② 无符号类型千万别跟着
+sext，`unsigned char 0x80` 必须是 128 而不是 -128，用例里留了对照。
+
+用例：`tests/c/signed_load.c`（局部 / 全局 / 数组 / 结构体成员 / 指针解引用 /
+窄类型形参与返回值 / `unsigned` 零扩展对照 / signed-unsigned 关系比较），
+由 `make c6c-c99test` 与 `make c6c-llvmtest` 覆盖；修复前它在这两个后端上
+退出码是 1。
+
 ### 第 59–64 轮：IR 表项数、cleanup 属性
 
 - **IR 三张表的项数**（9304830）：`IRK_N` 写的是 52，枚举实际 55 个 op

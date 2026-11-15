@@ -934,6 +934,10 @@ static u32 CUR_RET_TY;      /* 当前函数的返回类型（return 要按它转
  * 把对象拷进去、再把这个指针原样返回。只在 C99 后端开，所以同一个程序里
  * 每一对调用点/定义都一致；变参函数不参与（位置对不齐）。 */
 static u32 CUR_SRET;
+/* `CUR_SRET` 有没有值**不能**用"是不是 0"判断：虚寄存器 0 是合法的（零形参
+ * 函数的第一个 vreg 就是 0），拿 0 当哨兵会让 `struct A f(void)` 这种最常见的
+ * 写法悄悄退回旧路径。 */
+static int CUR_SRET_ON;
 
 /* 聚合按值返回走"调用者给槽"那套约定吗？ */
 static int agg_ret_abi(u32 fty, u32 rty)
@@ -942,7 +946,12 @@ static int agg_ret_abi(u32 fty, u32 rty)
         return 0;               /* native / LLVM 后端保持各自的既有约定 */
     if (!rty || !ty_is_agg(rty) || ty_size(rty) == 0)
         return 0;
-    if (fty && ty_func_variadic(fty))
+    /* 变参函数不参与：隐藏实参排在"实际传了几个实参"后面，被调方那边没有
+     * 确定位置。**零形参是例外**：c6c 把 `(void)`/`()` 这种无形参表当成
+     * "可以多传实参"（`f(void)` 写成 `f(1,2)` 也能编），但零形参时隐藏实参
+     * 正好落在第 0 个，两边一致——不认这条，`struct A ma(void)` 这种最常见的
+     * 写法就退回"返回被调方帧地址"，C99 后端在 `-O1` 下读出来是垃圾。 */
+    if (fty && ty_func_variadic(fty) && ty_func_nparams(fty) > 0)
         return 0;
     if (fty && ty_is_closure(fty, NULL))
         return 0;               /* 闭包走 thunk，隐藏实参位置对不齐 */
@@ -1197,6 +1206,13 @@ typedef struct Declarator {
     u8 vla;             /* C99 变长数组：长度是运行期表达式 */
     u32 vla_cnt;        /* 长度（vreg） */
     u32 vla_esz;        /* 元素大小（字节） */
+    /* 多维 VLA（`int b[n][m]`）：类型表示成 k 层指针，每一维的行 stride 在
+     * 声明处算成 vreg（`vla_str[i]` = 跳过第 i 维一个元素的字节数），
+     * 整块字节数 `vla_bytes` 也现算（多维时 ALLOCA 的立即数装不下 stride）。 */
+    u8 vla_nd;          /* 维度数（多维时 >= 2） */
+    u8 vla_multi;       /* 1 = 多维 VLA，vla_bytes/vla_str 有效 */
+    u32 vla_str[8];     /* 行 stride（vreg，字节；最内维不用，按元素大小缩放） */
+    u32 vla_bytes;      /* 整块字节数（vreg） */
     u32 type;           /* 解析出来的完整类型（形参/抽象声明符也要用） */
     u8 mgd;             /* `@T`：托管引用（机器层面还是 T *，但要插引用计数） */
     u8 mgd_kind;        /* 0=强引用 1=weak（不加计数） 2=own（同强引用） */
@@ -3924,6 +3940,8 @@ static void tmpl_mangle(u32 ty, char *out, u32 cap)
 typedef struct TmplSaved {
     IrFn fn;
     u32 ret;
+    u32 sret;                  /* 聚合返回的结果槽（C99 后端专用，见 CUR_SRET） */
+    int sret_on;               /* 有没有结果槽：不能用 vreg 0 当哨兵 */
     u32 self_ty;               /* 裸字段（`v` == `self->v`）靠它，模板实例化会改 */
     int loop;
     int sw;
@@ -5529,36 +5547,107 @@ static int pa_bracket_is_vla(void)
     return pa_bracket_is_vla_at(0);
 }
 
-/* 当前在 `[` 里面（`[` 已被吃掉）：这个括号闭合之后紧跟的 `[` 里如果是运行期
- * 长度，就是多维变长数组（`int b[n][m]`）——那条路现在还没做。 */
-static int pa_bracket_vla_follows(void)
+static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty);
+
+/* 一串数组维度 → 类型。全是常量就是普通数组；只要有一维是运行期长度，这个
+ * 对象就是 C99 VLA（`int b[n][m]`）。
+ *
+ * 多维 VLA 的难点是**行 stride 是运行期的**：`b[i]` 不能按 sizeof(元素) 缩放，
+ * 要乘 `m * sizeof(int)`。所以在**声明处**把每一维的 stride 现算成 vreg 记到
+ * 声明符上（vla_str[i] = 跳过第 i 维一个元素的字节数），下标那一段再按它缩放
+ * （见 gen_postfix_ops）。类型本身表示成 k 层指针（`int b[n][m]` → `int **`），
+ * 于是 `b[i]` 的结果就是 `int *`，再 `[j]` 回到普通指针下标，不用再记 stride。
+ *
+ * 一维（nd == 1）保持老表示法不动：类型 = 元素指针，长度是运行期 vreg、
+ * 元素大小是编译期常量，IR_ALLOCA 直接按 `cnt * imm` 开。 */
+static u32 dims_apply(u32 t, Declarator *d, u32 *dims, u32 *dimv, u8 *dimr, int nd)
 {
     int i = 0;
-    int depth = 1;
+    int nrun = 0;
+    int npar = 0;
 
-    for (i = 0; i < 64; i++) {
-        Tok *t = pa_peek(i);
-
-        if (!t || t->kind == TK_EOF)
-            return 0;
-        if (t->kind != TK_PUNCT)
-            continue;
-        if (TOK_EQ(t, "[")) {
-            depth++;
-        } else if (TOK_EQ(t, "]")) {
-            Tok *nb = NULL;
-
-            if (--depth != 0)
-                continue;
-            nb = pa_peek(i + 1);
-            if (!(nb && nb->kind == TK_PUNCT && TOK_EQ(nb, "[")))
-                return 0;
-            return pa_bracket_is_vla_at(i + 2);
-        } else if (TOK_EQ(t, ";") || TOK_EQ(t, "{") || TOK_EQ(t, "}")) {
-            return 0;
-        }
+    for (i = 0; i < nd; i++) {
+        if (dimr[i] == 1)
+            nrun++;
+        else if (dimr[i] == 2)
+            npar++;
     }
-    return 0;
+    /* 多维 VLA 形参：`int a[n][m]` 的 stride 要用形参 n/m 在**函数入口**算，
+     * 而解析形参表时这些名字还没绑上槽，这里算不出来。一维 `int a[n]` 不用
+     * stride，照旧支持；与其静默算错，不如明说。 */
+    if (npar > 0 && nd > 1 && nrun == 0)
+        pa_error("暂不支持多维 VLA 形参（`int a[n][m]`）：vla stride 要用形参的值在"
+                 "函数入口算，形参表里还看不到它。一维 `int a[n]` 可以；多维请"
+                 "显式传形状、或者用 `int *a` + 自己算下标");
+    if (nrun == 0) {
+        /* 普通常量数组。`[` 空着的维度是 0（不完整类型），照原样留着。 */
+        while (nd > 0)
+            t = ty_array(t, dims[--nd]);
+        return t;
+    }
+    if (nd > 8) {
+        /* vla_str[] 只有 8 格（真要有 9 维 VLA 再改，现在报清楚） */
+        pa_error("多维变长数组最多 8 维");
+        while (nd > 0)
+            t = ty_array(t, 0);
+        return t;
+    }
+    if (!d) {
+        /* 抽象声明符（`sizeof(int[n])`）：没有对象可分配，类型表达不了运行期
+         * 长度，按不完整数组处理——和以前一样，别在这儿发 stride 的 IR。 */
+        while (nd > 0)
+            t = ty_array(t, 0);
+        return t;
+    }
+    if (nd == 1) {
+        /* 一维 VLA：老路一个字都没改 */
+        d->vla = 1;
+        d->vla_cnt = dimv[0];
+        d->vla_esz = ty_size(t) ? ty_size(t) : 1;
+        d->vla_nd = 1;
+        d->vla_multi = 0;
+        return ty_ptr(t);
+    }
+    {
+        u32 esz = ty_size(t) ? ty_size(t) : 1;
+        u32 lenv[16] = {0};
+        u32 acc = 0;
+        u32 total = 0;
+
+        /* 每维长度都做成 vreg（常量也发一条 CONST）：stride 从最内层往外乘，
+         *   stride[nd-1] = sizeof(T)（编译期常量）
+         *   stride[i]    = len[i+1] * stride[i+1]
+         * 最内层那一维不用 stride（下标直接按元素大小缩放）。 */
+        for (i = 0; i < nd; i++) {
+            if (dimr[i] == 1) {
+                lenv[i] = dimv[i];
+            } else {
+                lenv[i] = irfn_vreg(&FN);
+                irfn_push(&FN, IR_CONST, IRT_U64, lenv[i], 0, 0, 0, dims[i]);
+            }
+        }
+        for (i = nd - 2; i >= 0; i--) {
+            u32 kk = acc;
+
+            if (!kk) {
+                kk = irfn_vreg(&FN);
+                irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, esz);
+            }
+            d->vla_str[i] = gen_bin2(lenv[i + 1], ty_ulong(), IR_MUL, kk, ty_ulong());
+            acc = d->vla_str[i];
+        }
+        total = gen_bin2(lenv[0], ty_ulong(), IR_MUL, d->vla_str[0], ty_ulong());
+        d->vla = 1;
+        d->vla_multi = 1;
+        d->vla_nd = (u8)nd;
+        /* sizeof 要的是整块字节数：cnt * esz = len[0] * stride[0]，正好对 */
+        d->vla_cnt = lenv[0];
+        d->vla_esz = d->vla_str[0];
+        d->vla_bytes = total;
+    }
+    for (i = 0; i < nd; i++)
+        t = ty_ptr(t);
+    return t;
 }
 
 /* --- C99 复数（_Complex）-------------------------------------------------
@@ -6454,6 +6543,11 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
      * 12，推断长度的 `int a[][3]` 更是直接变成 0 长度）。所以先攒起来。 */
     {
         u32 dims[16] = {0};
+        /* 每一维的两种情况：dims[i] = 常量长度；dimv[i] = 运行期长度的 vreg。
+         * dimr[i] 记这一维是哪一种（0 = 常量，1 = 运行期，2 = 形参里的
+         * 运行期维度，只在形参表里出现、这里不求值）。 */
+        u32 dimv[16] = {0};
+        u8 dimr[16] = {0};
         int nd = 0;
 
     while (pa_is_ch('(') || pa_is_ch('[')) {
@@ -6466,8 +6560,8 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                 /* c6 切片：`T[:]` */
                 pa_advance();
                 pa_expect_ch(']');
-                while (nd > 0)
-                    t = ty_array(t, dims[--nd]);
+                t = dims_apply(t, d, dims, dimv, dimr, nd);
+                nd = 0;
                 t = ty_slice_chk(t);
                 skip_attributes();
                 continue;
@@ -6502,27 +6596,19 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                 pa_advance();
                 cnt = 0;
             } else if (PA_VLA_OK && d && pa_bracket_is_vla()) {
-                /* C99 VLA：`char acc[maxlen];`。类型降成元素指针，存储由
-                 * IR_ALLOCA 在运行期按 rsp 现开；`&acc` 指向栈上那块。 */
-                u32 n = 0;
-
-                /* 多维变长数组（`int b[n][m]`、`int b[n][5]`）：行 stride 也是
-                 * 运行期的，要走"指针到 VLA"那条路，现在还没做——元素大小在
-                 * 这里只按标量算，静默算错。与其错，不如明说不支持。 */
-                if (nd > 0 || pa_bracket_vla_follows()) {
-                    pa_error("暂不支持多维变长数组（`int b[n][m]`）；一维 VLA"
-                             "（`int b[n]`）是可以的");
-                    n = 0;
+                /* C99 VLA：长度是运行期值。这里只把长度求出来记下，类型和
+                 * stride 留到 dims_apply——多维（`int b[n][m]`）每一维的
+                 * stride 都要先知道**后面**几维的长度才算得出来。 */
+                if (nd < 16) {
+                    dimv[nd] = value_of(gen_assign());
+                    dimr[nd] = 1;
+                    dims[nd] = 0;
+                    nd++;
                 } else {
-                    n = value_of(gen_assign());
+                    pa_error("数组维度太多（上限 16）");
+                    (void)value_of(gen_assign());
                 }
-                d->vla = 1;
-                d->vla_cnt = n;
-                d->vla_esz = ty_size(t) ? ty_size(t) : 1;
                 pa_expect_ch(']');
-                while (nd > 0)
-                    t = ty_array(t, dims[--nd]);
-                t = ty_ptr(t);
                 skip_attributes();
                 continue;
             } else if (d && PA_IN_PARAMS && pa_bracket_is_vla()) {
@@ -6541,6 +6627,8 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                     pa_advance();
                 }
                 cnt = 0;
+                if (nd < 16)
+                    dimr[nd] = 2;       /* 2 = 形参的运行期维度（不求值） */
             } else {
                 cnt = (u32)const_expr();
             }
@@ -6552,15 +6640,14 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
             }
         } else {
             /* 函数后缀前面攒下的数组维度要先按逆序套上 */
-            while (nd > 0)
-                t = ty_array(t, dims[--nd]);
+            t = dims_apply(t, d, dims, dimv, dimr, nd);
+            nd = 0;
             pa_advance();
             t = parse_param_list(t, d);
         }
         skip_attributes();
     }
-    while (nd > 0)
-        t = ty_array(t, dims[--nd]);
+    t = dims_apply(t, d, dims, dimv, dimr, nd);
     }
     for (i = 0; i < nptr; i++)
         t = ty_ptr(t);
@@ -7399,6 +7486,13 @@ static Sym *PEND_MGD_SYM;
 /* 当前左值对应的符号（不限托管量）。只用来判"这个对象是不是只读的"，
  * 赋值给 `int *const p` 时要发一条 tcc 口径的 warning。 */
 static Sym *PEND_SYM;
+/* 多维 VLA 的下标状态：`b[i]` 要乘**声明处算好的行 stride**，不是 sizeof(元素)。
+ * 这个状态跟"待取值的左值"同寿命——mark_lval 清零，标识符那条路（名字直接
+ * 就是 VLA 对象）设上，gen_postfix_ops 每吃掉一个 `[` 就往下挪一维。
+ * 只认"基址是直接声明出来的 VLA 符号"这一种形态：中间隔了任何别的运算
+ * （`f()[0]`、`(*p)[0]`）都会在 mark_lval 那里被清掉，不会张冠李戴。 */
+static Sym *PEND_VSYM;
+static u32 PEND_VDIM;
 
 static u32 mgd_call1(const char *fn, u32 v)
 {
@@ -7497,6 +7591,8 @@ static void mark_lval(u32 addr, u32 ty)
     PEND_MGD = 0;
     PEND_MGD_SYM = NULL;
     PEND_SYM = NULL;
+    PEND_VSYM = NULL;
+    PEND_VDIM = 0;
     GEN_TY = ty;
 }
 
@@ -7529,6 +7625,10 @@ static u32 value_of(u32 v)
     addr = PEND_ADDR;
     ty = PEND_TY;
     GEN_TY = ty;
+    /* 多维 VLA 的"行"左值（`b[i]`）：它的地址就是它的值（整块里的一层），
+     * 没有槽可以读。少这一条会去读数组里面那块字节当指针用（踩过）。 */
+    if (PEND_VSYM && PEND_VDIM > 0)
+        return addr;
     if (ty_is_array(ty)) {
         GEN_TY = ty_ptr(ty_target(ty));   /* 数组自动退化成指向首元素的指针 */
         return addr;
@@ -8169,12 +8269,26 @@ static u32 gen_postfix_ops(u32 v)
             u32 esz = 0;
             u32 off = 0;
             int pmgd = PEND_MGD;
+            /* 多维 VLA 的基址：这一维要乘的行 stride（见 mark_lval 上面的注释）。
+             * 先把状态摘下来（下标表达式里可能还有别的 VLA），算完再按下一维挂回去。 */
+            Sym *vsy = NULL;
+            u32 vdim = 0;
+            u32 vstr = 0;
 
             if (PEND_LVAL) {
                 /* 数组：地址就是首元素地址（自动退化）；
                  * 指针变量：**先取值**再当下标基址（取地址是它的槽地址，不是目标）。 */
                 u32 a0 = PEND_ADDR;
                 u32 ty0 = PEND_TY;
+
+                vsy = PEND_VSYM;
+                vdim = PEND_VDIM;
+                PEND_VSYM = NULL;
+                PEND_VDIM = 0;
+                /* 只剩运行期 stride 的维度才需要特殊处理：最内层还是按
+                 * sizeof(元素) 缩放，那时 vstr 保持 0 走老路。 */
+                if (vsy && vdim + 1 < vsy->vla_nd)
+                    vstr = vsy->vla_str[vdim];
 
                 /* c6 元组按下标取成员：`t[0]`。下标必须是常量（布局在编译期定） */
                 if (ty_is_tuple(ty0)) {
@@ -8199,8 +8313,11 @@ static u32 gen_postfix_ops(u32 v)
 
                 PEND_LVAL = 0;
                 /* 数组和切片都保持"地址"形态：切片还要从地址里取 .data，
-                 * 先 load 成值就把整块当标量读了（踩过：切片下标拿到垃圾指针） */
-                base = (ty_is_array(ty0) || ty_is_slice(ty0)) ? a0 : load_lval(a0, ty0);
+                 * 先 load 成值就把整块当标量读了（踩过：切片下标拿到垃圾指针）。
+                 * 多维 VLA 的行（`b[i]` 之后再来一个 `[`）同理：那个左值的
+                 * 地址就是行地址本身，槽在第 0 维那一步已经取过了（vdim > 0）。 */
+                base = (ty_is_array(ty0) || ty_is_slice(ty0) || (vsy && vdim > 0))
+                       ? a0 : load_lval(a0, ty0);
                 bty = ty0;
             } else {
                 base = v;
@@ -8367,7 +8484,14 @@ static u32 gen_postfix_ops(u32 v)
             if (esz == 0)
                 esz = 1;
             off = irfn_vreg(&FN);
-            if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
+            if (vstr) {
+                /* 多维 VLA 的这一维：乘**运行期**行 stride（`b[i]` 要跳过
+                 * m*sizeof(int) 字节，不是 sizeof(元素)） */
+                u32 m = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_MUL, IRT_U64, m, idx, vstr, 0, 0);
+                irfn_push(&FN, IR_ADD, IRT_PTR, off, base, m, 0, 0);
+            } else if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
                 irfn_push(&FN, IR_LEA, IRT_PTR, off, base, idx, 0, esz);
             } else {
                 u32 k = irfn_vreg(&FN);
@@ -8378,6 +8502,12 @@ static u32 gen_postfix_ops(u32 v)
                 irfn_push(&FN, IR_ADD, IRT_PTR, off, base, m, 0, 0);
             }
             mark_lval(off, elem);
+            /* 还有运行期 stride 的维度就挂回去：`b[i][j]` 的 `[j]` 要用下一维的
+             * stride（`int c[n][m][k]` 的 `c[i]` 和 `c[i][j]` 都要） */
+            if (vsy && vdim + 1 < vsy->vla_nd) {
+                PEND_VSYM = vsy;
+                PEND_VDIM = vdim + 1;
+            }
             /* `h->arr[0]`：托管数组字段的元素也是托管引用（成员那一层已经把
              * PEND_MGD 标上了，下标这层不能把它抹掉）。 */
             if (pmgd)
@@ -10146,6 +10276,13 @@ static u32 gen_postfix(void)
             a = ident_addr(s);
             mark_lval(a, s->type);
             PEND_SYM = s;
+            /* 多维 VLA 对象：接下来的 `[i]` 要按行 stride 缩放（见
+             * gen_postfix_ops 的下标那段）。一维 VLA 不走这条：它的
+             * 元素大小就是 sizeof(元素)，老路是对的。 */
+            if (s->vla_nd > 1) {
+                PEND_VSYM = s;
+                PEND_VDIM = 0;
+            }
             if (s->is_mgd) {
                 PEND_MGD = s->is_mgd == 2 ? 3 : 1;   /* 1/2 = 托管引用，3 = 弱 */
                 E_WEAK = s->is_mgd == 2;
@@ -10607,7 +10744,8 @@ static u32 ret_agg_copy(u32 v)
 {
     u32 ty = CUR_RET_TY;
 
-    if (CUR_SRET && ty_is_agg(ty) && ty_size(ty)) {
+
+    if (CUR_SRET_ON && ty_is_agg(ty) && ty_size(ty)) {
         irfn_push(&FN, IR_COPY, IRT_U8, CUR_SRET, v, 0, 0, ty_size(ty));
         return CUR_SRET;
     }
@@ -10618,13 +10756,16 @@ static void ret_emit(u32 v)
 {
     u32 ty = CUR_RET_TY;
 
-    if (CUR_SRET && ty_is_agg(ty) && ty_size(ty))
+    if (CUR_SRET_ON && ty_is_agg(ty) && ty_size(ty))
         irfn_push(&FN, IR_RET, IRT_PTR, 0, v, 0, 0, 0);
     else
         irfn_push(&FN, IR_RET, ir_ty_of(ty), 0, v, 0, 0, 0);
 }
 
-static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
+/* `sizeof` 的操作数 VLA 对象：返回 1 = 带括号、2 = 不带括号、0 = 不是。
+ * `esz_out` 对一维 VLA 是**编译期**的元素大小，对多维 VLA 是运行期的行
+ * stride（一个 vreg）——`esz_run` 说明是哪种，调用方别再把 vreg 号当立即数。 */
+static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out, int *esz_run)
 {
     Tok *t = pa_cur();
     Sym *sy = NULL;
@@ -10647,6 +10788,7 @@ static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
         return 0;
     *cnt_out = sy->vla_cnt;
     *esz_out = sy->vla_esz ? sy->vla_esz : 1;
+    *esz_run = sy->vla_nd > 1 ? 1 : 0;
     /* 1 = 源码写成 `sizeof(v)`；2 = 写成 `sizeof v`（不带括号） */
     return paren ? 1 : 2;
 }
@@ -11706,13 +11848,14 @@ static u32 gen_unary(void)
         if (PA_ACCEPT_IDENT("sizeof")) {
             u32 vcnt = 0;
             u32 vesz = 0;
+            int eszrun = 0;
             int paren = 0;
 
             is_align = 0;
             /* `sizeof vla_obj` / `sizeof(vla_obj)`：C99 6.5.3.4p2 要求变长
              * 数组的大小是**运行期**算的。长度在声明那里已经算成一个 vreg，
              * 这里现乘元素大小。 */
-            paren = pa_vla_sizeof(&vcnt, &vesz);
+            paren = pa_vla_sizeof(&vcnt, &vesz, &eszrun);
             if (paren != 0) {
                 u32 kk = 0;
                 u32 vv = 0;
@@ -11725,6 +11868,12 @@ static u32 gen_unary(void)
                 pa_advance();                   /* 数组名 */
                 if (paren == 1)
                     pa_expect_ch(')');
+                if (eszrun) {
+                    /* 多维 VLA：一层的字节数本身就是运行期 vreg，直接乘 */
+                    vv = gen_bin2(vcnt, ty_ulong(), IR_MUL, vesz, ty_ulong());
+                    GEN_TY = ty_ulong();
+                    return vv;
+                }
                 kk = irfn_vreg(&FN);
                 irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, vesz);
                 vv = gen_bin2(vcnt, ty_ulong(), IR_MUL, kk, ty_ulong());
@@ -15139,10 +15288,23 @@ static void gen_one_local(u32 ty, Declarator *d)
             irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
             irfn_push(&FN, IR_ALLOCA, IRT_PTR, SCOPE->vla_save, z, 0, 0, 1);
         }
-        irfn_push(&FN, IR_ALLOCA, IRT_PTR, p, d->vla_cnt, 0, 0, d->vla_esz);
+        /* 多维 VLA（`int b[n][m]`）的"元素大小"是运行期算出来的行 stride，
+         * IR_ALLOCA 的 imm 字段装不下——总字节数已经在声明处乘好了
+         * （d->vla_bytes），这里 imm 传 1，让它直接开这么多字节。 */
+        if (d->vla_multi)
+            irfn_push(&FN, IR_ALLOCA, IRT_PTR, p, d->vla_bytes, 0, 0, 1);
+        else
+            irfn_push(&FN, IR_ALLOCA, IRT_PTR, p, d->vla_cnt, 0, 0, d->vla_esz);
         s = sym_add(d->name, d->nlen, ty, SC_LOCAL);
         s->vla_cnt = d->vla_cnt;
         s->vla_esz = d->vla_esz;
+        if (d->vla_multi) {
+            int k = 0;
+
+            s->vla_nd = d->vla_nd;
+            for (k = 0; k + 1 < (int)d->vla_nd && k < 8; k++)
+                s->vla_str[k] = d->vla_str[k];
+        }
         s->slot = irfn_vreg(&FN);
         irfn_push(&FN, IR_ADDR, IRT_PTR, s->slot, 0, 0, 0, X64_SLOT(s->slot));
         irfn_push(&FN, IR_STORE, IRT_U64, s->slot, p, 0, 0, 0);
@@ -18264,6 +18426,7 @@ static void pa_func_def(Sym *fn, Declarator *d)
     /* 聚合按值返回（只有 C99 后端）：多接一个隐藏指针形参，`return <聚合>`
      * 往里写、再把它原样返回。见 CUR_SRET。 */
     CUR_SRET = 0;
+    CUR_SRET_ON = 0;
     if (agg_ret_abi(fn->type, CUR_RET_TY)) {
         if (FN.nparams >= 16) {
             pa_error("形参太多：聚合按值返回还要多接一个隐藏形参（上限 16 个）");
@@ -18272,6 +18435,7 @@ static void pa_func_def(Sym *fn, Declarator *d)
 
             FN.params[FN.nparams++] = rs;
             CUR_SRET = rs;
+            CUR_SRET_ON = 1;
         }
     }
     if (CUR_TASK_TY && TASK_MG_N) {
@@ -19563,6 +19727,8 @@ static void tmpl_save_state(TmplSaved *sv)
 {
     sv->fn = FN;
     sv->ret = CUR_RET_TY;
+    sv->sret = CUR_SRET;
+    sv->sret_on = CUR_SRET_ON;
     sv->self_ty = METHOD_SELF_TY;
     sv->loop = NLOOP;
     sv->sw = NSW;
@@ -19575,6 +19741,8 @@ static void tmpl_restore_state(TmplSaved *sv)
 {
     FN = sv->fn;
     CUR_RET_TY = sv->ret;
+    CUR_SRET = sv->sret;
+    CUR_SRET_ON = sv->sret_on;
     METHOD_SELF_TY = sv->self_ty;
     NLOOP = sv->loop;
     NSW = sv->sw;

@@ -39,6 +39,10 @@ typedef struct Sym {
     u32 tu;                /* 哪个翻译单元登记的（文件作用域 static 的隔离用） */
     u32 vla_cnt;           /* VLA 对象：长度（vreg，运行期算好的）；0 = 不是 VLA */
     u32 vla_esz;           /* VLA 对象：元素大小（sizeof 要按 cnt*esz 现算） */
+    /* 多维 VLA（`int b[n][m]`）：类型是 k 层指针，第 i 维的**行** stride 是
+     * 运行期算好的字节数（vreg），`b[i]` 按它缩放而不是按 sizeof(元素)。 */
+    u8 vla_nd;             /* 维度数；0/1 = 不是多维 VLA（走老的元素缩放） */
+    u32 vla_str[8];        /* vla_str[i] = 跳过第 i 维一个元素的字节数（i < nd-1） */
     u32 slot;              /* 局部/形参：虚拟寄存器槽号 */
     u32 goff;              /* 全局：数据段偏移 */
     u32 tls_slot;          /* tls_ref 用：装 goff 的那格数据段偏移 */
