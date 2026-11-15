@@ -3019,19 +3019,28 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 `closure` 还从 `TYKW_NAME` 关键字表里拿掉了，改成 `is_typename_tok()` 里显式判
 （否则 `int closure` 当形参时会把它当类型，一路错到函数体）。
 
+### 这一轮补掉的 C99 语言特性
+
+| 特性 | 做法 |
+|---|---|
+| digraph `<: :> <% %> %: %:%:` | `lex_punct` 里认，token 文本换成主拼写（`t->syn` 指向静态串），off 仍指源码 |
+| `_Pragma("…")` | 吃掉 `( "…" )`，de-stringize 之后走 `pp_pragma_line()`——和 `#pragma` 同一条路 |
+| 标识符里的 UCN | 名字重建成 UTF-8（`caf\u00e9` 与 `café` 同一个标识符，宏名同理） |
+| `sizeof` 变长数组 | 运行期 `cnt * esz`（长度在声明时已经算成 vreg，记在 `Sym.vla_cnt` 上） |
+| VLA 形参 `int a[n]` | 只当"VLA 形参"记号，长度表达式跳过不求值（以前按常量表达式求，报"未知名字 n"） |
+| `-std=` / `__STDC_VERSION__` | 收 `c89/c99/c11` 及 gnu 变体（语法不变）：`__STDC_VERSION__` 按级别给，c89 里不定义 |
+
 ### 还没做的 C99 语言特性（都不挡现在的闸门，但都是真缺口）
 
 | 特性 | 现状 | 最小复现 |
 |---|---|---|
-| digraph `<: :> <% %> %: %:%:` | 词法里没处理，`<:` 报错 | `int a<:3:> = {1,2,3};` |
-| `_Pragma("…")` | 没有 | `_Pragma("pack(1)")` |
-| 标识符里的 UCN | 只做了字符串/字符常量里的（`esc_decode`） | `int \u00e9 = 1;` |
-| VLA 的作用域/`sizeof` 求值 | `79_vla_continue`（test3）、`vla_test`（test2）仍挂 | 见 tests2 的 n/a 清单 |
-| `_Complex` / `_Imaginary` | 当实数处理 | `double _Complex z = 1.0;` |
-| `_Alignas(N)` | 只被 `skip_paren_group()` 吃掉，没真对齐 | `_Alignas(16) int x;` |
+| 多维变长数组 | **明确报错**（以前静默算错）：行 stride 是运行期的，要走"指针到 VLA"那条路 | `int b[n][m];` |
+| 指向变长数组的指针 | 静默算错（同上那条路的另一半）。`int (*p)[n];` 现在会把 `p` 当 VLA 对象分配 | `int (*p)[n]; int a[3][2]; p = a;` |
+| VLA 的 `goto`/`continue` 跨作用域 | `79_vla_continue`（test3）、`vla_test`（test2）仍挂 | 见 tests2 的 n/a 清单 |
+| `_Complex` / `_Imaginary` | 当实数处理（加减小对、乘除静默错）。C99 只强制 `_Complex`，`_Imaginary` 是可选的 | `double _Complex z = 1.0; z *= z;` |
+| `_Alignas(N)` | 只被 `skip_paren_group()` 吃掉，没真对齐（C11 特性，不属 C99） | `_Alignas(16) int x;` |
 | `_Generic` | 缺 C11 的类型合并细则（限定符要进嵌套层级 type id），卡 `94_generic`、`100_c99array-decls` | — |
-| `-std=` / `__STDC_VERSION__` | 写死 `199901L`（`main.c6`），没有 `-std=` 选项 | — |
-| `inline` | 只置 `PA_INLINE_SEEN`，没有 C99 的 inline/extern inline 语义 | — |
+| `inline` | 只置 `PA_INLINE_SEEN`，没有 C99 的 inline/extern inline 语义（单 TU 行为是对的） | — |
 
 库那一侧（`assert.h` / `complex.h` / `math.h` / `setjmp.h` / `signal.h` / `time.h` /
 `wchar.h` / `locale.h` / `inttypes.h` / `threads.h` / `uchar.h` 缺、`float.h` 与
