@@ -3130,3 +3130,20 @@ va_list。于是它的每个 `va_arg` 都走 `!is_variadic` 那条、直接写 0
 
 结论：这是**一行契约没实现**的 bug，不是玄学；下次按第 2 条、把 `a` 的语义对齐
 native 就能通。**注意**它不影响四条验收（`llvmtest` 的 29 条不读变参，一直是绿的）。
+
+**第三次尝试（按契约实现）与 gdb 结果**：把 `IR_VASTART` 改成"入口抓 `%ap` →
+`memcpy` 24 字节进用户那个 va_list"，`IR_VAARG` 改成 `inttoptr(a)` 后 `va_arg`，
+IR 形状完全正确（`%ap = alloca [1 x va_list_tag]` + `va_start(%ap)` +
+`memcpy(%t16, %ap, 24)` + `va_arg ptr %t398, i64`），但运行时还是段错误：
+
+```
+SIGSEGV in c6_c6c_vfmt ← c6_printf ← c6_main
+gdb: c6c_vfmt(rdi=fmt, rsi=cap, rdx=fmt2, rcx=0x7fffffffc110)   ← va_list 指针是像样的栈地址
+```
+
+也就是说**指针传对了、内容不对**（`va_list` 里的 `reg_save_area` 是垃圾）。到此为止
+可以有把握地说：问题在 `llvm.va_start` 与 c6c 给变参函数生成的帧形状（
+`%FR = alloca [frame x i8]` + `memset` + 几百条 `%sN` GEP）之间的相互作用，
+不在前端、不在数据段、不在调用约定、也不在 `IR_VAARG` 的读法（这三条都已用
+gdb 逐一证伪）。下一步该拿一份**手写 .ll**（在 `va_start` 之前放一个大的
+alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
