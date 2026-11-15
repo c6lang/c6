@@ -25,10 +25,10 @@ make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
 | 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅ 逐字节相同（大小随源码变，比的是 c6c2 与 c6c3 相等） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
-| tests/ 语料 | `make test` | 前端 123/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
+| tests/ 语料 | `make test` | 前端 124/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
-| 编译期诊断 | `make diagtest` | 314/314 | ✅ |
-| 三后端同一套用例 | `make c99test llvmtest` | C99 33/33、LLVM 29/29（LLVM 有 4 条走 `tests/c/llvm-only.txt`，见文末已知缺陷） | ✅ |
+| 编译期诊断 | `make diagtest` | 316/316 | ✅ |
+| 三后端同一套用例 | `make c99test llvmtest` | C99 37/37、LLVM **37/37**（`tests/c/llvm-only.txt` 现在是空的：LLVM 后端把 tests/c 全跑了） | ✅ |
 | 能编出 tcc 并自检 | `make build-tcc` | 出体，且这个 tcc 跑 tests2 **118/144** | ✅ |
 | 语言层 C99 外部闸门 | `make c99suite`（`check-all` 里也有） | 语言层 100%：`LANG+OUT == 0`（当前 通过 149 / 超出口径 1） | ✅ 见 (5) |
 
