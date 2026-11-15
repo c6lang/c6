@@ -18594,6 +18594,13 @@ static void tls_finish(void)
     glob_store(SYM_TLS_DELTA->goff, 0, ty_ulong(), (u64)TLS_LO);
 }
 
+/* vreg/label 是 16 位的（见 src/ir.c6 的说明）：用超了以前是静默绕回、算错结果，
+ * 现在由 ir.c6 回调到这里报一条明确的编译错误。 */
+static void ir_overflow_error(void)
+{
+    pa_error("函数太大：虚拟寄存器/标号超过 16 位上限（65535）");
+}
+
 static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
 {
     int rc = 0;
@@ -18602,6 +18609,7 @@ static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
     sym_init();
     tt_init();
     tykw_init();
+    ir_set_overflow_hook(ir_overflow_error);
     memset(&FN, 0, sizeof(FN));
     memset(&X64, 0, sizeof(X64));
     img_init(&CODE_IMG, 8192);

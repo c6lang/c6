@@ -13,7 +13,7 @@ make -s check-all-perf  ROOT=/path/to/superc C6C=$PWD/build/c6c   # 上面 + 验
 | 项 | 命令 | 要求 | 当前 |
 |---|---|---|---|
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
-| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11088440 字节逐字节相同） |
+| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11089504 字节逐字节相同） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
 | tests/ 语料 | `make test` | 前端 123/0、跑通 67/0 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
@@ -136,7 +136,7 @@ tcc tests2：通过 112 / 架构性 n/a 10 / 仅编译 8 / 上游 expect 旧 14 
 | 用例 | 卡在哪 |
 |---|---|
 | `94_generic` | 指向对象的 `const` 要进类型 id（`_Generic(const int *, int *:…)` 必须不匹配） |
-| `101_cleanup` | 65536 个同时活跃的栈槽，vreg 是 16 位 |
+| `101_cleanup` | 要 65536 个同时活跃的栈槽，vreg 是 16 位；现在会明确报"函数太大：虚拟寄存器超过 16 位上限"，不再静默算错 |
 | `104_inline` | 要 tcc 自己 `libtcc1.a` 里的 `check_exports`；上游本来就用 `104+_inline.c` 替代（只编不跑），那份变体 c6c 已干净编过 |
 | `120_alias` / `146_tls_extern` | 要第二个 TU（没有链接器）。`146` 不是 TLS 没做——TLS 是好的，缺的只是'值定义在另一个 TU'；`120` 上游同样用 `120+_alias.c` 替代 |
 | `99_fastcall` / `140_arm64_extasm` / `145_winarm64_interlocked` | i386 / arm64 / win-arm64，上游自己在 x86-64 上也跳（`145` 要 `windows.h` + win-arm64 内建） |

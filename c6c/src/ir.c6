@@ -480,8 +480,36 @@ static void irfn_reset(IrFn *f, const char *name)
     f->nk = 0;
 }
 
+/* vreg/label 的编号在 IR 里是 16 位（一条 op 16 字节，四个字段各 16 位）。
+ * 以前用超了会**静默绕回**——同一个函数里第 16385 个局部量开始就悄悄复用旧槽，
+ * 程序不报错、结果错（tcc tests2/101_cleanup 就是这么错的）。现在超了就置位，
+ * 由前端在 TU 收尾时报一条明确的编译错误。 */
+static int IR_OVERFLOW;
+static void (*IR_ON_OVERFLOW)(void);
+static int ir_overflowed(void)
+{
+    return IR_OVERFLOW;
+}
+
+/* 前端装一个回调：第一次溢出时报一条编译错误（比让语义静默错下去强）。 */
+static void ir_set_overflow_hook(void (*fn)(void))
+{
+    IR_ON_OVERFLOW = fn;
+}
+
+static void ir_mark_overflow(void)
+{
+    if (IR_OVERFLOW)
+        return;
+    IR_OVERFLOW = 1;
+    if (IR_ON_OVERFLOW)
+        IR_ON_OVERFLOW();
+}
+
 static u32 irfn_vreg(IrFn *f)
 {
+    if (f->nvreg >= 0xFFF0u)
+        ir_mark_overflow();
     return f->nvreg++;
 }
 
@@ -508,6 +536,8 @@ static u32 irfn_kconst(IrFn *f, u64 v)
 
 static u32 irfn_label(IrFn *f)
 {
+    if (f->nlbl >= 0xFFF0u)
+        ir_mark_overflow();
     return f->nlbl++;
 }
 
