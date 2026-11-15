@@ -16,12 +16,33 @@ set(C6C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/c6c")
 set(C6C_STAGE0 "${C6_TCC_DIR}/c6${C6_TCC_EXESUF}")
 set(C6C_BIN "${C6C_DIR}/build/c6c")
 
+# 引导编译器 tcc/c6 在 shared 形态（-DC6_TCC_SHARED_LIBTCC=ON）下自己就是链到
+# libtcc.so 的：构建树里的 c6 没有 rpath，直接执行会报
+#   tcc/c6: error while loading shared libraries: libtcc.so
+# 这正是 CI shared=ON 矩阵里 `cmake --build` 挂在 c6c 那一步的原因。所以凡是
+# 要**执行** c6 的地方（c6c 的自定义命令 + 下面几个 c6c-* 用例）都补上
+# LD_LIBRARY_PATH，口径和 C6Testing.cmake 里注给其它用例的那套一致。
+set(_c6c_ld_env "")
+if(NOT C6_TCC_STATIC)
+  set(_c6c_ld_path "${C6_TCC_DIR}:$ENV{LD_LIBRARY_PATH}")
+  string(REGEX REPLACE ":+$" "" _c6c_ld_path "${_c6c_ld_path}")
+  set(_c6c_ld_env "LD_LIBRARY_PATH=${_c6c_ld_path}")
+endif()
+if(_c6c_ld_env)
+  set(_c6c_make_cmd "${CMAKE_COMMAND}" -E env "${_c6c_ld_env}"
+                    "${C6_MAKE_EXECUTABLE}")
+  set(_c6c_test_env "ENVIRONMENT" "${_c6c_ld_env}")
+else()
+  set(_c6c_make_cmd "${C6_MAKE_EXECUTABLE}")
+  set(_c6c_test_env "")
+endif()
+
 file(GLOB C6C_SRCS CONFIGURE_DEPENDS "${C6C_DIR}/src/*.c6")
 
 if(EXISTS "${C6C_DIR}/Makefile")
   add_custom_command(
     OUTPUT "${C6C_BIN}"
-    COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" build
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" build
             "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}"
     DEPENDS ${C6C_SRCS} "${C6C_STAGE0}"
     COMMENT "c6c: 用 ${C6C_STAGE0} 编出自举编译器 (c6c/build/c6c)"
@@ -45,51 +66,51 @@ endif()
 # ---------------------------------------------------------------------------
 if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
   add_test(NAME c6c-build
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" build
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" build
                    "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}")
   set_tests_properties(c6c-build PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
-    TIMEOUT 600)
+    TIMEOUT 600 ${_c6c_test_env})
 
   # 目录边界检查（不 include tcc 头、不链接 libtcc、不引用 tcc 的 .c、不出现
   # LGPL 头、必需文件齐全）。纯 shell + grep，几百毫秒。
   add_test(NAME c6c-lint
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" lint)
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" lint)
   set_tests_properties(c6c-lint PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
-    TIMEOUT 300)
+    TIMEOUT 300 ${_c6c_test_env})
 
   # 验收 (1)(2)(3)：自举 fixpoint 逐字节、三后端同一套语料、tests+std+诊断、
   # c6c 编出上游 tcc 并让它跑 tests2（含**第三代 selfhost**）。
   add_test(NAME c6c-check-all
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" check-all
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" check-all
                    "ROOT=${CMAKE_CURRENT_SOURCE_DIR}" "C6C=${C6C_STAGE0}"
                    "BDIR=${C6_TCC_DIR}")
   set_tests_properties(c6c-check-all PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
-    TIMEOUT 2400)
+    TIMEOUT 2400 ${_c6c_test_env})
 
   # 验收 (3) 的闸门：tcc 上游 tests2 逐条比对，`c6c/tests/tcc-na.txt` 里登记的
   # 算"架构性不可达"，不在表里的失败一律算意外失败、这条就红。
   add_test(NAME c6c-tests2
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" tests2-check
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" tests2-check
                    "ROOT=${CMAKE_CURRENT_SOURCE_DIR}")
   set_tests_properties(c6c-tests2 PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
-    TIMEOUT 1800)
+    TIMEOUT 1800 ${_c6c_test_env})
 
   # 验收 (3) 的另一半：tcc 上游 tests/ 下那批老式单文件用例。
   add_test(NAME c6c-tests1
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" tests1-check
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" tests1-check
                    "ROOT=${CMAKE_CURRENT_SOURCE_DIR}")
   set_tests_properties(c6c-tests1 PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
-    TIMEOUT 1800)
+    TIMEOUT 1800 ${_c6c_test_env})
 
   # 一条命令的入口（和仓库里 `check-install` 同一个风格）：
   #   cmake --build build --target check-c6c       验收 (1)(2)(3) + 上游 tests1/tests2
@@ -110,10 +131,10 @@ if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
   # 验收 (4)：性能与内存门槛。门槛是按开发机定的，CI 的共享 runner 抖动 ±10%
   # 会误报，所以单独挂 `perf`，CI 里用 `-LE perf` 排除。
   add_test(NAME c6c-bench
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" bench-c6c
+           COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" bench-c6c
                    "ROOT=${CMAKE_CURRENT_SOURCE_DIR}")
   set_tests_properties(c6c-bench PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "perf"
-    TIMEOUT 1800)
+    TIMEOUT 1800 ${_c6c_test_env})
 endif()
