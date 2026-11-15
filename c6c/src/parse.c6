@@ -965,6 +965,15 @@ static int in_c6_tu(void)
     return 0;
 }
 
+/* c6 的软关键字（`shared` / `weak` / `own` / `closure` / `try` / `@` …）只在
+ * .c6 里才有特殊含义。`.c` 是**纯 C99**（README 明说没有 -std=c6），这些词
+ * 在那里必须是普通标识符：`int shared = 1;`、`struct S { int own; };`、
+ * `s.weak++`、`s.try` 全都要编得过。所有认这几个词的地方都先过这一道。 */
+static int c6_kw(void)
+{
+    return in_c6_tu();
+}
+
 static Tok *PA_ERR_AT;
 static void pa_error(const char *fmt, ...)
 {
@@ -1046,7 +1055,7 @@ static const char *const TYKW_NAME[64] = {
     "__restrict", "__restrict__", "__extension__", "typeof", "__typeof__",
     "__typeof", "_Alignas", "alignas", "_Thread_local", "__thread",
     "__attribute__", "__attribute", "_Static_assert", "__inline", "__inline__",
-    "typedef", "closure",
+    "typedef",
     NULL
 };
 
@@ -1078,6 +1087,11 @@ static int is_typename_tok(Tok *t)
 
     if (t->kind != TK_IDENT)
         return 0;
+    /* `closure` 不进关键字表：它是 c6 独有的类型关键字，`.c` 里必须能当普通
+     * 标识符（`static int wrap(int closure){ … }` 的形参名就是这么用的）。
+     * 先比长度，热路径上几乎不花钱。 */
+    if (t->len == 7 && memcmp(tok_data(t), "closure", 7) == 0)
+        return c6_kw();
     {
         u32 sl = t->hash & 255;
         int g = 0;
@@ -5418,7 +5432,7 @@ static u32 parse_typespec(void)
     if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof"))
         return parse_typeof();
     /* `closure RET(params)`：闭包类型，单字（指向 {代码指针, 捕获…} 的堆对象） */
-    if (PA_IS_IDENT("closure"))
+    if (c6_kw() && PA_IS_IDENT("closure"))
         return parse_closure_type();
     /* `thread` 是**软**关键字：`thread h = spawn f();` 里是类型，
      * `static int thread = 1;` 里就是普通标识符（tests/errors/thread_handle.c6
@@ -5473,7 +5487,8 @@ static u32 parse_typespec(void)
     /* 托管引用 `@T`：表示上和 `T *` 一样（对象头 + 引用计数还没做，
      * 见 docs/manual/gc.md 与 todo 的 P6-6）。`shared`/`weak`/`own` 是
      * 所有权修饰符，先按普通强引用处理。 */
-    while (PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own")) {
+    while (c6_kw()
+           && (PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own"))) {
         if (PA_IS_IDENT("weak"))
             PA_MGD_KIND = 1;
         else if (PA_IS_IDENT("own"))
@@ -5565,7 +5580,8 @@ static u32 parse_typespec(void)
         }
         if (PA_ACCEPT_IDENT("static")) { PA_STATIC = 1; continue; }
         /* 所有权修饰符也可能出现在 `static` 之后（`static weak @T g;`） */
-        if (PA_IS_IDENT("weak") || PA_IS_IDENT("own") || PA_IS_IDENT("shared")) {
+        if (c6_kw()
+            && (PA_IS_IDENT("weak") || PA_IS_IDENT("own") || PA_IS_IDENT("shared"))) {
             if (PA_IS_IDENT("weak"))
                 PA_MGD_KIND = 1;
             else if (PA_IS_IDENT("own"))
@@ -5585,7 +5601,7 @@ static u32 parse_typespec(void)
         /* `async T f(…)`：c6c 没有协程调度器，async 函数就是普通函数（和
          * rt.c6 里那组 __c6_co_* 桩一个口径）。这里只把 async 吃掉。 */
         /* `async (int, int) f()`：返回类型也可以是元组，所以后面跟 `(` 也算。 */
-        if (PA_IS_IDENT("async") && pa_peek(1)
+        if (PA_IS_IDENT("async") && c6_kw() && pa_peek(1)
             && (pa_peek(1)->kind == TK_IDENT
                 || (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")))) {
             pa_advance();
@@ -5627,16 +5643,17 @@ static u32 parse_typespec(void)
         if (pa_cur()->kind == TK_IDENT) {
             char c0 = tok_data(pa_cur())[0];
 
-            if ((c0 == 'w' && PA_IS_IDENT("weak"))
-                || (c0 == 's' && PA_IS_IDENT("shared"))
-                || (c0 == 'o' && PA_IS_IDENT("own"))) {
+            if (c6_kw()
+                && ((c0 == 'w' && PA_IS_IDENT("weak"))
+                    || (c0 == 's' && PA_IS_IDENT("shared"))
+                    || (c0 == 'o' && PA_IS_IDENT("own")))) {
                 if (c0 == 's')
                     PA_MGD_SHARED = 1;
                 pa_advance();
                 continue;
             }
         }
-        if (PA_IS_IDENT("closure")) { base = parse_closure_type(); continue; }
+        if (c6_kw() && PA_IS_IDENT("closure")) { base = parse_closure_type(); continue; }
         if (pa_cur()->kind == TK_IDENT && tok_data(pa_cur())[0] == 't'
             && PA_IS_IDENT("thread") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
             base = ty_thread();
@@ -10539,7 +10556,7 @@ static u32 gen_unary(void)
     }
     /* `await expr`：任务都同步跑完了，await 就是取它的值（和 __c6_co_wait
      * 那组桩一致）。软关键字：后面跟 `=`/`;`/`)` 之类时是普通标识符。 */
-    if (PA_IS_IDENT("await") && pa_peek(1)
+    if (PA_IS_IDENT("await") && c6_kw() && pa_peek(1)
         && !(pa_peek(1)->kind == TK_PUNCT
              && (TOK_EQ(pa_peek(1), "=") || TOK_EQ(pa_peek(1), ";")
                  || tok_eq(pa_peek(1), ")") || tok_eq(pa_peek(1), ",")
@@ -10614,7 +10631,7 @@ static u32 gen_unary(void)
     /* c6 的 `try expr`：出错就当场从当前函数返回那个错误码（错误槽保持置位，
      * 由调用方的 catch 接手），成功则原样给出表达式的值。软关键字——后面跟
      * `=` / `;` / `)` / `,` / `.` / `[` 的时候它是普通标识符。 */
-    if (PA_IS_IDENT("try") && pa_peek(1)
+    if (c6_kw() && PA_IS_IDENT("try") && pa_peek(1)
         && !(pa_peek(1)->kind == TK_PUNCT
              && (TOK_EQ(pa_peek(1), "=") || TOK_EQ(pa_peek(1), ";")
                  || tok_eq(pa_peek(1), ")") || tok_eq(pa_peek(1), ",")
@@ -10685,7 +10702,7 @@ static u32 gen_unary(void)
         return gen_postfix_ops(d);
     }
     /* `spawn f(a, b)`：软关键字——后面是 标识符 + `(` 才算 */
-    if (PA_IS_IDENT("spawn") && pa_peek(1)->kind == TK_IDENT
+    if (PA_IS_IDENT("spawn") && c6_kw() && pa_peek(1)->kind == TK_IDENT
         && pa_peek(2)->kind == TK_PUNCT
         && (tok_eq(pa_peek(2), "(") || TOK_EQ(pa_peek(2), "@"))) {
         if (PA_IN_DROP)
@@ -11003,7 +11020,7 @@ static u32 gen_unary(void)
     /* c6 的 `try f(...)`：在 `T!error` 函数里转发错误。错误 id 就是返回值
      * （0 = 成功），所以非 0 时直接 `return 那个 id`，成功时值就是 0。
      * 语句形式 `try reserve(n + 1);` 是丢弃这个值，同一条路径。 */
-    if (PA_IS_IDENT("try")) {
+    if (c6_kw() && PA_IS_IDENT("try")) {
         u32 l_bad = irfn_label(&FN);
         u32 l_ok = irfn_label(&FN);
         u32 v = 0;
@@ -11956,9 +11973,9 @@ static u32 gen_cond(void)
         pa_error("'drop' 不能失败：它在对象释放时跑，错误没处去");
     if (PA_IN_DEFER && PA_IS_IDENT("catch") && pa_peek(1))
         pa_error("'catch' 不能出现在 defer 体里");
-    if (PA_IS_IDENT("catch") && pa_peek(1) && E_CALL_FALLIBLE == 2)
+    if (PA_IS_IDENT("catch") && c6_kw() && pa_peek(1) && E_CALL_FALLIBLE == 2)
         pa_error("'catch' requires a call to a function returning 'T!error'");
-    while (PA_IS_IDENT("catch") && pa_peek(1)
+    while (PA_IS_IDENT("catch") && c6_kw() && pa_peek(1)
            && (pa_peek(1)->kind == TK_IDENT || TOK_EQ(pa_peek(1), "{")
                || tok_eq(pa_peek(1), "("))
            && (pa_peek(1)->kind != TK_IDENT || pa_peek(2))
@@ -12623,7 +12640,7 @@ static int pa_at_typename(void)
      * 函数字面量的返回类型就可能是 `@int`（`tests/fn_lit.c6`）。 */
     if (pa_is_ch('@'))
         return 1;
-    if (pa_cur()->kind == TK_IDENT
+    if (c6_kw() && pa_cur()->kind == TK_IDENT
         && (PA_IS_IDENT("weak") || PA_IS_IDENT("shared") || PA_IS_IDENT("own"))
         && (pa_peek(1)->kind == TK_IDENT || pa_peek(1)->kind == TK_PUNCT))
         return 1;
@@ -15686,7 +15703,7 @@ static void gen_stmt(void)
      * 再从流里撤掉；出口处由 defer_run() 插回去。软关键字——后面不是
      * `= ; ( . , )` 才算。 */
     {
-        int is_def = (PA_IS_IDENT("defer") || PA_IS_IDENT("errdefer"));
+        int is_def = (c6_kw() && (PA_IS_IDENT("defer") || PA_IS_IDENT("errdefer")));
         int bad = 0;
 
         if (is_def && pa_peek(1)->kind == TK_PUNCT) {
@@ -15812,7 +15829,7 @@ static void gen_stmt(void)
     /* `co f(args);`：起一个游离任务（不等它）。c6c 的任务都是同步跑完的，
      * 所以这里就是"调一次、丢掉返回值"。软关键字：只有后面跟
      * `标识符 (` 时才算，`co = 1;` / `co(x)` 之类照旧。 */
-    if (PA_IS_IDENT("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+    if (PA_IS_IDENT("co") && c6_kw() && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
         && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "(")) {
         pa_advance();
         {
@@ -16151,7 +16168,7 @@ static void gen_stmt(void)
     /* c6 `foreach (T v = it)` / `foreach ((T i, T v) = it)`：数组与切片。
      * 语法：foreach ( ['('] T1 n1 [, T2 n2] [')'] = expr ) stmt
      * 展开成"快照 ptr/len + 普通循环"。 */
-    if (PA_ACCEPT_IDENT("foreach")) {
+    if (c6_kw() && PA_ACCEPT_IDENT("foreach")) {
         u32 bty[2] = {0};
         u32 bsl[2] = {0};
         int bnamed[2] = {0};
@@ -16194,8 +16211,9 @@ static void gen_stmt(void)
             {
                 int head_ty = is_typename_tok(pa_cur());
 
-                if (pa_is_ch('@') || PA_IS_IDENT("shared") || PA_IS_IDENT("weak")
-                    || PA_IS_IDENT("own"))
+                if (c6_kw()
+                    && (pa_is_ch('@') || PA_IS_IDENT("shared")
+                        || PA_IS_IDENT("weak") || PA_IS_IDENT("own")))
                     head_ty = 1;      /* `@T` / `shared @T` 也是类型写法 */
                 if (!head_ty && pa_cur()->kind == TK_IDENT) {
                     Sym *hs = sym_find(tok_data(pa_cur()), pa_cur()->len);
@@ -16931,9 +16949,10 @@ static void gen_stmt(void)
     }
     /* 托管引用/所有权修饰符开头的局部声明：`@T p = new T;`、
      * `shared @T q = …;` */
-    if (pa_is_ch('@')
-        || ((PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own"))
-            && (pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "@")))) {
+    if (c6_kw()
+        && (pa_is_ch('@')
+            || ((PA_IS_IDENT("shared") || PA_IS_IDENT("weak") || PA_IS_IDENT("own"))
+                && (pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "@"))))) {
         gen_local_decl(1);
         return;
     }
@@ -18039,7 +18058,7 @@ static void pa_parse_tu(void)
          * 那边 skip_attributes 会把 `asm` 当属性关键字默默吃掉。 */
         if (try_toplevel_asm())
             continue;
-        if (PA_IS_IDENT("foreach"))
+        if (PA_IS_IDENT("foreach") && c6_kw())
             pa_error("'foreach' can only be used inside a function");
         /* 模块声明（改写阶段把 `module a.b;` 换成了这条）：
          *   - 必须是本文件里的第一个声明；
@@ -18085,7 +18104,7 @@ static void pa_parse_tu(void)
         any_decl = 1;
         /* `co f();` 是语句，文件作用域上没有意义（软关键字：后面跟
          * `标识符 (` 才算，`co` 自己也还能是普通名字）。 */
-        if (PA_IS_IDENT("co") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+        if (PA_IS_IDENT("co") && c6_kw() && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "(")
             && !sym_find(tok_data(pa_cur()), pa_cur()->len))
             pa_error("'co' 只能在函数里用");
@@ -18096,7 +18115,8 @@ static void pa_parse_tu(void)
         if (cm_expand(-1))
             continue;
         /* c6 的 `test "名字" { … }` 块：当函数编，失败返回非 0 */
-        if (PA_IS_IDENT("test") && (pa_peek(1)->kind == TK_STR || TOK_EQ(pa_peek(1), "{"))) {
+        if (PA_IS_IDENT("test") && c6_kw()
+            && (pa_peek(1)->kind == TK_STR || TOK_EQ(pa_peek(1), "{"))) {
             char nm[128] = {0};
             Declarator td = {0};
 
@@ -18139,7 +18159,7 @@ static void pa_parse_tu(void)
         /* c6 的模块头：`module a.b.c;` / `import a.b.c;`（可能带 `as x`）。
          * c6c 是 C 前端，模块/导入暂不作语义处理——先把它们当"声明"吃掉，
          * 这样一个模块文件本身就能按 C 编译（c6 的扩展语法另算）。 */
-        if (PA_IS_IDENT("module") || PA_IS_IDENT("import")) {
+        if (c6_kw() && (PA_IS_IDENT("module") || PA_IS_IDENT("import"))) {
             int is_mod = PA_IS_IDENT("module");
             char path[256] = {0};
             int pn = 0;
@@ -18181,7 +18201,7 @@ static void pa_parse_tu(void)
             parse_static_assert_rest();
             continue;
         }
-        if (PA_ACCEPT_IDENT("interface")) {
+        if (c6_kw() && PA_ACCEPT_IDENT("interface")) {
             const char *inm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : "";
             u32 iln = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
             u32 idx = NIFACE;
