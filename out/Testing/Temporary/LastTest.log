@@ -1,0 +1,3692 @@
+Start testing: Nov 15 18:34 CST
+----------------------------------------------------------
+55/125 Testing: std-proto2
+55/125 Test: std-proto2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-proto2"
+Directory: /media/winger/_dde_data/superc
+"std-proto2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== smtp
+   末行：250 2.0.0 Ok
+   DATA → 33 字节
+== ftp
+   PASV → 10.0.0.7:50000
+   LIST：- 2048 data.bin
+== redis
+   批量串：5 字节，从偏移 4 开始
+   SET k v → 27 字节
+== telnet
+   去转义：1 字节数据，1 条协商
+
+23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-proto2" end time: Nov 15 18:34 CST
+"std-proto2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+51/125 Testing: std-font
+51/125 Test: std-font
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-font"
+Directory: /media/winger/_dde_data/superc
+"std-font" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== bdf
+   8pt，8x8，1 个字符
+   位图首行 0x18，第 4 行 0x7E
+== woff
+   2 张表，sfnt 120 字节，版本 1.0
+== svg
+   4 段：M L C Z 
+   bbox = (0, 0) - (10, 10)
+== ttf
+   upem=2048，2 个字形，ascender=1600
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-font" end time: Nov 15 18:34 CST
+"std-font" time elapsed: 00:00:00
+----------------------------------------------------------
+
+67/125 Testing: std-geo
+67/125 Test: std-geo
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-geo"
+Directory: /media/winger/_dde_data/superc
+"std-geo" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== geo
+   北京 → 上海：1067.3 km，方位 153.1°
+   5 公里包围盒：39.8592..39.9492 / 116.3488..116.4660
+== geohash
+   北京 6 位：wx4g0b，中心 (39.9051, 116.4056)，东邻居 wx4g10
+== maidenhead
+   (41.714, -72.727) → FN31pr，中心 (41.7292, -72.7083)
+== dms
+   39°54'15"N = 39.90417，经度 -72.7273 → 72°43'38.3"W
+
+30 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-geo" end time: Nov 15 18:34 CST
+"std-geo" time elapsed: 00:00:00
+----------------------------------------------------------
+
+49/125 Testing: std-hash
+49/125 Test: std-hash
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-hash"
+Directory: /media/winger/_dde_data/superc
+"std-hash" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== sha3
+   SHA3-256(abc) = 3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+   SHAKE128("",32) = 7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26
+== blake2s
+   BLAKE2s-256(abc) = 508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982
+   BLAKE2s-128(abc) = aa4938119b1dc7b87cbad0ffd200d0ae
+== crc32c
+   CRC32C("123456789") = 0xe3069283
+== xxhash
+   XXH32(abc) = 32d153ff，XXH64(abc) = 44bc2cf5ad770999
+
+17 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-hash" end time: Nov 15 18:34 CST
+"std-hash" time elapsed: 00:00:00
+----------------------------------------------------------
+
+48/125 Testing: std-sys
+48/125 Test: std-sys
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-sys"
+Directory: /media/winger/_dde_data/superc
+"std-sys" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== sysinfo
+   Linux 6.12.65-amd64-desktop-rolling（x86_64）
+   主机 winger-PC，44 个 CPU，页大小 4096
+   已运行 683512 秒
+   负载 5.19 5.26 4.54
+== resource
+   最多开 1024 个文件（上限 1048576）
+   栈上限 8388608 字节
+   用户态 0 ms，内核态 0 ms，峰值 RSS 1464 KiB
+   缺页 63 次（次缺页 0），上下文切换 0 次
+== user
+   winger（uid 1000，gid 1000）
+   家目录 /home/winger，登录壳 /bin/bash
+   主组 winger
+== pty
+   子进程输出：pty-ok
+
+13 check(s), 0 failure(s)
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"std-sys" end time: Nov 15 18:34 CST
+"std-sys" time elapsed: 00:00:00
+----------------------------------------------------------
+
+45/125 Testing: std-proto
+45/125 Test: std-proto
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-proto"
+Directory: /media/winger/_dde_data/superc
+"std-proto" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== sse
+   2 个事件，最后一段 data 拼成 13 字节
+== socks5
+   问候 3 字节：05 01 00
+   CONNECT 域名 23 字节（域名 16 字节）
+   应答 10 字节：rep=0 绑定 198.51.100.9:8080
+== mqtt
+   CONNECT 20 字节、keepalive 30
+   PUBLISH 19 字节
+== snappy
+   108 字节压成 58 字节，解回来 108 字节
+
+21 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-proto" end time: Nov 15 18:34 CST
+"std-proto" time elapsed: 00:00:00
+----------------------------------------------------------
+
+43/125 Testing: std-gfx
+43/125 Test: std-gfx
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-gfx"
+Directory: /media/winger/_dde_data/superc
+"std-gfx" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== lzw
+   256 字节压缩成 57 字节，解回来 256 字节
+== gif
+   3x2，4 个全局色，透明索引 1
+== tiff
+   4x3，3 样本/像素，压缩 1，1 条带
+== ico
+   4x3，DIB 位深 32、PNG 负载 102 字节
+== png
+   4x3 RGBA，颜色类型 6，位深 8
+
+18 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-gfx" end time: Nov 15 18:34 CST
+"std-gfx" time elapsed: 00:00:00
+----------------------------------------------------------
+
+37/125 Testing: std-data
+37/125 Test: std-data
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-data"
+Directory: /media/winger/_dde_data/superc
+"std-data" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stddata: 标准库第二十六批（bencode / msgpack / cbor / pem）
+bencode: d4:name4:demo3:idsli1ei2eee 编解码都对
+msgpack: map/str/int 编解码都对
+cbor: a1616101 / 3903e7 / 半精度 1.5 都对
+pem: PUBLIC KEY 封装/拆封与多块迭代都对
+stddata: 15 check(s), 0 failure(s)
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"std-data" end time: Nov 15 18:34 CST
+"std-data" time elapsed: 00:00:00
+----------------------------------------------------------
+
+42/125 Testing: std-enc
+42/125 Test: std-enc
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-enc"
+Directory: /media/winger/_dde_data/superc
+"std-enc" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== asn1
+   INTEGER 7
+   OID 2.5.4.3
+   UTF8String hi
+   UTCTime 2026-01-01 00:00:00
+== x509
+   subject: C=CN O=SuperC CN=example.test
+   serial=1092  v3  key=2048  sig=256 字节
+   有效期: 2026-11-12 -> 2036-11-09
+== jwt
+   header : {"alg":"HS256","typ":"JWT"}
+   payload: {"sub":"1234567890","name":"John Doe","iat":1516239022}
+== otp
+   HOTP(6) 前五个：755224 287082 359152 969429 338314
+   TOTP(8) t=1234567890 -> 89005924
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-enc" end time: Nov 15 18:34 CST
+"std-enc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+58/125 Testing: std-math2
+58/125 Test: std-math2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-math2"
+Directory: /media/winger/_dde_data/superc
+"std-math2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== vector
+   |(3,4)| = 5，a·b = 2，a×b = (-3,0,1)
+== poly
+   p(2) = 13，p'(2) = 20
+   p'(x) = 0 + -2 x + 6 x^2
+== fft
+   峰值频点 2 的幅度 = 8（n/2 = 8），DC = 1.9916e-16
+== spline
+   采样：1 1.25 1.5 1.75 2 
+
+23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-math2" end time: Nov 15 18:34 CST
+"std-math2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+50/125 Testing: std-legacy
+50/125 Test: std-legacy
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-legacy"
+Directory: /media/winger/_dde_data/superc
+"std-legacy" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== pcx
+   4x2，8 位，1 平面
+   第一行色号：1 2 3 4
+== hdr
+   1x2
+   转成 RGB：(255,200,100) 与 (128,128,128)
+== xbm
+   10x2，每行 2 字节
+== xpm
+   3x2，3 色，每像素 1 字符
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-legacy" end time: Nov 15 18:34 CST
+"std-legacy" time elapsed: 00:00:00
+----------------------------------------------------------
+
+28/125 Testing: std-wire
+28/125 Test: std-wire
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-wire"
+Directory: /media/winger/_dde_data/superc
+"std-wire" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdwire: 标准库第十七批（sha1 / ws / dns / tcp）
+sha1: sha1(abc) = a9993e364706816aba3e25717850c26c9cd0d89d
+ws: accept = s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+ws: 帧 11 字节，解出 "Hello"
+dns: example.com A 93.184.216.34 ttl=300
+tcp: 监听端口 43251
+tcp: 往返 4 字节
+stdwire: 19 check(s), 0 failure(s)
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"std-wire" end time: Nov 15 18:34 CST
+"std-wire" time elapsed: 00:00:00
+----------------------------------------------------------
+
+90/125 Testing: std-geo2
+90/125 Test: std-geo2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-geo2"
+Directory: /media/winger/_dde_data/superc
+"std-geo2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== hull
+   顶点 4 个，面积 16.0，周长 16.0
+   第 3 个顶点 (4, 4)
+== polygon
+   面积 12.0，周长 16.0，凸？0
+   形心 (1.667, 1.667)
+== segment
+   交点 (2.0, 2.0)，kind=1
+   重叠段中点 (3.0, 0.0)
+   投影参数 t=0.50，垂足 (2.0, 0.0)
+== closest
+   分治 1.414214（0-2） vs 暴力 1.414214（0-2）
+
+23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"std-geo2" end time: Nov 15 18:34 CST
+"std-geo2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+94/125 Testing: std-async5
+94/125 Test: std-async5
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-async5"
+Directory: /media/winger/_dde_data/superc
+"std-async5" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== apool（并发额度）
+   active=2 peak=2 acquired=2 denied=1
+== agroup（任务组）
+   joined=4 count=4 fails=0
+== abudget（预算 / 让出）
+   走了 20 轮，用掉 0 ms，剩 1000 ms
+== acancel（协作取消）
+   parent.reason=1 child.checks=11 child.steps=8
+== 性能指标
+   async 任务创建+驱动+回收: 2000 ops / 396 us -> 5046083 ops/s (198 ns/op)
+   async 一次挂起+恢复（await c6_io）: 300 ops / 1283 us -> 233646 ops/s (4279 ns/op)
+   co 顶层任务批跑（__c6_co_run）: 300 ops / 702 us -> 427036 ops/s (2341 ns/op)
+
+34 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-async5" end time: Nov 15 18:34 CST
+"std-async5" time elapsed: 00:00:00
+----------------------------------------------------------
+
+71/125 Testing: std-bin2
+71/125 Test: std-bin2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-bin2"
+Directory: /media/winger/_dde_data/superc
+"std-bin2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== binio
+   u16le=0x1234 u32le=0xDEADBEEF u16be=0xABCD
+== bitio
+   写入 8 位，占 1 字节
+== half
+   1.5 → 0x3E00 → 1.5
+   π 的 bf16 = 0x4049（还原 3.14062）
+== align
+   up(13,8)=16 down(13,8)=8 pad=3 next_pow2(100)=128
+
+25 check(s), 0 failure(s)
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"std-bin2" end time: Nov 15 18:34 CST
+"std-bin2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+86/125 Testing: std-linalg
+86/125 Test: std-linalg
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-linalg"
+Directory: /media/winger/_dde_data/superc
+"std-linalg" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== lu
+   det = 4.000000，主元行 2/2/2
+   解：(1, 1, 1)
+== eigen
+   特征值 1 与 3（2 次扫掠）
+   幂法主特征值 3.0000000000
+== tridiag
+   det = 9.0000
+   x = (1, 1, … , 1)
+== sparse
+   行非零数 2/1/2，行和 3/3/9
+   A·[1,2,3] = [7, 6, 19]
+
+31 check(s), 0 failure(s)
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"std-linalg" end time: Nov 15 18:34 CST
+"std-linalg" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/125 Testing: std-demo
+12/125 Test: std-demo
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-demo"
+Directory: /media/winger/_dde_data/superc
+"std-demo" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+单词最多的行有 5 个单词
+单词 12，数字 12，字符 61，最长单词 10
+只取前两行：4 / 5 个单词
+0..9 里有 5 个偶数
+<end of output>
+Test time =   0.16 sec
+----------------------------------------------------------
+Test Passed.
+"std-demo" end time: Nov 15 18:34 CST
+"std-demo" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/125 Testing: std-web
+16/125 Test: std-web
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-web"
+Directory: /media/winger/_dde_data/superc
+"std-web" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdweb: 标准库第五批（base64 / url / uuid / mime）
+stdweb: 58 条自检, 0 个失败
+<end of output>
+Test time =   0.15 sec
+----------------------------------------------------------
+Test Passed.
+"std-web" end time: Nov 15 18:34 CST
+"std-web" time elapsed: 00:00:00
+----------------------------------------------------------
+
+17/125 Testing: std-net
+17/125 Test: std-net
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-net"
+Directory: /media/winger/_dde_data/superc
+"std-net" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdnet: 标准库第六批（inet / bitbuf / pqueue / ini）
+stdnet: 47 条自检, 0 个失败
+<end of output>
+Test time =   0.15 sec
+----------------------------------------------------------
+Test Passed.
+"std-net" end time: Nov 15 18:34 CST
+"std-net" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/125 Testing: std-tour
+13/125 Test: std-tour
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-tour"
+Directory: /media/winger/_dde_data/superc
+"std-tour" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdtour: 标准库新模块一日游
+strbuf  -42 deadbeef             std/container/vec.c6 ...
+path    docs + stdlib.md = stdlib [.md]
+hash    fnv32=9cccb87e fnv64=b142c6921124ac1e crc32=123456789->cbf43926
+bits    0x0101010101010101 parity=0
+utf8    14 bytes / 9 runes, first=19990
+deque   窗口=[3 4 5 6] 加上 1 2 后 sum=21
+stdtour: 73 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-tour" end time: Nov 15 18:34 CST
+"std-tour" time elapsed: 00:00:00
+----------------------------------------------------------
+
+23/125 Testing: std-text
+23/125 Test: std-text
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-text"
+Directory: /media/winger/_dde_data/superc
+"std-text" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdtext: 标准库第十二批（regex / diff / fuzzy / wrap）
+---- wrap(34, indent 2 / hang 6) ----
+  fuzzy search finds the closest
+      command; 折行让帮助文本在窄
+      终端里也能读，中英混排按显示
+      列算宽度。
+---- center(30) ----
+        标准库第十二批        
+---- diff -u (ctx=1) ----
+@@ -1,4 +1,4 @@
+-port = 8080
++port = 9090
+ host = localhost
+-debug = false
+-timeout = 30
++debug = true
++timeout = 60
+stdtext: 35 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-text" end time: Nov 15 18:34 CST
+"std-text" time elapsed: 00:00:00
+----------------------------------------------------------
+
+27/125 Testing: std-cli
+27/125 Test: std-cli
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-cli"
+Directory: /media/winger/_dde_data/superc
+"std-cli" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdcli: 标准库第十六批（args / table / natural / proc）
+args: 1 个开关、2 个选项、3 个位置参数（port=8080）
+natural: file1 < file2 < file10 < file20
+natural: 1536 字节 = 1.5 KiB
+natural: 3723000ms = 1h 2m 3s
+table:
++--------+---------+
+| file   |    size |
++--------+---------+
+| file1  | 1.5 KiB |
+| file2  | 1.0 MiB |
+| file10 |   512 B |
++--------+---------+
+proc: sh -c exit 5 -> exited=1 code=5
+proc: which sh = /usr/bin/sh
+stdcli: 17 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-cli" end time: Nov 15 18:34 CST
+"std-cli" time elapsed: 00:00:00
+----------------------------------------------------------
+
+40/125 Testing: std-bin
+40/125 Test: std-bin
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-bin"
+Directory: /media/winger/_dde_data/superc
+"std-bin" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdbin: 标准库第二十九批（wav / png / elf / zip）
+wav: 48 字节文件，4 帧 @ 8000 Hz
+png: 70 字节，IHDR/IDAT/IEND 三块，IDAT 解出 5 字节
+elf: 320 字节，machine=62 entry=0x400000，节名表解析正常
+zip: 225 字节归档，2 个条目（stored + deflate）全解出
+stdbin: 20 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-bin" end time: Nov 15 18:34 CST
+"std-bin" time elapsed: 00:00:00
+----------------------------------------------------------
+
+15/125 Testing: std-box
+15/125 Test: std-box
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-box"
+Directory: /media/winger/_dde_data/superc
+"std-box" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdbox: 标准库第四批一日游
+stdbox: 59 check(s), 0 failure(s)
+<end of output>
+Test time =   0.18 sec
+----------------------------------------------------------
+Test Passed.
+"std-box" end time: Nov 15 18:34 CST
+"std-box" time elapsed: 00:00:00
+----------------------------------------------------------
+
+66/125 Testing: std-creds
+66/125 Test: std-creds
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-creds"
+Directory: /media/winger/_dde_data/superc
+"std-creds" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== netrc
+   deploy：login=ci password=****
+== sshconfig
+   块模式：web
+   host=web.example.com user=deploy
+== keys
+   ssh-ed25519（256 位）ci@build
+   ssh-rsa（0 位）dev@laptop
+== crontab
+   PATH=/usr/local/bin:/usr/bin
+   0 3 * * * → /usr/local/bin/backup
+   @reboot /usr/local/bin/warmup
+
+20 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-creds" end time: Nov 15 18:34 CST
+"std-creds" time elapsed: 00:00:00
+----------------------------------------------------------
+
+34/125 Testing: std-crypto
+34/125 Test: std-crypto
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-crypto"
+Directory: /media/winger/_dde_data/superc
+"std-crypto" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdcrypto: 标准库第二十三批（md5 / sha512 / hkdf / pbkdf2）
+md5: abc = 900150983cd24fb0d6963f7d28e17f72
+sha512: abc = ddaf35a193617abacc417349ae204131...
+hkdf: prk = 077709362c2e32df0ddc3f0dc47bba63...
+pbkdf2: sha1(salt,4096) = 4b007901b765489abead49d926f721...
+token: hmac-sha256 = 7d2f...（校验用常数时间比较）...
+stdcrypto: 28 check(s), 0 failure(s)
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"std-crypto" end time: Nov 15 18:34 CST
+"std-crypto" time elapsed: 00:00:00
+----------------------------------------------------------
+
+61/125 Testing: std-db
+61/125 Test: std-db
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-db"
+Directory: /media/winger/_dde_data/superc
+"std-db" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== log
+   最新：[ERROR] db: query failed
+   dump（80 字节）：
+#1 ERROR db: query failed
+#2 WARN io: slow
+#3 WARN io: slower
+#4 FATAL io: gone
+== sqlite
+   页大小 4096，2 页，文本编码 1
+   页类型 13，1 个单元
+   单元：rowid=7 payload=2（本地 2 字节）
+== postgres
+   报文类型 'Q'，长度 13，正文 9 字节
+== mysql
+   服务端 8.0.36，连接 12345，盐 20 字节
+
+30 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-db" end time: Nov 15 18:34 CST
+"std-db" time elapsed: 00:00:00
+----------------------------------------------------------
+
+89/125 Testing: std-async3
+89/125 Test: std-async3
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-async3"
+Directory: /media/winger/_dde_data/superc
+"std-async3" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== co
+   第一步后 step=1、done=0
+   拿到 1234，step=4，恢复 3 次，join=3
+== await
+   线性代码跑完：sum=110、got=9、恢复 3 次
+== scope
+   起了 3 个，正在跑 3 个
+   收尾：completed=3，join=3
+== limiter
+   占用 2 / 2，排队 2
+   转交完占用 1，累计放行 4、拒绝 2
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.20 sec
+----------------------------------------------------------
+Test Passed.
+"std-async3" end time: Nov 15 18:34 CST
+"std-async3" time elapsed: 00:00:00
+----------------------------------------------------------
+
+93/125 Testing: std-https
+93/125 Test: std-https
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-https"
+Directory: /media/winger/_dde_data/superc
+"std-https" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== tlskdf
+   握手 client key = 0fabd170…
+== https（同步）
+   明文：200 hello, https!
+   加密：hello, https!
+== httpsa（异步）
+   task：200 hello, https!
+   co：a=one b=two
+== 性能指标（async 框架本身的开销）
+   async 任务创建+驱动+回收: 3000 ops / 972 us -> 3085835 ops/s (324 ns/op)
+   async 一次挂起+恢复（await c6_io）: 500 ops / 3020 us -> 165510 ops/s (6041 ns/op)
+   co 顶层任务批跑（__c6_co_run）: 500 ops / 1436 us -> 347977 ops/s (2873 ns/op)
+
+25 check(s), 0 failure(s)
+<end of output>
+Test time =   0.20 sec
+----------------------------------------------------------
+Test Passed.
+"std-https" end time: Nov 15 18:34 CST
+"std-https" time elapsed: 00:00:00
+----------------------------------------------------------
+
+53/125 Testing: std-transcode
+53/125 Test: std-transcode
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-transcode"
+Directory: /media/winger/_dde_data/superc
+"std-transcode" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== base91
+   14 字节 → 17 字符：>OwJh>}AMfN[O081Q
+== uuencode
+   3 字节 → 27 字节块
+== yEnc
+   12 字节 → 12 字节
+== ebcdic
+   HELLO → C8 C5 D3 D3 D6
+
+21 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-transcode" end time: Nov 15 18:34 CST
+"std-transcode" time elapsed: 00:00:00
+----------------------------------------------------------
+
+62/125 Testing: std-hash2
+62/125 Test: std-hash2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-hash2"
+Directory: /media/winger/_dde_data/superc
+"std-hash2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== fnv
+   FNV-1a 32("foobar") = 0xBF9CF968，FNV-1a 64 = 0x85944171F73967E8
+== adler32
+   adler32("Wikipedia") = 0x11E60398
+== murmur3
+   murmur3_32("hello") = 0x248BFA47
+   murmur3_128("hello") = 0xCBD8A7B341BD9B02 0x5B1E906A48AE1D19
+== siphash
+   空串：2-4 = 0x726FDB47DD0E0E31，1-3 = 0x1545254695AD571C
+
+20 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-hash2" end time: Nov 15 18:34 CST
+"std-hash2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+68/125 Testing: std-pkg
+68/125 Test: std-pkg
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-pkg"
+Directory: /media/winger/_dde_data/superc
+"std-pkg" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== ar
+   main.o（4 字节，0 权限）
+   util.o（3 字节，0 权限）
+== coff
+   节 .text：raw 32 字节，特征 0x60000020
+== class
+   方法 run()V（access 0x0009）
+== rpm
+   NAME = demo
+   ARCH = noarch
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-pkg" end time: Nov 15 18:34 CST
+"std-pkg" time elapsed: 00:00:00
+----------------------------------------------------------
+
+85/125 Testing: std-math3
+85/125 Test: std-math3
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-math3"
+Directory: /media/winger/_dde_data/superc
+"std-math3" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== solve
+   二分：√2 = 1.414213562373106（42 次，残差 3.24e-14）
+   牛顿：√2 = 1.414213562373095（6 次）
+== ode
+   y'=y, y(0)=1 → RK4 2.718281828234（误差 2.25e-10，导函数调用 400 次）
+   同一问题 Euler 只得 2.70481383（误差 1.35e-02）
+== optimize
+   黄金分割：极小点 0.750000000000（64 次迭代）
+   三分法：极小点 0.750000000000
+== least
+   y ≈ 3.0400 + 1.9900 x（rss 0.1070，r2 0.997305）
+   二次：1.0000 + 0.0000 x + 0.5000 x²（r2 1.000000）
+
+25 check(s), 0 failure(s)
+<end of output>
+Test time =   0.17 sec
+----------------------------------------------------------
+Test Passed.
+"std-math3" end time: Nov 15 18:34 CST
+"std-math3" time elapsed: 00:00:00
+----------------------------------------------------------
+
+96/125 Testing: std-sec
+96/125 Test: std-sec
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-sec"
+Directory: /media/winger/_dde_data/superc
+"std-sec" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== x25519（Curve25519 密钥交换）
+   shared = 5266019be756db8c25a94f398234f82d8fc04c95ca6375587edaf39ce04cc631…
+== hsts（Strict-Transport-Security 策略库）
+== robots（robots.txt 抓取许可）
+== base45（RFC 9285 编解码 + 流式编码器）
+== 串联：策略 + 指纹
+   https://cdn.shop.example  fp = /*0LJ40$E.PC/UI%60EXI7JA…
+
+75 check(s), 0 failure(s)
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"std-sec" end time: Nov 15 18:34 CST
+"std-sec" time elapsed: 00:00:00
+----------------------------------------------------------
+
+84/125 Testing: std-async2
+84/125 Test: std-async2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-async2"
+Directory: /media/winger/_dde_data/superc
+"std-async2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== executor
+   累计事件 2，now=100
+== asio
+   行：alpha / beta / gamma（累计 3 行、17 字节）
+== retry
+   第 1 次失败 → 等 100ms
+   第 2 次失败 → 等 200ms
+   第 3 次失败 → 等 400ms
+   第 4 次失败 → 等 800ms
+   第 5 次失败 → 等 1000ms
+== awaitgroup
+   三个任务收尾 → Future 就绪，值 3
+
+32 check(s), 0 failure(s)
+<end of output>
+Test time =   0.20 sec
+----------------------------------------------------------
+Test Passed.
+"std-async2" end time: Nov 15 18:34 CST
+"std-async2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+21/125 Testing: std-form
+21/125 Test: std-form
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-form"
+Directory: /media/winger/_dde_data/superc
+"std-form" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdform: 标准库第十批（props / multipart / punycode / width）
+stdform: 26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-form" end time: Nov 15 18:34 CST
+"std-form" time elapsed: 00:00:00
+----------------------------------------------------------
+
+26/125 Testing: std-conf
+26/125 Test: std-conf
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-conf"
+Directory: /media/winger/_dde_data/superc
+"std-conf" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdconf: 标准库第十五批（toml / xml / query / template）
+toml: 6 条，title=demo host=localhost port=8080
+xml: 1 个开始 item、1 个自闭合、2 段文本
+query: q=hello world
+query: 构建 = q=hello+world&page=3
+template: [demo] localhost:8080 (debug=off)
+stdconf: 19 check(s), 0 failure(s)
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"std-conf" end time: Nov 15 18:34 CST
+"std-conf" time elapsed: 00:00:00
+----------------------------------------------------------
+
+57/125 Testing: std-words
+57/125 Test: std-words
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-words"
+Directory: /media/winger/_dde_data/superc
+"std-words" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== slug
+   "Hello, World! 2025" → hello-world-2025（16 字符）
+   "Café À la Carte" → cafe-a-la-carte
+== casing
+   snake  = http_server_config
+   camel  = httpServerConfig
+   pascal = HttpServerConfig
+== roman
+   2024 → MMXXIV
+   1..3999 往返失败 0 个
+== phonetic
+   Robert=R163 Rupert=R163
+   Smith=SM0 Smyth=SM0
+
+23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-words" end time: Nov 15 18:34 CST
+"std-words" time elapsed: 00:00:00
+----------------------------------------------------------
+
+76/125 Testing: std-search
+76/125 Test: std-search
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-search"
+Directory: /media/winger/_dde_data/superc
+"std-search" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== kmp
+   "the" 首次出现 0，出现 2 次
+== bmh
+   首次出现 2，出现 2 次
+== suffix
+   后缀数组：5 3 1 0 4 2
+   LCP：0 1 3 0 0 2
+== wordplay
+   listen 与 silent 异位？1，最小回文指纹 6 个
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-search" end time: Nov 15 18:34 CST
+"std-search" time elapsed: 00:00:00
+----------------------------------------------------------
+
+64/125 Testing: std-bwt
+64/125 Test: std-bwt
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-bwt"
+Directory: /media/winger/_dde_data/superc
+"std-bwt" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== bwt
+   banana → nnbaaa（主行号 3）
+   "mississippi river mississippi delta" 变换后有 13 处相邻重复
+== mtf
+   banana → 98 98 110 1 1 1
+   200 个相同字节 → 199 个 0
+== delta
+   时间戳差分：1704067200 + 4×60
+== huffman
+   35 字节 → 10 字节（80 位），解回 35 字节
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-bwt" end time: Nov 15 18:34 CST
+"std-bwt" time elapsed: 00:00:00
+----------------------------------------------------------
+
+47/125 Testing: std-ser
+47/125 Test: std-ser
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-ser"
+Directory: /media/winger/_dde_data/superc
+"std-ser" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== bson
+   svc = "api"
+   port = 8080
+   tags = 数组
+== ubjson
+   svc   = "api"
+   port  = 126
+   tags  = 数组[     "a"
+     "b"
+]
+== plist
+   根：2 个键
+   k = "v"
+   n = 5
+== markdown
+<h1>记录</h1>
+<p>一共 <strong>3</strong> 项：</p>
+<ul>
+<li><code>port</code> 8080</li>
+<li><code>tags</code> 数组</li>
+</ul>
+<pre><code class="language-c">if (a &lt; b) x++;
+</code></pre>
+
+14 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-ser" end time: Nov 15 18:34 CST
+"std-ser" time elapsed: 00:00:00
+----------------------------------------------------------
+
+69/125 Testing: std-check
+69/125 Test: std-check
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-check"
+Directory: /media/winger/_dde_data/superc
+"std-check" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== 校验位
+   7992739871 + 校验位 3 = 79927398713（合法）
+== CRC
+   分片更新 CRC-16/CCITT = 0x29B1
+== 汉明码
+   打错 1 位后校验子 = 3，纠正后解出 0xA
+== 经典密码
+   凯撒 +3：Khoor, Zruog!
+   维吉尼亚（key=LEMON）：LXFOPVEFRNHR
+   栅栏 3 栏：WECRLTEERDSOEEFEAOCAIVDEN
+
+28 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-check" end time: Nov 15 18:34 CST
+"std-check" time elapsed: 00:00:00
+----------------------------------------------------------
+
+75/125 Testing: std-stats
+75/125 Test: std-stats
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-stats"
+Directory: /media/winger/_dde_data/superc
+"std-stats" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== histogram
+   20 个样本，箱宽 1.0，均值 ≈ 2.50
+== moving
+   10,20,30 → SMA 20.0，滑入 50 后 SMA 35.0，EMA 50.0
+== series
+   xs：均值 3.0，标准差 1.581，范围 1..5
+== quantile
+   p25=3.0 p50=5.0 p75=7.0 IQR=4.0
+
+21 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-stats" end time: Nov 15 18:34 CST
+"std-stats" time elapsed: 00:00:00
+----------------------------------------------------------
+
+87/125 Testing: std-search2
+87/125 Test: std-search2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-search2"
+Directory: /media/winger/_dde_data/superc
+"std-search2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== inverted
+   词槽 4、倒排项 7、文档 3
+   fast → 2 篇：2 0
+   fast AND car → 2 篇：2 0
+== bm25
+   平均长度 120.0，df=1 的 IDF 0.9808
+   同样 tf=3：短文档 1.7263 > 长文档 1.3921
+== keyword
+   1. fox ×2
+   2. quick ×1
+   3. brown ×1
+== stem
+   running    → run
+   caresses   → caress
+   quickly    → quick
+   happiness  → happi
+   cats       → cat
+
+25 check(s), 0 failure(s)
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"std-search2" end time: Nov 15 18:34 CST
+"std-search2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+91/125 Testing: std-async4
+91/125 Test: std-async4
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-async4"
+Directory: /media/winger/_dde_data/superc
+"std-async4" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== aio
+   第一行 alpha
+   第二行 beta
+== achan
+   通道收到 ping（累计 1 帧 / 8 字节）
+== apump
+   转发结果 streaming data
+== art
+   读到 task!（wait 1 次，state -1）
+
+18 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-async4" end time: Nov 15 18:34 CST
+"std-async4" time elapsed: 00:00:00
+----------------------------------------------------------
+
+65/125 Testing: std-subs
+65/125 Test: std-subs
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-subs"
+Directory: /media/winger/_dde_data/superc
+"std-subs" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== srt
+   #1 1000ms → 你好
+   #2 3000ms → 世界
+   #3 5000ms → 再见
+   seek 后第一条：3000ms
+== ass
+   标题：演示
+   第一条：1000ms → 第一句
+== lrc
+   标题：示例歌曲，offset = 500ms
+   [1500ms] 第一行
+   [3000ms] 第二行
+   [4500ms] 
+== m3u
+   a.mp3（123 秒，第一首）
+   b.mp3（45 秒，第二首）
+   c.mp3
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-subs" end time: Nov 15 18:34 CST
+"std-subs" time elapsed: 00:00:00
+----------------------------------------------------------
+
+77/125 Testing: std-audio2
+77/125 Test: std-audio2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-audio2"
+Directory: /media/winger/_dde_data/superc
+"std-audio2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== aiff
+   1 声道，800 帧，16 位，8000 Hz
+   块 COMM（18 字节）
+   块 SSND（24 字节）
+== au
+   pcm16，16000 Hz，1 声道
+== voc
+   采样率 11111 Hz
+== ircam
+   32768 Hz，1 声道，pcm8，数据从 16 开始
+
+17 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-audio2" end time: Nov 15 18:34 CST
+"std-audio2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+78/125 Testing: std-proto3
+78/125 Test: std-proto3
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-proto3"
+Directory: /media/winger/_dde_data/superc
+"std-proto3" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== irc
+   nick → PRIVMSG #chan : Hello there
+== gopher
+   1 About    dir:70
+   0 README   text:70
+   7 Search   search:70
+== whois
+   域名 EXAMPLE.COM
+== ident
+   4321 , 5678 : UNIX : alice
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-proto3" end time: Nov 15 18:34 CST
+"std-proto3" time elapsed: 00:00:00
+----------------------------------------------------------
+
+70/125 Testing: std-linux
+70/125 Test: std-linux
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-linux"
+Directory: /media/winger/_dde_data/superc
+"std-linux" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== /proc/mounts
+   /dev/sda1 → /（ext4，0/1）
+   proc → /proc（proc，0/0）
+   /dev/sdb1 → /mnt/my disk（xfs，0/2）
+== fstab
+   /tmp → tmpfs（dump=0 passno=0）
+== /etc/os-release
+   Debian GNU/Linux 12 (bookworm)
+== systemd unit
+   [Unit] Description=Demo service
+   [Unit] After=network.target
+   [Service] Type=simple
+   [Service] ExecStart=/usr/bin/demo --serve
+
+20 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-linux" end time: Nov 15 18:34 CST
+"std-linux" time elapsed: 00:00:00
+----------------------------------------------------------
+
+92/125 Testing: std-mesh
+92/125 Test: std-mesh
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-mesh"
+Directory: /media/winger/_dde_data/superc
+"std-mesh" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== obj
+   顶点 4 个、面 4 个（法向 1 个）
+   包围盒 [0,1]³
+== stl
+   法向 (0, 0, 1)，面积 0.50
+   二进制三角形 v1 = (2, 0, 0)
+== ply
+   面 0：4 个顶点，前三个 0/1/2
+== mtl
+   red: Kd=1,0,0 map=red.png
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"std-mesh" end time: Nov 15 18:34 CST
+"std-mesh" time elapsed: 00:00:00
+----------------------------------------------------------
+
+60/125 Testing: std-packet
+60/125 Test: std-packet
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-packet"
+Directory: /media/winger/_dde_data/superc
+"std-packet" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== ntp
+   VN=4 Mode=4 Stratum=2 RefID=0x47505300
+   偏移估计 = 5 秒
+== syslog
+   pri=165 facility=20 severity=5 app=myapp
+   构造：<165>1 - host1 myapp - - - hi（29 字节）
+== stun
+   type=0x0101 method=1 class=2
+   映射地址 = 192.0.2.1:32853
+== tftp
+   RRQ：boot.img（模式 octet）
+
+29 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-packet" end time: Nov 15 18:34 CST
+"std-packet" time elapsed: 00:00:00
+----------------------------------------------------------
+
+31/125 Testing: std-term
+31/125 Test: std-term
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-term"
+Directory: /media/winger/_dde_data/superc
+"std-term" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdterm: 标准库第二十批（tty / signal / pipe / poll）
+tty: 伪终端 40x120，原始模式写入/读取/恢复都对
+signal: SIGUSR1 收到 2 次，屏蔽期间挂起后补投
+pipe: 5 字节往返、EOF、非阻塞 EAGAIN 都对
+poll: 2 个 fd 里第 2 个先就绪，单 fd 超时正常
+stdterm: 45 check(s), 0 failure(s)
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"std-term" end time: Nov 15 18:34 CST
+"std-term" time elapsed: 00:00:00
+----------------------------------------------------------
+
+46/125 Testing: std-exec
+46/125 Test: std-exec
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-exec"
+Directory: /media/winger/_dde_data/superc
+"std-exec" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== cpio
+   bin/hello：8 字节，数据在 236
+== pe
+   amd64，1 个节，入口 RVA 0x1000，镜像基址 0x140000000
+== macho
+   arm64，exec，1 个节，入口偏移 0x1000
+== wasm
+   导出 start（kind=0 index=0）
+
+15 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-exec" end time: Nov 15 18:34 CST
+"std-exec" time elapsed: 00:00:00
+----------------------------------------------------------
+
+79/125 Testing: std-markup
+79/125 Test: std-markup
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-markup"
+Directory: /media/winger/_dde_data/superc
+"std-markup" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== reST
+   heading   lvl=1 Guide
+   para      lvl=0 Intro text.
+   directive lvl=0 note
+   list      lvl=0 one
+   list      lvl=0 two
+== org
+   kind=4 lvl=0 todo=          title=
+   kind=1 lvl=1 todo=TODO      title=ship it
+   kind=1 lvl=2 todo=DONE      title=done part
+   kind=2 lvl=0 todo=          title=
+== LaTeX
+   begin    lvl=0 document
+   section  lvl=2 Intro
+   section  lvl=3 Detail
+   end      lvl=0 document
+== POD
+   head    lvl=1 arg=NAME
+   text    lvl=0 arg=
+   over    lvl=0 arg=4
+   item    lvl=0 arg=B<new>
+   back    lvl=0 arg=
+   cut     lvl=0 arg=
+
+18 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-markup" end time: Nov 15 18:34 CST
+"std-markup" time elapsed: 00:00:00
+----------------------------------------------------------
+
+44/125 Testing: std-doc
+44/125 Test: std-doc
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-doc"
+Directory: /media/winger/_dde_data/superc
+"std-doc" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== html
+   7 个开始标签、6 个结束标签、13 段文本、1 处注释、1 个 DOCTYPE
+   实体解码 12 字节：[a < b && c A]
+== yaml
+   10 个键、2 个序列项、最深 3 层
+== vcard
+   Grace Hoppe / US Nav / 7 个属性
+== ics
+   2 个事件，第二个 SUMMARY 长 41 字节
+
+23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-doc" end time: Nov 15 18:34 CST
+"std-doc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+18/125 Testing: std-more
+18/125 Test: std-more
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-more"
+Directory: /media/winger/_dde_data/superc
+"std-more" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdmore: 标准库第七批（bitset / glob / base32 / http）
+stdmore: 28 check(s), 0 failure(s)
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"std-more" end time: Nov 15 18:34 CST
+"std-more" time elapsed: 00:00:00
+----------------------------------------------------------
+
+52/125 Testing: std-disk
+52/125 Test: std-disk
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-disk"
+Directory: /media/winger/_dde_data/superc
+"std-disk" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== mbr / gpt
+   MBR：1 个分区，GPT=1
+   GPT：表项 4 × 128 字节，可用 34..2013
+   名字 "EFI"（3 字节），LBA 2048..4095
+== fat
+   512 字节/扇区，1 扇区/簇，FAT16，32671 个簇
+   找到 README.TXT，簇 7，42 字节
+== iso9660
+   卷 "DEMOISO"，2048 字节块 × 1000 块
+   找到 "HELLO.TXT"，LBA 21，33 字节
+== ext2
+   卷 "DEMOFS"，256 个 inode，8192 块 × 1024 字节
+   根目录：模式 0x41ED，1024 字节，首块 12
+
+28 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-disk" end time: Nov 15 18:34 CST
+"std-disk" time elapsed: 00:00:00
+----------------------------------------------------------
+
+72/125 Testing: std-clean
+72/125 Test: std-clean
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-clean"
+Directory: /media/winger/_dde_data/superc
+"std-clean" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== sanitize
+   清洗后（11 字节）："hello world"
+== tabs
+   "\t x" 宽度 4 → "    x"（5 字节）
+   还原 → 2 字节（首字节是否 tab：1）
+== quote
+   引用：'it'\''s a test'
+   去引用：it's a test
+== nato
+   "c6" → Charlie Six
+   解码 → C6
+
+21 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-clean" end time: Nov 15 18:34 CST
+"std-clean" time elapsed: 00:00:00
+----------------------------------------------------------
+
+39/125 Testing: std-arch
+39/125 Test: std-arch
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-arch"
+Directory: /media/winger/_dde_data/superc
+"std-arch" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdarch: 标准库第二十八批（deflate / zlib / gzip / tar）
+deflate: 600 字节重复文本压到 28 字节，stored 兜底也通
+zlib: 600 字节 -> 34 字节（含 6 字节头尾）
+gzip: 600 字节 -> 46 字节，mtime 与校验都写进去了
+tar: 2 个文件、3072 字节归档，读回来都对
+targz: tar(3072) -> gzip(162) -> 解压回 tar，读回 readme.txt
+stdarch: 22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-arch" end time: Nov 15 18:34 CST
+"std-arch" time elapsed: 00:00:00
+----------------------------------------------------------
+
+83/125 Testing: std-async
+83/125 Test: std-async
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-async"
+Directory: /media/winger/_dde_data/superc
+"std-async" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== future
+   resolve(7) → 回调 1 次、看到 7
+== timer
+   最早截止 100，此刻 150 时触发 1 个
+   触发顺序：2 → 3 → 1
+== task
+   任务 a tick 3 次（完成 1），任务 b 完成 1，轮数 3
+== reactor
+   累计派发 2 次（读 1、超时 1）
+
+25 check(s), 0 failure(s)
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"std-async" end time: Nov 15 18:34 CST
+"std-async" time elapsed: 00:00:00
+----------------------------------------------------------
+
+30/125 Testing: std-thread
+30/125 Test: std-thread
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-thread"
+Directory: /media/winger/_dde_data/superc
+"std-thread" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdthread: 标准库第十九批（atomic / sync / thread / chan）
+atomic: 计数=20000，自旋锁求和=2000
+sync: 计数=2000，信号量=1
+thread: 4 个 worker 跑完 4 个任务，1..400 的和=80200
+chan: 100 个元素全部过通道，和=5050
+stdthread: 29 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-thread" end time: Nov 15 18:34 CST
+"std-thread" time elapsed: 00:00:00
+----------------------------------------------------------
+
+80/125 Testing: std-textan
+80/125 Test: std-textan
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-textan"
+Directory: /media/winger/_dde_data/superc
+"std-textan" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== words
+   The    quick    brown    fox …（共 9 个）
+== sentences
+   [First one.]    [Second!]    [Third?] 
+== ngram
+   首个 ban，不同 gram 3 个，"ana" 出现 2 次
+== readability
+   简单句：9 词 2 句 10 音节，Flesch 108.3，年级 0
+   长词句：Flesch -150.1，年级 20，长词 8 个
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-textan" end time: Nov 15 18:34 CST
+"std-textan" time elapsed: 00:00:00
+----------------------------------------------------------
+
+63/125 Testing: std-ordered
+63/125 Test: std-ordered
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-ordered"
+Directory: /media/winger/_dde_data/superc
+"std-ordered" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== treap
+   插入 10 个键，最小 0，第 5 小 15
+== heap
+   最大堆顶 = 88
+   前 3 大：和 = 191
+== skiplist
+   有序键：0 1 2 3 4 5 6 7 （8 个）
+== counter
+   GET=3 PUT=2 POST=1，不同键 3 个
+
+26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-ordered" end time: Nov 15 18:34 CST
+"std-ordered" time elapsed: 00:00:00
+----------------------------------------------------------
+
+54/125 Testing: std-audio
+54/125 Test: std-audio
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-audio"
+Directory: /media/winger/_dde_data/superc
+"std-audio" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== mp3
+   ID3v2.3（30 字节），v1 标题 "Demo Song"
+   MPEG1 Layer3 128 kbps 44100 Hz 2 声道，帧长 417
+== ogg
+   页：serial 0xABCD，1 段，数据 19 字节，总长 47
+   Opus：2 声道，pre-skip 312，输入采样率 48000
+== flac
+   44100 Hz，2 声道，16 位，88200 个样本，2 个元数据块
+== midi
+   format 1，1 轨，480 ticks/四分音符
+   轨 0：13 字节
+   note off 的 delta = 200
+
+26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-audio" end time: Nov 15 18:34 CST
+"std-audio" time elapsed: 00:00:00
+----------------------------------------------------------
+
+82/125 Testing: std-match
+82/125 Test: std-match
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-match"
+Directory: /media/winger/_dde_data/superc
+"std-match" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== aho
+   ushers → 3 条命中：[1]@1 [0]@2 [3]@2 
+== rabin
+   首次出现 2，出现 2 次
+== interval
+   段数 2，总长度 15
+== align
+   abc vs ac → abc / a-c（score 1）
+   GATTACA vs GCATGCU → G-ATTACA / GCA-TGCU（score 0，匹配 4）
+
+24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-match" end time: Nov 15 18:34 CST
+"std-match" time elapsed: 00:00:00
+----------------------------------------------------------
+
+73/125 Testing: std-color
+73/125 Test: std-color
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-color"
+Directory: /media/winger/_dde_data/superc
+"std-color" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== color
+   #3366CC → #3366CC，HSL(220.0, 0.60, 0.50)
+   与白色各半 → #99B3E6，对比度 7.8
+== palette
+   Black → #000000
+   White → #FFFFFF
+   Blue → #3366CC
+== 命名颜色
+   #FE0102 最接近 red
+== units
+   1.5 km = 1500 m，100°C = 212°F，1 MiB = 1024 KiB
+
+26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"std-color" end time: Nov 15 18:34 CST
+"std-color" time elapsed: 00:00:00
+----------------------------------------------------------
+
+95/125 Testing: std-ub
+95/125 Test: std-ub
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-ub"
+Directory: /media/winger/_dde_data/superc
+"std-ub" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+（没给文件，分析内置的演示样例）
+
+demo.c6:1:35: 一定 [UB-DIV0] 除以常量 0
+    1 | int div_zero(int a) { return a / 0; }
+        | / 的除数是常量 0：整数除以 0 在 C6 里是未定义行为
+   修法 | 除数本来就是字面量 0：换成非 0 的常量（例如 1），或者整段删掉
+   代码 | a / 1;   // 除数改成 1
+
+demo.c6:2:44: 一定 [UB-OOB] 常量下标越界
+    2 | int oob(void) { int a[4] = { 0 }; return a[4]; }
+        | a 只有 4 个元素（合法下标 0..3），这里用了下标 4
+   修法 | 把下标 4 改成 3 以内；要是这个下标非留不可，就把数组声明成 int a[5];
+   代码 | a[3]   // 换掉越界的下标
+
+demo.c6:6:7: 一定 [UB-UAF] 释放后使用
+    6 |     p[0] = 1;
+        | p 在第 5 行已经释放，这里又用了
+   修法 | 把第 5 行的 free 挪到这个作用域的末尾（defer free），或者删掉这次使用
+   代码 | defer free(p);   // 放到函数开头，让释放发生在最后一次使用之后
+
+demo.c6:7:9: 一定 [UB-DFREE] 重复释放
+    7 |     free(p);
+        | p 在第 5 行已经释放过，再 free 一次是 double free
+   修法 | 把第 5 行的那次 free 删掉，只保留一次
+   代码 | p = NULL;   // 释放后立刻置空，第二次 free 就是 free(NULL)，安全
+
+demo.c6:10:39: 一定 [UB-ESCAPE] 返回局部变量地址
+   10 | int *escape(void) { int x = 1; return &x; }
+        | 返回了局部变量 x 的地址：函数一返回这块栈空间就失效了
+   修法 | 别返回 x 的地址：改成让调用方传缓冲区进来，或者返回值本身
+   代码 | // 调用方给空间：
+        | // void escape(char *out, int n) { ... }
+        | // 或者按值返回：直接 return 结构体
+
+demo.c6:11:49: 可能 [UB-UNINIT] 读未初始化的堆内存
+   11 | int uninit(void) { int *p = malloc(8); return p[0]; }
+        | p 是第 11 行 malloc 出来的，读之前没写过
+   修法 | 先给 p 写一遍，或者把 malloc 换成 calloc
+   代码 | p = calloc(8, 1);   // 直接拿到清零的内存
+
+demo.c6:12:31: 一定 [UB-OVERLAP] memcpy 区间重叠
+   12 | void overlap(char *b) { memcpy(b, b, 4); }
+        | memcpy 的源和目标是同一个对象 b：区间重叠时行为未定义
+   修法 | 把 memcpy 换成 memmove：它允许源和目标重叠
+   代码 | memmove(b, src, n);   // memmove 允许重叠
+
+demo.c6:13:33: 一定 [UB-SHIFT] 移位量超宽
+   13 | int shift(void) { return 1 << 32; }
+        | 移位量是 32，左边只有 32 位，移位量必须落在 0..(宽度-1) 才是定义好的行为
+   修法 | 把移位量夹到 0..31：对变量用 & 31，常量就直接改成 31 以内的值
+   代码 | 1 << (32 & 31)
+
+demo.c6:14:48: 一定 [UB-OVFL] 有符号常量溢出
+   14 | int ovfl(void) { return 2000000000 + 2000000000; }
+        | 常量运算 2000000000 + 2000000000 的结果 4000000000 超出 int 范围（有符号溢出是未定义行为）
+   修法 | 把其中一个操作数写成 64 位或 32 位无符号，让运算在宽类型里做
+   代码 | ((i64)2000000000) + 2000000000
+
+stdub: 演示样例共 9 条（一定 8、可能 1）
+<end of output>
+Test time =   0.30 sec
+----------------------------------------------------------
+Test Passed.
+"std-ub" end time: Nov 15 18:34 CST
+"std-ub" time elapsed: 00:00:00
+----------------------------------------------------------
+
+20/125 Testing: std-node
+20/125 Test: std-node
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-node"
+Directory: /media/winger/_dde_data/superc
+"std-node" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdnode: 标准库第九批（list / ring / utf16 / ansi）
+stdnode: 17 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-node" end time: Nov 15 18:34 CST
+"std-node" time elapsed: 00:00:00
+----------------------------------------------------------
+
+81/125 Testing: std-cfg2
+81/125 Test: std-cfg2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-cfg2"
+Directory: /media/winger/_dde_data/superc
+"std-cfg2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== dotenv
+   PORT=8080
+   HOST=api.example.com
+   DEBUG=true
+== hosts
+   127.0.0.1 → localhost
+   10.0.0.5 → web.internal
+== resolv.conf
+   nameserver  1.1.1.1
+   nameserver  8.8.8.8
+   search      example.com
+== known_hosts
+   plain   ssh-ed25519 AAAAC3Nza
+   (hashed) ssh-rsa AAAAB3Nza
+
+20 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-cfg2" end time: Nov 15 18:34 CST
+"std-cfg2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+22/125 Testing: std-embed
+22/125 Test: std-embed
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-embed"
+Directory: /media/winger/_dde_data/superc
+"std-embed" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdembed: 标准库第十一批（crc / fixed / pool / frame）
+stdembed: 30 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-embed" end time: Nov 15 18:34 CST
+"std-embed" time elapsed: 00:00:00
+----------------------------------------------------------
+
+56/125 Testing: std-ds
+56/125 Test: std-ds
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-ds"
+Directory: /media/winger/_dde_data/superc
+"std-ds" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== fenwick
+   前缀和 [0..3] = 15，总和 = 255
+== segtree
+   总和 = 39，最小值 = 1，[0..3] 和 = 22
+== dsu
+   合并后集合数 = 1，0 所在集合大小 = 8
+== bloom
+   置位 12 / 2048（千分数 5）
+
+26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"std-ds" end time: Nov 15 18:34 CST
+"std-ds" time elapsed: 00:00:00
+----------------------------------------------------------
+
+74/125 Testing: std-cont
+74/125 Test: std-cont
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-cont"
+Directory: /media/winger/_dde_data/superc
+"std-cont" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== stack
+   压入 1..4，size=4，满=1
+== queue
+   回绕后出队顺序 = 3041011
+== slots
+   分配：0 与 1，已用 2/16
+== bag
+   42×5 7×2 99×1，不同键 3，总数 8
+
+22 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-cont" end time: Nov 15 18:34 CST
+"std-cont" time elapsed: 00:00:00
+----------------------------------------------------------
+
+25/125 Testing: std-pack
+25/125 Test: std-pack
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-pack"
+Directory: /media/winger/_dde_data/superc
+"std-pack" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdpack: 标准库第十四批（lz4 / rle / base85 / hexdump）
+lz4: 1024 -> 34 字节（3%）
+rle: 256 字节采样 -> 差分 256 -> RLE 6 字节
+---- hexdump(width=8, base=0x1000) ----
+00001000  68 65 78 64 75 6d 70 20  |hexdump |
+00001008  72 6f 63 6b 73 21 68 65  |rocks!he|
+00001010  78 64 75 6d              |xdum    |
+stdpack: 24 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-pack" end time: Nov 15 18:34 CST
+"std-pack" time elapsed: 00:00:00
+----------------------------------------------------------
+
+24/125 Testing: std-num
+24/125 Test: std-num
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-num"
+Directory: /media/winger/_dde_data/superc
+"std-num" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdnum: 标准库第十三批（bignum / decimal / rational / complex）
+bignum: 30! = 265252859812191058636308480000000
+decimal: 19.99 * 3 = 59.97
+decimal: 税额 6.5% = 3.90
+decimal: 合计 = 63.87
+rational: H_10 = 7381/2520
+complex: (3+4i)(1-2i) = 11-2i
+stdnum: 21 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-num" end time: Nov 15 18:34 CST
+"std-num" time elapsed: 00:00:00
+----------------------------------------------------------
+
+29/125 Testing: std-algo
+29/125 Test: std-algo
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-algo"
+Directory: /media/winger/_dde_data/superc
+"std-algo" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdalgo: 标准库第十八批（graph / lru / trie / region）
+graph: 拓扑序 0 2 1 3 4
+graph: 到 1/2/3 的最短距离 = 3/1/4（经 2,1）
+lru: size=3 hits=4 misses=2 evicts=1
+trie: 5 个命令、18 个节点；"git " 前缀命中
+region: 1 段、共 0x3000 字节，空隙在 0x2000
+stdalgo: 26 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-algo" end time: Nov 15 18:34 CST
+"std-algo" time elapsed: 00:00:00
+----------------------------------------------------------
+
+36/125 Testing: std-cipher
+36/125 Test: std-cipher
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-cipher"
+Directory: /media/winger/_dde_data/superc
+"std-cipher" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdcipher: 标准库第二十五批（aes / chacha20 / poly1305 / random）
+aes: 128/192/256 + CTR(SP 800-38A) 都对
+chacha20: RFC 8439 的块与加密向量都对
+poly1305: RFC 8439 向量与流式喂入都对
+random: 16 字节 / hex / [0,6) 都来自 /dev/urandom
+aead: ChaCha20 + Poly1305 的 encrypt-then-MAC 与篡改检测都对
+stdcipher: 27 check(s), 0 failure(s)
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"std-cipher" end time: Nov 15 18:34 CST
+"std-cipher" time elapsed: 00:00:00
+----------------------------------------------------------
+
+88/125 Testing: std-graph2
+88/125 Test: std-graph2
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-graph2"
+Directory: /media/winger/_dde_data/superc
+"std-graph2" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== mst
+   Kruskal：总权 11，边 0-2(1) 1-2(2) 3-4(3) 1-3(5)
+   Prim：总权 11
+== flow
+   最大流 23：0→1 12、0→2 11、3→5 19
+== scc
+   顶点 0 → 分量 0
+   顶点 1 → 分量 0
+   顶点 2 → 分量 0
+   顶点 3 → 分量 1
+   顶点 4 → 分量 2
+== match
+   左 0 ↔ 右 0
+   左 1 ↔ 右 1
+   左 2 ↔ 右 2
+
+18 check(s), 0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"std-graph2" end time: Nov 15 18:34 CST
+"std-graph2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+98/125 Testing: std-proto4
+98/125 Test: std-proto4
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-proto4"
+Directory: /media/winger/_dde_data/superc
+"std-proto4" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== coap（RFC 7252 报文层）
+== dhcp（RFC 2131 报文层）
+== ssdp（UPnP 发现）
+== translit（折叠成 ASCII）
+== 串联：SSDP 发现 -> CoAP 取数 -> 折叠日志
+
+56 check(s), 0 failure(s)
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"std-proto4" end time: Nov 15 18:34 CST
+"std-proto4" time elapsed: 00:00:00
+----------------------------------------------------------
+
+100/125 Testing: std-docs
+100/125 Test: std-docs
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-docs"
+Directory: /media/winger/_dde_data/superc
+"std-docs" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== plural（单复数与计数短语）
+== mbox（Unix mailbox 分卷）
+== kdl（KDL 文档）
+== rtf（RTF 纯文本提取）
+== 串联：配置 + 邮件 + 数量 + 正文
+   build finished: 2 files changed
+ (/tmp/reports)
+
+48 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-docs" end time: Nov 15 18:34 CST
+"std-docs" time elapsed: 00:00:00
+----------------------------------------------------------
+
+102/125 Testing: std-util
+102/125 Test: std-util
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-util"
+Directory: /media/winger/_dde_data/superc
+"std-util" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== cidr（网段与子网划分）
+== endian（字节序读写）
+== collate（排序键）
+== hyphen（断词）
+== 串联：清单 -> 归组 -> 排序 -> 折行
+   排序后: DB1 db2 web2 web10
+   折词:   hyp-hena-tion
+
+45 check(s), 0 failure(s)
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"std-util" end time: Nov 15 18:34 CST
+"std-util" time elapsed: 00:00:00
+----------------------------------------------------------
+
+97/125 Testing: std-mw
+97/125 Test: std-mw
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-mw"
+Directory: /media/winger/_dde_data/superc
+"std-mw" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== ratelimit（令牌桶 / 滑动窗口）
+== httpcache（Cache-Control / 新鲜度 / 缓存槽）
+== quotedprintable（邮件编码）
+== strdist（距离 / 相似度 / 最佳匹配）
+== 串联：限流 + 缓存 + 模糊找
+
+60 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-mw" end time: Nov 15 18:34 CST
+"std-mw" time elapsed: 00:00:00
+----------------------------------------------------------
+
+19/125 Testing: std-next
+19/125 Test: std-next
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-next"
+Directory: /media/winger/_dde_data/superc
+"std-next" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdnext: 标准库第八批（base58 / varint / semver / cookie）
+stdnext: 23 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-next" end time: Nov 15 18:34 CST
+"std-next" time elapsed: 00:00:00
+----------------------------------------------------------
+
+38/125 Testing: std-calc
+38/125 Test: std-calc
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-calc"
+Directory: /media/winger/_dde_data/superc
+"std-calc" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdcalc: 标准库第二十七批（geometry / interp / stats / matrix）
+stats: 1..5 均值 3、样本方差 2.5，分位数/直方图/相关都对
+matrix: 2x2 乘法、3x3 det=1、solve 得到 (1,3)
+geometry: 向量/单位化/矩形交并都对
+interp: lerp/remap/smoothstep/缓动/Catmull-Rom 都对
+stdcalc: 32 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-calc" end time: Nov 15 18:34 CST
+"std-calc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+41/125 Testing: std-img
+41/125 Test: std-img
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-img"
+Directory: /media/winger/_dde_data/superc
+"std-img" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdimg: 标准库第三十批（bmp / tga / qoi / pnm）
+bmp: 70 字节、24 位、行对齐后 8 字节/行
+tga: 31 字节、类型 10、左下原点
+qoi: 38 字节解出 2x2，重编码 38 字节后仍一致
+pnm: 23 字节 P6，另加一张 16 位灰度
+stdimg: 16 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-img" end time: Nov 15 18:34 CST
+"std-img" time elapsed: 00:00:00
+----------------------------------------------------------
+
+101/125 Testing: std-mgmt
+101/125 Test: std-mgmt
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-mgmt"
+Directory: /media/winger/_dde_data/superc
+"std-mgmt" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== prometheus（文本暴露格式）
+== gemini（请求/响应报文层）
+== snmp（SNMPv2c 报文层）
+== nntp（NNTP 报文层）
+== 串联：健康检查 -> Prometheus
+
+53 check(s), 0 failure(s)
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"std-mgmt" end time: Nov 15 18:34 CST
+"std-mgmt" time elapsed: 00:00:00
+----------------------------------------------------------
+
+99/125 Testing: std-ops
+99/125 Test: std-ops
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-ops"
+Directory: /media/winger/_dde_data/superc
+"std-ops" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== netflow（NetFlow v5 报文层）
+== wol（Wake-on-LAN 魔术包）
+== vtt（WebVTT 字幕）
+== zone（DNS 区域文件）
+== 串联：区域文件 -> 唤醒 -> 记流 -> 出字幕
+
+62 check(s), 0 failure(s)
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"std-ops" end time: Nov 15 18:34 CST
+"std-ops" time elapsed: 00:00:00
+----------------------------------------------------------
+
+59/125 Testing: std-time
+59/125 Test: std-time
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-time"
+Directory: /media/winger/_dde_data/superc
+"std-time" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+== calendar
+   2024-02-29 = 第 19782 天，星期 4，ISO 周 2024-W09
+== iso8601
+   2024-01-01T00:00:00Z = 1704067200
+   东八区表示：2024-01-01T08:00:00+08:00
+== duration
+   "1h30m" = 5400000 ms → "1h30m"
+== cron
+   "30 3 * * *" 的下一次：2024-01-01 03:30
+
+27 check(s), 0 failure(s)
+<end of output>
+Test time =   0.74 sec
+----------------------------------------------------------
+Test Passed.
+"std-time" end time: Nov 15 18:34 CST
+"std-time" time elapsed: 00:00:00
+----------------------------------------------------------
+
+123/125 Testing: selfhost
+123/125 Test: selfhost
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "selfhost"
+Directory: /media/winger/_dde_data/superc
+"selfhost" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+c6 自举 1/4：tcc/c6 编译自己的源码
+c6 自举 2/4：stage1 重新编译同一份源码
+c6 自举 3/4：比较两次的目标文件
+ 两次编译逐字节相同
+c6 自举 4/4：stage2 编一个程序并运行
+hello from the c6 self-hosted tcc
+c6 自举完成：/media/winger/_dde_data/superc/out/tests/selfhost/selfhost/c6/tcc-stage2
+<end of output>
+Test time =   0.88 sec
+----------------------------------------------------------
+Test Passed.
+"selfhost" end time: Nov 15 18:34 CST
+"selfhost" time elapsed: 00:00:00
+----------------------------------------------------------
+
+104/125 Testing: test
+104/125 Test: test
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "test"
+Directory: /media/winger/_dde_data/superc
+"test" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+Test: 00_assignment...
+Test: 01_comment...
+Test: 02_printf...
+Test: 03_struct...
+Test: 04_for...
+Test: 05_array...
+Test: 06_case...
+Test: 07_function...
+Test: 08_while...
+Test: 09_do_while...
+Test: 10_pointer...
+Test: 11_precedence...
+Test: 12_hashdefine...
+Test: 13_integer_literals...
+Test: 14_if...
+Test: 15_recursion...
+Test: 16_nesting...
+Test: 17_enum...
+Test: 18_include...
+Test: 19_pointer_arithmetic...
+Test: 20_pointer_comparison...
+Test: 21_char_array...
+Test: 22_floating_point...
+Test: 23_type_coercion...
+Test: 24_math_library...
+Test: 25_quicksort...
+Test: 26_character_constants...
+Test: 27_sizeof...
+Test: 28_strings...
+Test: 29_array_address...
+Test: 30_hanoi...
+Test: 31_args...
+Test: 32_led...
+Test: 33_ternary_op...
+Test: 35_sizeof...
+Test: 36_array_initialisers...
+Test: 37_sprintf...
+Test: 38_multiple_array_index...
+Test: 39_typedef...
+Test: 40_stdio...
+Test: 41_hashif...
+Test: 42_function_pointer...
+Test: 43_void_param...
+Test: 44_scoped_declarations...
+Test: 45_empty_for...
+Test: 46_grep...
+Test: 47_switch_return...
+Test: 48_nested_break...
+Test: 49_bracket_evaluation...
+Test: 50_logical_second_arg...
+Test: 51_static...
+Test: 52_unnamed_enum...
+Test: 54_goto...
+Test: 55_lshift_type...
+Test: 60_errors_and_warnings...
+Test: 61_integers...
+Test: 64_macro_nesting...
+Test: 67_macro_concat...
+Test: 70_floating_point_literals...
+Test: 71_macro_empty_arg...
+Test: 72_long_long_constant...
+Test: 73_arm64...
+Test: 75_array_in_struct_init...
+Test: 76_dollars_in_identifiers...
+Test: 77_push_pop_macro...
+Test: 78_vla_label...
+Test: 79_vla_continue...
+Test: 80_flexarray...
+Test: 81_types...
+Test: 82_attribs_position...
+Test: 83_utf8_in_identifiers...
+Test: 84_hex-float...
+Test: 85_asm-outside-function...
+Test: 86_memory-model...
+Test: 87_dead_code...
+Test: 88_codeopt...
+Test: 89_nocode_wanted...
+Test: 90_struct-init...
+Test: 91_ptr_longlong_arith32...
+Test: 92_enum_bitfield...
+Test: 93_integer_promotion...
+Test: 94_generic...
+Test: 95_bitfields...
+Test: 95_bitfields_ms...
+Test: 96_nodata_wanted...
+Test: 97_utf8_string_literal...
+Test: 100_c99array-decls...
+Test: 101_cleanup...
+Test: 102_alignas...
+Test: 103_implicit_memmove...
+Test: 104_inline...
+Test: 105_local_extern...
+Test: 106_versym...
+Test: 107_stack_safe...
+Test: 108_constructor...
+Test: 109_float_struct_calling...
+Test: 110_average...
+Test: 111_conversion...
+Test: 112_backtrace...
+Test: 113_btdll...
+Test: 114_bound_signal...
+Test: 115_bound_setjmp...
+Test: 116_bound_setjmp2...
+Test: 117_builtins...
+Test: 118_switch...
+Test: 119_random_stuff...
+Test: 120_alias...
+Test: 121_struct_return...
+Test: 122_vla_reuse...
+Test: 123_vla_bug...
+Test: 124_atomic_counter...
+Test: 125_atomic_misc...
+Test: 126_bound_global...
+Test: 127_asm_goto...
+Test: 128_run_atexit...
+Test: 129_scopes...
+Test: 130_large_argument...
+Test: 131_return_struct_in_reg...
+Test: 132_bound_test...
+Test: 133_old_func...
+Test: 134_double_to_signed...
+Test: 135_func_arg_struct_compare...
+Test: 136_atomic_gcc_style...
+Test: 137_funcall_struct_args...
+Test: 142_int_conversion...
+Test: 143_void_expr...
+Test: 144_tls...
+Test: 146_tls_extern...
+Test: 148_linker_symbols...
+Test: 149_parameter_qualifier_errors...
+Test: 149_parameter_qualifiers...
+Test: 150_return_qualifiers...
+Test: 151_atomic_header...
+Test: 152_designator_chain...
+<end of output>
+Test time =   2.35 sec
+----------------------------------------------------------
+Test Passed.
+"test" end time: Nov 15 18:34 CST
+"test" time elapsed: 00:00:02
+----------------------------------------------------------
+
+106/125 Testing: errcheck
+106/125 Test: errcheck
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "errcheck"
+Directory: /media/winger/_dde_data/superc
+"errcheck" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+ok   errbase.def 是最新的（12 个模块已钉号）
+ok   -errbase-file 指向的表会被读
+ok   -no-errbase 不读表
+ok   -errbase-file 指定的表必须存在（C128）
+ok   std 模块的号段不能写进表里（C126）
+ok   钉号必须落在 0x6100..0x7FFF（C126）
+ok   同一个号不能给两个模块（C126）
+ok   同一个模块不能钉两个号（C126）
+ok   每一行都要有号（C126）
+ok   两个模块撞进同一个号段要报错（C127）
+ok   没有表时自动创建一份只有注释的空表
+ok   -no-errbase 不写表
+ok   -emit-errbase 把 app.a 钉在 0x6100
+ok   -emit-errbase 是幂等的（表不会抖动）
+ok   钉住之后还能正常编译
+
+run-errbase: 15 通过, 0 失败
+<end of output>
+Test time =   2.92 sec
+----------------------------------------------------------
+Test Passed.
+"errcheck" end time: Nov 15 18:34 CST
+"errcheck" time elapsed: 00:00:02
+----------------------------------------------------------
+
+105/125 Testing: selftest
+105/125 Test: selftest
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "selftest"
+Directory: /media/winger/_dde_data/superc
+"selftest" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+ok   async: 22 test(s), 0 failure(s)
+ok   async_frame: 8 test(s), 0 failure(s)
+ok   async_highfd: 1 test(s), 0 failure(s)
+ok   closure: 16 test(s), 0 failure(s)
+ok   data_zero: 4 test(s), 0 failure(s)
+ok   defer: 5 test(s), 0 failure(s)
+ok   defer_reent: 5 test(s), 0 failure(s)
+ok   defer_scope: 8 test(s), 0 failure(s)
+ok   defer_thread: 3 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
+ok   err: 18 test(s), 0 failure(s)
+ok   err_ids: 5 test(s), 0 failure(s)
+ok   fn_lit: 16 test(s), 0 failure(s)
+ok   foreach: 15 test(s), 0 failure(s)
+ok   foreach_head: 9 test(s), 0 failure(s)
+ok   foreach_iter: 21 test(s), 0 failure(s)
+ok   fstr: 15 test(s), 0 failure(s)
+ok   gc: 11 test(s), 0 failure(s)
+ok   gc_async: 7 test(s), 0 failure(s)
+ok   gc_chain: 1 test(s), 0 failure(s)
+ok   gc_drop: 6 test(s), 0 failure(s)
+ok   gc_field: 6 test(s), 0 failure(s)
+ok   gc_own: 4 test(s), 0 failure(s)
+ok   gc_return: 4 test(s), 0 failure(s)
+ok   gc_thread: 4 test(s), 0 failure(s)
+ok   gc_type: 4 test(s), 0 failure(s)
+ok   generic: 26 test(s), 0 failure(s)
+ok   generic_fn: 9 test(s), 0 failure(s)
+ok   generic_scope: 5 test(s), 0 failure(s)
+ok   iface_agg: 4 test(s), 0 failure(s)
+ok   interface: 8 test(s), 0 failure(s)
+ok   macro: 11 test(s), 0 failure(s)
+ok   method: 22 test(s), 0 failure(s)
+ok   module: 10 test(s), 0 failure(s)
+ok   slice: 15 test(s), 0 failure(s)
+ok   task_method: 6 test(s), 0 failure(s)
+ok   test-block: 7 test(s), 0 failure(s)
+ok   thread: 15 test(s), 0 failure(s)
+ok   thread_handle: 5 test(s), 0 failure(s)
+ok   try: 22 test(s), 0 failure(s)
+ok   tuple: 11 test(s), 0 failure(s)
+ok   tuple_async: 6 test(s), 0 failure(s)
+ok   tuple_error: 4 test(s), 0 failure(s)
+ok   tuple_thread: 4 test(s), 0 failure(s)
+ok   typename: 16 test(s), 0 failure(s)
+ok   weak: 6 test(s), 0 failure(s)
+ok   c6ext/basic: 3 test(s), 0 failure(s)
+ok   c6ext/c6mod: 3 test(s), 0 failure(s)
+ok   c6ext/pick: 1 test(s), 0 failure(s)
+ok   c6ext/run: -run 退出码 7
+ok   c6ext/rule: .c 不开启扩展、-std=c6 报错
+ok   test-block: -test-filter 只跑匹配块、空块 PASS、err 块 FAIL、main 不执行
+ok   c6ext/modpath: 模块按路径分级、扁平文件被拒绝
+ok   errors/async: 19 个诊断片段
+ok   errors/closure_capture: 2 个诊断片段
+ok   errors/closure_capture_type: 5 个诊断片段
+ok   errors/closure_convert: 5 个诊断片段
+ok   errors/closure_cross: 2 个诊断片段
+ok   errors/closure_cycle: 1 个诊断片段
+ok   errors/closure_opaque: 4 个诊断片段
+ok   errors/closure_signature: 4 个诊断片段
+ok   errors/defer: 7 个诊断片段
+ok   errors/drop_bad: 8 个诊断片段
+ok   errors/enum_scope: 8 个诊断片段
+ok   errors/err_code: 2 个诊断片段
+ok   errors/err_usage: 7 个诊断片段
+ok   errors/fn_lit: 9 个诊断片段
+ok   errors/foreach: 13 个诊断片段
+ok   errors/foreach_head: 10 个诊断片段
+ok   errors/foreach_iter: 16 个诊断片段
+ok   errors/fstr: 20 个诊断片段
+ok   errors/gc: 12 个诊断片段
+ok   errors/gc_borrow: 6 个诊断片段
+ok   errors/gc_cycle: 4 个诊断片段
+ok   errors/gc_cycle_cross_tu: 1 个诊断片段
+ok   errors/gc_move: 9 个诊断片段
+ok   errors/gc_type: 2 个诊断片段
+ok   errors/generic: 26 个诊断片段
+ok   errors/iface: 7 个诊断片段
+ok   errors/init: 9 个诊断片段
+ok   errors/loc: 1 个诊断片段
+ok   errors/macro: 13 个诊断片段
+ok   errors/method: 5 个诊断片段
+ok   errors/module: 4 个诊断片段
+ok   errors/module_import: 8 个诊断片段
+ok   errors/slice: 13 个诊断片段
+ok   errors/spawn: 10 个诊断片段
+ok   errors/thread_handle: 2 个诊断片段
+ok   errors/try: 17 个诊断片段
+ok   errors/tuple: 13 个诊断片段
+ok   errors/typename: 8 个诊断片段
+ok   exit/closure_global: 退出码 0
+ok   exit/drop_exit: 退出码 0
+ok   exit/go_join: 退出码 7
+ok   exit/return: 退出码 42
+ok   abi/closure: 退出码 0
+ok   abi/fn_lit: 退出码 0
+ok   abi/generic: 退出码 0
+ok   abi/method: 退出码 0
+ok   abi/module: 退出码 0
+ok   abi/sret12: 退出码 0
+ok   abi/tuple: 退出码 0
+ok   c99/c99test: 退出码 0
+ok   c99/closure: 退出码 0
+ok   c99/deadcode: 退出码 0
+ok   c99/generic: 退出码 0
+ok   c99/generic_fn: 退出码 0
+ok   c99/sret_fnptr: 退出码 0
+
+run-tests: 108 通过, 0 失败
+<end of output>
+Test time =   4.67 sec
+----------------------------------------------------------
+Test Passed.
+"selftest" end time: Nov 15 18:34 CST
+"selftest" time elapsed: 00:00:04
+----------------------------------------------------------
+
+125/125 Testing: c99selfhost-tcc
+125/125 Test: c99selfhost-tcc
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "c99selfhost-tcc"
+Directory: /media/winger/_dde_data/superc
+"c99selfhost-tcc" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+c99+tcc 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C
+c99+tcc 自举 2/4：同一个 tcc 编译生成的 C，得到 stage2 编译器
+c99+tcc 自举 3/4：stage2 编一遍 tcc.c，tcc 自己也编一遍
+c99+tcc 自举 4/4：比较两个目标文件
+ 逐字节相同
+hello from the tcc-hosted c99 self-hosted tcc
+c99+tcc 自举完成：/media/winger/_dde_data/superc/out/tests/c99selfhost-tcc/selfhost/c99tcc/tcc-stage2
+<end of output>
+Test time =   4.76 sec
+----------------------------------------------------------
+Test Passed.
+"c99selfhost-tcc" end time: Nov 15 18:34 CST
+"c99selfhost-tcc" time elapsed: 00:00:04
+----------------------------------------------------------
+
+120/125 Testing: c99tcc-test
+120/125 Test: c99tcc-test
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "c99tcc-test"
+Directory: /media/winger/_dde_data/superc
+"c99tcc-test" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+ok   async: 22 test(s), 0 failure(s)
+ok   async_frame: 8 test(s), 0 failure(s)
+ok   async_highfd: 1 test(s), 0 failure(s)
+ok   closure: 16 test(s), 0 failure(s)
+ok   data_zero: 4 test(s), 0 failure(s)
+ok   defer: 5 test(s), 0 failure(s)
+ok   defer_reent: 5 test(s), 0 failure(s)
+ok   defer_scope: 8 test(s), 0 failure(s)
+ok   defer_thread: 3 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
+ok   err: 18 test(s), 0 failure(s)
+ok   err_ids: 5 test(s), 0 failure(s)
+ok   fn_lit: 16 test(s), 0 failure(s)
+ok   foreach: 15 test(s), 0 failure(s)
+ok   foreach_head: 9 test(s), 0 failure(s)
+ok   foreach_iter: 21 test(s), 0 failure(s)
+ok   fstr: 15 test(s), 0 failure(s)
+ok   gc: 11 test(s), 0 failure(s)
+ok   gc_async: 7 test(s), 0 failure(s)
+ok   gc_chain: 1 test(s), 0 failure(s)
+ok   gc_drop: 6 test(s), 0 failure(s)
+ok   gc_field: 6 test(s), 0 failure(s)
+ok   gc_own: 4 test(s), 0 failure(s)
+ok   gc_return: 4 test(s), 0 failure(s)
+ok   gc_thread: 4 test(s), 0 failure(s)
+ok   gc_type: 4 test(s), 0 failure(s)
+ok   generic: 26 test(s), 0 failure(s)
+ok   generic_fn: 9 test(s), 0 failure(s)
+ok   generic_scope: 5 test(s), 0 failure(s)
+ok   iface_agg: 4 test(s), 0 failure(s)
+ok   interface: 8 test(s), 0 failure(s)
+ok   macro: 11 test(s), 0 failure(s)
+ok   method: 22 test(s), 0 failure(s)
+ok   module: 10 test(s), 0 failure(s)
+ok   slice: 15 test(s), 0 failure(s)
+ok   task_method: 6 test(s), 0 failure(s)
+ok   test-block: 7 test(s), 0 failure(s)
+ok   thread: 15 test(s), 0 failure(s)
+ok   thread_handle: 5 test(s), 0 failure(s)
+ok   try: 22 test(s), 0 failure(s)
+ok   tuple: 11 test(s), 0 failure(s)
+ok   tuple_async: 6 test(s), 0 failure(s)
+ok   tuple_error: 4 test(s), 0 failure(s)
+ok   tuple_thread: 4 test(s), 0 failure(s)
+ok   typename: 16 test(s), 0 failure(s)
+ok   weak: 6 test(s), 0 failure(s)
+ok   c6ext/basic: 3 test(s), 0 failure(s)
+ok   c6ext/c6mod: 3 test(s), 0 failure(s)
+ok   c6ext/pick: 1 test(s), 0 failure(s)
+ok   errors/async: 19 个诊断片段
+ok   errors/closure_capture: 2 个诊断片段
+ok   errors/closure_capture_type: 5 个诊断片段
+ok   errors/closure_convert: 5 个诊断片段
+ok   errors/closure_cross: 2 个诊断片段
+ok   errors/closure_cycle: 1 个诊断片段
+ok   errors/closure_opaque: 4 个诊断片段
+ok   errors/closure_signature: 4 个诊断片段
+ok   errors/defer: 7 个诊断片段
+ok   errors/drop_bad: 8 个诊断片段
+ok   errors/enum_scope: 8 个诊断片段
+ok   errors/err_code: 2 个诊断片段
+ok   errors/err_usage: 7 个诊断片段
+ok   errors/fn_lit: 9 个诊断片段
+ok   errors/foreach: 13 个诊断片段
+ok   errors/foreach_head: 10 个诊断片段
+ok   errors/foreach_iter: 16 个诊断片段
+ok   errors/fstr: 20 个诊断片段
+ok   errors/gc: 12 个诊断片段
+ok   errors/gc_borrow: 6 个诊断片段
+ok   errors/gc_cycle: 4 个诊断片段
+ok   errors/gc_cycle_cross_tu: 1 个诊断片段
+ok   errors/gc_move: 9 个诊断片段
+ok   errors/gc_type: 2 个诊断片段
+ok   errors/generic: 26 个诊断片段
+ok   errors/iface: 7 个诊断片段
+ok   errors/init: 9 个诊断片段
+ok   errors/loc: 1 个诊断片段
+ok   errors/macro: 13 个诊断片段
+ok   errors/method: 5 个诊断片段
+ok   errors/module: 4 个诊断片段
+ok   errors/module_import: 8 个诊断片段
+ok   errors/slice: 13 个诊断片段
+ok   errors/spawn: 10 个诊断片段
+ok   errors/thread_handle: 2 个诊断片段
+ok   errors/try: 17 个诊断片段
+ok   errors/tuple: 13 个诊断片段
+ok   errors/typename: 8 个诊断片段
+ok   exit/closure_global: 退出码 0
+ok   exit/drop_exit: 退出码 0
+ok   exit/go_join: 退出码 7
+ok   exit/return: 退出码 42
+ok   abi/closure: 退出码 0
+ok   abi/fn_lit: 退出码 0
+ok   abi/generic: 退出码 0
+ok   abi/method: 退出码 0
+ok   abi/module: 退出码 0
+ok   abi/sret12: 退出码 0
+ok   abi/tuple: 退出码 0
+ok   c99/c99test: 退出码 0
+ok   c99/closure: 退出码 0
+ok   c99/deadcode: 退出码 0
+ok   c99/generic: 退出码 0
+ok   c99/generic_fn: 退出码 0
+ok   c99/sret_fnptr: 退出码 0
+ok   c99/cli: 每个 TU 一个 .c，退出码 7
+
+run-tests: 105 通过, 0 失败
+<end of output>
+Test time =   5.97 sec
+----------------------------------------------------------
+Test Passed.
+"c99tcc-test" end time: Nov 15 18:34 CST
+"c99tcc-test" time elapsed: 00:00:05
+----------------------------------------------------------
+
+107/125 Testing: stdtest
+107/125 Test: stdtest
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "stdtest"
+Directory: /media/winger/_dde_data/superc
+"stdtest" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+std/analysis/lex.c6        28 test(s), 0 failure(s)
+std/analysis/parse.c6      43 test(s), 0 failure(s)
+std/analysis/ub.c6         78 test(s), 0 failure(s)
+std/async/abench.c6        31 test(s), 0 failure(s)
+std/async/abudget.c6       31 test(s), 0 failure(s)
+std/async/acancel.c6       24 test(s), 0 failure(s)
+std/async/achan.c6         27 test(s), 0 failure(s)
+std/async/agroup.c6        27 test(s), 0 failure(s)
+std/async/aio.c6           25 test(s), 0 failure(s)
+std/async/apool.c6         27 test(s), 0 failure(s)
+std/async/apump.c6         29 test(s), 0 failure(s)
+std/async/art.c6           27 test(s), 0 failure(s)
+std/async/await.c6         41 test(s), 0 failure(s)
+std/async/co.c6            39 test(s), 0 failure(s)
+std/async/limiter.c6       24 test(s), 0 failure(s)
+std/async/scope.c6         41 test(s), 0 failure(s)
+std/container/bag.c6       24 test(s), 0 failure(s)
+std/container/bitset.c6    11 test(s), 0 failure(s)
+std/container/bloom.c6     24 test(s), 0 failure(s)
+std/container/chan.c6      10 test(s), 0 failure(s)
+std/container/counter.c6   24 test(s), 0 failure(s)
+std/container/deque.c6     9 test(s), 0 failure(s)
+std/container/dsu.c6       2 test(s), 0 failure(s)
+std/container/fenwick.c6   2 test(s), 0 failure(s)
+std/container/flow.c6      24 test(s), 0 failure(s)
+std/container/graph.c6     3 test(s), 0 failure(s)
+std/container/heap.c6      2 test(s), 0 failure(s)
+std/container/interval.c6  24 test(s), 0 failure(s)
+std/container/list.c6      4 test(s), 0 failure(s)
+std/container/lru.c6       3 test(s), 0 failure(s)
+std/container/map.c6       9 test(s), 0 failure(s)
+std/container/match.c6     24 test(s), 0 failure(s)
+std/container/mst.c6       24 test(s), 0 failure(s)
+std/container/pqueue.c6    38 test(s), 0 failure(s)
+std/container/queue.c6     24 test(s), 0 failure(s)
+std/container/range.c6     6 test(s), 0 failure(s)
+std/container/region.c6    2 test(s), 0 failure(s)
+std/container/ring.c6      2 test(s), 0 failure(s)
+std/container/scc.c6       24 test(s), 0 failure(s)
+std/container/segtree.c6   2 test(s), 0 failure(s)
+std/container/set.c6       17 test(s), 0 failure(s)
+std/container/skiplist.c6  2 test(s), 0 failure(s)
+std/container/slots.c6     24 test(s), 0 failure(s)
+std/container/sort.c6      30 test(s), 0 failure(s)
+std/container/span.c6      6 test(s), 0 failure(s)
+std/container/stack.c6     24 test(s), 0 failure(s)
+std/container/treap.c6     2 test(s), 0 failure(s)
+std/container/trie.c6      3 test(s), 0 failure(s)
+std/container/vec.c6       42 test(s), 0 failure(s)
+std/core/align.c6          24 test(s), 0 failure(s)
+std/core/atomic.c6         5 test(s), 0 failure(s)
+std/core/awaitgroup.c6     26 test(s), 0 failure(s)
+std/core/bignum.c6         7 test(s), 0 failure(s)
+std/core/binio.c6          24 test(s), 0 failure(s)
+std/core/bitio.c6          24 test(s), 0 failure(s)
+std/core/bits.c6           6 test(s), 0 failure(s)
+std/core/closest.c6        24 test(s), 0 failure(s)
+std/core/color.c6          24 test(s), 0 failure(s)
+std/core/complex.c6        10 test(s), 0 failure(s)
+std/core/crc.c6            3 test(s), 0 failure(s)
+std/core/decimal.c6        5 test(s), 0 failure(s)
+std/core/eigen.c6          24 test(s), 0 failure(s)
+std/core/endian.c6         2 test(s), 0 failure(s)
+std/core/err.c6            3 test(s), 0 failure(s)
+std/core/executor.c6       35 test(s), 0 failure(s)
+std/core/fft.c6            2 test(s), 0 failure(s)
+std/core/fixed.c6          4 test(s), 0 failure(s)
+std/core/future.c6         24 test(s), 0 failure(s)
+std/core/geo.c6            2 test(s), 0 failure(s)
+std/core/geometry.c6       2 test(s), 0 failure(s)
+std/core/half.c6           24 test(s), 0 failure(s)
+std/core/hash.c6           7 test(s), 0 failure(s)
+std/core/histogram.c6      24 test(s), 0 failure(s)
+std/core/hull.c6           24 test(s), 0 failure(s)
+std/core/interp.c6         2 test(s), 0 failure(s)
+std/core/least.c6          24 test(s), 0 failure(s)
+std/core/lu.c6             24 test(s), 0 failure(s)
+std/core/math.c6           6 test(s), 0 failure(s)
+std/core/matrix.c6         3 test(s), 0 failure(s)
+std/core/mem.c6            7 test(s), 0 failure(s)
+std/core/moving.c6         24 test(s), 0 failure(s)
+std/core/ode.c6            24 test(s), 0 failure(s)
+std/core/optimize.c6       24 test(s), 0 failure(s)
+std/core/polygon.c6        24 test(s), 0 failure(s)
+std/core/polynomial.c6     2 test(s), 0 failure(s)
+std/core/pool.c6           2 test(s), 0 failure(s)
+std/core/quantile.c6       24 test(s), 0 failure(s)
+std/core/rand.c6           9 test(s), 0 failure(s)
+std/core/rational.c6       5 test(s), 0 failure(s)
+std/core/retry.c6          24 test(s), 0 failure(s)
+std/core/segment.c6        24 test(s), 0 failure(s)
+std/core/series.c6         24 test(s), 0 failure(s)
+std/core/solve.c6          24 test(s), 0 failure(s)
+std/core/sparse.c6         24 test(s), 0 failure(s)
+std/core/spline.c6         2 test(s), 0 failure(s)
+std/core/stats.c6          3 test(s), 0 failure(s)
+std/core/task.c6           24 test(s), 0 failure(s)
+std/core/timer.c6          24 test(s), 0 failure(s)
+std/core/tridiag.c6        24 test(s), 0 failure(s)
+std/core/types.c6          4 test(s), 0 failure(s)
+std/core/units.c6          24 test(s), 0 failure(s)
+std/core/vector.c6         2 test(s), 0 failure(s)
+std/data/aiff.c6           24 test(s), 0 failure(s)
+std/data/ar.c6             24 test(s), 0 failure(s)
+std/data/ass.c6            25 test(s), 0 failure(s)
+std/data/au.c6             23 test(s), 0 failure(s)
+std/data/bdf.c6            24 test(s), 0 failure(s)
+std/data/bencode.c6        24 test(s), 0 failure(s)
+std/data/bmp.c6            2 test(s), 0 failure(s)
+std/data/bson.c6           24 test(s), 0 failure(s)
+std/data/cbor.c6           24 test(s), 0 failure(s)
+std/data/class.c6          24 test(s), 0 failure(s)
+std/data/coff.c6           24 test(s), 0 failure(s)
+std/data/cpio.c6           24 test(s), 0 failure(s)
+std/data/crontab.c6        24 test(s), 0 failure(s)
+std/data/csv.c6            41 test(s), 0 failure(s)
+std/data/dms.c6            24 test(s), 0 failure(s)
+std/data/dotenv.c6         24 test(s), 0 failure(s)
+std/data/elf.c6            2 test(s), 0 failure(s)
+std/data/ext2.c6           24 test(s), 0 failure(s)
+std/data/fat.c6            24 test(s), 0 failure(s)
+std/data/flac.c6           24 test(s), 0 failure(s)
+std/data/geohash.c6        26 test(s), 0 failure(s)
+std/data/gif.c6            5 test(s), 0 failure(s)
+std/data/hdr.c6            24 test(s), 0 failure(s)
+std/data/hosts.c6          24 test(s), 0 failure(s)
+std/data/html.c6           24 test(s), 0 failure(s)
+std/data/ico.c6            35 test(s), 0 failure(s)
+std/data/ics.c6            24 test(s), 0 failure(s)
+std/data/ini.c6            6 test(s), 0 failure(s)
+std/data/ircam.c6          23 test(s), 0 failure(s)
+std/data/iso.c6            24 test(s), 0 failure(s)
+std/data/json.c6           60 test(s), 0 failure(s)
+std/data/jwt.c6            58 test(s), 0 failure(s)
+std/data/kdl.c6            2 test(s), 0 failure(s)
+std/data/keys.c6           24 test(s), 0 failure(s)
+std/data/knownhosts.c6     24 test(s), 0 failure(s)
+std/data/lrc.c6            24 test(s), 0 failure(s)
+std/data/m3u.c6            24 test(s), 0 failure(s)
+std/data/macho.c6          24 test(s), 0 failure(s)
+std/data/maidenhead.c6     26 test(s), 0 failure(s)
+std/data/mbox.c6           2 test(s), 0 failure(s)
+std/data/mbr.c6            24 test(s), 0 failure(s)
+std/data/midi.c6           24 test(s), 0 failure(s)
+std/data/mp3.c6            24 test(s), 0 failure(s)
+std/data/msgpack.c6        24 test(s), 0 failure(s)
+std/data/mtl.c6            24 test(s), 0 failure(s)
+std/data/netrc.c6          24 test(s), 0 failure(s)
+std/data/obj.c6            25 test(s), 0 failure(s)
+std/data/ogg.c6            24 test(s), 0 failure(s)
+std/data/palette.c6        26 test(s), 0 failure(s)
+std/data/pcx.c6            24 test(s), 0 failure(s)
+std/data/pe.c6             24 test(s), 0 failure(s)
+std/data/pem.c6            32 test(s), 0 failure(s)
+std/data/plist.c6          24 test(s), 0 failure(s)
+std/data/ply.c6            24 test(s), 0 failure(s)
+std/data/png.c6            33 test(s), 0 failure(s)
+std/data/pnm.c6            2 test(s), 0 failure(s)
+std/data/props.c6          4 test(s), 0 failure(s)
+std/data/qoi.c6            2 test(s), 0 failure(s)
+std/data/query.c6          26 test(s), 0 failure(s)
+std/data/resolvconf.c6     24 test(s), 0 failure(s)
+std/data/rpm.c6            24 test(s), 0 failure(s)
+std/data/rtf.c6            2 test(s), 0 failure(s)
+std/data/sqlite.c6         25 test(s), 0 failure(s)
+std/data/srt.c6            26 test(s), 0 failure(s)
+std/data/sshconfig.c6      24 test(s), 0 failure(s)
+std/data/stl.c6            24 test(s), 0 failure(s)
+std/data/svg.c6            24 test(s), 0 failure(s)
+std/data/tga.c6            2 test(s), 0 failure(s)
+std/data/tiff.c6           11 test(s), 0 failure(s)
+std/data/toml.c6           41 test(s), 0 failure(s)
+std/data/ttf.c6            24 test(s), 0 failure(s)
+std/data/ubjson.c6         24 test(s), 0 failure(s)
+std/data/vcf.c6            24 test(s), 0 failure(s)
+std/data/voc.c6            23 test(s), 0 failure(s)
+std/data/vtt.c6            2 test(s), 0 failure(s)
+std/data/wasm.c6           24 test(s), 0 failure(s)
+std/data/wav.c6            2 test(s), 0 failure(s)
+std/data/woff.c6           24 test(s), 0 failure(s)
+std/data/x509.c6           26 test(s), 0 failure(s)
+std/data/xbm.c6            24 test(s), 0 failure(s)
+std/data/xml.c6            26 test(s), 0 failure(s)
+std/data/xpm.c6            24 test(s), 0 failure(s)
+std/data/yaml.c6           24 test(s), 0 failure(s)
+std/data/zip.c6            7 test(s), 0 failure(s)
+std/data/zone.c6           2 test(s), 0 failure(s)
+std/encoding/adler32.c6    24 test(s), 0 failure(s)
+std/encoding/aes.c6        2 test(s), 0 failure(s)
+std/encoding/asn1.c6       24 test(s), 0 failure(s)
+std/encoding/base32.c6     5 test(s), 0 failure(s)
+std/encoding/base45.c6     5 test(s), 0 failure(s)
+std/encoding/base58.c6     3 test(s), 0 failure(s)
+std/encoding/base64.c6     8 test(s), 0 failure(s)
+std/encoding/base85.c6     4 test(s), 0 failure(s)
+std/encoding/base91.c6     24 test(s), 0 failure(s)
+std/encoding/bitbuf.c6     7 test(s), 0 failure(s)
+std/encoding/blake2s.c6    24 test(s), 0 failure(s)
+std/encoding/bwt.c6        24 test(s), 0 failure(s)
+std/encoding/chacha20.c6   8 test(s), 0 failure(s)
+std/encoding/classic.c6    24 test(s), 0 failure(s)
+std/encoding/codec.c6      7 test(s), 0 failure(s)
+std/encoding/crc16.c6      24 test(s), 0 failure(s)
+std/encoding/crc32c.c6     24 test(s), 0 failure(s)
+std/encoding/deflate.c6    2 test(s), 0 failure(s)
+std/encoding/delta.c6      24 test(s), 0 failure(s)
+std/encoding/ebcdic.c6     24 test(s), 0 failure(s)
+std/encoding/fnv.c6        24 test(s), 0 failure(s)
+std/encoding/frame.c6      4 test(s), 0 failure(s)
+std/encoding/gzip.c6       7 test(s), 0 failure(s)
+std/encoding/hamming.c6    24 test(s), 0 failure(s)
+std/encoding/hexdump.c6    5 test(s), 0 failure(s)
+std/encoding/hkdf.c6       28 test(s), 0 failure(s)
+std/encoding/huffman.c6    24 test(s), 0 failure(s)
+std/encoding/luhn.c6       24 test(s), 0 failure(s)
+std/encoding/lz4.c6        5 test(s), 0 failure(s)
+std/encoding/lzw.c6        2 test(s), 0 failure(s)
+std/encoding/md5.c6        9 test(s), 0 failure(s)
+std/encoding/mtf.c6        24 test(s), 0 failure(s)
+std/encoding/murmur3.c6    24 test(s), 0 failure(s)
+std/encoding/otp.c6        13 test(s), 0 failure(s)
+std/encoding/pbkdf2.c6     33 test(s), 0 failure(s)
+std/encoding/poly1305.c6   2 test(s), 0 failure(s)
+std/encoding/punycode.c6   11 test(s), 0 failure(s)
+std/encoding/quotedprintable.c6 3 test(s), 0 failure(s)
+std/encoding/random.c6     3 test(s), 0 failure(s)
+std/encoding/rle.c6        4 test(s), 0 failure(s)
+std/encoding/sha1.c6       4 test(s), 0 failure(s)
+std/encoding/sha256.c6     23 test(s), 0 failure(s)
+std/encoding/sha3.c6       24 test(s), 0 failure(s)
+std/encoding/sha512.c6     9 test(s), 0 failure(s)
+std/encoding/siphash.c6    24 test(s), 0 failure(s)
+std/encoding/snappy.c6     2 test(s), 0 failure(s)
+std/encoding/tar.c6        24 test(s), 0 failure(s)
+std/encoding/uu.c6         24 test(s), 0 failure(s)
+std/encoding/uuid.c6       24 test(s), 0 failure(s)
+std/encoding/varint.c6     4 test(s), 0 failure(s)
+std/encoding/xxhash.c6     24 test(s), 0 failure(s)
+std/encoding/yenc.c6       24 test(s), 0 failure(s)
+std/encoding/zlib.c6       4 test(s), 0 failure(s)
+std/net/assets.c6          75 test(s), 0 failure(s)
+std/net/cidr.c6            2 test(s), 0 failure(s)
+std/net/coap.c6            2 test(s), 0 failure(s)
+std/net/cookie.c6          4 test(s), 0 failure(s)
+std/net/dhcp.c6            2 test(s), 0 failure(s)
+std/net/dns.c6             3 test(s), 0 failure(s)
+std/net/ftp.c6             24 test(s), 0 failure(s)
+std/net/gemini.c6          2 test(s), 0 failure(s)
+std/net/gopher.c6          24 test(s), 0 failure(s)
+std/net/hsts.c6            3 test(s), 0 failure(s)
+std/net/http.c6            5 test(s), 0 failure(s)
+std/net/httpcache.c6       3 test(s), 0 failure(s)
+std/net/httpc.c6           39 test(s), 0 failure(s)
+std/net/httpd.c6           33 test(s), 0 failure(s)
+std/net/httpsa.c6          36 test(s), 0 failure(s)
+std/net/https.c6           36 test(s), 0 failure(s)
+std/net/ident.c6           24 test(s), 0 failure(s)
+std/net/inet.c6            8 test(s), 0 failure(s)
+std/net/irc.c6             24 test(s), 0 failure(s)
+std/net/mime.c6            37 test(s), 0 failure(s)
+std/net/mqtt.c6            25 test(s), 0 failure(s)
+std/net/multipart.c6       4 test(s), 0 failure(s)
+std/net/mysql.c6           24 test(s), 0 failure(s)
+std/net/netflow.c6         2 test(s), 0 failure(s)
+std/net/nntp.c6            2 test(s), 0 failure(s)
+std/net/ntp.c6             24 test(s), 0 failure(s)
+std/net/postgres.c6        24 test(s), 0 failure(s)
+std/net/prometheus.c6      2 test(s), 0 failure(s)
+std/net/ratelimit.c6       4 test(s), 0 failure(s)
+std/net/redis.c6           24 test(s), 0 failure(s)
+std/net/resolver.c6        36 test(s), 0 failure(s)
+std/net/robots.c6          2 test(s), 0 failure(s)
+std/net/router.c6          3 test(s), 0 failure(s)
+std/net/session.c6         45 test(s), 0 failure(s)
+std/net/smtp.c6            24 test(s), 0 failure(s)
+std/net/snmp.c6            2 test(s), 0 failure(s)
+std/net/socks5.c6          35 test(s), 0 failure(s)
+std/net/ssdp.c6            2 test(s), 0 failure(s)
+std/net/sse.c6             24 test(s), 0 failure(s)
+std/net/stun.c6            24 test(s), 0 failure(s)
+std/net/syslog.c6          24 test(s), 0 failure(s)
+std/net/tcp.c6             3 test(s), 0 failure(s)
+std/net/telnet.c6          24 test(s), 0 failure(s)
+std/net/tftp.c6            24 test(s), 0 failure(s)
+std/net/tlskdf.c6          49 test(s), 0 failure(s)
+std/net/tlsrec.c6          34 test(s), 0 failure(s)
+std/net/udp.c6             3 test(s), 0 failure(s)
+std/net/uds.c6             2 test(s), 0 failure(s)
+std/net/url.c6             32 test(s), 0 failure(s)
+std/net/whois.c6           24 test(s), 0 failure(s)
+std/net/wol.c6             2 test(s), 0 failure(s)
+std/net/ws.c6              18 test(s), 0 failure(s)
+std/net/x25519.c6          2 test(s), 0 failure(s)
+std/os/args.c6             25 test(s), 0 failure(s)
+std/os/asio.c6             33 test(s), 0 failure(s)
+std/os/calendar.c6         2 test(s), 0 failure(s)
+std/os/cron.c6             26 test(s), 0 failure(s)
+std/os/duration.c6         2 test(s), 0 failure(s)
+std/os/env.c6              39 test(s), 0 failure(s)
+std/os/fs.c6               7 test(s), 0 failure(s)
+std/os/fstab.c6            24 test(s), 0 failure(s)
+std/os/io.c6               5 test(s), 0 failure(s)
+std/os/iso8601.c6          26 test(s), 0 failure(s)
+std/os/lock.c6             9 test(s), 0 failure(s)
+std/os/log.c6              24 test(s), 0 failure(s)
+std/os/mmap.c6             2 test(s), 0 failure(s)
+std/os/mounts.c6           24 test(s), 0 failure(s)
+std/os/osrelease.c6        24 test(s), 0 failure(s)
+std/os/path.c6             30 test(s), 0 failure(s)
+std/os/pipe.c6             4 test(s), 0 failure(s)
+std/os/poll.c6             5 test(s), 0 failure(s)
+std/os/proc.c6             3 test(s), 0 failure(s)
+std/os/pty.c6              24 test(s), 0 failure(s)
+std/os/reactor.c6          31 test(s), 0 failure(s)
+std/os/resource.c6         24 test(s), 0 failure(s)
+std/os/signal.c6           4 test(s), 0 failure(s)
+std/os/sync.c6             6 test(s), 0 failure(s)
+std/os/sysinfo.c6          24 test(s), 0 failure(s)
+std/os/systemd.c6          24 test(s), 0 failure(s)
+std/os/temp.c6             3 test(s), 0 failure(s)
+std/os/thread.c6           4 test(s), 0 failure(s)
+std/os/time.c6             7 test(s), 0 failure(s)
+std/os/tty.c6              2 test(s), 0 failure(s)
+std/os/user.c6             24 test(s), 0 failure(s)
+std/os/walk.c6             43 test(s), 0 failure(s)
+std/text/aho.c6            24 test(s), 0 failure(s)
+std/text/align.c6          24 test(s), 0 failure(s)
+std/text/ansi.c6           4 test(s), 0 failure(s)
+std/text/ascii.c6          5 test(s), 0 failure(s)
+std/text/bm25.c6           24 test(s), 0 failure(s)
+std/text/bmh.c6            24 test(s), 0 failure(s)
+std/text/casing.c6         24 test(s), 0 failure(s)
+std/text/collate.c6        2 test(s), 0 failure(s)
+std/text/colorname.c6      26 test(s), 0 failure(s)
+std/text/diff.c6           13 test(s), 0 failure(s)
+std/text/fmt.c6            10 test(s), 0 failure(s)
+std/text/fuzzy.c6          15 test(s), 0 failure(s)
+std/text/glob.c6           6 test(s), 0 failure(s)
+std/text/hyphen.c6         2 test(s), 0 failure(s)
+std/text/inverted.c6       24 test(s), 0 failure(s)
+std/text/keyword.c6        24 test(s), 0 failure(s)
+std/text/kmp.c6            24 test(s), 0 failure(s)
+std/text/markdown.c6       25 test(s), 0 failure(s)
+std/text/nato.c6           24 test(s), 0 failure(s)
+std/text/natural.c6        3 test(s), 0 failure(s)
+std/text/ngram.c6          24 test(s), 0 failure(s)
+std/text/num.c6            11 test(s), 0 failure(s)
+std/text/org.c6            24 test(s), 0 failure(s)
+std/text/phonetic.c6       24 test(s), 0 failure(s)
+std/text/plural.c6         2 test(s), 0 failure(s)
+std/text/pod.c6            24 test(s), 0 failure(s)
+std/text/quote.c6          24 test(s), 0 failure(s)
+std/text/rabin.c6          24 test(s), 0 failure(s)
+std/text/readability.c6    28 test(s), 0 failure(s)
+std/text/regex.c6          15 test(s), 0 failure(s)
+std/text/roman.c6          24 test(s), 0 failure(s)
+std/text/rst.c6            24 test(s), 0 failure(s)
+std/text/sanitize.c6       24 test(s), 0 failure(s)
+std/text/semver.c6         4 test(s), 0 failure(s)
+std/text/sentences.c6      24 test(s), 0 failure(s)
+std/text/slug.c6           24 test(s), 0 failure(s)
+std/text/stem.c6           24 test(s), 0 failure(s)
+std/text/strbuf.c6         18 test(s), 0 failure(s)
+std/text/str.c6            22 test(s), 0 failure(s)
+std/text/strdist.c6        3 test(s), 0 failure(s)
+std/text/suffix.c6         24 test(s), 0 failure(s)
+std/text/table.c6          13 test(s), 0 failure(s)
+std/text/tabs.c6           24 test(s), 0 failure(s)
+std/text/template.c6       25 test(s), 0 failure(s)
+std/text/tex.c6            24 test(s), 0 failure(s)
+std/text/translit.c6       2 test(s), 0 failure(s)
+std/text/utf16.c6          4 test(s), 0 failure(s)
+std/text/utf8.c6           7 test(s), 0 failure(s)
+std/text/width.c6          10 test(s), 0 failure(s)
+std/text/wordplay.c6       24 test(s), 0 failure(s)
+std/text/words.c6          24 test(s), 0 failure(s)
+std/text/wrap.c6           16 test(s), 0 failure(s)
+<end of output>
+Test time =  10.00 sec
+----------------------------------------------------------
+Test Passed.
+"stdtest" end time: Nov 15 18:34 CST
+"stdtest" time elapsed: 00:00:10
+----------------------------------------------------------
+
+35/125 Testing: std-fsx
+35/125 Test: std-fsx
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-fsx"
+Directory: /media/winger/_dde_data/superc
+"std-fsx" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+stdfsx: 标准库第二十四批（walk / temp / lock / mmap）
+temp: 临时文件/目录都建在系统临时目录下
+mmap: anon 4 KiB 清零、文件映射改字节并 sync 回盘
+walk: 2 文件 1 目录 7 字节，max_depth 与删树都对
+lock: 跨进程互斥、超时与等待都对
+stdfsx: 33 check(s), 0 failure(s)
+<end of output>
+Test time =   0.35 sec
+----------------------------------------------------------
+Test Passed.
+"std-fsx" end time: Nov 15 18:35 CST
+"std-fsx" time elapsed: 00:00:00
+----------------------------------------------------------
+
+32/125 Testing: std-client
+32/125 Test: std-client
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-client"
+Directory: /media/winger/_dde_data/superc
+"std-client" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+stdclient: 标准库第二十一批（udp / uds / resolver / httpc）
+udp: 127.0.0.1:42228 收发 4 字节，空报文与超时都对
+uds: socketpair 2 字节、EOF=0；路径 build/stdclient.sock 也通了
+resolver: example.com -> 93.184.216.34（ttl=60）
+httpc: http://127.0.0.1:33463/hello -> 200 OK，chunked body = "hello, world"（12 字节）
+stdclient: 36 check(s), 0 failure(s)
+<end of output>
+Test time =   0.22 sec
+----------------------------------------------------------
+Test Passed.
+"std-client" end time: Nov 15 18:35 CST
+"std-client" time elapsed: 00:00:00
+----------------------------------------------------------
+
+33/125 Testing: std-serve
+33/125 Test: std-serve
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-serve"
+Directory: /media/winger/_dde_data/superc
+"std-serve" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+stdserve: 标准库第二十二批（httpd / router / assets / session）
+stdserve: 5 条路由 / 静态文件（含 403）/ 会话 Cookie 都通了
+stdserve: 28 check(s), 0 failure(s)
+<end of output>
+Test time =   0.23 sec
+----------------------------------------------------------
+Test Passed.
+"std-serve" end time: Nov 15 18:35 CST
+"std-serve" time elapsed: 00:00:00
+----------------------------------------------------------
+
+14/125 Testing: std-kit
+14/125 Test: std-kit
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "std-kit"
+Directory: /media/winger/_dde_data/superc
+"std-kit" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+stdkit: 标准库第三批一日游
+stdkit: 70 check(s), 0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"std-kit" end time: Nov 15 18:35 CST
+"std-kit" time elapsed: 00:00:00
+----------------------------------------------------------
+
+122/125 Testing: c6selfcheck
+122/125 Test: c6selfcheck
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "c6selfcheck"
+Directory: /media/winger/_dde_data/superc
+"c6selfcheck" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+c6 0.6.0 (TinyCC 0.9.28rc)
+tcc version 0.9.28rc (x86_64 Linux)
+<end of output>
+Test time =  11.91 sec
+----------------------------------------------------------
+Test Passed.
+"c6selfcheck" end time: Nov 15 18:35 CST
+"c6selfcheck" time elapsed: 00:00:11
+----------------------------------------------------------
+
+124/125 Testing: c99selfhost
+124/125 Test: c99selfhost
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "c99selfhost"
+Directory: /media/winger/_dde_data/superc
+"c99selfhost" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+c99 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C
+c99 自举 2/4：宿主 gcc 编译生成的 C，得到 stage2 编译器
+c99 自举 3/4：stage2 编译 tcc.c 得到 stage3
+c99 自举 4/4：stage3 再编一次并比较目标文件
+ 两次编译逐字节相同
+hello from the c99 self-hosted tcc
+c99 自举完成：/media/winger/_dde_data/superc/out/tests/c99selfhost/selfhost/c99/tcc-stage3
+<end of output>
+Test time =  12.05 sec
+----------------------------------------------------------
+Test Passed.
+"c99selfhost" end time: Nov 15 18:35 CST
+"c99selfhost" time elapsed: 00:00:12
+----------------------------------------------------------
+
+115/125 Testing: fstest-bare-tests
+115/125 Test: fstest-bare-tests
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-bare-tests"
+Directory: /media/winger/_dde_data/superc
+"fstest-bare-tests" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+ok   async: 22 test(s), 0 failure(s)
+ok   async_frame: 8 test(s), 0 failure(s)
+ok   closure: 16 test(s), 0 failure(s)
+ok   data_zero: 4 test(s), 0 failure(s)
+ok   defer: 5 test(s), 0 failure(s)
+ok   defer_reent: 5 test(s), 0 failure(s)
+ok   defer_scope: 8 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
+ok   err: 18 test(s), 0 failure(s)
+ok   err_ids: 5 test(s), 0 failure(s)
+ok   fn_lit: 16 test(s), 0 failure(s)
+ok   foreach: 15 test(s), 0 failure(s)
+ok   foreach_head: 9 test(s), 0 failure(s)
+ok   foreach_iter: 21 test(s), 0 failure(s)
+ok   fstr: 15 test(s), 0 failure(s)
+ok   gc: 11 test(s), 0 failure(s)
+ok   gc_async: 7 test(s), 0 failure(s)
+ok   gc_chain: 1 test(s), 0 failure(s)
+ok   gc_field: 6 test(s), 0 failure(s)
+ok   gc_own: 4 test(s), 0 failure(s)
+ok   gc_return: 4 test(s), 0 failure(s)
+ok   gc_type: 4 test(s), 0 failure(s)
+ok   generic: 26 test(s), 0 failure(s)
+ok   generic_fn: 8 test(s), 0 failure(s)（块级跳过 1）
+ok   generic_scope: 5 test(s), 0 failure(s)
+ok   iface_agg: 4 test(s), 0 failure(s)
+ok   interface: 8 test(s), 0 failure(s)
+ok   macro: 11 test(s), 0 failure(s)
+ok   module: 10 test(s), 0 failure(s)
+ok   slice: 15 test(s), 0 failure(s)
+ok   task_method: 6 test(s), 0 failure(s)
+ok   test-block: 7 test(s), 0 failure(s)
+ok   try: 22 test(s), 0 failure(s)
+ok   tuple: 11 test(s), 0 failure(s)
+ok   tuple_async: 6 test(s), 0 failure(s)
+ok   tuple_error: 4 test(s), 0 failure(s)
+ok   typename: 16 test(s), 0 failure(s)
+ok   weak: 6 test(s), 0 failure(s)
+bare tests: 38 通过, 0 失败（跳过: async_highfd defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
+<end of output>
+Test time =  18.39 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-bare-tests" end time: Nov 15 18:35 CST
+"fstest-bare-tests" time elapsed: 00:00:18
+----------------------------------------------------------
+
+118/125 Testing: fstest-bare-smp
+118/125 Test: fstest-bare-smp
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-bare-smp"
+Directory: /media/winger/_dde_data/superc
+"fstest-bare-smp" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+== 1b. 汇编 AP 跳板（多核用，as --32）
+ld: warning: cannot find entry symbol _start; defaulting to 00008000
+   AP 跳板: 222 字节（加载到 0x8000）
+== 1. 编译 payload（c6 程序 + libtcc1）
+examples/boot/sched.plain.c:458: warning: implicit declaration of function 'memcpy'
+examples/boot/sched.plain.c:459: warning: implicit declaration of function 'sched_read_cr3'
+examples/boot/sched.plain.c:545: warning: assignment from incompatible pointer type
+   payload: 94336 字节文件 + 4601152 字节 .bss（185 个扇区），入口 0x403da5
+== 2. 汇编引导扇区
+   引导扇区: 512 字节
+== 3. 拼镜像
+== 4. 启动 qemu-system-x86_64
+Could not open option rom 'kvmvapic.bin': No such file or directory
+smp: 在线核数 2，A 跑在核 0
+smp: B 跑在核 1（它自己从 LAPIC 读的）
+smp: A 关中断空转期间 B 的计数器涨了 1358004
+smp: A 在核 0，B 在核 1，时钟切换 3 次
+smp: 真并行 —— 两个任务同时跑在两个核上
+fstest-bare: ok（裸机启动，全部断言通过；KVM；2 核）
+== 1b. 汇编 AP 跳板（多核用，as --32）
+ld: warning: cannot find entry symbol _start; defaulting to 00008000
+   AP 跳板: 222 字节（加载到 0x8000）
+== 1. 编译 payload（c6 程序 + libtcc1）
+examples/boot/sched.plain.c:458: warning: implicit declaration of function 'memcpy'
+examples/boot/sched.plain.c:459: warning: implicit declaration of function 'sched_read_cr3'
+examples/boot/sched.plain.c:545: warning: assignment from incompatible pointer type
+   payload: 94336 字节文件 + 4601152 字节 .bss（185 个扇区），入口 0x403da5
+== 2. 汇编引导扇区
+   引导扇区: 512 字节
+== 3. 拼镜像
+== 4. 启动 qemu-system-x86_64
+Could not open option rom 'kvmvapic.bin': No such file or directory
+smp: 在线核数 1，A 跑在核 0
+smp: B 跑在核 0（它自己从 LAPIC 读的）
+smp: A 关中断空转期间 B 的计数器涨了 0
+smp: A 在核 0，B 在核 0，时钟切换 2 次
+smp: 单核，只有交错没有并行（负对照，符合预期）
+fstest-bare: ok（裸机启动，全部断言通过；KVM；单核）
+<end of output>
+Test time =   0.90 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-bare-smp" end time: Nov 15 18:35 CST
+"fstest-bare-smp" time elapsed: 00:00:00
+----------------------------------------------------------
+
+114/125 Testing: fstest-bare
+114/125 Test: fstest-bare
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-bare"
+Directory: /media/winger/_dde_data/superc
+"fstest-bare" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+== 1b. 汇编 AP 跳板（多核用，as --32）
+ld: warning: cannot find entry symbol _start; defaulting to 00008000
+   AP 跳板: 222 字节（加载到 0x8000）
+== 1. 编译 payload（c6 程序 + libtcc1）
+   payload: 64912 字节文件 + 262784 字节 .bss（127 个扇区），入口 0x403cef
+== 2. 汇编引导扇区
+   引导扇区: 512 字节
+== 3. 拼镜像
+== 4. 启动 qemu-system-x86_64
+Could not open option rom 'kvmvapic.bin': No such file or directory
+n=42 hex=002a pi=3.142
+s=bare p=42 managed=<42>
+co: total=9 hits=2
+bare metal: ok
+fstest-bare: ok（裸机启动，全部断言通过；KVM；单核）
+<end of output>
+Test time =   0.37 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-bare" end time: Nov 15 18:35 CST
+"fstest-bare" time elapsed: 00:00:00
+----------------------------------------------------------
+
+116/125 Testing: fstest-bare-go
+116/125 Test: fstest-bare-go
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-bare-go"
+Directory: /media/winger/_dde_data/superc
+"fstest-bare-go" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+== 1b. 汇编 AP 跳板（多核用，as --32）
+ld: warning: cannot find entry symbol _start; defaulting to 00008000
+   AP 跳板: 222 字节（加载到 0x8000）
+== 1. 编译 payload（c6 程序 + libtcc1）
+examples/boot/sched.plain.c:458: warning: implicit declaration of function 'memcpy'
+examples/boot/sched.plain.c:459: warning: implicit declaration of function 'sched_read_cr3'
+examples/boot/sched.plain.c:545: warning: assignment from incompatible pointer type
+   payload: 93984 字节文件 + 4601152 字节 .bss（184 个扇区），入口 0x403d1f
+== 2. 汇编引导扇区
+   引导扇区: 512 字节
+== 3. 拼镜像
+== 4. 启动 qemu-system-x86_64
+Could not open option rom 'kvmvapic.bin': No such file or directory
+spawn: 空转 4443048 次（上限 200000000）、时钟切换 5 次、go_flag=1
+spawn: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
+fstest-bare: ok（裸机启动，全部断言通过；KVM；单核）
+<end of output>
+Test time =   0.50 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-bare-go" end time: Nov 15 18:35 CST
+"fstest-bare-go" time elapsed: 00:00:00
+----------------------------------------------------------
+
+117/125 Testing: fstest-bare-handle
+117/125 Test: fstest-bare-handle
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-bare-handle"
+Directory: /media/winger/_dde_data/superc
+"fstest-bare-handle" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+== 1b. 汇编 AP 跳板（多核用，as --32）
+ld: warning: cannot find entry symbol _start; defaulting to 00008000
+   AP 跳板: 222 字节（加载到 0x8000）
+== 1. 编译 payload（c6 程序 + libtcc1）
+examples/boot/sched.plain.c:458: warning: implicit declaration of function 'memcpy'
+examples/boot/sched.plain.c:459: warning: implicit declaration of function 'sched_read_cr3'
+examples/boot/sched.plain.c:545: warning: assignment from incompatible pointer type
+   payload: 93536 字节文件 + 4601152 字节 .bss（183 个扇区），入口 0x403b3f
+== 2. 汇编引导扇区
+   引导扇区: 512 字节
+== 3. 拼镜像
+== 4. 启动 qemu-system-x86_64
+Could not open option rom 'kvmvapic.bin': No such file or directory
+handle: join=0 value=42 saw=1
+fstest-bare: ok（裸机启动，全部断言通过；KVM；单核）
+<end of output>
+Test time =   0.41 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-bare-handle" end time: Nov 15 18:35 CST
+"fstest-bare-handle" time elapsed: 00:00:00
+----------------------------------------------------------
+
+113/125 Testing: fstest-qemu
+113/125 Test: fstest-qemu
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-qemu"
+Directory: /media/winger/_dde_data/superc
+"fstest-qemu" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+n=42 hex=0000002a pi=3.142
+slice / managed 42 / true
+defer ran
+freestanding: ok
+spinner 1: waiting
+setter 2: done
+spawn: ok
+fstest-noos: ok（全部断言通过，最后 ud2 陷阱）
+n=42 hex=0000002a pi=3.142
+slice / managed 42 / true
+defer ran
+freestanding: ok
+spinner 1: waiting
+setter 2: done
+spawn: ok
+fstest-qemu: noos ok（ud2 陷阱）
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-qemu" end time: Nov 15 18:35 CST
+"fstest-qemu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+110/125 Testing: fstest
+110/125 Test: fstest
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest"
+Directory: /media/winger/_dde_data/superc
+"fstest" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+n=42 hex=0000002a pi=3.142
+slice / managed 42 / true
+defer ran
+freestanding: ok
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"fstest" end time: Nov 15 18:35 CST
+"fstest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+111/125 Testing: fstest-go
+111/125 Test: fstest-go
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-go"
+Directory: /media/winger/_dde_data/superc
+"fstest-go" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+spinner 1: waiting
+setter 2: done
+spawn: ok
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-go" end time: Nov 15 18:35 CST
+"fstest-go" time elapsed: 00:00:00
+----------------------------------------------------------
+
+112/125 Testing: fstest-noos
+112/125 Test: fstest-noos
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "fstest-noos"
+Directory: /media/winger/_dde_data/superc
+"fstest-noos" start time: Nov 15 18:35 CST
+Output:
+----------------------------------------------------------
+fstest-noos: ok（全部断言通过，最后 ud2 陷阱）
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"fstest-noos" end time: Nov 15 18:35 CST
+"fstest-noos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+119/125 Testing: c99test
+119/125 Test: c99test
+Command: "/media/winger/_dde_data/superc/tests/regression.sh" "c99test"
+Directory: /media/winger/_dde_data/superc
+"c99test" start time: Nov 15 18:34 CST
+Output:
+----------------------------------------------------------
+ok   async: 22 test(s), 0 failure(s)
+ok   async_frame: 8 test(s), 0 failure(s)
+ok   async_highfd: 1 test(s), 0 failure(s)
+ok   closure: 16 test(s), 0 failure(s)
+ok   data_zero: 4 test(s), 0 failure(s)
+ok   defer: 5 test(s), 0 failure(s)
+ok   defer_reent: 5 test(s), 0 failure(s)
+ok   defer_scope: 8 test(s), 0 failure(s)
+ok   defer_thread: 3 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
+ok   err: 18 test(s), 0 failure(s)
+ok   err_ids: 5 test(s), 0 failure(s)
+ok   fn_lit: 16 test(s), 0 failure(s)
+ok   foreach: 15 test(s), 0 failure(s)
+ok   foreach_head: 9 test(s), 0 failure(s)
+ok   foreach_iter: 21 test(s), 0 failure(s)
+ok   fstr: 15 test(s), 0 failure(s)
+ok   gc: 11 test(s), 0 failure(s)
+ok   gc_async: 7 test(s), 0 failure(s)
+ok   gc_chain: 1 test(s), 0 failure(s)
+ok   gc_drop: 6 test(s), 0 failure(s)
+ok   gc_field: 6 test(s), 0 failure(s)
+ok   gc_own: 4 test(s), 0 failure(s)
+ok   gc_return: 4 test(s), 0 failure(s)
+ok   gc_thread: 4 test(s), 0 failure(s)
+ok   gc_type: 4 test(s), 0 failure(s)
+ok   generic: 26 test(s), 0 failure(s)
+ok   generic_fn: 9 test(s), 0 failure(s)
+ok   generic_scope: 5 test(s), 0 failure(s)
+ok   iface_agg: 4 test(s), 0 failure(s)
+ok   interface: 8 test(s), 0 failure(s)
+ok   macro: 11 test(s), 0 failure(s)
+ok   method: 22 test(s), 0 failure(s)
+ok   module: 10 test(s), 0 failure(s)
+ok   slice: 15 test(s), 0 failure(s)
+ok   task_method: 6 test(s), 0 failure(s)
+ok   test-block: 7 test(s), 0 failure(s)
+ok   thread: 15 test(s), 0 failure(s)
+ok   thread_handle: 5 test(s), 0 failure(s)
+ok   try: 22 test(s), 0 failure(s)
+ok   tuple: 11 test(s), 0 failure(s)
+ok   tuple_async: 6 test(s), 0 failure(s)
+ok   tuple_error: 4 test(s), 0 failure(s)
+ok   tuple_thread: 4 test(s), 0 failure(s)
+ok   typename: 16 test(s), 0 failure(s)
+ok   weak: 6 test(s), 0 failure(s)
+ok   c6ext/basic: 3 test(s), 0 failure(s)
+ok   c6ext/c6mod: 3 test(s), 0 failure(s)
+ok   c6ext/pick: 1 test(s), 0 failure(s)
+ok   errors/async: 19 个诊断片段
+ok   errors/closure_capture: 2 个诊断片段
+ok   errors/closure_capture_type: 5 个诊断片段
+ok   errors/closure_convert: 5 个诊断片段
+ok   errors/closure_cross: 2 个诊断片段
+ok   errors/closure_cycle: 1 个诊断片段
+ok   errors/closure_opaque: 4 个诊断片段
+ok   errors/closure_signature: 4 个诊断片段
+ok   errors/defer: 7 个诊断片段
+ok   errors/drop_bad: 8 个诊断片段
+ok   errors/enum_scope: 8 个诊断片段
+ok   errors/err_code: 2 个诊断片段
+ok   errors/err_usage: 7 个诊断片段
+ok   errors/fn_lit: 9 个诊断片段
+ok   errors/foreach: 13 个诊断片段
+ok   errors/foreach_head: 10 个诊断片段
+ok   errors/foreach_iter: 16 个诊断片段
+ok   errors/fstr: 20 个诊断片段
+ok   errors/gc: 12 个诊断片段
+ok   errors/gc_borrow: 6 个诊断片段
+ok   errors/gc_cycle: 4 个诊断片段
+ok   errors/gc_cycle_cross_tu: 1 个诊断片段
+ok   errors/gc_move: 9 个诊断片段
+ok   errors/gc_type: 2 个诊断片段
+ok   errors/generic: 26 个诊断片段
+ok   errors/iface: 7 个诊断片段
+ok   errors/init: 9 个诊断片段
+ok   errors/loc: 1 个诊断片段
+ok   errors/macro: 13 个诊断片段
+ok   errors/method: 5 个诊断片段
+ok   errors/module: 4 个诊断片段
+ok   errors/module_import: 8 个诊断片段
+ok   errors/slice: 13 个诊断片段
+ok   errors/spawn: 10 个诊断片段
+ok   errors/thread_handle: 2 个诊断片段
+ok   errors/try: 17 个诊断片段
+ok   errors/tuple: 13 个诊断片段
+ok   errors/typename: 8 个诊断片段
+ok   exit/closure_global: 退出码 0
+ok   exit/drop_exit: 退出码 0
+ok   exit/go_join: 退出码 7
+ok   exit/return: 退出码 42
+ok   abi/closure: 退出码 0
+ok   abi/fn_lit: 退出码 0
+ok   abi/generic: 退出码 0
+ok   abi/method: 退出码 0
+ok   abi/module: 退出码 0
+ok   abi/sret12: 退出码 0
+ok   abi/tuple: 退出码 0
+ok   c99/c99test: 退出码 0
+ok   c99/closure: 退出码 0
+ok   c99/deadcode: 退出码 0
+ok   c99/generic: 退出码 0
+ok   c99/generic_fn: 退出码 0
+ok   c99/sret_fnptr: 退出码 0
+ok   c99/cli: 每个 TU 一个 .c，退出码 7
+
+run-tests: 105 通过, 0 失败
+<end of output>
+Test time =  37.17 sec
+----------------------------------------------------------
+Test Passed.
+"c99test" end time: Nov 15 18:35 CST
+"c99test" time elapsed: 00:00:37
+----------------------------------------------------------
+
+End testing: Nov 15 18:35 CST
+
+backend =  43.14 sec*proc
+
+core =  60.01 sec*proc
+
+freestanding =  20.67 sec*proc
+
+parallel = 103.35 sec*proc
+
+regression = 123.77 sec*proc
+
+selfhost =  29.60 sec*proc
+
+source-tree =  10.89 sec*proc
+
+std =  20.42 sec*proc
+
+tests2 =   2.35 sec*proc
+

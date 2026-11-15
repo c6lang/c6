@@ -1,0 +1,904 @@
+/*
+ *  TCC - Tiny C Compiler
+ * 
+ *  Copyright (c) 2001-2004 Fabrice Bellard
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#ifndef ONE_SOURCE
+# define ONE_SOURCE 1
+#endif
+
+#include "tcc.h"
+#if ONE_SOURCE
+# include "libtcc.c"
+#endif
+#include "tcctools.c"
+
+/* Both text back-ends write a source file instead of linking; the driver
+   treats them the same way and only the file extension differs.  The
+   CONFIG_TEXT_DRIVER macro also covers the native binary, which carries
+   them as embedded compilers (see tcc/Makefile). */
+#if defined(TCC_TARGET_C99) || defined(TCC_TARGET_LLVM)
+# define TCC_TARGET_TEXT_OUT 1
+#endif
+#if defined(TCC_TARGET_TEXT_OUT) || defined(CONFIG_EMBED_C99) \
+    || defined(CONFIG_EMBED_LLVM)
+# define CONFIG_TEXT_DRIVER 1
+# ifndef _WIN32
+#  include <sys/stat.h>
+# endif
+#endif
+#ifdef TCC_TARGET_TEXT_OUT
+# if defined(TCC_TARGET_LLVM)
+#  define TEXT_EXT      ".ll"
+#  define TEXT_COMPILE_ONLY(s) ((s)->llvm_compile_only)
+#  define TEXT_PRODUCT  "LLVM IR"
+# else
+#  define TEXT_EXT      ".c"
+#  define TEXT_COMPILE_ONLY(s) ((s)->c99_compile_only)
+#  define TEXT_PRODUCT  "C source"
+# endif
+#endif
+
+static const char help[] =
+    "Tiny C Compiler "TCC_VERSION" - Copyright (C) 2001-2006 Fabrice Bellard\n"
+    "Usage: tcc [options...] [-o outfile] [-c] infile(s)...\n"
+    "       tcc [options...] -run infile (or --) [arguments...]\n"
+    "General options:\n"
+#ifdef TCC_TARGET_C99
+    "  -c           one generated C file per input file (with -o dir)\n"
+    "  -o outfile   set output file, or directory for one .c per input\n"
+    "  -c99         generate portable C source (default in this build)\n"
+#elif defined TCC_TARGET_LLVM
+    "  -c           one generated .ll file per input file (with -o dir)\n"
+    "  -o outfile   set output file, or directory for one .ll per input\n"
+    "               (this build always generates LLVM IR)\n"
+#else
+    "  -c           compile only - generate an object file\n"
+    "  -o outfile   set output filename\n"
+#endif
+#ifdef CONFIG_EMBED_C99
+    "  -c99         generate portable C source (also -o out.c / -o dir)\n"
+#endif
+    "  -run         run compiled source\n"
+    "  -fflag       set or reset (with 'no-' prefix) 'flag' (see tcc -hh)\n"
+    "  -Wwarning    set or reset (with 'no-' prefix) 'warning' (see tcc -hh)\n"
+    "  -w           disable all warnings\n"
+    "  -v --version show version\n"
+    "  -vv          show search paths or loaded files\n"
+    "  -h -hh       show this, show more help\n"
+    "  -bench       show compilation statistics\n"
+    "  -            use stdin pipe as infile\n"
+    "  @listfile    read arguments from listfile\n"
+    "Preprocessor options:\n"
+    "  -Idir        add include path 'dir'\n"
+    "  -Dsym[=val]  define 'sym' with value 'val'\n"
+    "  -Usym        undefine 'sym'\n"
+    "  -E           preprocess only\n"
+    "  -nostdinc    do not use standard system include paths\n"
+    "Linker options:\n"
+    "  -Ldir        add library path 'dir'\n"
+    "  -llib        link with dynamic or static library 'lib'\n"
+    "  -nostdlib    do not link with standard crt and libraries\n"
+    "  -r           generate (relocatable) object file\n"
+    "  -rdynamic    export all global symbols to dynamic linker\n"
+    "  -shared      generate a shared library/dll\n"
+    "  -soname      set name for shared library to be used at runtime\n"
+    "  -Wl,-opt[=val]  set linker option (see tcc -hh)\n"
+    "Debugger options:\n"
+    "  -g           generate stab runtime debug info\n"
+    "  -gdwarf[-x]  generate dwarf runtime debug info\n"
+#ifdef TCC_TARGET_PE
+    "  -g.pdb       create .pdb debug database\n"
+#endif
+#ifdef CONFIG_TCC_BCHECK
+    "  -b           compile with built-in memory and bounds checker (implies -g)\n"
+#ifdef C6_EXT
+    "  --ub         run the c6 UB checker (stdub) on the source files\n"
+    "               (see docs/ubcheck.md; build it with 'make std-ub')\n"
+#endif
+#endif
+#ifdef CONFIG_TCC_BACKTRACE
+    "  -bt[N]       link with backtrace (stack dump) support [show max N callers]\n"
+#endif
+    "Misc. options:\n"
+#ifdef C6_EXT
+    "  -std=version define __STDC_VERSION__ according to version (c11/gnu11/c6)\n"
+#else
+    "  -std=version define __STDC_VERSION__ according to version (c11/gnu11)\n"
+#endif
+    "  -x[c|a|b|n]  specify type of the next infile (C,ASM,BIN,NONE)\n"
+    "  -Bdir        set tcc's private include/library dir\n"
+    "  -M[M]D       generate make dependency file [ignore system files]\n"
+    "  -M[M]        as above but no other output\n"
+    "  -MF file     specify dependency file name\n"
+#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
+    "  -m32/64      defer to i386/x86_64 cross compiler\n"
+#endif
+#ifdef CONFIG_EMBED_LLVM
+    "LLVM IR back-end and cross targets:\n"
+    "  --target=TRIPLE  write IR for TRIPLE and let the C compiler build the\n"
+    "                   result (e.g. wasm32-unknown-unknown, or\n"
+    "                   aarch64-unknown-linux-gnu for a cross .o)\n"
+    "  --emit-llvm      with --target: stop at the .ll file\n"
+    "  --cc=COMPILER    what turns the IR into the result [$TCC_CC, clang]\n"
+    "                   (an -o name ending in .ll asks for the IR alone)\n"
+    "  --print-targets  list the triples --target= knows (and their runtime)\n"
+#endif
+    "Tools:\n"
+    "  create library  : tcc -ar [crstvx] lib [files]\n"
+#ifdef TCC_TARGET_PE
+    "  create def file : tcc -impdef lib.dll [-v] [-o lib.def]\n"
+#endif
+    "Discussion & bug reports:\n"
+    "  https://lists.nongnu.org/mailman/listinfo/tinycc-devel\n"
+    ;
+
+static const char help2[] =
+    "Tiny C Compiler "TCC_VERSION" - More Options\n"
+    "Special options:\n"
+    "  -P -P1                        with -E: no/alternative #line output\n"
+    "  -dD -dM                       with -E: output #define directives\n"
+    "  -pthread                      same as -D_REENTRANT and -lpthread\n"
+    "  -On                           same as -D__OPTIMIZE__ for n > 0\n"
+    "  -Wp,-opt                      same as -opt\n"
+    "  -include file                 include 'file' above each input file\n"
+    "  -nostdlib                     do not link with standard crt/libs\n"
+    "  -isystem dir                  add 'dir' to system include path\n"
+    "  -static                       link to static libraries (not recommended)\n"
+    "  -dumpversion                  print version\n"
+    "  -print-search-dirs            print search paths\n"
+    "  -rstdin file                  with -run: use 'file' as custom stdin\n"
+    "  -dt                           with -run/-E: auto-define 'test_...' macros\n"
+    "LLVM IR back-end (see also -h; '-o name.ll' asks for the IR alone):\n"
+    "  --target=TRIPLE               write IR for TRIPLE and let the C\n"
+    "                                compiler build the result\n"
+    "  --emit-llvm                   with --target: stop at the .ll\n"
+    "  --cc=COMPILER                 build the IR with COMPILER [$TCC_CC, clang]\n"
+    "  --print-targets               list the triples --target= knows\n"
+    "Ignored options:\n"
+    "  -arch -C --param -pedantic -pipe -s -traditional\n"
+    "-W[no-]... warnings:\n"
+    "  all                           turn on some (*) warnings\n"
+    "  error[=warning]               stop after warning (any or specified)\n"
+    "  write-strings                 strings are const\n"
+    "  unsupported                   warn about ignored options, pragmas, etc.\n"
+    "  implicit-function-declaration warn for missing prototype (*)\n"
+    "  discarded-qualifiers          warn when const is dropped (*)\n"
+    "-f[no-]... flags:\n"
+    "  unsigned-char                 default char is unsigned\n"
+    "  signed-char                   default char is signed\n"
+    "  common                        use common section instead of bss\n"
+    "  leading-underscore            decorate extern symbols\n"
+    "  ms-extensions                 allow anonymous struct in struct\n"
+    "  dollars-in-identifiers        allow '$' in C symbols\n"
+    "  reverse-funcargs              evaluate function arguments right to left\n"
+    "  gnu89-inline                  'extern inline' is like 'static inline'\n"
+    "  asynchronous-unwind-tables    create eh_frame section [on]\n"
+    "  test-coverage                 create code coverage code\n"
+    "-m... target specific options:\n"
+    "  ms-bitfields                  use MSVC bitfield layout\n"
+#ifdef TCC_TARGET_ARM
+    "  float-abi                     hard/softfp on arm\n"
+#endif
+#ifdef TCC_TARGET_X86_64
+    "  no-sse                        disable floats on x86_64\n"
+#endif
+    "-Wl,... linker options:\n"
+    "  -nostdlib                     do not search standard library paths\n"
+    "  -[no-]whole-archive           load lib(s) fully/only as needed\n"
+    "  -export-all-symbols           same as -rdynamic\n"
+    "  -export-dynamic               same as -rdynamic\n"
+    "  -image-base= -Ttext=          set base address of executable\n"
+    "  -section-alignment=           set section alignment in executable\n"
+#ifdef TCC_TARGET_PE
+    "  -file-alignment=              set PE file alignment\n"
+    "  -stack=                       set PE stack reserve\n"
+    "  -large-address-aware          set related PE option\n"
+    "  -subsystem=[console/windows]  set PE subsystem\n"
+    "  -oformat=[pe-* binary]        set executable output format\n"
+    "Predefined macros:\n"
+    "  tcc -E -dM - < nul\n"
+#else
+    "  -rpath=                       set dynamic library search path\n"
+    "  -enable-new-dtags             set DT_RUNPATH instead of DT_RPATH\n"
+    "  -soname=                      set DT_SONAME elf tag\n"
+#if defined(TCC_TARGET_MACHO)
+    "  -install_name=                set DT_SONAME elf tag (soname macOS alias)\n"
+#else
+    "  -Ipath, -dynamic-linker=path  set ELF interpreter to path\n"
+#endif
+    "  -Bsymbolic                    set DT_SYMBOLIC elf tag\n"
+    "  -oformat=[elf32/64-* binary]  set executable output format\n"
+    "  -init= -fini= -Map= -as-needed -O -z= (ignored)\n"
+    "Predefined macros:\n"
+    "  tcc -E -dM - < /dev/null\n"
+#endif
+    "See also the manual for more details.\n"
+    ;
+
+static const char version[] =
+#ifdef C6_VERSION
+    /* c6 的发布版本（仓库根 VERSION，由 c6 的 CMake 包装层传进来）；
+       独立构建 tcc/ 时没有这个宏，`-v` 就只剩下面那行上游格式。 */
+    "c6 " C6_VERSION " (TinyCC " TCC_VERSION ")\n"
+#endif
+    "tcc version "TCC_VERSION
+#ifdef TCC_GITHASH
+    " "TCC_GITHASH
+#endif
+    " ("
+#ifdef TCC_TARGET_I386
+        "i386"
+#elif defined TCC_TARGET_X86_64
+        "x86_64"
+#elif defined TCC_TARGET_C67
+        "C67"
+#elif defined TCC_TARGET_ARM
+        "ARM"
+# ifdef TCC_ARM_EABI
+        " eabi"
+#  ifdef TCC_ARM_HARDFLOAT
+        "hf"
+#  endif
+# endif
+#elif defined TCC_TARGET_ARM64
+        "AArch64"
+#elif defined TCC_TARGET_RISCV64
+        "riscv64"
+#endif
+#ifdef TCC_TARGET_PE
+        " Windows"
+#elif defined(TCC_TARGET_MACHO)
+        " Darwin"
+#elif TARGETOS_FreeBSD || TARGETOS_FreeBSD_kernel
+        " FreeBSD"
+#elif TARGETOS_OpenBSD
+        " OpenBSD"
+#elif TARGETOS_NetBSD
+        " NetBSD"
+#else
+        " Linux"
+#endif
+    ")\n"
+    ;
+
+static void print_dirs(const char *msg, char **paths, int nb_paths)
+{
+    int i = 0;
+    printf("%s:\n%s", msg, nb_paths ? "" : "  -\n");
+    for(i = 0; i < nb_paths; i++)
+        printf("  %s\n", paths[i]);
+}
+
+static void print_search_dirs(TCCState *s)
+{
+    printf("install: %s\n", s->tcc_lib_path);
+    /* print_dirs("programs", NULL, 0); */
+    print_dirs("include", s->sysinclude_paths, s->nb_sysinclude_paths);
+    print_dirs("libraries", s->library_paths, s->nb_library_paths);
+    printf("libtcc1:\n  %s/%s\n", s->library_paths[0], CONFIG_TCC_CROSSPREFIX TCC_LIBTCC1);
+#ifdef TCC_TARGET_UNIX
+    print_dirs("crt", s->crt_paths, s->nb_crt_paths);
+    printf("elfinterp:\n  %s\n",  s->elfint);
+#endif
+}
+
+static void set_environment(TCCState *s)
+{
+    char * path = 0;
+
+    path = getenv("C_INCLUDE_PATH");
+    if(path != NULL) {
+        tcc_add_sysinclude_path(s, path);
+    }
+    path = getenv("CPATH");
+    if(path != NULL) {
+        tcc_add_include_path(s, path);
+    }
+    path = getenv("LIBRARY_PATH");
+    if(path != NULL) {
+        tcc_add_library_path(s, path);
+    }
+}
+
+static char *default_outputfile(TCCState *s, const char *first_file)
+{
+    char buf[1024] = {0};
+    char *ext = 0;
+    const char *name = "a";
+
+    if (first_file && strcmp(first_file, "-"))
+        name = tcc_basename(first_file);
+    if (strlen(name) + 4 >= sizeof buf)
+        name = "a";
+    strcpy(buf, name);
+    ext = tcc_fileextension(buf);
+    /* '--target=<triple>': the IR is only an intermediate file, so the default
+       output name is the artifact itself, exactly as in a native compile */
+    if (s->target_triple && !s->llvm_emit_only) {
+#ifdef TCC_TARGET_TEXT_OUT
+        if ((s->just_deps || TEXT_COMPILE_ONLY(s)) && *ext)
+#else
+        if (s->just_deps && *ext)
+#endif
+            strcpy(ext, ".o");
+        else
+            strcpy(buf, "a.out");
+        return tcc_strdup(buf);
+    }
+#ifdef TCC_TARGET_TEXT_OUT
+    /* same convention as a.out, but the result is a source file; never derive
+       the name from the input, that would overwrite the source itself */
+    if (s->output_type == TCC_OUTPUT_C99)
+        strcpy(buf, "a.c");
+    else if (s->output_type == TCC_OUTPUT_LLVM)
+        strcpy(buf, "a.ll");
+    else
+#endif
+#ifdef TCC_TARGET_PE
+    if (s->output_type == TCC_OUTPUT_DLL)
+        strcpy(ext, ".dll");
+    else
+    if (s->output_type == TCC_OUTPUT_EXE)
+        strcpy(ext, ".exe");
+    else
+#endif
+    if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
+        strcpy(ext, ".o");
+    else
+        strcpy(buf, "a.out");
+    return tcc_strdup(buf);
+}
+
+static unsigned getclock_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount();
+#else
+    struct timeval tv = {0};
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec*1000 + (tv.tv_usec+500)/1000;
+#endif
+}
+
+#ifdef CONFIG_TEXT_DRIVER
+/* -o may name a directory: each translation unit then gets its own
+   generated file, named after its input file. */
+static int is_dir_path(const char *path)
+{
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES
+        && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int has_trailing_dirsep(const char *path)
+{
+    int n = strlen(path);
+    return n > 0 && IS_DIRSEP(path[n - 1]);
+}
+#endif
+
+#ifdef TCC_TARGET_TEXT_OUT
+static int same_file(const char *a, const char *b)
+{
+    if (!strcmp(a, b))
+        return 1;
+#ifndef _WIN32
+    {
+        struct stat sa, sb;
+        if (stat(a, &sa) == 0 && stat(b, &sb) == 0
+            && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino)
+            return 1;
+    }
+#endif
+    return 0;
+}
+
+/* "<dir>/<input basename with a .c / .ll extension>" */
+static char *text_output_in_dir(const char *dir, const char *infile)
+{
+    const char *base = tcc_basename(infile);
+    int dlen = strlen(dir);
+    int blen = strlen(base);
+    int sep = dlen > 0 && !IS_DIRSEP(dir[dlen - 1]);
+    char *path = tcc_malloc(dlen + sep + blen + 3);
+    char *ext;
+
+    memcpy(path, dir, dlen);
+    if (sep)
+        path[dlen++] = '/';
+    memcpy(path + dlen, base, blen + 1);
+    ext = tcc_fileextension(path);
+    if (*ext)
+        strcpy(ext, TEXT_EXT);
+    else
+        strcpy(path + dlen + blen, TEXT_EXT);
+    return path;
+}
+#endif /* TCC_TARGET_TEXT_OUT */
+
+#ifdef CONFIG_EMBED_C99
+/* The native tcc carries the C99 output back-end as a second, embedded
+   compiler (see tcc/Makefile).  This decides when that one should run:
+   -c99 asks explicitly; otherwise a .c output file, or an output directory,
+   is what the C back-end can produce.  Preprocessing and linking options
+   keep their native meaning. */
+static int has_c99_suffix(const char *path)
+{
+    int n = strlen(path);
+    return n >= 2 && path[n - 2] == '.' && path[n - 1] == 'c';
+}
+
+static int wants_c99_output(int argc, char **argv)
+{
+    const char *out = NULL;
+    int i;
+
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-c99"))
+            return 1;
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        /* preprocessing, dependency output and linking are native jobs */
+        if (!strcmp(a, "-E") || !strcmp(a, "-shared")
+            || !strncmp(a, "-r", 2) || !strncmp(a, "-M", 2))
+            return 0;
+        if (!strcmp(a, "-o")) {
+            if (i + 1 < argc)
+                out = argv[++i];
+        } else if (!strncmp(a, "-o", 2) && a[2]) {
+            out = a + 2;
+        }
+    }
+    if (!out)
+        return 0;
+    return has_c99_suffix(out) || is_dir_path(out)
+        || has_trailing_dirsep(out);
+}
+
+extern int c99_main(int argc, char **argv);
+#endif /* CONFIG_EMBED_C99 */
+
+#if defined(CONFIG_EMBED_LLVM) || defined(TCC_TARGET_LLVM)
+/* an output name that asks for the IR back-end; needed by both builds (the
+   embedded one and the standalone TCC_TARGET_LLVM one) */
+static int has_llvm_suffix(const char *path)
+{
+    int n = strlen(path);
+
+    return n >= 3 && path[n - 3] == '.' && path[n - 2] == 'l'
+        && path[n - 1] == 'l';
+}
+#endif
+
+#ifdef CONFIG_EMBED_LLVM
+/* The native tcc carries the LLVM IR generator as a second, embedded
+   compiler as well.  There is no option for it: an output file whose name
+   ends in .ll is what the IR back-end produces, everything else (including
+   -E, -c, -r, -shared and -run) keeps its native meaning.  Like '-o out.c',
+   one .ll file holds everything the command line compiles. */
+static int wants_llvm_output(int argc, char **argv)
+{
+    const char *out = NULL;
+    int i;
+
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-E") || !strcmp(a, "-shared")
+            || !strncmp(a, "-r", 2) || !strncmp(a, "-M", 2)
+            || !strcmp(a, "-run") || !strcmp(a, "--run"))
+            return 0;
+        /* '--target=' / '-emit-llvm' ask for this back-end by name, whatever
+           the output file is called */
+        if (!strncmp(a, "-target", 7) || !strncmp(a, "--target", 8)
+            || !strcmp(a, "-emit-llvm") || !strcmp(a, "--emit-llvm")
+            || !strcmp(a, "-print-targets") || !strcmp(a, "--print-targets"))
+            return 1;
+        if (!strcmp(a, "-o")) {
+            if (i + 1 < argc)
+                out = argv[++i];
+        } else if (!strncmp(a, "-o", 2) && a[2]) {
+            out = a + 2;
+        }
+    }
+    return out && has_llvm_suffix(out);
+}
+
+extern int llvm_main(int argc, char **argv);
+#endif /* CONFIG_EMBED_LLVM */
+
+#ifdef TCC_TARGET_LLVM
+/* '--target=<triple>' without '-emit-llvm': the IR is written next to the
+   output file and handed to clang, which produces the artifact the user asked
+   for (executable, object, wasm module, ...).  The .ll stays on disk: it is
+   what the error messages of the host compiler point at. */
+/* '--target=<triple>': write the IR next to the output, hand it to the C
+   compiler, then drop it -- it is only a step on the way.  A failed link keeps
+   it around, because that is exactly when somebody wants to look at it. */
+static int tcc_output_for_target(TCCState *s)
+{
+    char *ir = tcc_malloc(strlen(s->outfile) + 4);
+    int ret;
+
+    sprintf(ir, "%s.ll", s->outfile);
+    ret = tcc_output_file(s, ir);
+    if (!ret)
+        ret = llvm_tool_cc(s, ir, s->outfile);
+    if (ret)
+        fprintf(stderr, "tcc: LLVM IR left in '%s'\n", ir);
+    else
+        remove(ir);
+    tcc_free(ir);
+    return ret;
+}
+#endif
+
+#ifdef C6_EXT
+/* `--ub [选项] 文件...`：把源码交给 UB 检查器 stdub。
+ *
+ * 检查器本身是用 c6 写的程序（std/analysis/ub.c6，`make std-ub` 出 build/stdub），
+ * 不在这个 C 编译器里，所以这里只做三件事：找到它、把参数原样转过去、把退出码
+ * 带回来。位置查找顺序：$C6_STDUB、./build/stdub、./stdub、与本程序同目录的
+ * stdub。找不到就直说怎么装。 */
+static int c6_ub_quote(char *dst, int cap, const char *a)
+{
+    int n = 0;
+
+    if (n < cap) dst[n++] = '\'';
+    for (; *a && n + 5 < cap; a++) {
+        if (*a == '\'') {                 /* 单引号要断开再拼接 */
+            memcpy(dst + n, "'\\''", 4);
+            n += 4;
+        } else {
+            dst[n++] = *a;
+        }
+    }
+    if (n < cap) dst[n++] = '\'';
+    if (n < cap) dst[n++] = ' ';
+    dst[n] = 0;
+    return n;
+}
+
+static int c6_run_ub(int argc, char **argv)
+{
+    char cmd[8192] = { 0 };
+    char one[2048] = { 0 };
+    const char *env = getenv("C6_STDUB");
+    const char *cand[3] = { 0, 0, 0 };
+    int k = 0, i = 0, ret = 0, nfiles = 0;
+
+    for (i = 0; i < argc; i++)
+        if (argv[i][0] != '-')
+            nfiles++;
+    if (nfiles == 0) {
+        fprintf(stderr, "c6: --ub 需要至少一个源文件\n");
+        return 2;
+    }
+    if (env && *env) {
+        cand[0] = env;                 /* 指定了就用它，不再猜别的 */
+        cand[1] = 0;
+        cand[2] = 0;
+    } else {
+        cand[0] = "build/stdub";
+        cand[1] = "stdub";
+        cand[2] = 0;
+    }
+    for (k = 0; k < 3; k++) {
+        if (!cand[k])
+            continue;
+        cmd[0] = 0;
+        c6_ub_quote(one, sizeof(one), cand[k]);
+        strcat(cmd, one);
+        for (i = 0; i < argc; i++) {
+            c6_ub_quote(one, sizeof(one), argv[i]);
+            if (strlen(cmd) + strlen(one) + 2 >= sizeof(cmd))
+                break;
+            strcat(cmd, one);
+        }
+        ret = system(cmd);
+        if (ret == -1)
+            continue;
+#ifdef _WIN32
+        return ret;
+#else
+        if (((ret >> 8) & 0xff) == 127)
+            continue;              /* 没找到这个可执行文件：试下一个位置 */
+        return (ret >> 8) & 0xff;
+#endif
+    }
+    if (env && *env)
+        fprintf(stderr, "c6: C6_STDUB 指向的 '%s' 跑不起来\n", env);
+    else
+        fprintf(stderr, "c6: 找不到 UB 检查器 stdub"
+                        "（先跑 'make std-ub'，或用 C6_STDUB=/path/to/stdub 指定）\n");
+    return 2;
+}
+#endif /* C6_EXT */
+
+int main(int argc, char **argv)
+{
+    TCCState *s = 0, *s1 = 0;
+#ifdef C6_EXT
+    /* `c6 --ub 文件.c6`：直接跑 UB 检查，不编译 */
+    if (argc > 1 && (!strcmp(argv[1], "--ub") || !strcmp(argv[1], "-fub")))
+        return c6_run_ub(argc - 2, argv + 2);
+#endif
+    int ret = 0, opt = 0, n = 0, t = 0, done = 0;
+#ifdef TCC_TARGET_TEXT_OUT
+    int out_dir = 0;
+#endif
+    unsigned start_time = 0, end_time = 0;
+    const char *first_file = 0;
+    int argc0 = argc;
+    char **argv0 = argv;
+    FILE *ppfp = NULL;
+
+
+
+#ifdef CONFIG_EMBED_C99
+    if (wants_c99_output(argc, argv))
+        return c99_main(argc, argv);
+#endif
+#ifdef CONFIG_EMBED_LLVM
+    if (wants_llvm_output(argc, argv))
+        return llvm_main(argc, argv);
+#endif
+
+redo:
+    argc = argc0, argv = argv0;
+    s = s1 = tcc_new();
+    opt = tcc_parse_args(s, &argc, &argv);
+#ifdef TCC_TARGET_LLVM
+    if (s->target_triple)
+        llvm_set_target(s);
+#endif
+
+    if (n == 0) {
+        ret = 0;
+        if (opt == OPT_HELP) {
+            fputs(help, stdout);
+            if (s->verbose)
+                goto help2;
+        } else if (opt == OPT_HELP2) {
+            help2: fputs(help2, stdout);
+        } else if (opt == OPT_M32 || opt == OPT_M64) {
+            ret = tcc_tool_cross(argv, opt);
+        } else if (s->verbose)
+            printf("%s", version);
+
+        if (opt == OPT_AR)
+            ret = tcc_tool_ar(argc, argv);
+#ifdef TCC_TARGET_PE
+        if (opt == OPT_IMPDEF)
+            ret = tcc_tool_impdef(argc, argv);
+#endif
+        if (opt == OPT_PRINT_TARGETS) {
+#ifdef TCC_TARGET_LLVM
+            llvm_print_targets(s);
+#else
+            fprintf(stderr, "tcc: this build has no LLVM IR back-end\n");
+            ret = 1;
+#endif
+        }
+        if (opt == OPT_PRINT_DIRS) {
+            /* initialize search dirs */
+            set_environment(s);
+            tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+            print_search_dirs(s);
+        }
+        if (opt) {
+            if (opt < 0) fail:
+                ret = 1;
+            tcc_delete(s);
+            return ret;
+        }
+        if (s->nb_files == 0) {
+            tcc_error_noabort("no input files");
+#ifdef TCC_TARGET_TEXT_OUT
+        } else if (s->output_type
+                   && s->output_type != TCC_OUTPUT_C99
+                   && s->output_type != TCC_OUTPUT_LLVM
+                   && s->output_type != TCC_OUTPUT_PREPROCESS) {
+            /* no machine code, no linker: say so instead of pretending */
+            tcc_error_noabort("this back-end only produces " TEXT_PRODUCT
+                              "; use -o out" TEXT_EXT);
+#endif
+        } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {
+            if (s->outfile && 0!=strcmp("-",s->outfile)) {
+                ppfp = tcc_fopen(s->outfile, "wb");
+                if (!ppfp)
+                    tcc_error_noabort("could not write '%s'", s->outfile);
+            }
+        } else if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r) {
+            if (s->nb_libraries)
+                tcc_error_noabort("cannot specify libraries with -c");
+            else if (s->nb_files > 1 && s->outfile)
+                tcc_error_noabort("cannot specify output file with -c many files");
+        }
+#ifdef TCC_TARGET_TEXT_OUT
+        /* -o may name a directory (or end with a separator) to ask for one
+           generated file per translation unit.  The output type is still 0
+           when no action was given, and that means a source file here. */
+        if (!s->nb_errors && s->outfile
+            && (s->output_type == 0 || s->output_type == TCC_OUTPUT_C99
+                || s->output_type == TCC_OUTPUT_LLVM)) {
+            if (has_trailing_dirsep(s->outfile)) {
+                if (!is_dir_path(s->outfile))
+                    tcc_error_noabort("output directory '%s' does not exist",
+                                      s->outfile);
+                else
+                    out_dir = 1;
+            } else if (is_dir_path(s->outfile)) {
+                out_dir = 1;
+            }
+            if (out_dir && s->nb_libraries)
+                tcc_error_noabort("cannot specify libraries with an output directory");
+        }
+        if (!s->nb_errors && TEXT_COMPILE_ONLY(s) && s->nb_libraries)
+            tcc_error_noabort("cannot specify libraries with -c");
+        if (!s->nb_errors && TEXT_COMPILE_ONLY(s) && !out_dir
+            && s->nb_files > 1)
+            tcc_error_noabort("cannot compile multiple files with -c to one output file; use -o <dir>");
+#endif
+        if (s->nb_errors)
+            goto fail;
+        if (s->do_bench)
+            start_time = getclock_ms();
+    }
+
+    set_environment(s);
+    if (s->output_type == 0)
+#ifdef TCC_TARGET_C99
+        /* the only thing this build can generate is C source */
+        s->output_type = TCC_OUTPUT_C99;
+#elif defined TCC_TARGET_LLVM
+        s->output_type = TCC_OUTPUT_LLVM;
+#else
+        s->output_type = TCC_OUTPUT_EXE;
+#endif
+    ret = tcc_set_output_type(s, s->output_type);
+    if (ppfp)
+        s->ppfp = ppfp;
+
+    if ((s->output_type == TCC_OUTPUT_MEMORY
+      || s->output_type == TCC_OUTPUT_PREPROCESS)
+        && (s->dflag & 16)) { /* -dt option */
+        if (t)
+            s->dflag |= 32;
+        s->run_test = ++t;
+        if (n)
+            --n;
+    }
+
+    /* compile or add each files or library */
+    first_file = NULL;
+    while (0 == ret) {
+        struct filespec *f = s->files[n];
+        s->filetype = f->type;
+        if (f->type & AFF_TYPE_LIB) {
+            ret = tcc_add_library(s, f->name);
+        } else {
+            if (1 == s->verbose)
+                printf("-> %s\n", f->name);
+            if (!first_file)
+                first_file = f->name;
+            ret = tcc_add_file(s, f->name);
+        }
+        if (++n == s->nb_files)
+            break;
+        if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r)
+            break;
+#ifdef TCC_TARGET_TEXT_OUT
+        if (out_dir)
+            break;
+#endif
+    }
+
+    if (s->do_bench)
+        end_time = getclock_ms();
+
+#ifdef C6_EXT
+    if (0 == ret && s->c6_emit_errbase) {
+        /* '-emit-errbase': write the table and stop, before any output */
+        if (c6_errbase_write(s, s->c6_emit_errbase) < 0)
+            ret = 1;
+        tcc_delete(s);
+        return ret;
+    }
+    if (0 == ret && c6_err_finish(s))
+        ret = 1;
+#endif
+
+    if (s->run_test) {
+        t = 0;
+    } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {
+        ;
+    } else if (0 == ret) {
+        if (s->output_type == TCC_OUTPUT_MEMORY) {
+#ifdef TCC_IS_NATIVE
+            ret = tcc_run(s, argc, argv);
+#endif
+        } else {
+#ifdef TCC_TARGET_TEXT_OUT
+            int clash = -1;
+#endif
+            if (!s->outfile)
+                s->outfile = default_outputfile(s, first_file);
+#ifdef TCC_TARGET_TEXT_OUT
+            else if (out_dir) {
+                char *path = text_output_in_dir(s->outfile, first_file);
+                tcc_free(s->outfile);
+                s->outfile = path;
+            }
+            {
+                int i;
+                for (i = 0; i < s->nb_files; i++)
+                    if (!(s->files[i]->type & AFF_TYPE_LIB)
+                        && same_file(s->outfile, s->files[i]->name)) {
+                        clash = i;
+                        break;
+                    }
+            }
+#endif
+            if (!s->just_deps) {
+#ifdef TCC_TARGET_TEXT_OUT
+                if (clash >= 0) {
+                    fprintf(stderr, "tcc: error: output file '%s' would "
+                            "overwrite input file '%s'\n",
+                            s->outfile, s->files[clash]->name);
+                    ret = 1;
+                } else
+#endif
+#ifdef TCC_TARGET_LLVM
+                    ret = s->target_triple && !s->llvm_emit_only
+                        && !has_llvm_suffix(s->outfile)
+                        ? tcc_output_for_target(s)
+                        : tcc_output_file(s, s->outfile);
+#else
+                    ret = tcc_output_file(s, s->outfile);
+#endif
+            }
+            if (!ret && s->gen_deps)
+                gen_makedeps(s, s->outfile, s->deps_outfile);
+        }
+    }
+
+    done = 1;
+    if (t)
+        done = 0; /* run more tests with -dt -run */
+    else if (ret) {
+        if (s->nb_errors)
+            ret = 1;
+        /* else keep the original exit code from tcc_run() */
+    } else if (n < s->nb_files)
+        done = 0; /* compile more files with -c */
+    else if (s->do_bench)
+        tcc_print_stats(s, end_time - start_time);
+
+    tcc_delete(s);
+    if (!done)
+        goto redo;
+    if (ppfp)
+        tcc_fclose(ppfp);
+    return ret;
+}

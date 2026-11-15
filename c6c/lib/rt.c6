@@ -1858,6 +1858,40 @@ static long c6c_utoa(char *buf, unsigned long v, long base, long upper, long pre
     return n;
 }
 
+/* -b 的下标越界处理（parse.c6 的 pa_bound_check 会 call 到这里）。
+ *
+ * 只做一件事：往 stderr 打一行"谁越界了"，然后以退出码 2 结束。不尝试恢复
+ * ——越界写过的内存状态已经不可信，接着跑只会把损坏摊得更开。用 write(2)
+ * 直发而不是 stdio：越界之后连 stdio 自己的状态都不敢信。 */
+static void c6c_err_str(const char *s)
+{
+    c6c_sys3(C6C_SYS_WRITE, 2, (long)s, strlen(s));
+}
+
+long c6c_bound_fail(long idx, long bound)
+{
+    char buf[64] = {0};
+    long n = 0;
+
+    /* 负下标要带负号：按无符号打印会是一串天文数字 */
+    if (idx < 0) {
+        buf[0] = '-';
+        n = 1 + c6c_utoa(buf + 1, (unsigned long)(-idx), 10, 0, 1);
+    } else {
+        n = c6c_utoa(buf, (unsigned long)idx, 10, 0, 1);
+    }
+    buf[n] = 0;
+    c6c_err_str("c6c: 下标越界：index ");
+    c6c_err_str(buf);
+    c6c_err_str(" 不在 [0, ");
+    n = c6c_utoa(buf, (unsigned long)bound, 10, 0, 1);
+    buf[n] = 0;
+    c6c_err_str(buf);
+    c6c_err_str(") 之内\n");
+    c6c_sys3(C6C_SYS_EXIT, 2, 0, 0);
+    return 0;
+}
+
 /* ---------- 格式化 ---------- */
 static void c6c_out(char *out, long cap, long *n, const char *s, long len)
 {
