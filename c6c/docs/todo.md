@@ -2987,3 +2987,52 @@ ELF_HDR + s->goff)`。也就是说同一个对象只要被"声明"两次（同�
 而 `x64_data_sym()` 是**按名字**取符号再覆盖 offset，于是"谁最后写谁赢"，
 初始化器写的那块和代码早前拿到的 id 可能不是同一块。修法大概就是"已经有 goff
 就别再分配"（注意 `goff == 0` 是合法偏移，别用真值判断，得有个显式标记）。
+
+## 语言层 C99：外部闸门有了，剩下的语言特性还差这些
+
+自产语料证明不了"标准里还有没想到的"，所以引了一份外部标准用例当闸门：
+`third_party/c-testsuite/single-exec/`（scc 的 c-testsuite，150 条 portable 单文件，
+ISC）。跑法 `make c99suite`（就是 `tests/c99-suite.sh`），口径和判类见
+`docs/acceptance.md` 的 (5)。当前 **通过 149 / 超出口径 1**，唯一那条 `00046` 是
+C11 匿名成员，不是 C99 的账。
+
+这一轮从这套用例里清出来的语言层缺口（都已修，各自一个 commit）：声明表里函数声
+明符后面跟 `,`、`pp_pushback` 会丢合成 EOF、静态初始化器里的复合字面量地址、
+`case`/`default` 分支末尾直接跟语句、多层参数表各记各的（`int(f)(int)`）、`#line`
+（含 `__FILE__` 跟着变）。
+
+### 以后加 c6 软关键字，必须先过 `c6_kw()`
+
+`.c` 文件是**纯 C99**（README 明说没有 `-std=c6`），c6 的扩展词在那里必须是普通
+标识符。这一轮踩到的是 `shared / own / weak / closure / try / defer / foreach /
+test / catch / spawn / async / await / co / module / import / interface`：
+
+```c
+struct S { int shared, own, weak, closure, try; };      /* 成员名 */
+static int wrap(int closure, int try) { … }             /* 形参名 */
+int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
+```
+
+规矩：`parse.c6` 里任何 `PA_IS_IDENT("defer")` 这种识别软关键字的地方，都要写成
+`PA_IS_IDENT("x") && c6_kw()`（`c6_kw()` 放在后面，热路径上先比 token 文本）；
+`PA_ACCEPT_IDENT` 那几处写成 `c6_kw() && PA_ACCEPT_IDENT("x")`（不能先吃 token）。
+`closure` 还从 `TYKW_NAME` 关键字表里拿掉了，改成 `is_typename_tok()` 里显式判
+（否则 `int closure` 当形参时会把它当类型，一路错到函数体）。
+
+### 还没做的 C99 语言特性（都不挡现在的闸门，但都是真缺口）
+
+| 特性 | 现状 | 最小复现 |
+|---|---|---|
+| digraph `<: :> <% %> %: %:%:` | 词法里没处理，`<:` 报错 | `int a<:3:> = {1,2,3};` |
+| `_Pragma("…")` | 没有 | `_Pragma("pack(1)")` |
+| 标识符里的 UCN | 只做了字符串/字符常量里的（`esc_decode`） | `int \u00e9 = 1;` |
+| VLA 的作用域/`sizeof` 求值 | `79_vla_continue`（test3）、`vla_test`（test2）仍挂 | 见 tests2 的 n/a 清单 |
+| `_Complex` / `_Imaginary` | 当实数处理 | `double _Complex z = 1.0;` |
+| `_Alignas(N)` | 只被 `skip_paren_group()` 吃掉，没真对齐 | `_Alignas(16) int x;` |
+| `_Generic` | 缺 C11 的类型合并细则（限定符要进嵌套层级 type id），卡 `94_generic`、`100_c99array-decls` | — |
+| `-std=` / `__STDC_VERSION__` | 写死 `199901L`（`main.c6`），没有 `-std=` 选项 | — |
+| `inline` | 只置 `PA_INLINE_SEEN`，没有 C99 的 inline/extern inline 语义 | — |
+
+库那一侧（`assert.h` / `complex.h` / `math.h` / `setjmp.h` / `signal.h` / `time.h` /
+`wchar.h` / `locale.h` / `inttypes.h` / `threads.h` / `uchar.h` 缺、`float.h` 与
+`limits.h` 不全）按目标口径"库不管"不计入，但列在这儿免得当成已完成。
