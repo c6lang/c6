@@ -186,6 +186,8 @@ ctest --test-dir build -R '^std-demo$' --output-on-failure
 ```sh
 cmake --build build --target check-all     # 提交/发布前跑这一条：等价于 ctest -L regression -LE aux -j N
                    # （三组 RESOURCE_LOCK 串行，其余并发；-DC6_CHECK_JOBS=1 整轮串行）
+cmake --build build --target fast          # c6c 当编译器的快速门禁（≈40 s，含外部语料 c-testsuite / 上游 tests1·tests2）
+cmake --build build --target check-all-c6c # c6c 当编译器的全量门禁（≈4 min）：上面的 fast + 自举 fixpoint / std / tests / 诊断 / c99test / build-tcc
 cmake --build build --target check-aux     # 4 个 aux 用例，串行
 cmake --build build --target test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
 ctest --test-dir build -R c6-tests2          # 扩展模式：上游 tests2 全量
