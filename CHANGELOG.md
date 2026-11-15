@@ -7,6 +7,27 @@
 
 ## 未发布 — 2026-11-15
 
+### 新增 `fast` / `check-all-c6c`：c6c 替换 c6 的两条门禁（含第三方语料）
+
+- 现状：仓库的门禁只有 c6 那一条（`cmake --build build --target check-all`，
+  被测编译器是 `tcc/c6`）；c6c 只有 `check-c6c` 一个 ctest 入口，且没有"改一行
+  先跑一遍"的快车道。
+- 新增两个 CMake 聚合目标，被测编译器换成 **c6c 自己**：
+  - `cmake --build build --target fast` —— 快速门禁，实测 ≈40 s：`lint` +
+    `unit`/`irtest`/`hello` + `ctest`/`runflag`/`testflag` + 外部语料 `c99suite`
+    （`third_party/c-testsuite` 150 条）+ 上游 `tests1-check`/`tests2-check` +
+    `llvmtest`。
+  - `cmake --build build --target check-all-c6c` —— 全量门禁，实测 ≈4 min：
+    `c6c/Makefile` 的 `check-all`（自举 fixpoint / 三后端 / std 377 / tests /
+    诊断 316 / `c99suite` / `build-tcc` 里 c6c 编出上游 tcc 再跑上游 tests2 与
+    第三代 selfhost）再加 `tests1-check`、`tests2-check`。
+- 第三方测试集是这两条门禁的一部分，不是可选装饰：c-testsuite（`c99suite`）、
+  tcc 上游 `tests1` / `tests2`，以及 c6c 编出的 tcc 再跑上游 tests2。
+- 实现：`c6c/Makefile` 增 `fast`（`check-all` 依赖的子集，注释里列了挪出去
+  哪几条及各自耗时），CMake 两条目标直调它，所以 `make -C c6c fast` 与
+  `--target fast` 跑的是同一套脚本、同一批数字；`ctest -R '^c6c-'` 那套
+  （`check-c6c`）不变。
+
 ### `make -C c6c check-all` 不再卡死：`-j` 以前在 dash 下等于没限流
 
 - 现象：`check-all` 在小机器/CI 上偶发"卡死"，或者跑到一半出现一整轮
