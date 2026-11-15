@@ -6,7 +6,9 @@
 ```sh
 # CMake 入口（仓库根，CI 走这条）
 cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --parallel
-cmake --build build --target check-c6c         # 验收 (1)(2)(3)，一条命令（实测 132 s）
+cmake --build build --target fast              # 快速门禁 ≈40 s（改一行先跑这条）
+cmake --build build --target check-all-c6c     # 全量门禁 ≈4 min（= 下面 make 那三条）
+cmake --build build --target check-c6c         # 验收 (1)(2)(3)，走 ctest（实测 132 s）
 cmake --build build --target check-c6c-perf    # 再加验收 (4)
 
 # 细粒度入口（CI 用这几个）
@@ -14,6 +16,7 @@ ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4)
 
 # 或者直接调 c6c 自己的 Makefile（等价，`make -C c6c` 也行）
+make -s fast            ROOT=/path/to/superc   # 快速门禁 ≈40 s
 make -s check-all       ROOT=/path/to/superc   # 验收 (1)(2)(3)
 make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 ```
@@ -58,6 +61,21 @@ G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个�
 `C6_ENABLE_TCC=OFF` 时安装/打包/pkgconf/wasm 与 tcc 侧的 115 个回归用例都不
 注册（它们描述的是 libtcc 与 tcc 产品面，不是 c6c 的能力）；c6c 自己的发布
 布局是下一步。
+
+`fast` 与 `check-all` 是同一套闸门、同一个被测编译器（c6c 自己），区别只在
+是否跑那几条全量编译：
+
+| | `make fast`（≈40 s） | `make check-all`（≈4 min） |
+|---|---|---|
+| 前端 / IR / ELF 骨架 | `lint` `unit` `irtest` `hello` | 同左 |
+| 运行器与选项 | `ctest` `runflag` `testflag` | 同左 |
+| 外部语料 c-testsuite（150 条） | ✅ `c99suite` | ✅ |
+| 上游 tcc `tests1` / `tests2` 闸门 | ✅ | ✅（`check-all-c6c` 里显式加上） |
+| 自举 fixpoint / 自测 | ❌ | ✅ `selfhost` `selftest` |
+| std 377 模块 / 主仓 tests / 诊断 316 | ❌ | ✅ `stdtest` `test` `diagtest` |
+| C99 后端差分（165 s） | ❌ | ✅ `c99test` |
+| c6c 编出的 tcc 跑上游 tests2 + 第三代 selfhost | ❌ | ✅ `build-tcc` |
+| LLVM 后端对齐 | ✅ `llvmtest` | ✅ |
 
 ## (1) `check-all`：自举 + 三后端 + 语料
 
