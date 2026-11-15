@@ -1,5 +1,14 @@
 # 安装：复刻 tcc/Makefile 的 install-unx 清单，支持 DESTDIR 与 --prefix 落点。
 
+# C6_ENABLE_TCC=OFF 时没有 tcc 的 install-unx 清单可复刻：c6c 的安装布局
+# （二进制 + 自带 include/ 与 rt.c6 的落点、默认搜索路径）是下一步，
+# 这一轮先把"能构建、能验收、不需要 tcc"这条路打通并钉进 CI。
+if(NOT C6_ENABLE_TCC)
+  message(STATUS
+    "c6: C6_ENABLE_TCC=OFF —— 本次不生成安装/库配置清单（c6c 的发布布局是下一步）")
+  return()
+endif()
+
 # ---------------------------------------------------------------------------
 # 4. 安装：与 tcc/Makefile 的 install-unx 同一套文件，但由 CMake 自己装，
 #    文件落点 / DESTDIR 按 CMake 语义生效，且与生成的库配置共用一套路径。

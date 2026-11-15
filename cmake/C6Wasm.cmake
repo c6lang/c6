@@ -1,5 +1,17 @@
 # wasm 目标：直接调用 scripts/ 下的两个脚本。
 
+# wasm 运行库（libtcc1-<arch>.a）与冒烟测试都用 tcc/c6 当编译器；没有 tcc
+# 时这两个目标如实说明，而不是给出一条必然失败的构建链。
+if(NOT C6_ENABLE_TCC)
+  foreach(_c6_wasm_target IN ITEMS wasmrt wasmtest)
+    add_custom_target("${_c6_wasm_target}"
+      COMMAND "${CMAKE_COMMAND}" -E echo
+        "c6: ${_c6_wasm_target} 用 tcc/c6 交叉编 wasm 运行库；本次 C6_ENABLE_TCC=OFF"
+      VERBATIM)
+  endforeach()
+  return()
+endif()
+
 # wasm：CMake 直接调用 scripts/ 下的两个脚本。LLVMCC / LLVMAR /
 # NODE / WASM_TRIPLE 都从 -D 参数注入脚本的环境。
 set(_c6_wasm_env "${CMAKE_COMMAND}" -E env)
