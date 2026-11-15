@@ -1,17 +1,13 @@
 # 只有 LLVM IR 后端要跳的用例（c99 后端能跑）。
 #
-# 现在只剩 cleanup_attr 一条：它生成的 IR 里有个基本块缺终结指令，
-# `llc -O0` 直接报 "expected instruction opcode"（指着 `L5:` 那一行），程序
-# 根本跑不起来。是 LLVM 后端在 cleanup/goto 密集的代码上的既有缺陷，和用例
-# 本身的语义无关。
+# 现在是**空的**：tests/c 里每一条用例三个后端都能跑、输出逐字节一致。
 #
-# 历史上这里还挂着 init_bound / alloca_runtime / qualifier_types —— 理由是
-# "静态数据的初值在 LLVM 后端读出来全是 0"（数据段里那份常量块 @__c6l_D0
-# 和符号偏移对不上）。那条已经好了，三条都回到 LLVM 的跑批里。
-#
-# 整个变参也曾经是坏的：va_start/va_arg 都落在"函数入口自己的 %ap"上，前端
-# 那个 va_list 对象从没被初始化，于是 `printf("%d", 7)` 印 0、把 va_list 传给
-# 别的函数（printf → vfprintf）直接崩。现在 va_start 作用在前端对象上，
-# va_arg 手写 SysV 取字（不用 llvm.va_arg：-O0 下它对"传进来的 va_list 指针"
-# 会退化成空指针）。细节见 tests/c/varargs.c 的文件头。
-cleanup_attr
+# 历史（都修好了，留着当索引）：
+#   * init_bound / alloca_runtime / qualifier_types —— "静态数据的初值在 LLVM
+#     后端读出来全是 0"（数据段里那份常量块 @__c6l_D0 和符号偏移对不上）。
+#   * cleanup_attr —— 它生成的 IR 里有"紧跟无条件跳转的死代码"，LLVM 不允许
+#     终结指令后面直接接指令，`llc` 报 expected instruction opcode。现在后端
+#     遇到这种情况会自动开一个没人跳进来的死块接住。
+#   * 整个变参 —— va_start/va_arg 落在"函数入口自己的 %ap"上，前端那个
+#     va_list 对象从没初始化，`printf("%d", 7)` 印 0、转发 va_list 直接崩。
+#     现在 va_start 作用在前端对象上、va_arg 手写 SysV 取字。
