@@ -13,6 +13,8 @@ VERBOSE=0
 FILTER=""
 NA=$HERE/tcc-na.txt
 JOBS=${JOBS:-1}
+# 编译一条用例的上限（秒）：编译器卡死时由它出手，别把整轮验收挂住。
+C6C_TMO=${C6C_TMO:-120}
 while [ $# -gt 0 ]; do
     case "$1" in
     -v) VERBOSE=1 ;;
@@ -49,15 +51,19 @@ one_case() {
     146_tls_extern) srcs="$src -DDEFS $src" ;;
     esac
 
-    if ! "$CC" $srcs -o "$TMP/$base" >"$TMP/$base.log" 2>"$TMP/$base.err"; then
-        if grep -q '未定义的符号' "$TMP/$base.err"; then
+    timeout -k 5 "$C6C_TMO" "$CC" $srcs -o "$TMP/$base" >"$TMP/$base.log" 2>"$TMP/$base.err"
+    crc=$?
+    if [ "$crc" -ne 0 ]; then
+        if [ "$crc" -eq 124 ] || [ "$crc" -eq 137 ]; then
+            echo "TMO 编译超时（>${C6C_TMO}s）" >"$vf"
+        elif grep -q '未定义的符号' "$TMP/$base.err"; then
             echo "LINK $(grep -o "未定义的符号 '[^']*'" "$TMP/$base.err" | head -1)" >"$vf"
             grep -o "未定义的符号 '[^']*'" "$TMP/$base.err" | sed "s/.*'\(.*\)'/\1/" \
                 >"$TMP/miss.$base"
         elif grep -q '没有 main' "$TMP/$base.err"; then
             # 库用例：源文件本来就没有 main（104+_inline 之类），上游也是只编不跑。
             # 判据是"编译期干净"，所以走 -fsyntax-only 再验一遍。
-            if "$CC" -fsyntax-only "$src" >"$TMP/$base.syn" 2>&1; then
+            if timeout -k 5 "$C6C_TMO" "$CC" -fsyntax-only "$src" >"$TMP/$base.syn" 2>&1; then
                 echo "NOLINK" >"$vf"
             else
                 echo "CERR $(head -1 "$TMP/$base.syn")" >"$vf"
@@ -81,7 +87,7 @@ one_case() {
     if [ -s "$TMP/$base.err" ]; then
         sed "s|$TCCDIR/||g" "$TMP/$base.err" | grep -v '^$' >> "$TMP/$base.out" 2>/dev/null
     fi
-    ( cd "$TMP" && timeout 10 "./$base" $args >>"$TMP/$base.out" 2>"$TMP/$base.runerr" )
+    ( cd "$TMP" && timeout -k 2 10 "./$base" $args >>"$TMP/$base.out" 2>"$TMP/$base.runerr" )
     if diff -q "$exp" "$TMP/$base.out" >/dev/null 2>&1; then
         echo "PASS" >"$vf"
     else
@@ -89,8 +95,8 @@ one_case() {
         # gcc 的输出对不上 expect，就不是 c6c 的错（仓库里的 expect 是旧的）。
         stale=0
         if command -v gcc >/dev/null 2>&1; then
-            if gcc -w -o "$TMP/g_$base" "$src" 2>/dev/null; then
-                ( cd "$TMP" && "$TMP/g_$base" >"$TMP/$base.gccout" 2>/dev/null )
+            if timeout -k 5 "$C6C_TMO" gcc -w -o "$TMP/g_$base" "$src" 2>/dev/null; then
+                ( cd "$TMP" && timeout -k 2 10 "$TMP/g_$base" >"$TMP/$base.gccout" 2>/dev/null )
                 if ! diff -q "$exp" "$TMP/$base.gccout" >/dev/null 2>&1; then
                     stale=1
                 fi
@@ -105,6 +111,7 @@ one_case() {
 }
 
 i=0
+nrun=0
 for src in "$TCCDIR"/*.c; do
     [ -e "$src" ] || continue
     base=$(basename "$src" .c)
@@ -113,12 +120,18 @@ for src in "$TCCDIR"/*.c; do
     *) continue ;;
     esac
     i=$((i + 1))
+    # 先占位：子进程要是被打死，这一条仍然留在总数里当失败，不会悄悄消失。
+    echo "MISS 结论缺失（子进程没跑完就被打死了？）" >"$TMP/v.$i"
     if [ "$JOBS" -le 1 ]; then
         one_case "$src" "$TMP/v.$i"
     else
         one_case "$src" "$TMP/v.$i" &
-        if [ "$(jobs -p | wc -l)" -ge "$JOBS" ]; then
+        # 限流自己数：`$(jobs -p | wc -l)` 在 dash 下恒为 0（命令替换是子
+        # shell，看不见父 shell 的作业表），那一版等于没有限流。
+        nrun=$((nrun + 1))
+        if [ "$nrun" -ge "$JOBS" ]; then
             wait
+            nrun=0
         fi
     fi
 done

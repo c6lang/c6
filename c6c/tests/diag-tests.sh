@@ -16,6 +16,8 @@ set -u
 
 C6C=${C6C:-./build/c6c}
 ROOT=${ROOT:-..}
+# 编译一条用例的上限（秒）：编译器卡死时由它出手，别把整轮验收挂住。
+C6C_TMO=${C6C_TMO:-120}
 V=0
 JOBS=${JOBS:-1}
 while [ $# -gt 0 ]; do
@@ -40,7 +42,7 @@ one_file() {
     [ -f "$tu_src" ] && extra="$tu_src"
     : >"$out"
     # 正常路径
-    if ! "$C6C" -fsyntax-only -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" "$f" \
+    if ! timeout -k 5 "$C6C_TMO" "$C6C" -fsyntax-only -I"$ROOT" -I"$ROOT/std" -I"$ROOT/tests" "$f" \
             $extra >/dev/null 2>&1; then
         echo "SKIP" >>"$out"
     else
@@ -53,8 +55,9 @@ one_file() {
         rest=${spec#*:}
         rest=${rest#error: }
         frag=$(echo "$frag" | tr -d ' ')
-        o=$("$C6C" -fsyntax-only -D"$frag" -I"$ROOT" -I"$ROOT/std" \
-                 -I"$ROOT/tests" "$f" $extra 2>&1)
+        # 编译器卡死 ⇒ 超时、输出为空 ⇒ 下面按"没报错"记 FAIL，不会挂住
+        o=$(timeout -k 5 "$C6C_TMO" "$C6C" -fsyntax-only -D"$frag" -I"$ROOT" \
+                 -I"$ROOT/std" -I"$ROOT/tests" "$f" $extra 2>&1)
         # 判据一：这个片段必须**报错**（c6c 的诊断文本是中文的，上游 EXPECT
         # 里写的是英文原文，所以不强求逐字一致；下面把逐字命中的条数单独统计，
         # 作为"离上游措辞还有多远"的参考）。
@@ -71,6 +74,7 @@ one_file() {
 }
 
 i=0
+nrun=0
 for f in "$ROOT"/tests/errors/*.c6 "$ROOT"/c6c/tests/errors/*.c6; do
     [ -f "$f" ] || continue
     i=$((i + 1))
@@ -78,8 +82,12 @@ for f in "$ROOT"/tests/errors/*.c6 "$ROOT"/c6c/tests/errors/*.c6; do
         one_file "$f" "$TMP/r.$i"
     else
         one_file "$f" "$TMP/r.$i" &
-        if [ "$(jobs -p | wc -l)" -ge "$JOBS" ]; then
+        # 计数自己数，别用 `$(jobs -p | wc -l)`：命令替换是子 shell，dash 下
+        # 看不见父 shell 的作业表，那个表达式恒为 0，等于没有限流。
+        nrun=$((nrun + 1))
+        if [ "$nrun" -ge "$JOBS" ]; then
             wait
+            nrun=0
         fi
     fi
 done
@@ -96,7 +104,13 @@ for f in "$ROOT"/tests/errors/*.c6 "$ROOT"/c6c/tests/errors/*.c6; do
     i=$((i + 1))
     nfile=$((nfile + 1))
     r="$TMP/r.$i"
-    [ -f "$r" ] || continue
+    # 空文件/没有文件 = 这一条没跑出结论（子进程被打死了）：算失败。
+    # 以前直接 `continue`，它会悄悄从统计里消失。
+    if [ ! -s "$r" ]; then
+        bad=$((bad + 1))
+        [ $V -eq 1 ] && echo "没有结论（子进程被打死？）  $(basename "$f")"
+        continue
+    fi
     if [ "$(sed -n '1p' "$r")" = "SKIP" ]; then
         skip=$((skip + 1))
         [ $V -eq 1 ] && echo "正常路径编不过  $(basename "$f")"

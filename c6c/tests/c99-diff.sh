@@ -9,6 +9,10 @@ set -u
 C6C=${C6C:-./build/c6c}
 CC=${CC:-gcc}
 CORPUS=${CORPUS:-tests/c}
+# 上限（秒）：TMO 管"编一遍"（c6c / 宿主 cc），RUN_TMO 管"跑一下"。
+# 一条用例卡死不该把整轮验收挂住；`timeout -k` 保证不理 SIGTERM 的也收得掉。
+TMO=${TMO:-120}
+RUN_TMO=${RUN_TMO:-60}
 TMP=${TMPDIR:-/tmp}/c6c-c99diff.$$
 mkdir -p "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -24,17 +28,17 @@ for f in "$CORPUS"/*.c; do
     if [ -f "$CORPUS/native-only.txt" ] && grep -qx "$name" "$CORPUS/native-only.txt"; then
         continue
     fi
-    if ! "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(native-cc)"; continue
     fi
-    if ! "$C6C" --emit-c "$f" -o "$TMP/$name.c" >"$TMP/$name.clog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$C6C" --emit-c "$f" -o "$TMP/$name.c" >"$TMP/$name.clog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(c99-emit)"; continue
     fi
-    if ! "$CC" -w -O1 -o "$TMP/$name.cx" "$TMP/$name.c" >>"$TMP/$name.clog" 2>&1; then
+    if ! timeout -k 5 "$TMO" "$CC" -w -O1 -o "$TMP/$name.cx" "$TMP/$name.c" >>"$TMP/$name.clog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(c99-cc)"; continue
     fi
-    "$TMP/$name.n" >"$TMP/$name.nout" 2>&1; nrc=$?
-    "$TMP/$name.cx" >"$TMP/$name.cout" 2>&1; crc=$?
+    timeout -k 5 "$RUN_TMO" "$TMP/$name.n" >"$TMP/$name.nout" 2>&1; nrc=$?
+    timeout -k 5 "$RUN_TMO" "$TMP/$name.cx" >"$TMP/$name.cout" 2>&1; crc=$?
     if [ "$nrc" -ne "$crc" ]; then
         bad=$((bad + 1)); badlist="$badlist $name(rc $nrc!=$crc)"; continue
     fi

@@ -21,6 +21,11 @@ for a in "$@"; do
     *) FILTER=$a ;;
     esac
 done
+# 编译/运行的上限（秒）。c6c 编出来的 tcc 要编 tcc.c 本体（2.5 MB），
+# 给得宽一点；目的只有一个：卡死的时候别让 build-tcc（check-all 的最后一步）
+# 永久挂在那里。`timeout -k` = 先 SIGTERM，几秒后还在就 SIGKILL。
+TMO=${TMO:-300}
+RUN_TMO=${RUN_TMO:-30}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 pass=0
@@ -39,7 +44,7 @@ for src in "$TCCDIR"/*.c; do
     esac
     # 在用例目录里用**文件名**编：编译期告警里的路径要和上游 .expect 一致
     # （`03_struct.c:14: …` 而不是 `tcc/tests/tests2/03_struct.c:14: …`）。
-    if ! sh -c "cd '$TCCDIR' && exec; \"\$0\" -B'$ROOT/tcc' -I'$ROOT/tcc/include' \
+    if ! timeout -k 5 "$TMO" sh -c "cd '$TCCDIR' && exec; \"\$0\" -B'$ROOT/tcc' -I'$ROOT/tcc/include' \
         -o '$TMP/$base' '$base.c' >'$TMP/$base.log' 2>&1" "$TCCBIN"; then
         cerr=$((cerr + 1))
         [ "$VERBOSE" = 1 ] && printf '编不过 %-22s %s\n' "$base" "$(head -1 "$TMP/$base.log")"
@@ -47,15 +52,17 @@ for src in "$TCCDIR"/*.c; do
     fi
     exp="$TCCDIR/$base.expect"
     [ -e "$exp" ] || exp=/dev/null
-    # 多套一层 sh：让它先把**自己**的 stderr 关掉，这样被信号打死的用例不会
-    # 让外层 shell 打一行 "Segmentation fault" 混进记分板。
     # 编译期的**告警**要先进输出：上游的 .expect 里就是这么排的
     # （`03_struct.expect` 第一行就是那条 `__cleanup__ ignored on type`）。
     : > "$TMP/$base.out"
     if [ -s "$TMP/$base.log" ]; then
         grep -v '^$' "$TMP/$base.log" >> "$TMP/$base.out" 2>/dev/null
     fi
-    ( cd "$TMP" && sh -c "exec 2>/dev/null; timeout 10 ./$base $args >>'$TMP/$base.out'" )
+    # `) 2>/dev/null` 只关掉**这个子 shell 自己**的 stderr：被信号打死的用例
+    # 会打一行 "Segmentation fault"，那不是记分板的内容；程序的 stderr 上面
+    # 已经显式并进 .out 了。
+    ( cd "$TMP" && timeout -k 2 "$RUN_TMO" "./$base" $args \
+        >>"$TMP/$base.out" 2>&1 ) 2>/dev/null
     if diff -q "$exp" "$TMP/$base.out" >/dev/null 2>&1; then
         pass=$((pass + 1))
     else
@@ -75,16 +82,16 @@ MIN=${C6C_TCC_SELF_MIN:-100}
 # 也能编它自己。
 if [ -z "$FILTER" ]; then
     g2="$TMP/tcc-g2"
-    if "$TCCBIN" -B"$ROOT/tcc" -DONE_SOURCE=1 -I "$ROOT/tcc" -o "$g2" \
-            "$ROOT/tcc/tcc.c" >"$TMP/g2.log" 2>&1 && [ -x "$g2" ]; then
+    if timeout -k 10 "$TMO" "$TCCBIN" -B"$ROOT/tcc" -DONE_SOURCE=1 -I "$ROOT/tcc" \
+            -o "$g2" "$ROOT/tcc/tcc.c" >"$TMP/g2.log" 2>&1 && [ -x "$g2" ]; then
         n=0
         bad=0
         for base in 01_comment 27_sizeof 73_arm64 90_struct-init; do
             [ -f "$TCCDIR/$base.c" ] || continue
             n=$((n + 1))
-            ( cd "$TCCDIR" && "$g2" -B"$ROOT/tcc" "$base.c" -o "$TMP/g2-$base" ) \
-                >"$TMP/g2-$base.log" 2>&1 || bad=$((bad + 1))
-            ( cd "$TMP" && timeout 10 "./g2-$base" >"$TMP/g2-$base.out" 2>&1 )
+            ( cd "$TCCDIR" && timeout -k 5 "$TMO" "$g2" -B"$ROOT/tcc" "$base.c" \
+                -o "$TMP/g2-$base" ) >"$TMP/g2-$base.log" 2>&1 || bad=$((bad + 1))
+            ( cd "$TMP" && timeout -k 2 "$RUN_TMO" "./g2-$base" >"$TMP/g2-$base.out" 2>&1 )
             cmp -s "$TCCDIR/$base.expect" "$TMP/g2-$base.out" || bad=$((bad + 1))
         done
         echo "c6c-built tcc 再编一遍 tcc.c（第三代 selfhost）：编出 OK / 抽查 $n 条用例，坏 $bad"
