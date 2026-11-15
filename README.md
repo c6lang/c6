@@ -314,6 +314,8 @@ ctest --test-dir build -L daily --output-on-failure # 只跑 5 个日常用例
 cmake --build build --target test-all          # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
 cmake --build build --target check-all         # 全部回归门禁用例（发布前跑这一条）
 cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all  # 整轮串行
+cmake --build build --target fast              # c6c 当编译器：快速门禁 ≈40 s（含外部语料）
+cmake --build build --target check-all-c6c     # c6c 当编译器：全量门禁 ≈4 min（含外部语料）
 cmake --build build --target check-aux         # 4 个 aux 用例
 cmake --build build --target check-install     # 校验装出去的 CMake / pkgconf 库配置
 cmake --build build --target c6-help           # 常用命令与用例清单

@@ -239,7 +239,8 @@ set(_c6_reserved_targets
   build build-plain c6 c99
   wasmrt wasmtest distclean mode-ext mode-plain
   check-install c6-clean clean-all c6-help tcc-clean tcc-distclean
-  check-all test-all check-std-serial test-plain check-aux)
+  check-all test-all check-std-serial test-plain check-aux
+  fast check-all-c6c check-c6c)
 foreach(_case IN LISTS _c6_cases)
   if(NOT _case IN_LIST _c6_reserved_targets)
     if(BUILD_TESTING AND C6_ENABLE_TCC)
