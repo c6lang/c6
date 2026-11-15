@@ -688,7 +688,7 @@ testing / methods / tuples / fstrings / gc / concurrency / macros / freestanding
 | P6-2 | 错误通道 | 🟡 `T!error` 当 `T`、`err(a,b)` 当 int、`expr catch e { … }` 已实现（错误载荷 `e` 只有 `id` 字段）；`defer`/`errdefer`/`try`/`or`/号段未做 | `docs/manual/errors.md` |
 | P6-3 | 切片 `T[:]` / `s[a:b]` | 🟡 类型/声明/`s[i]`/数组实参隐式转换都通了（std 19→28/153）；子切片、越界检查、切片形参的运行时行为还要修 | `docs/manual/slices.md` |
 | P6-4 | `foreach`、`match` | 🟡 `foreach` 已实现并端到端验证：数组/切片，`(T v = it)` 单绑定=值、`((T i, T v) = it)` 双绑定=下标+值（求和/索引都验过）。还差**迭代器协议**（`has/next`）和区间 `lo:hi`——std 里 56 处报错现在是"foreach 只能遍历数组或切片"。`match` 未做 | `docs/manual/foreach.md` |
-| P6-5 | `test { … }` 块 | 🟡 能解析成函数并登记；`tests/` 121 个 c6 用例里 **29 个能编过**（缺泛型/defer/match/await/closure）。`--run-tests` 运行器未做 | `make c6c-test` |
+| P6-5 | `test { … }` 块 | 🟡 能解析成函数并登记；`-test` / `-test-filter` 运行器已实现（输出协议与 tcc 的 native 运行器一致，`make testflag` 19 条）。`tests/` 121 个 c6 用例里 **29 个能编过**（缺泛型/defer/match/await/closure） | `make c6c-test` |
 | P6-6 | 方法调用 `v.method()`（= `f(v, …)`）、元组、fstring、c6 宏 | 🟡 方法调用语法糖已实现（std 31→68 的主力）；其余未做 | `docs/manual/{methods,tuples,fstrings,macros}.md` |
 | P6-7 | managed 引用 / GC / 并发 | ⬜ | `docs/manual/{gc,concurrency}.md` |
 | P6-8 | `std/` 153 模块全绿 | 🟡 **115/153**（0→19 模块/测试块 →28 切片 →31 catch →68 方法调用 →114 foreach 迭代器 →115 fcntl）；剩 38：泛型 `struct Deque@T`（8+10 处）、`defer`、`await`/`closure`、`match` | `make stdtest` |
@@ -728,7 +728,7 @@ P6-5（test 块）→ 其余。
 | P5-3 | 元组 `(T1,T2)` + 解构 + sret/寄存器对 | `tests/tuple*.c6` 绿 | ⬜ |
 | P5-4 | `foreach`（数组/切片/区间/迭代器协议） | `tests/foreach*.c6` 绿 | ⬜ |
 | P5-5 | `interface` + vtable + 胖指针 | `tests/iface*.c6` 绿 | ⬜ |
-| P5-6 | `test` 块 + `-test` + `-test-filter` | `tests/test-block.c6` 绿 | ⬜ |
+| P5-6 | `test` 块 + `-test` + `-test-filter` | `tests/test-block.c6` 绿 | ✅ `tests/test-block.c6` 在 c6c 下 7 test(s) / 0 failure(s)，`-D FAILING_BLOCK` 报 `FAIL: … : on purpose` 且退出码非 0，用户 main 不执行；`make c6c-testflag` 19 条|
 | P5-7 | 诊断号 C1–C134 逐条实现（337 条 `EXPECT`） | `make c6c-errcheck` 全绿 | ⬜ |
 | P5-8 | 上游 `tests2` 全量（VLA/computed goto 缺口据实上报） | `make c6c-test` 绿（缺口单列） | 🟡 93/144 |
 
@@ -753,7 +753,7 @@ P6-5（test 块）→ 其余。
 | P7-2 | 文本后端性能：`.c` ≤120 ms、`.ll` ≤200 ms（现状 569 / 1186） | `make c6c-bench` 断言 | ⬜ |
 | P7-3 | 并行模块编译（DAG + N worker + 固定合并顺序） | 8 线程 ≤0.3× tcc；输出与串行逐字节相同 | ⬜ |
 | P7-4 | 增量缓存（内容寻址） | 二次自举 ≤10 ms | ⬜ |
-| P7-5 | 自研链接（不 spawn `ld`）与 `-run`/`-test`（可选） | 链接 ≤5 ms；`-test` 绿 | 🟡 `-run` 已落地（编到临时 ELF 再 exec；首行 `#!` 当空白，可当脚本解释器；test 块由合成入口跑，失败数当退出码，`make c6c-runflag` 覆盖）；自研链接未做 |
+| P7-5 | 自研链接（不 spawn `ld`）与 `-run`/`-test`（可选） | 链接 ≤5 ms；`-test` 绿 | 🟡 `-run` 已落地（编到临时 ELF 再 exec；首行 `#!` 当空白，可当脚本解释器，`make c6c-runflag` 覆盖）；`-test`/`-test-filter` 已落地（用户 main 不执行、PASS/FAIL 行 + `N test(s), M failure(s)` 收尾、失败数当退出码、零块静默，`make c6c-testflag` 覆盖）；自研链接未做 |
 
 ## P8 交付
 

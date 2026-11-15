@@ -3836,4 +3836,46 @@ double asinh(double x) { return log(x + sqrt(x * x + 1.0)); }
 double acosh(double x) { return log(x + sqrt(x * x - 1.0)); }
 double atanh(double x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
 
+/* ---- -test 运行器：和 tcc 的 native 运行器（tccrun.c 的 tcc_run_tests）同一套
+ * 输出协议 ----
+ *
+ * c6c 的 synth_test_main() 给每条 `test "描述" { … }` 块生成一次调用：跑它、
+ * 报告、把失败数累加起来当退出码。协议逐字对齐 tcc，所以 tests/run-tests.sh
+ * 里那几条检查（PASS 行、FAIL 行带错误消息、收尾统计、过滤后块数）对两个
+ * 编译器同样成立：
+ *
+ *   PASS: 描述                → stdout
+ *   FAIL: 描述: 错误消息       → stderr（错误通道里没有消息时只报描述）
+ *   N test(s), M failure(s)   → stdout，报告的最后一行
+ *
+ * 返回 1 表示这条失败、0 表示通过——调用方直接把它加起来当失败数。
+ */
+int __c6c_test_run(int (*fn)(void), const char *desc)
+{
+    const char *msg = 0;
+    int r = 0;
+
+    /* 上一条的 err 状态不能漏到这一条（tcc 的运行器也每块清一次） */
+    __tcc_err_clear();
+    r = fn();
+    if (!r) {
+        printf("PASS: %s\n", desc);
+        return 0;
+    }
+    msg = __tcc_err_msg_get();
+    if (msg && msg[0])
+        fprintf((void *)2, "FAIL: %s: %s\n", desc, msg);
+    else
+        fprintf((void *)2, "FAIL: %s\n", desc);
+    return 1;
+}
+
+/* 收尾一行。顺带等所有 spawn 出去的线程：它们还在这段代码里跑着，
+ * 主线程一返回（进程退出）就没人回收了（tcc 的运行器同样先 join）。 */
+void __c6c_test_summary(int nrun, int nfail)
+{
+    __c6_th_join_all();
+    printf("%d test(s), %d failure(s)\n", nrun, nfail);
+}
+
 #endif /* _C6C_RT_C6 */
