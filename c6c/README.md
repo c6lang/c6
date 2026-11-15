@@ -21,7 +21,9 @@
 
 ```sh
 cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --parallel
-cmake --build build --target check-c6c        # 验收 (1)(2)(3)（一条命令）
+cmake --build build --target fast             # c6c 当编译器的快速门禁（≈40 s，含外部语料）
+cmake --build build --target check-all-c6c    # c6c 当编译器的全量门禁（≈4 min，含外部语料）
+cmake --build build --target check-c6c        # 验收 (1)(2)(3)（同上，走 ctest）
 cmake --build build --target check-c6c-perf   # 再加上验收 (4)
 
 # 等价的细粒度入口（CI 用这几个）：
@@ -29,13 +31,18 @@ ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4) 性能/内存
 ```
 
-不用 CMake 也行（c6c 自带 Makefile，两个入口等价）：
+不用 CMake 也行（c6c 自带 Makefile，入口等价）：
 
 ```sh
+make -C c6c fast ROOT=$PWD          # 快速门禁（≈40 s）
 make -C c6c check-all ROOT=$PWD     # 验收 (1)(2)(3)
 make -C c6c bench-c6c ROOT=$PWD     # 验收 (4)
 make -C c6c tests2-check ROOT=$PWD  # 只跑 tcc 上游 tests2 的闸门
 ```
+
+`fast` 与 `check-all` 的口径一致——被测编译器就是 c6c 自己——只是 `fast` 把
+`selfhost`/`selftest`/`stdtest`/`test`/`diagtest`/`c99test`/`build-tcc` 这几条
+全量编译挪出去；第三方语料（`c99suite`、上游 `tests1`/`tests2`）两条都包含。
 
 | # | 要求 | 现状 |
 |---|---|---|

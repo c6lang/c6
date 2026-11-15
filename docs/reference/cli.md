@@ -129,6 +129,9 @@ c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DO
 | `cmake --build build --target test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机（等价于 `ctest --test-dir build -L core -j N`） |
 | `cmake --build build --target check-all` | **提交/发布前跑这一条**：全部回归门禁用例（等价于 `ctest --test-dir build -L regression -LE aux -j N`）；每用例独占 `build/tests/<用例>/`，整组并发，fstest / tests2 / source-tree 三组用 `RESOURCE_LOCK` 互斥。`-DC6_CHECK_JOBS=1` 则整轮串行 |
 | `cmake --build build --target check-aux` | 单独跑 4 个 `aux` 用例（`check-tcc` / `ubcheck` / `safegate` / `bench-async`）；`bench-async` 需要 g++/rustc/go |
+| `cmake --build build --target fast` | **c6c 替换 c6 的快速门禁**（≈40 s）：`lint` + `unit`/`irtest`/`hello` + `ctest`/`runflag`/`testflag` + 外部语料 `c99suite`（c-testsuite 150 条）+ 上游 `tests1-check`/`tests2-check` + `llvmtest`。直调 `c6c/Makefile` 的 `fast`，不走 ctest |
+| `cmake --build build --target check-all-c6c` | **c6c 替换 c6 的全量门禁**（≈4 min）：`c6c/Makefile` 的 `check-all`（自举 fixpoint / 三后端 / std 377 / tests / 诊断 / c99suite / `build-tcc` 编出 tcc 跑上游 tests2 + 第三代 selfhost）再加 `tests1-check`、`tests2-check` 两条上游闸门 |
+| `cmake --build build --target check-c6c` | 同一套 c6c 验收的 ctest 入口（`-R '^c6c-' -LE perf`，6 条用例；`check-c6c-perf` 再加性能/内存门槛） |
 
 ### 标准库
 

@@ -138,3 +138,39 @@ if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
     LABELS "perf"
     TIMEOUT 1800 ${_c6c_test_env})
 endif()
+
+# ---------------------------------------------------------------------------
+# c6c 替换 c6 的两个聚合门禁：fast / check-all-c6c
+#
+# 主仓原来的门禁是 `check-all`（被测编译器是 tcc/c6，见 C6Testing.cmake）。这
+# 两条把被测编译器换成 c6c 自己：自举 fixpoint、三后端、全部语料都由 c6c 跑。
+# 第三方语料是这两条门禁的一部分，不是可选装饰：
+#   c99suite      third_party/c-testsuite 的 150 条外部 C99 用例（语言层闸门）
+#   tests1-check  tcc 上游 tests/ 那批老式单文件用例
+#   tests2-check  tcc 上游 tests2 逐条比对（tests/tcc-na.txt 之外不许有意外失败）
+#   build-tcc     c6c 编出上游 tcc，再由它跑上游 tests2 + 第三代 selfhost
+#
+#   cmake --build build --target fast           ≈40 s，日常改一行就够
+#   cmake --build build --target check-all-c6c  ≈4 min，提交/发布前
+#
+# 两条都直调 c6c/Makefile（fast / check-all + 上游那两条闸门），不走 ctest：
+# 这样 `make -C c6c fast` 和 `--target fast` 跑的是同一套脚本、同一批数字。
+# ctest 视角的同一套验收仍然是 `check-c6c`（拆成 6 条用例，CI 按标签跑）。
+# 不设 BUILD_TESTING 守卫：它们跑的是 c6c 自己的脚本，跟测试注册无关。
+if(EXISTS "${C6C_DIR}/Makefile")
+  set(_c6c_gate_args
+    "ROOT=${CMAKE_CURRENT_SOURCE_DIR}" "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}")
+
+  add_custom_target(fast
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" fast ${_c6c_gate_args}
+    DEPENDS c6c
+    USES_TERMINAL
+    COMMENT "c6c: fast（c6c 替换 c6 的快速门禁 ≈40 s，含外部 c99suite / 上游 tests1·tests2）")
+
+  add_custom_target(check-all-c6c
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" check-all ${_c6c_gate_args}
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" tests1-check tests2-check ${_c6c_gate_args}
+    DEPENDS c6c
+    USES_TERMINAL
+    COMMENT "c6c: check-all-c6c（c6c 替换 c6 的全量门禁，含外部语料 c-testsuite / 上游 tests1·tests2 / c6c 编出的 tcc）")
+endif()
