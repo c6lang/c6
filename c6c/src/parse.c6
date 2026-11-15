@@ -2479,6 +2479,8 @@ static int SAW_DTOR;
 static int PA_SAW_ENUM;
 /* -fsyntax-only：完整跑前端，但既不要求 main 也不写输出 */
 static int PA_SYNTAX_ONLY;
+/* -run：输出只是临时 ELF，别把临时文件名报出来（main.c6 里置 1） */
+static int PA_QUIET_OUT;
 
 /* 吞掉多余的初始化器元素：跳到 depth 0 处的 ',' 或 '}'（都不吃掉） */
 static void skip_init_list(void)
@@ -18793,7 +18795,8 @@ static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
             elf_write_parts(out, hdr, &DATA_IMG, &CODE_IMG, entry_off + code_off);
         }
     }
-    printf("c6c: %s（%u 字节，%u 个符号）\n", out, code_len, X64.nsym);
+    if (!PA_QUIET_OUT)
+        printf("c6c: %s（%u 字节，%u 个符号）\n", out, code_len, X64.nsym);
     return rc;
 }
 

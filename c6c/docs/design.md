@@ -433,7 +433,9 @@ tcc/c6 ──► c6c stage1 ──► (stage1 编 c6c) ──► c6c stage2
 
 ## 13. 开放问题（P1 前必须定，但先记录）
 
-1. `-run`（JIT）要不要做？v1 不做（靠 `-o` + 直接执行），P7 再评估（`tccrun.c` 那套 mmap+重定位）。
+1. `-run`（JIT）要不要做？**已做，但走的是"临时 ELF + exec"，不是 mmap + 重定位**：
+   c6c 只产静态 ELF，exec 它没有 ld.so / PLT 成本，也不需要先补动态链接；JIT 式
+   装载器仍不做（P7 再评估 `tccrun.c` 那套）。见 `src/main.c6` 的 `run_make_tmp`/`run_elf`。
 2. `tests2` 里出现的 VLA / computed goto / 内联汇编：c6c 支持到哪一档？（P5 用实测缺口定）
 3. `.c6i` 的版本兼容策略：v1 直接版本号失配即重建。
 4. 是否保留 `-B` 语义（`libtcc1.a` 路径）与 `-emit-header`（模块头生成）。
