@@ -5293,14 +5293,14 @@ static int PA_VLA_OK;
  * 常量表达式里不可能有局部变量，所以这个判断不会把常量数组误判成 VLA。
  * `sizeof(x)` 里出现局部变量是唯一的反例——它会按 VLA 处理，分配同样大小，
  * 语义仍然对，只是 `sizeof` 会退化成指针宽度。 */
-static int pa_bracket_is_vla(void)
+static int pa_bracket_is_vla_at(int base)
 {
     int i = 0;
     /* 调用点已经吃掉了 `[`，所以一开始就在里面（depth = 1） */
     int depth = 1;
 
     for (i = 0; i < 64; i++) {
-        Tok *t = pa_peek(i);
+        Tok *t = pa_peek(base + i);
 
         if (!t || t->kind == TK_EOF)
             return 0;
@@ -5321,14 +5321,14 @@ static int pa_bracket_is_vla(void)
         if (TOK_EQ(t, "sizeof") || TOK_EQ(t, "alignof")
             || TOK_EQ(t, "_Alignof") || TOK_EQ(t, "__alignof__")) {
             /* 跳过 sizeof(...)：括号里的局部变量是合法的常量表达式 */
-            Tok *n1 = pa_peek(i + 1);
+            Tok *n1 = pa_peek(base + i + 1);
 
             if (n1 && n1->kind == TK_PUNCT && tok_eq(n1, "(")) {
                 int k = i + 1;
                 int d2 = 0;
 
                 for (; k < 200; k++) {
-                    Tok *tk = pa_peek(k);
+                    Tok *tk = pa_peek(base + k);
 
                     if (!tk || tk->kind == TK_EOF)
                         return 0;
@@ -5351,8 +5351,8 @@ static int pa_bracket_is_vla(void)
 
             /* c6 的枚举限定名 `Color.RED` 也是常量：两段拼起来再查一次 */
             if (!v) {
-                Tok *n2 = pa_peek(i + 1);
-                Tok *n3 = pa_peek(i + 2);
+                Tok *n2 = pa_peek(base + i + 1);
+                Tok *n3 = pa_peek(base + i + 2);
 
                 if (n2 && n2->kind == TK_PUNCT && TOK_EQ(n2, ".") && n3
                     && n3->kind == TK_IDENT && t->len + n3->len + 2 < 256) {
@@ -5369,6 +5369,44 @@ static int pa_bracket_is_vla(void)
             /* 只有枚举常量和常量全局量能出现在常量表达式里，其余都是运行期长度 */
             if (!v || v->is_func || (v->kind != SC_ENUMC && v->kind != SC_GLOBAL))
                 return 1;
+        }
+    }
+    return 0;
+}
+
+/* 当前 token 已经在括号里面（`[` 被吃掉了）：`[n]` 里的 n 是不是运行期长度。 */
+static int pa_bracket_is_vla(void)
+{
+    return pa_bracket_is_vla_at(0);
+}
+
+/* 当前在 `[` 里面（`[` 已被吃掉）：这个括号闭合之后紧跟的 `[` 里如果是运行期
+ * 长度，就是多维变长数组（`int b[n][m]`）——那条路现在还没做。 */
+static int pa_bracket_vla_follows(void)
+{
+    int i = 0;
+    int depth = 1;
+
+    for (i = 0; i < 64; i++) {
+        Tok *t = pa_peek(i);
+
+        if (!t || t->kind == TK_EOF)
+            return 0;
+        if (t->kind != TK_PUNCT)
+            continue;
+        if (TOK_EQ(t, "[")) {
+            depth++;
+        } else if (TOK_EQ(t, "]")) {
+            Tok *nb = NULL;
+
+            if (--depth != 0)
+                continue;
+            nb = pa_peek(i + 1);
+            if (!(nb && nb->kind == TK_PUNCT && TOK_EQ(nb, "[")))
+                return 0;
+            return pa_bracket_is_vla_at(i + 2);
+        } else if (TOK_EQ(t, ";") || TOK_EQ(t, "{") || TOK_EQ(t, "}")) {
+            return 0;
         }
     }
     return 0;
@@ -6181,8 +6219,18 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
             } else if (PA_VLA_OK && d && pa_bracket_is_vla()) {
                 /* C99 VLA：`char acc[maxlen];`。类型降成元素指针，存储由
                  * IR_ALLOCA 在运行期按 rsp 现开；`&acc` 指向栈上那块。 */
-                u32 n = value_of(gen_assign());
+                u32 n = 0;
 
+                /* 多维变长数组（`int b[n][m]`、`int b[n][5]`）：行 stride 也是
+                 * 运行期的，要走"指针到 VLA"那条路，现在还没做——元素大小在
+                 * 这里只按标量算，静默算错。与其错，不如明说不支持。 */
+                if (nd > 0 || pa_bracket_vla_follows()) {
+                    pa_error("暂不支持多维变长数组（`int b[n][m]`）；一维 VLA"
+                             "（`int b[n]`）是可以的");
+                    n = 0;
+                } else {
+                    n = value_of(gen_assign());
+                }
                 d->vla = 1;
                 d->vla_cnt = n;
                 d->vla_esz = ty_size(t) ? ty_size(t) : 1;
@@ -6192,6 +6240,22 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                 t = ty_ptr(t);
                 skip_attributes();
                 continue;
+            } else if (d && PA_IN_PARAMS && pa_bracket_is_vla()) {
+                /* C99 6.7.5.3p7：形参里的 `int a[n]` 只说明它是"VLA 形参"，
+                 * 类型照样降成指针；长度表达式在**调用处**求值，这里既不必
+                 * 求值也不能求值（还没进函数体）。以前这里按常量表达式求，
+                 * 于是 `int sum(int n, int a[n])` 直接报"未知名字 n"。 */
+                int dep = 1;
+
+                while (pa_cur()->kind != TK_EOF) {
+                    if (pa_is_ch('[')) {
+                        dep++;
+                    } else if (pa_is_ch(']') && --dep == 0) {
+                        break;
+                    }
+                    pa_advance();
+                }
+                cnt = 0;
             } else {
                 cnt = (u32)const_expr();
             }
@@ -10156,6 +10220,38 @@ static u32 fstr_fmt_arg(char *fmt, u32 *fl, u32 ty, u32 hv,
     return arg;
 }
 
+static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty);
+
+/* `sizeof` 的操作数是不是一个 VLA 对象：`名字` 或 `(名字)`。
+ * 返回 1 = 带括号、2 = 不带括号（调用方据此吃 token），0 = 不是。
+ * 长度和元素大小从符号上取（声明时算好的）。 */
+static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
+{
+    Tok *t = pa_cur();
+    Sym *sy = NULL;
+    int paren = 0;
+
+    if (t->kind == TK_PUNCT && TOK_EQ(t, "(")) {
+        Tok *n1 = pa_peek(1);
+        Tok *n2 = pa_peek(2);
+
+        if (!(n1 && n1->kind == TK_IDENT && n2 && n2->kind == TK_PUNCT
+              && TOK_EQ(n2, ")")))
+            return 0;
+        t = n1;
+        paren = 1;
+    } else if (t->kind != TK_IDENT) {
+        return 0;
+    }
+    sy = sym_find(tok_data(t), t->len);
+    if (!sy || !sy->vla_cnt)
+        return 0;
+    *cnt_out = sy->vla_cnt;
+    *esz_out = sy->vla_esz ? sy->vla_esz : 1;
+    return paren ? 1 : 2;
+}
+
+
 static u32 gen_unary(void)
 {
     /* 表达式位置上的 c6 角色宏：`imax(a + 1, b * 2)`。展开成 `( 体 )` 之后
@@ -11170,7 +11266,30 @@ static u32 gen_unary(void)
         int is_align = 0;
 
         if (PA_ACCEPT_IDENT("sizeof")) {
+            u32 vcnt = 0;
+            u32 vesz = 0;
+            int paren = 0;
+
             is_align = 0;
+            /* `sizeof vla_obj` / `sizeof(vla_obj)`：C99 6.5.3.4p2 要求变长
+             * 数组的大小是**运行期**算的。长度在声明那里已经算成一个 vreg，
+             * 这里现乘元素大小。 */
+            paren = pa_vla_sizeof(&vcnt, &vesz);
+            if (paren != 0) {
+                u32 kk = 0;
+                u32 vv = 0;
+
+                if (paren > 0)
+                    pa_advance();               /* `(` */
+                pa_advance();                   /* 数组名 */
+                if (paren > 0)
+                    pa_expect_ch(')');
+                kk = irfn_vreg(&FN);
+                irfn_push(&FN, IR_CONST, IRT_U64, (u16)kk, 0, 0, 0, vesz);
+                vv = gen_bin2(vcnt, ty_ulong(), IR_MUL, kk, ty_ulong());
+                GEN_TY = ty_ulong();
+                return vv;
+            }
         } else {
             (void)PA_ACCEPT_IDENT("__alignof__");
             (void)PA_ACCEPT_IDENT("_Alignof");
@@ -14316,6 +14435,8 @@ static void gen_one_local(u32 ty, Declarator *d)
         }
         irfn_push(&FN, IR_ALLOCA, IRT_PTR, (u16)p, (u16)d->vla_cnt, 0, 0, d->vla_esz);
         s = sym_add(d->name, d->nlen, ty, SC_LOCAL);
+        s->vla_cnt = d->vla_cnt;
+        s->vla_esz = d->vla_esz;
         s->slot = irfn_vreg(&FN);
         irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)s->slot, 0, 0, 0, X64_SLOT(s->slot));
         irfn_push(&FN, IR_STORE, IRT_U64, (u16)s->slot, (u16)p, 0, 0, 0);
