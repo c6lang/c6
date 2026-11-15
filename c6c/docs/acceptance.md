@@ -13,7 +13,7 @@ make -s check-all-perf  ROOT=/path/to/superc C6C=$PWD/build/c6c   # 上面 + 验
 | 项 | 命令 | 要求 | 当前 |
 |---|---|---|---|
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
-| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11075952 字节逐字节相同） |
+| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11088440 字节逐字节相同） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
 | tests/ 语料 | `make test` | 前端 123/0、跑通 67/0 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
@@ -33,7 +33,7 @@ make -s check-all-perf  ROOT=/path/to/superc C6C=$PWD/build/c6c   # 上面 + 验
 
 | 项 | 命令 | 当前 |
 |---|---|---|
-| tests2 | `make tests2-check` | **通过 111 / 架构性 n/a 11 / 仅编译 8 / 上游 expect 旧 14 / 意外失败 0（共 144）** |
+| tests2 | `make tests2-check` | **通过 112 / 架构性 n/a 10 / 仅编译 8 / 上游 expect 旧 14 / 意外失败 0（共 144）** |
 | tests1 | `tests/tcc-tests1.sh` | 通过 3 / 编不过 1 / 缺符号 1（另 6 条上游本就要 tcc 自身的产物） |
 
 剩下 9 条（汇编器做完之后 `85/98/127` 已经转绿）的归属：`104`/`113` 要 tcc
@@ -114,7 +114,7 @@ c 越小越接近 4。想让它 ≤2.6 反而需要 c ≥ 0.875·s，也就是"�
 | 要限定符进类型 id | 1 | 94_generic |
 | 要 65536 个同时活跃的栈槽（16 位 vreg 装不下） | 1 | 101_cleanup |
 
-**111 条通过 = 122 − 11**，上面表里 11 条全是"c6c 现有架构下的 n/a"或
+**112 条通过 = 122 − 10**，上面表里 11 条全是"c6c 现有架构下的 n/a"或
 "要改 IR 编码格式"。也就是说：**不引入链接器、不把 vreg 加宽、不重做类型
 id 的前提下，111 就是天花板**；能再往上走的只有 94（限定符）这一条。
 
@@ -125,7 +125,7 @@ id 的前提下，111 就是天花板**；能再往上走的只有 94（限定�
 要限定符进类型 id）。`make tests2-check`（就是 `tests/tcc-tests2.sh`）按这张表分类：
 
 ```
-tcc tests2：通过 111 / 架构性 n/a 11 / 仅编译 8 / 上游 expect 旧 14 / 意外失败 0（共 144）
+tcc tests2：通过 112 / 架构性 n/a 10 / 仅编译 8 / 上游 expect 旧 14 / 意外失败 0（共 144）
 ```
 
 **不在表里的失败一律算意外失败，脚本退出码非 0**。所以"111"不是"还差多少"，
@@ -135,7 +135,7 @@ tcc tests2：通过 111 / 架构性 n/a 11 / 仅编译 8 / 上游 expect 旧 14 
 
 | 用例 | 卡在哪 |
 |---|---|
-| `94_generic` / `100_c99array-decls` | 限定符要进类型 id（`_Generic(const int*, int*:…)` 必须不匹配） |
+| `94_generic` | 指向对象的 `const` 要进类型 id（`_Generic(const int *, int *:…)` 必须不匹配） |
 | `101_cleanup` | 65536 个同时活跃的栈槽，vreg 是 16 位 |
 | `104_inline` / `113_btdll` / `114_bound_signal` | 要 tcc 自己 `libtcc1.a` 里的 `check_exports` / `tcc_backtrace` / `-b` 边界检查 |
 | `120_alias` / `146_tls_extern` | 要第二个 TU（没有链接器） |
