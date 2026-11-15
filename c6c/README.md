@@ -137,3 +137,40 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 还没有的：c6c 自己的链接器（现在得借系统 `cc` 的）、`.bss`（零初始化数据也
 落在 `.data` 里）、weak / 可见性 / 段 GC、`-fPIC` 与 `-shared`。
 回归：`make -C c6c objcheck`（单/多 TU 真编、真链、真跑 + readelf 结构核对）。
+
+## 链接：`c6c -o prog a.o b.o`
+
+输入里出现 `.o` 就走 c6c **自己的链接器**（`src/ld.c6`），不再借系统的 `cc`：
+
+```sh
+./c6c/build/c6c -c lib.c6  -o lib.o
+./c6c/build/c6c -c main.c6 -o main.o
+./c6c/build/c6c -o prog main.o lib.o && ./prog     # 静态链接，产物 ET_EXEC
+```
+
+它做什么：
+
+* 读 ELF64 `ET_REL`（c6c 自己出的为主，`cc -c` 出的简单 C 目标文件也吃），
+  按段名归并 `.text` / `.rodata` / `.data` / `.bss` / `.init_array` /
+  `.fini_array`，其余（`.comment`、`.note*`、`.eh_frame`、调试段）丢掉；
+* 符号解析：本地符号各管各的 `.o`，全局按名字，强定义盖弱定义，两个强定义
+  报错；未定义符号默认**硬报错**（退出码 2，名字进 stderr）；
+* 重定位：`R_X86_64_64` / `PC32` / `PLT32` / `32` / `32S`，越界报错不截断；
+* 合成 `_start`：取 `argc/argv/envp` → 跑 `.init_array` → 调 `main` →
+  跑 `.fini_array` → `syscall 60` 退出（退出码 = `main` 的返回值）；
+* 产物：两个 `PT_LOAD`（代码 R+E / 数据 R+W）+ 不可执行的 `PT_GNU_STACK`。
+
+口径与限制（都是刻意的，写在这儿免得被当成 bug）：
+
+* **静态**链接。要调 libc 就得接 libc.so.6（`DT_NEEDED` + PLT/GOT + 动态
+  loader），那是下一步；现在给带 libc 名字的 `.o`（比如自带运行时 `rt.o`
+  里 `environ`、`openat` 那些）用 `-Wl,--allow-undefined`：未定义符号按 0
+  处理并打一条汇总警告——只要运行路径不碰它就能跑。
+* 多 TU 的 **TLS** 不合并：c6c 的 TLS 偏移按 TU 分配，跨 `.o` 会重叠。
+  恰好一个 `.o` 带 TLS 时，链接器会把它的 `__c6_tls_img/len/delta` 抄给
+  其它 `.o`（构造函数在运行时那侧，它得知道有 TLS 块要建）；两个以上就
+  如实报错。
+* 不做：`.a` 静态库、`-shared`/`-fPIC`、段 GC、符号版本、调试信息重定位。
+
+回归：`make -C c6c ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
+重定位 / 构造函数顺序 / 跨 `.o` TLS / 缺符号报错 / `readelf` 结构核对）。

@@ -3538,3 +3538,74 @@ Makefile 里本来也记着"`async` 在共享 runner 上偶发段错误"。跑�
   段 GC、`-fPIC` 与 `-shared`。
 * 硬缺口 ②③④⑤（动态链接 / libtcc 嵌入、x86-64 之外的 native 后端、`-g` /
   独立 `.s` / `-b`、库形态与 `find_package(c6 COMPONENTS libtcc)`）都还没动。
+
+## 第 198 轮：自己的静态链接器（`c6c -o prog a.o b.o`）
+
+上一轮把 `.o` 做出来了，可"最后一步"还得借系统 `cc`。这一轮把它也拿回来：
+新增 `src/ld.c6`（≈800 行），输入 ELF64 `ET_REL`，输出 `ET_EXEC`。
+
+**它做的四件事**：
+
+1. **归并段**：`.text` / `.rodata`(.rodata.*) / `.data`(.data.*) / `.bss` /
+   `.init_array` / `.fini_array`；`.comment`、`.note*`、`.eh_frame`、调试段
+   丢掉（连带丢掉指向它们的重定位）。每个输入段在归并段里的起点记下来，
+   后面重定位和布局都靠它。
+2. **符号解析**：本地符号按各自 `.o` 的段起点算地址；全局按名字，强定义盖
+   弱定义，两个强定义报"重复定义"（带上是哪两个 `.o`）；`SHN_COMMON` 当
+   BSS 格子；未定义默认硬报错（退出码 2 + 名字 + 在哪条 `.rela` 里引用的）。
+3. **重定位**：`R_X86_64_64` / `PC32` / `PLT32`（按 PC32 处理）/ `32` /
+   `32S`，越界报错不静默截断。
+4. **合成 `_start`**：取 `argc/argv/envp`（`envp = argv + 8*(argc+1)`）→ 逐个
+   `call` `.init_array` → `call main` → 逐个 `call` `.fini_array`（倒序）→
+   `syscall 60` 退出。栈对齐按 SysV：入口 `rsp%16==0`，`call` 压 8 字节后
+   函数里看到的正是 `rsp%16==8`。
+
+**产物布局**（文件偏移与虚拟地址恒等映射，所以 `p_offset%0x1000 ==
+p_vaddr%0x1000` 自然成立）：`[ELF 头 + 3 个程序头][.text/.rodata: PT_LOAD
+R+X][页对齐][.data/.init_array/.fini_array: PT_LOAD R+W，.bss 走 p_memsz]`
+`+ PT_GNU_STACK(RW)`（不可执行栈）。
+
+**这一轮踩的四个坑**（都进注释了）：
+
+1. **重定位写错地方**：`r_offset` 是**输入段内**的偏移，落到归并缓冲区要加
+   这一段在归并段里的起点，算 `P` 时同理。第一版漏了这步，`R_X86_64_64`
+   写到别的函数头上——症状是 `SIGILL`（好在那条用例的退出码把它抓出来了）。
+2. **析构函数踩掉 main 的返回值**：`call main; mov rdi,rax; <dtor 调用>` 这
+   个顺序里，`rax` 已经被最后一个析构函数的返回值覆盖。改成
+   `call main; mov rbx,rax; <dtor>; mov rdi,rbx`（`rbx` 是调用者保存寄存
+   器，被调函数保证不破坏）。症状：`main` 返回 3，进程却以 0 退出。
+3. **TLS 记账格跨 `.o`**：跑 TLS 初始化的构造函数在 `rt.o` 里，读的是 `rt.o`
+   自己那三个格子（`__c6_tls_img/len/delta`，全零）。用户 TU 里真有 `__thread`
+   变量时 TLS 块压根没建，一访问就段错。链接器现在做一件事：**恰好一个**
+   `.o` 带 TLS 时，把它的三个值抄给所有 `len==0` 的 `.o`；两个以上就报错
+   （各 TU 的 `%fs:` 位移都从 0 附近算，合并要改代码里的位移，重定位里没有）。
+4. **asmblob 的指令跳板重复定义**：`__c6_fsbase`、`__c6_atomic_inc` 这些
+   `asmblob.c6` 里的跳板是"哪个 TU 用到就在那个 TU 发一份"，做成 `GLOBAL`
+   以后两个用了 TLS 的 `.o` 一链就"重复定义 `__c6_fsbase`"。改成 `LOCAL`
+   （它们没有状态，各留各的正是内联语义）。
+
+**实测**（同一台机器）：
+
+```
+c6c -c a.c6 -o a.o && c6c -c b.c6 -o b.o
+c6c -o prog b.o a.o && ./prog; echo $?      # → 45（1+2+42，跨 TU 全局+函数）
+c6c -o prog2 a.o b.o && ./prog2             # → 45（链接顺序无关）
+c6c -c lib/rt.c6 -o rt.o                    # 285144 代码 / 154703 数据 / 400 符号 / 564 重定位
+c6c -Wl,--allow-undefined -o hello hello.o rt.o && ./hello
+  → "hello from c6c linker"，退出码 3；警告：1 个未定义符号按 0 处理（environ）
+c6c -Wl,--allow-undefined -o tlsprog tls.o rt.o && ./tlsprog   # → tv=7
+make -C c6c ldcheck                         # 13/13
+make -C c6c selfhost                        # fixpoint 逐字节相同（3573052 字节）
+make -C c6c fast                            # 全绿（objcheck + ldcheck 都在里面）
+```
+
+**还差的（硬缺口①的尾巴 + 其余四件）**：
+
+* **动态链接**：`DT_NEEDED libc.so.6` + `.plt`/`.got.plt` + `.rela.plt` +
+  `PT_INTERP`。这是硬缺口②的一半，也是"`rt.o` 不用 `--allow-undefined` 就能
+  链接"的前提：那 23 个 libc 名字（`environ`、`openat`、`feof` …）从
+  libc.so.6 解析。做完它，链接器才算真能替掉 `cc`。
+* `.a` 静态库（`ar` 那一层）、`--gc-sections`、`-shared`/`-fPIC`、符号版本、
+  调试信息的重定位。
+* 硬缺口②的另半（**可嵌入的编译库**：`libtcc` 那种"编到内存里再执行"的
+  API）、③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。
