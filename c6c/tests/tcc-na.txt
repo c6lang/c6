@@ -3,11 +3,11 @@
 # 记分板把它们单独算一类（n/a），不算失败；反过来，**不在**这张表里的失败
 # 才是真失败——这样这份记分板才能当验收闸门用，而不是"差多少条"的进度条。
 # 每一条的理由都写死了具体卡点，不许写"暂不支持"这种糊话。
-104_inline	需要 tcc 自己 libtcc1.a 里的 check_exports（我们没有链接器，也没有那份库）
+104_inline	要 tcc 自己 libtcc1.a 里的 check_exports；上游 tests2/Makefile 自己就是用 104+_inline.c 替代（只编不跑），而那份变体 c6c 已干净编过
 113_btdll	需要 tcc 自己的 tcc_backtrace
-114_bound_signal	要 tcc 的 -b 边界检查运行时 + __sigsetjmp，是 tcc 自己的扩展
-120_alias	要第二个 TU（inunit2.c）—— 没有链接器
-146_tls_extern	要第二个 TU
+114_bound_signal	要 tcc 的 -b 边界检查运行时：用例有 main、会被真跑，光补 __sigsetjmp 不够（要 pthread/fork/signal/longjmp 一整套）
+120_alias	要第二个 TU（inunit2.c），没有链接器；上游同样用 120+_alias.c 替代，c6c 已干净编过那份变体
+146_tls_extern	TLS 本身是好的（144_tls 就是靠 lib/rt.c6 的 TLS 过的），缺的只是"值定义在另一个 TU" —— 没有链接器
 140_arm64_extasm	arm64 汇编（上游在 x86-64 上也跳）
 145_winarm64_interlocked	要 windows.h + win-arm64 内建函数（上游也跳）
 99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
