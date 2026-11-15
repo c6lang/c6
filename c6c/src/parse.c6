@@ -957,25 +957,50 @@ static int DEF_DEPTH;      /* 前向声明：块嵌套深度（定义在后面�
 
 static int C6_TU_SEEN;      /* 这个编译单元里有 .c6 文件（主文件就是） */
 
+/* in_c6_tu() 的按文件缓存：文件 id → 后缀类别（1 = `.c6`，2 = `.h`，3 = 别的）。
+ * 这个判断每个 token 都要被问一次（`c6_kw()` 撒在声明、表达式、语句解析的每个
+ * 岔路口），原来每问一次就 strlen(路径) + memcmp 走一遍路径字符串——c6c 自己
+ * 1.2 MB 源码上有几百万次，profiler 里占 2.7%。后缀不会变，按文件 id 记一次就
+ * 够；`.h` 的答案还取决于 C6_TU_SEEN（从 .c6 里 include 进来的头文件也按 c6 的
+ * 规矩查），所以这一位每次现判。 */
+#define C6K_MAX 8192
+static u8 C6K_CLASS[C6K_MAX];
+
 static int in_c6_tu(void)
 {
     Tok *t = pa_cur();
-    SrcFile *f = t ? file_by_id(t->file) : NULL;
+    SrcFile *f = NULL;
+    u32 id = 0;
+    u8 k = 0;
     size_t n = 0;
 
-    if (!f || !f->path)
+    if (!t)
         return 0;
-    n = strlen(f->path);
-    if (n > 3 && memcmp(f->path + n - 3, ".c6", 3) == 0) {
+    id = t->file;
+    if (id < C6K_MAX)
+        k = C6K_CLASS[id];
+    if (!k) {
+        f = file_by_id(id);
+        if (!f || !f->path)
+            return 0;
+        n = strlen(f->path);
+        if (n > 3 && memcmp(f->path + n - 3, ".c6", 3) == 0)
+            k = 1;
+        else if (n > 2 && memcmp(f->path + n - 2, ".h", 2) == 0)
+            k = 2;
+        else
+            k = 3;
+        if (id < C6K_MAX)
+            C6K_CLASS[id] = k;
+    }
+    if (k == 1) {
         /* 记一笔：从 .c6 里 include 进来的头文件（`.h`）也按 c6 的规矩查
          * （tests/errors/loc.c6 的 test_sizeof_in_header：头文件里不能
          * `int g;` 这样定义未初始化的对象）。 */
         C6_TU_SEEN = 1;
         return 1;
     }
-    if (C6_TU_SEEN && n > 2 && memcmp(f->path + n - 2, ".h", 2) == 0)
-        return 1;
-    return 0;
+    return (k == 2 && C6_TU_SEEN) ? 1 : 0;
 }
 
 /* c6 的软关键字（`shared` / `weak` / `own` / `closure` / `try` / `@` …）只在
@@ -1189,6 +1214,15 @@ static void pa_func_def(Sym *s, Declarator *d);
  * tu_static_name() 加 `$<TU>` 后缀。自带运行时算 TU 0，命令行上的源文件
  * 从 TU 1 起。 */
 static u32 PA_TU;
+/* 输入文件个数：只有多 TU 才需要给 static 符号分家（见 tu_static_name）。
+ * 驱动（main.c6）在开编之前把命令行上的文件数传进来；不传就是 1 = 单文件。 */
+static u32 PA_NFILES = 1;
+
+static void pa_set_nfiles(u32 n)
+{
+    PA_NFILES = n ? n : 1;
+}
+
 /* 文件作用域 `static` 的**发射名**：拿不到模块前缀那套（static 本来就
  * 不跨模块），换成 TU 后缀 —— `helper$2`。符号表里仍是短名 `helper`
  * （本 TU 内的解析、诊断、方法表全按短名走），只有落到镜像里的名字分家：
@@ -1199,6 +1233,11 @@ static const char *tu_static_name(const char *nm)
     char buf[256] = {0};
 
     if (!nm)
+        return nm;
+    /* 单文件（自编译就是）根本不需要分家：直接返回原名，省掉每个 static 符号
+     * 一次 snprintf + 一次 arena 复制（c6c 自己两千多个 static 函数，实测
+     * 1~2 ms）。多 TU 才走下面那条路。 */
+    if (PA_NFILES <= 1)
         return nm;
     snprintf(buf, sizeof(buf), "%s$%u", nm, (unsigned)PA_TU);
     return arena_strdup(&A_main, buf);

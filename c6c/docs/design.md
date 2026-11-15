@@ -584,6 +584,12 @@ pa_begin_multi(out, argv0, with_rt)   ① 一次性初始化：符号表/类型�
 | 类型表 | **共享**（hash-consing，跨 TU 同构的类型就是同一个 id） | GC 环检查要跨 TU 看引用链（`tests/errors/gc_cycle_cross_tu.c6`） |
 | 宏 | **隔离**（每个 TU 重新 `pp_reset()`） | 不然 `-DDEFS` 那一遍会漏到下一遍 |
 
+**单文件是绝大多数编译（自编译就是），它不许为多 TU 付任何钱**：`PA_NFILES`
+（`main.c6` 在开编之前调 `pa_set_nfiles(O.nfiles)`）为 1 时，`tu_static_name()`
+原样返回名字，不做 `snprintf` + `arena` 复制；`sym_tu_begin()` 压根不会被调到；
+`pp_reset()` 单文件只跑一次（和以前一样）。这条口径是有硬指标的（`make
+bench-c6c` 的 `self:src/c6c.c6`），改 §17 的代码时要盯着 `PA_NFILES` 这个岔路。
+
 那块作用域里重声明一个文件作用域 `static` 函数（`{ int f6(int); … }`）时，
 新符号的落点名要跟文件作用域那条声明走，也是带后缀的那个名字——否则就指向一个
 镜像里不存在的 ELF 符号（`129_scopes`）。数据段初始化器里写函数名

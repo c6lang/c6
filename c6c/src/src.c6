@@ -98,15 +98,50 @@ typedef struct ModHdr {
 
 static ModHdr MODHDR;
 
+/* 这一行的行首（跳过空格/制表符）是不是 `module ` / `import `？ */
+static int c6_line_kw(const char *d, size_t ls, size_t le)
+{
+    size_t k = ls;
+
+    while (k < le && (d[k] == ' ' || d[k] == '\t'))
+        k++;
+    return le - k > 7 && (memcmp(d + k, "module ", 7) == 0
+                          || memcmp(d + k, "import ", 7) == 0);
+}
+
+/* 整份文件里有没有需要改写的行。用 memchr 找行尾，逐**行**走一遍很便宜
+ * （c6c 自己 3.4 万行只要 ~0.2 ms）。 */
+static int c6_has_module_lines(const char *d, size_t n)
+{
+    size_t i = 0;
+
+    while (i < n) {
+        const char *q = memchr(d + i, '\n', n - i);
+        size_t le = q ? (size_t)(q - d) : n;
+
+        if (c6_line_kw(d, i, le))
+            return 1;
+        i = q ? le + 1 : n;
+    }
+    return 0;
+}
+
 static char *c6_rewrite_modules(const char *data, size_t size, int *out_owned)
 {
     size_t i = 0;
     size_t cap = size + 4096;
-    char *out = malloc(cap);
+    char *out = NULL;
     size_t o = 0;
 
     memset(&MODHDR, 0, sizeof(MODHDR));
     *out_owned = 0;
+    /* 绝大多数 .c6 是"没有 module/import、以换行结尾"的普通文件（c6c 自己那
+     * 20 个源文件就是）：那种文件抄一遍和原样用**逐字节相同**，没理由为它
+     * malloc 1.2 MB、逐字节搬一趟、再 strlen 一趟——自编译实测这一趟 ~2 ms。
+     * 真出现 module/import（或者末行没换行，抄的时候会补一个）才走慢路。 */
+    if (size > 0 && data[size - 1] == '\n' && !c6_has_module_lines(data, size))
+        return NULL;
+    out = malloc(cap);
     if (!out)
         return NULL;
     while (i < size) {
@@ -210,15 +245,29 @@ static void src_note_modhdr(SrcFile *f)
  * 列号会往前挪两个字节，可以接受。
  *
  * gcc 默认把三字符组当"忽略的扩展"（-std=c99 下才开），但 C99 6.4.6 是
- * 标准要求，所以按标准做。没有 `?` 的文件只多一趟 strchr，几乎不要钱。 */
+ * 标准要求，所以按标准做。没有 `??` 的文件只多几趟 memchr，几乎不要钱；
+ * 有 `?` 但没有 `??`（三元表达式满地都是）也一样不改写——**只有真出现
+ * `??` 才走下面那趟逐字节左移**，否则 1.2 MB 源码白扫一遍（自编译实测 ~2 ms）。 */
 static void src_trigraphs(char *p, size_t *size)
 {
     size_t r = 0;
     size_t w = 0;
     size_t n = *size;
+    const char *q = NULL;
 
-    if (!p || n == 0 || !strchr(p, '?'))
+    if (!p || n == 0)
         return;
+    {
+        const char *cur = p;
+
+        while ((q = memchr(cur, '?', n - (size_t)(cur - p))) != NULL) {
+            if (q[1] == '?')
+                break;      /* 真有 `??`：走改写 */
+            cur = q + 1;
+        }
+        if (!q)
+            return;
+    }
     while (r < n) {
         if (p[r] == '?' && r + 2 < n && p[r + 1] == '?') {
             char m = 0;
@@ -323,8 +372,15 @@ static void src_build_lines(SrcFile *f)
         return;
     f->lines = arena_alloc(&A_main, (size_t)cap * sizeof(u32));
     f->lines[n++] = 0;
-    for (i = 0; i < f->size; i++) {
-        if (f->data[i] == '\n') {
+    /* 找行首用 memchr 整段跳：逐字节扫 1.2 MB 要 4~5 ms（占 c6c 自编译的 5%），
+     * memchr 是向量化的，同样的活几乎免费。 */
+    while (i < f->size) {
+        const char *q = memchr(f->data + i, '\n', f->size - i);
+
+        if (!q)
+            break;
+        i = (size_t)(q - f->data);
+        {
             if (n + 1 >= cap) {
                 u32 ncap = cap * 2;
                 u32 *nl = arena_alloc(&A_main, (size_t)ncap * sizeof(u32));
@@ -335,6 +391,7 @@ static void src_build_lines(SrcFile *f)
             }
             f->lines[n++] = (u32)(i + 1);
         }
+        i++;
     }
     f->nlines = n;
     f->line_cap = cap;
