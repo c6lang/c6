@@ -2979,3 +2979,11 @@ _Static_assert(__builtin_types_compatible_p(const int *, int *) == 0,
 `gen_glob_obj()` 的顶层调用点往回找就能看到）。修好后
 `tests/c/llvm-only.txt` 里那三条（`init_bound` / `cleanup_attr` /
 `alloca_runtime`）就能放回 LLVM 后端跑。
+
+**再加一条线索**：`gen_one_global()`（`parse.c6` 里 `s = sym_add(...)` 那几行）对
+**每次声明**都无条件 `s->goff = data_alloc(sz, ...)` + `x64_data_sym(&X64, s->name,
+ELF_HDR + s->goff)`。也就是说同一个对象只要被"声明"两次（同一 TU 里的重复声明、
+静态局部的别名提升、或者前面某趟预扫描先建过一次），数据段就会多分一块；
+而 `x64_data_sym()` 是**按名字**取符号再覆盖 offset，于是"谁最后写谁赢"，
+初始化器写的那块和代码早前拿到的 id 可能不是同一块。修法大概就是"已经有 goff
+就别再分配"（注意 `goff == 0` 是合法偏移，别用真值判断，得有个显式标记）。
