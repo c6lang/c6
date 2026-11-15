@@ -3009,3 +3009,11 @@ static int g = 42;
 （`glob_store(s->goff, 0, ty, v)` 之类）在 LLVM 模式下是不是被跳过了——
 `data_u64`/`glob_store` 直接写 `DATA_IMG`，前端不应该分后端；怀疑是标量初值
 走了一条"运行期赋值"的 IR 路径（native 能跑，LLVM 的 `c6c_init_data` 覆盖不到）。
+
+**顺带修掉一个真的悬垂指针**（不是上面那个症状的成因）：`gen_one_global()` 里
+`s = sym_add(...)` 拿到的是符号表里的槽，而解析初始化器（`const_expr()`、
+`gen_glob_braced_new()` 里的 `str_lit_data()` 等）会继续 `sym_add`，符号表一扩容
+搬家 `s` 就悬垂了。现在把 `data_alloc` 得到的 `goff` 立刻抄进局部量，后面只用
+它；`s->type = …` 那处先 `sym_find` 重新取一次。改完全绿（fixpoint 11092320 →
+11103840），但 LLVM 那条症状没变，说明成因在别处（`glob_store` 收到的 goff 仍然
+是 154620，说明 scalar 初值走的根本是 `gen_glob_braced_new → INIT_GOFF` 那条路）。
