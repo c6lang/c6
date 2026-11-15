@@ -30,6 +30,7 @@ make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 | 编译期诊断 | `make diagtest` | 314/314 | ✅ |
 | 三后端同一套用例 | `make c99test llvmtest` | C99 33/33、LLVM 29/29（LLVM 有 4 条走 `tests/c/llvm-only.txt`，见文末已知缺陷） | ✅ |
 | 能编出 tcc 并自检 | `make build-tcc` | 出体，且这个 tcc 跑 tests2 **118/144** | ✅ |
+| 语言层 C99 外部闸门 | `make c99suite` | 语言层 100%：`LANG+OUT == 0`（当前 通过 149 / 超出口径 1） | ✅ 见 (5) |
 
 ## (2) G2c：c6c 编出 tcc，这个 tcc 跑上游用例
 
@@ -52,6 +53,36 @@ i386/arm64/win-arm64 代码、`114` 要 tcc 的 `-b` 边界检查运行时。剩
 `100` 卡同一件事（限定符要进**嵌套层级**的 type id——现在只进了顶层），
 `101` 要 65536 个同时活跃的栈槽（vreg 是 16 位）。完整清单见 `tests/tcc-na.txt`，
 那里面每条都写了具体卡点，记分板按它分类，不在表里的失败一律算意外失败。
+
+## (5) 语言层 C99 外部闸门：`make c99suite`
+
+自产用例只能证明"我们自己想到的都过"，证明不了"标准里还有没想到的"。所以引一份
+外部标准用例当闸门：`third_party/c-testsuite/single-exec/`（scc 的 c-testsuite，
+150 条 portable 单文件用例，ISC，见那里的 README）。
+
+口径是 `tests/single-exec` 的原样口径：编出可执行 → 跑 → stdout+stderr 必须逐字节
+等于 `.c.expected`、**退出码必须是 0**。只有退出码变了、输出一样的用例（`00046`
+这类）也记失败——上游就是这么判的。
+
+判定顺序（先摘掉"不是 c6c 的账"，再看自己的红）：
+
+| 类 | 含义 |
+|---|---|
+| `PASS` | 与 `.expected` 一致且退出码 0 |
+| `LANG` | 前端编不过（语法/语义/诊断）——**闸门只盯这一类加 OUT** |
+| `OUT` | 编过了但输出对不上，或退出码非 0 |
+| `LIB` | 链接期缺符号 —— 按"语言 100%，库不管"的口径单列，不挡闸门 |
+| `STALE` | 上游 `.expected` 过期：gcc `-std=c99` 编同一份、跑出来也对不上 |
+| `SKIP` | gcc `-std=c99` 都编不过（用例本身不是合法 C99） |
+| `N/A` | 写进 `tests/c99-out-of-scope.txt` 的超口径用例（C11 才有的语言特性），每条都写了具体卡点 |
+
+当前：**通过 149 / 语言层失败 0 / 输出不符 0 / 库缺符号 0 / 上游 expect 旧 0 /
+用例不成立 0 / 超出口径 1（共 150）**。唯一那条 `00046` 是 C11 匿名成员
+（6.7.2.1p13），卡点在同构匿名聚合共用 type id：`struct { struct {int d;}; struct
+{int e;}; }` 里 `e` 的偏移取成 0。
+
+这条闸门还没并进 `check-all`：先把 `LANG+OUT` 清零，再接进去（`c6c/Makefile` 里
+`c99suite` 目标旁边有注释记着这件事）。
 
 ## (4) 性能与内存
 

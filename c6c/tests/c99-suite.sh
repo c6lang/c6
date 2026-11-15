@@ -12,6 +12,8 @@
 #   STALE  上游 .expected 本身过期：拿 gcc -std=c99 编同一份、跑出来也对不上。
 #          这类是套件自己的账，不算 c6c 的
 #   SKIP   gcc -std=c99 都编不过（用例不是合法 C99，常见于故意写错的负例）
+#   N/A    超出口径的用例（C11 才有的语言特性等），清单在 tests/c99-out-of-scope.txt，
+#          每条都写了具体卡点。它们照样跑、照样显示，只是不挡闸门
 #
 # 判定顺序保证了"不是 c6c 的错"先被摘出去：先用 gcc 当 oracle，再把 c6c 的
 # 失败按 LANG/LIB 分开，最后才比输出。
@@ -29,6 +31,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$HERE/../..}
 SUITE=${SUITE:-$ROOT/third_party/c-testsuite/single-exec}
 ORACLE_CC=${ORACLE_CC:-gcc}
+OOS=${OOS:-$HERE/c99-out-of-scope.txt}
 VERBOSE=0
 FILTER=""
 JOBS=${JOBS:-1}
@@ -54,6 +57,15 @@ if [ ! -x "$C6C" ]; then
     echo "找不到可执行的 C6C：$C6C（先 make build）" >&2
     exit 2
 fi
+
+# 超出口径的用例清单（tests/c99-out-of-scope.txt：`用例名 原因`）
+oos_has() {
+    [ -f "$OOS" ] || return 1
+    grep -q "^$1 " "$OOS"
+}
+oos_reason() {
+    grep "^$1 " "$OOS" | sed "s/^$1 //"
+}
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -138,6 +150,7 @@ out=0
 lib=0
 stale=0
 skip=0
+na=0
 i=0
 for src in "$SUITE"/*.c; do
     [ -e "$src" ] || continue
@@ -152,6 +165,16 @@ for src in "$SUITE"/*.c; do
     vl=$(cat "$v")
     tags=""
     [ -f "$src.tags" ] && tags=$(tr '\n' ',' <"$src.tags" | sed 's/,$//')
+    if oos_has "$base"; then
+        case "$vl" in
+        PASS*) [ "$VERBOSE" = 1 ] && \
+            printf 'N/A    %-8s 已经过了，可以从 c99-out-of-scope.txt 里删掉\n' "$base" ;;
+        *) na=$((na + 1))
+           printf 'N/A    %-8s %s\n' "$base" "${vl}"
+           printf '       卡点：%s\n' "$(oos_reason "$base")" ;;
+        esac
+        continue
+    fi
     case "$vl" in
     PASS*) pass=$((pass + 1)) ;;
     LANG*) lang=$((lang + 1))
@@ -170,10 +193,10 @@ for src in "$SUITE"/*.c; do
     esac
 done
 
-total=$((pass + lang + out + lib + stale + skip))
+total=$((pass + lang + out + lib + stale + skip + na))
 echo
 echo "c-testsuite（语言层 C99）：通过 $pass / 语言层失败 $lang / 输出不符 $out" \
-    "/ 库缺符号 $lib / 上游 expect 旧 $stale / 用例不成立 $skip（共 $total）"
+    "/ 库缺符号 $lib / 上游 expect 旧 $stale / 用例不成立 $skip / 超出口径 $na（共 $total）"
 if [ "$lang" -ne 0 ] || [ "$out" -ne 0 ]; then
     echo "闸门：红（LANG+OUT = $((lang + out))，语言层 C99 还没到 100%）"
     exit 1
