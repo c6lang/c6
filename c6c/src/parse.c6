@@ -1232,7 +1232,8 @@ typedef struct Declarator {
     u8 vla_multi;       /* 1 = 多维 VLA，vla_bytes/vla_str 有效 */
     u32 vla_str[8];     /* 行 stride（vreg，字节；最内维不用，按元素大小缩放） */
     u32 vla_bytes;      /* 整块字节数（vreg） */
-    u8 ptr_depth;       /* 这个声明符里已经吃掉几层 `*`（`int (*p)[m]` 要认出来） */
+    u8 ptr_depth;       /* 这个声明符里已经吃掉几层 `*` */
+    u8 paren;           /* 套过括号声明符：`int (*p)[m]` 才是"指向数组的指针" */
     PVla pvla;          /* 多维 VLA 形参的形状（见 PVla；nd == 0 = 不是） */
     PVla *pvla_head;    /* 函数声明符：形参们留下的形状记录链 */
     u32 type;           /* 解析出来的完整类型（形参/抽象声明符也要用） */
@@ -5625,7 +5626,10 @@ static u32 dims_apply(u32 t, Declarator *d, u32 *dims, u32 *dimv, u8 *dimr, int 
      * 跟着**这个指针**走，类型里没有地方放它（c6c 的类型是静态 id）。以前这条
      * 会静默按 `sizeof(元素)` 缩放，`p[i][j]` 读出来是垃圾；与其算错，不如说清。
      * 多维 VLA 本身请写成 `int a[n][m]` 这种"数组形参"形式（那条现在支持）。 */
-    if (d && d->ptr_depth > 0 && (nrun > 0 || npar > 0)) {
+    /* 只有"括号声明符 + 有指针层"才是"指向数组的指针"（`int (*p)[m]`）。
+     * `void *addr[count]` 是**指针数组**：ptr_depth 也是 1，但数组本身是对象、
+     * 元素才是指针，那条路是支持的一维 VLA（tcc tests2/79_vla_continue 就是它）。 */
+    if (d && d->paren && d->ptr_depth > 0 && (nrun > 0 || npar > 0)) {
         pa_error("暂不支持指向变长数组的指针（`int (*p)[m]`）：运行期 stride 没有"
                  "地方放；请写成数组形参 `int p[][m]`、或自己按 `p[i * m + j]` 算");
     }
@@ -6926,6 +6930,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
         pa_advance();                 /* ( */
         inner = parse_declarator(base, d);
         pa_expect_ch(')');
+        d->paren = 1;
         d->type = decl_fill_hole(inner, nptr, d, pq);
         d->is_func = ty_is_func(d->type);
         return d->type;
