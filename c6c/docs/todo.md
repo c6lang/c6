@@ -3052,3 +3052,20 @@ c6_printf 里的变参取值 ✗                     ← 问题在这里
 下一次直接看 `c6_printf` 怎么走 `va_start`/`va_arg`（它自己就是 c6c 编出来的），
 对比"能跑对的 29 条 LLVM 用例"里 printf 的调用形状，就能定位。**别再查前端和
 数据段了**，那两段已经用 gdb 证伪。
+
+**再往下试了两条，把范围压到"变参读取"本身**：
+
+```c
+printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "hi|7" */
+```
+
+也就是**所有**变参在 LLVM 后端都读成 0/null。检查过的事实：`c6_printf` 的定义确实
+带 `...`（`define i64 @c6_printf(i64 %arg0, ...)`）、`%struct.__va_list_tag` 在模块
+开头有正确定义（`{ i32, i32, ptr, ptr }`）、入口有 `call void @llvm.va_start.p0(ptr %ap)`、
+取参是 `va_arg ptr %ap, i64`——形状全对，而且 gdb 里 `c6_printf` 入口的 `rsi` 就是
+传进来的值。所以嫌疑落在"`va_start` 的调用点落在 `memset`/若干 `getelementptr`
+之后，llc 在 -O0 下把寄存器 save area 的处理放错了位置"这一类 ABI 细节上。
+
+下一步（留给以后）：把 `va_start` 提到函数第一条指令，或者干脆手写一块
+`@__c6l_ap` 缓冲区 + 自己按 SysV ABI 摆 `gp_offset/fp_offset/overflow_arg_area/
+reg_save_area`（native 后端在 `x64.c6` 里就是这么干的，照抄即可）。
