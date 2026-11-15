@@ -1,0 +1,61 @@
+# 由 tcc/CMakeLists.txt 生成，cmake -P 执行；每次构建由 tcc-config 调用。
+set(_tcc_src "/media/winger/_dde_data/superc/tcc")
+set(_tcc_gen "/media/winger/_dde_data/superc/out/tcc/generated")
+set(_tcc_make "/usr/bin/gmake")
+set(_tcc_cmake "/usr/bin/cmake")
+set(_tcc_clean FALSE)
+
+# 比较时剥掉 owner 注释：同配置的多个构建目录只需更新 owner，不必 clean；
+# 功能配置（如 CONFIG_static）真的变了才清旧目标文件。
+function(_tcc_functional content out)
+  string(REGEX REPLACE "# c6-build-dir: [^\n]*\n" "" _s "${content}")
+  set(${out} "${_s}" PARENT_SCOPE)
+endfunction()
+
+foreach(_tcc_name IN ITEMS config.mak config.h config.texi)
+  set(_tcc_from "${_tcc_gen}/${_tcc_name}")
+  set(_tcc_to "${_tcc_src}/${_tcc_name}")
+  set(_tcc_new "")
+  set(_tcc_old "")
+  file(READ "${_tcc_from}" _tcc_new)
+  if(EXISTS "${_tcc_to}")
+    file(READ "${_tcc_to}" _tcc_old)
+  endif()
+  _tcc_functional("${_tcc_new}" _tcc_new_key)
+  _tcc_functional("${_tcc_old}" _tcc_old_key)
+  if(NOT _tcc_new_key STREQUAL _tcc_old_key)
+    set(_tcc_clean TRUE)
+  endif()
+  if(NOT _tcc_new STREQUAL _tcc_old)
+    execute_process(COMMAND "${_tcc_cmake}" -E copy_if_different
+      "${_tcc_from}" "${_tcc_to}" RESULT_VARIABLE _tcc_r)
+    if(NOT _tcc_r EQUAL 0)
+      message(FATAL_ERROR "tcc: 同步 ${_tcc_name} 失败 (${_tcc_r})")
+    endif()
+    message(STATUS "tcc: 同步 ${_tcc_name}")
+  endif()
+endforeach()
+
+# EXTRA-DEFS / CFLAGS / 额外 make 变量不进 config.mak，用 config.sig 单独
+# 记录「上次成功应用的签名」，变化也要触发清理。
+set(_tcc_sig_new "")
+set(_tcc_sig_old "")
+if(EXISTS "${_tcc_gen}/config.sig")
+  file(READ "${_tcc_gen}/config.sig" _tcc_sig_new)
+endif()
+if(EXISTS "${_tcc_gen}/config.applied")
+  file(READ "${_tcc_gen}/config.applied" _tcc_sig_old)
+endif()
+if(NOT _tcc_sig_new STREQUAL _tcc_sig_old)
+  set(_tcc_clean TRUE)
+endif()
+
+if(_tcc_clean)
+  message(STATUS "tcc: 配置变化，清理旧目标文件")
+  execute_process(COMMAND "${_tcc_make}" -C "${_tcc_src}" clean
+    RESULT_VARIABLE _tcc_r)
+  if(NOT _tcc_r EQUAL 0)
+    message(FATAL_ERROR "tcc: make clean 失败 (${_tcc_r})")
+  endif()
+endif()
+file(WRITE "${_tcc_gen}/config.applied" "${_tcc_sig_new}")

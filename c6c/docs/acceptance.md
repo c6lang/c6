@@ -86,6 +86,7 @@ G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个�
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
 | 自己的静态链接器 | `make ldcheck` | 13/13：两个自足 `.o` 真链真跑（退出码 45）、`rt.o` 的 **564 条重定位**全部应用后 hello 输出与退出码都对、构造函数在 `main` 之前、跨 `.o` TLS 记账格、缺符号退出码 2、`readelf` 结构（ET_EXEC / 两个 PT_LOAD / 栈不可执行） | ✅ |
 | 动态链接（`-Wl,--dynamic`） | `make dyncheck` | 14/14：`DT_NEEDED libc.so.6` + `PT_INTERP` + PLT/GOT + `BIND_NOW`；`rt.o` 的 22 个 libc 函数真从 libc 解析（`getpid`/`getppid`/`strlen`/`getcwd` 返回值逐字对、退出码 7）；`readelf` 逐项核对 ET_EXEC / 两个 `PT_LOAD` / JUMP_SLOT 条数 = 导入个数；数据符号（`environ`）点名警告；默认静态仍对未定义符号报错 | ✅ |
+| 数组下标边界检查（`-b`） | `make bcheck` | 9/9：越界写/越界读都拦住（停在越界语句前，stderr 点名 `index 5` / `[0, 3)`，退出码 2）、界内访问加不加 `-b` 输出一致（sum=62）、二维行越界与结构体数组字段越界都拦、指针下标与 VLA 不误报、`-run -b` 同效、不加 `-b` 默认不检查 | ✅ |
 | `-c` 出可重定位目标文件 | `make objcheck` | 11/11：单/多 TU 真编、系统链接器真链、真跑；ET_REL 类型 / 段表 / `PLT32+UND` / `R_X86_64_64` / `LOCAL` 绑定逐条核对 | ✅ |
 | 可嵌入的编译库（`libc6c`） | `make embedcheck` | 6/6：宿主程序链 `.a` 与 `.so` 都能把 c6 源码编进内存、就地跑 `main`（`printf` 走自带运行时）、`c6_get_symbol` 取到地址、`c6_output_file` 落盘的程序独立跑通（退出码 42）、编译失败经 `c6_error` 如实报告、二次编译被拒绝、`tcc_*` 兼容层一条龙 | ✅ |
 | 库形态与安装契约 | `make pkgcheck` | 7/7：`C6_ENABLE_TCC=OFF` 也能 configure + install（`bin/c6` / `libc6c.a`+`.so` / `include/c6lib.h`+`libtcc.h` / `lib/c6/rt.c6`+自带头 / `c6.pc`+`c6lib.pc` / `c6Config.cmake` 逐项核对）、`include/` 不盖系统头、`find_package(c6 COMPONENTS libtcc)` 的 `c6::libtcc` 真编真跑、`pkgconf --cflags --libs c6lib` 的旗子 `-Wall -Werror` 编得过、换成别的前缀装出来的 `c6` 自找 include 与 rt | ✅ |

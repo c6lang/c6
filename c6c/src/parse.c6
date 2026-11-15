@@ -8407,6 +8407,45 @@ static Sym *fnlit_parse_sym(void);
 static u32 parse_param_list(u32 fnret, Declarator *d);
 static u32 slice_len_load(u32 sadd);
 
+/* ---- -b：数组下标的边界检查 ----
+ * 打开 PA_BCHECK 之后，对**数组**类型的下标访问在取址之前插一段检查：
+ *
+ *   c = (unsigned)idx < n        无符号比较：负数下标变成巨大值，一次抓住
+ *   br c ? ok : fail
+ * fail: call c6c_bound_fail(idx, n)  不返回（打印一行、退出码 2）
+ * ok:   ...原来的取址...
+ *
+ * 只对"编译期知道长度的数组"生效。指针下标、VLA 的边界要么得在运行期才知道
+ * （VLA 的 length 不在类型里）、要么根本不存在（`int *p` 没有边界可言），
+ * 那些地方不插检查——这一点和 tcc 的 -b 一样：按手上有的信息来，不假装能查
+ * 所有内存访问。
+ */
+static int PA_BCHECK;
+
+static void pa_set_bcheck(int v) { PA_BCHECK = v ? 1 : 0; }
+
+static void pa_bound_check(u32 idx, u32 n)
+{
+    u32 k = irfn_vreg(&FN);
+    u32 c = irfn_vreg(&FN);
+    u32 z = irfn_vreg(&FN);
+    u32 lfail = 0;
+    u32 lok = 0;
+
+    irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, n);
+    irfn_push(&FN, IR_CMP, IRT_U64, c, idx, k, 0, 0);
+    irfn_setcc(&FN, IRCC_ULT);
+    lfail = irfn_label(&FN);
+    lok = irfn_label(&FN);
+    irfn_push(&FN, IR_BR, IRT_VOID, 0, c, lok, lfail, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lfail, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, idx, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, k, 0, 0, 1);
+    irfn_push(&FN, IR_CALL, IRT_VOID, z, 0, 0, 0, x64_sym(&X64, "c6c_bound_fail"));
+    FN.ops[FN.n - 1].narg = 2;
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lok, 0, 0, 0);
+}
+
 static u32 gen_postfix_ops(u32 v)
 {
     for (;;) {
@@ -8649,6 +8688,9 @@ static u32 gen_postfix_ops(u32 v)
             esz = ty_size(elem);
             if (esz == 0)
                 esz = 1;
+            /* -b：编译期知道长度的数组，下标先过一道边界检查 */
+            if (PA_BCHECK && !vstr && ty_is_array(bty) && ty_array_n(bty) > 0)
+                pa_bound_check(idx, ty_array_n(bty));
             off = irfn_vreg(&FN);
             if (vstr) {
                 /* 多维 VLA 的这一维：乘**运行期**行 stride（`b[i]` 要跳过
