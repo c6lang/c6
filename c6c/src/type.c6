@@ -75,6 +75,7 @@ static u32 ty_intern_full(u8 kind, u8 qual, u16 align, u32 size, u32 nkid, u32 a
 static void tt_grow(void);
 static u32 ty_size(u32 id);
 static u16 ty_align_of(u32 id);
+static u32 ty_array(u32 elem, u32 n);
 
 /* 每个 32 位值一次乘法（FNV-1a 的做法）。原来是逐字节四次乘法，而
  * ty_intern_full 每个类型至少要混 6 个值 —— 类型 interning 占 3% 的指令，
@@ -245,13 +246,33 @@ static u32 ty_float(void)   { return ty_leaf(TY_FLOAT, 0, 4, 4); }
 static u32 ty_double(void)  { return ty_leaf(TY_DOUBLE, 0, 8, 8); }
 static u32 ty_ldouble(void) { return ty_leaf(TY_LDOUBLE, 0, 16, 16); }
 
-/* typeof：类型已经是 intern 过的 id，重新限定只需要再 intern 一次 */
+/* typeof：类型已经是 intern 过的 id，重新限定只需要再 intern 一次。
+ *
+ * `bits` 只有聚合类型才有，所以喂给 `ty_hash` 的位数只能取 `t->bits ? t->nkid : 0`。
+ * 以前这里无条件传 `nkid`，而 PTR/ARRAY/FUNC 的 `bits` 是 NULL —— 指针层一有
+ * 限定符就会在 `ty_hash` 里解引用空指针。
+ *
+ * 数组上的限定符按 C11 6.7.3p9 落到**元素**上（`typedef restrict int *arr[2]`
+ * 里的 restrict 归元素，不是数组自己）：`restricted_pointer[2]` 与
+ * `restrict pointer_array` 必须是同一个类型 id（tcc tests2/100_c99array-decls）。
+ * 函数类型上的限定符无意义，直接吞掉。 */
 static u32 ty_qual(u32 id, u8 add)
 {
     C6Type *t = TY_AT(id);
+    u32 nb = 0;
 
+    if (!add || t->kind == TY_FUNC)
+        return id;
+    if (t->kind == TY_ARRAY) {
+        u32 e = ty_qual(t->kids[0], add);
+
+        if (e == t->kids[0])
+            return id;
+        return ty_array(e, t->a);
+    }
+    nb = t->bits ? t->nkid : 0;
     return ty_intern_full(t->kind, (u8)(t->qual | add), t->align, t->size, t->nkid,
-                          t->a, t->b, t->tag, t->kids, t->nkid, t->bits, t->offs);
+                          t->a, t->b, t->tag, t->kids, nb, t->bits, t->offs);
 }
 
 static u32 ty_ptr(u32 elem)
@@ -259,6 +280,19 @@ static u32 ty_ptr(u32 elem)
     u32 k = elem;
 
     return ty_intern_full(TY_PTR, 0, 8, 8, 1, 0, 0, TY_NO_TAG, &k, 0, NULL, NULL);
+}
+
+/* 带限定符的指针层：`int *const`、`int *restrict`。限定符写在 `*` 后面时
+ * 修饰的是**这一层指针类型**（C11 6.7.6.1p2），所以它必须进类型 id——
+ * 否则 `__builtin_types_compatible_p(int **, restricted_pointer *)` 会把
+ * `typedef int *restrict restricted_pointer` 当成 `int *`（tests2/100）。 */
+static u32 ty_ptr_q(u32 elem, u8 qual)
+{
+    u32 k = elem;
+
+    if (!qual)
+        return ty_ptr(elem);
+    return ty_intern_full(TY_PTR, qual, 8, 8, 1, 0, 0, TY_NO_TAG, &k, 0, NULL, NULL);
 }
 
 /* 闭包类型：一个机器字，指向堆上的 {代码指针, 捕获变量…}。
@@ -291,11 +325,14 @@ static int ty_is_closure(u32 id, u32 *fty)
 static u32 ty_unqual(u32 t)
 {
     C6Type *x = TY_AT(t);
+    u32 nb = 0;
 
     if (!x->qual)
         return t;
+    /* 位数只对聚合类型有意义（`x->a` 是数组元素个数，不是位数） */
+    nb = x->bits ? x->nkid : 0;
     return ty_intern_full(x->kind, 0, x->align, x->size, x->nkid, x->a, x->b,
-                          x->tag, x->kids, x->a, x->bits, x->offs);
+                          x->tag, x->kids, nb, x->bits, x->offs);
 }
 
 static u32 ty_thread(void)
@@ -329,18 +366,24 @@ static u32 ty_array(u32 elem, u32 n)
                           &k, 0, NULL, NULL);
 }
 
+/* 函数类型的**顶层**限定符一律丢掉（C11 6.7.6.3p15：形参的顶层限定符不影响
+ * 函数类型，返回类型的顶层限定符也一样）。`int *const p` 的形参符号本身还是
+ * 带限定的（`&p` 是 `int *const *`，tests2/149_parameter_qualifiers），但函数
+ * 类型里必须是 `int *`（`void declared_const(int *pointer)` 才和它兼容）。
+ * tests2/150_return_qualifiers 查的是返回类型这一半。 */
 static u32 ty_func(u32 ret, const u32 *params, u32 n, u32 variadic)
 {
     u32 sc[TY_PARAM_MAX] = {0};
     u32 *kids = sc;
     u32 r = 0;
+    u32 i = 0;
 
     if (n + 1 > TY_PARAM_MAX) {
         kids = arena_alloc(&A_main, (size_t)(n + 1) * sizeof(u32));
     }
-    kids[0] = ret;
-    if (n)
-        memcpy(kids + 1, params, (size_t)n * sizeof(u32));
+    kids[0] = ty_unqual(ret);
+    for (i = 0; i < n; i++)
+        kids[i + 1] = ty_unqual(params[i]);
     r = ty_intern_full(TY_FUNC, 0, 1, 0, n + 1, n, variadic, TY_NO_TAG, kids, 0, NULL, NULL);
     return r;
 }
