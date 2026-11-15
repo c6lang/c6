@@ -23,7 +23,7 @@ make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 | 项 | 命令 | 要求 | 当前 |
 |---|---|---|---|
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
-| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11092320 字节逐字节相同） |
+| 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11128160 字节逐字节相同） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
 | tests/ 语料 | `make test` | 前端 123/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
