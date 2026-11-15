@@ -221,6 +221,94 @@ static u32 lex_block_comment_end(const char *d, u32 p, u32 size)
     }
 }
 
+/* 不生效的预处理区域（`#if 0`、没走到的 `#else` 分支……）整行整行地跳。
+ *
+ * 原来这块是“照常词法、拿到 token 再看 pp_active() 丢掉”：tcc.c 走一遍
+ * 690846 次 lex_next，其中 254447 次（37%）落在不生效的区域里，
+ * 白扫了 82 万字节（占全部标识符字节的一半）。这里直接从**行首**跳到下一个
+ * “行首（可以带空白）是 '#'”的位置，中间的整行连词法都不做。
+ *
+ * 只认四种东西，其余一律按普通字节走过：
+ *   - 块注释 / 行注释：注释里的 '#' 不是指令；
+ *   - 反斜杠续行：拼接之后 '#' 不在行首，不算指令；
+ *   - 字符串/字符常量：里面的 '#' 同理（`puts("#");`）。
+ * 行号是 src_line_of() 二分查表算的，跟词法走不走这些行无关。
+ * 调用方保证 L->at_bol 为真（当前在行首），返回时也停在行首。 */
+static void lex_skip_inactive(Lex *L)
+{
+    char *d = L->data;
+    u32 size = L->size;
+    u32 p = L->pos;
+
+    for (;;) {
+        u32 q = p;
+
+        while (q < size && (d[q] == ' ' || d[q] == '\t' || d[q] == '\r'))
+            q++;
+        if (q >= size) {
+            L->pos = size;
+            return;
+        }
+        if (d[q] == '#') {
+            L->pos = q;
+            L->at_bol = 1;
+            return;
+        }
+        p = q;
+        for (;;) {
+            char c = 0;
+
+            if (p >= size) {
+                L->pos = size;
+                return;
+            }
+            c = d[p];
+            if (c == '\n') {
+                p++;
+                break;
+            }
+            if (c == '\\' && (d[p + 1] == '\n'
+                              || (d[p + 1] == '\r' && d[p + 2] == '\n'))) {
+                p += (d[p + 1] == '\n') ? 2 : 3;
+                continue;
+            }
+            if (c == '/' && d[p + 1] == '*') {
+                u32 e = lex_block_comment_end(d, p + 2, size);
+
+                if (e > size) {
+                    L->pos = size;
+                    return;
+                }
+                p = e;
+                continue;
+            }
+            if (c == '/' && d[p + 1] == '/') {
+                while (p < size && d[p] != '\n')
+                    p++;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                int qc = c;
+
+                p++;
+                while (p < size && d[p] != '\n') {
+                    if (d[p] == '\\' && d[p + 1]) {
+                        p += 2;
+                        continue;
+                    }
+                    if (d[p] == qc) {
+                        p++;
+                        break;
+                    }
+                    p++;
+                }
+                continue;
+            }
+            p++;
+        }
+    }
+}
+
 static void lex_skip(Lex *L, Tok *t)
 {
     char *d = L->data;

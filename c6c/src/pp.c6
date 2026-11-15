@@ -246,6 +246,11 @@ static int raw_next(Tok *out)
             return TK_EOF;
         }
         if (s->is_file) {
+            /* 不生效的区域整行跳（见 lex_skip_inactive）：at_bol 为真说明正站在
+             * 行首，可以安全地一次跳过若干整行。tcc.c 上 37% 的 lex_next 调用
+             * 原本都落在这里面，白扫了一半的源字节。 */
+            if (s->lex.at_bol && !pp_active())
+                lex_skip_inactive(&s->lex);
             /* 直接词法到 out 里：原来先建一个局部 Tok、再整块拷给 out，
              * 每个 token 两次 40 字节的搬运（profile 里是实打实的开销）。
              * out 只是调用方的临时落脚点，中途丢弃的 token 写进去也没关系。 */
