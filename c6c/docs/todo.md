@@ -3071,3 +3071,11 @@ printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "h
 ——`x64.c6` 里那块（`gp_offset / fp_offset / overflow_arg_area / reg_save_area`，
 `IR_VASTART` 的 case 就是）是能跑通的，LLVM 后端照抄成"手写一张 va_list 结构 +
 `va_arg` 也按那张结构取"，绕开 `llvm.va_start` 这个 intrinsic 就行。
+
+**又排除了两条**：`llc -O1` / `-O2` 编同一份 IR 结果一样（`(null)|0`），所以不是
+`-O0` 的寄存器 save-area 摆放问题；`va_start` 提到第一条指令也试过、同样无效。
+剩下大概率是 c6c 给变参函数生成的帧形状（一个巨大的 `alloca [frame x i8]` +
+`memset`）和 `llvm.va_start` 的 lowering 不兼容。真要修，建议**别用 intrinsic**：
+照 `x64.c6` 里 `IR_VASTART` 那段，自己按 SysV ABI 摆 `gp_offset / fp_offset /
+overflow_arg_area / reg_save_area`，`IR_VAARG` 也按同一张结构取——native 后端
+二十多行就干完了，LLVM 这边同样能这么干。
