@@ -15851,6 +15851,12 @@ static void gen_stmt(void)
             pa_error("case 只能出现在 switch 里");
         }
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbl, 0, 0, 0);
+        /* 和名字标号同一条规矩：`case N:` 后面那条语句是**被标号**的语句，
+         * 必须在这儿一起生成。`switch (x) case 1: return 1;` 这种不带花括号的
+         * switch 以前就把 `return 1;` 漏在了 switch 外面——x 不是 1 也照跑
+         * （c-testsuite single-exec/00051）。 */
+        if (!pa_is_ch('}'))
+            gen_stmt();
         return;
     }
     if (PA_ACCEPT_IDENT("default")) {
@@ -15861,6 +15867,8 @@ static void gen_stmt(void)
         } else {
             pa_error("default 只能出现在 switch 里");
         }
+        if (!pa_is_ch('}'))
+            gen_stmt();
         return;
     }
     if (PA_ACCEPT_IDENT("switch")) {
