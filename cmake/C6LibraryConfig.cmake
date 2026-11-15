@@ -1,5 +1,11 @@
 # 生成并安装 CMake 包配置（find_package(c6)）与 pkgconf 元数据。
 
+# 这两个文件描述的是 libtcc（find_package(c6) COMPONENTS libtcc / pkgconf c6），
+# 没有 tcc 就没有库可描述；OFF 时跳过，避免装出指向不存在产物的元数据。
+if(NOT C6_ENABLE_TCC)
+  return()
+endif()
+
 # ---------------------------------------------------------------------------
 # 5. CMake 库配置：find_package(c6) -> c6::libtcc / c6::compiler
 # ---------------------------------------------------------------------------

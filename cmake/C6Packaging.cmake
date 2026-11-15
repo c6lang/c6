@@ -17,6 +17,13 @@
 # Release，这样 deb 的排序（0.2.0~rc1 < 0.2.0）才是正确的。
 # ---------------------------------------------------------------------------
 
+# 没有 tcc 就没有可打的包：CPack 复用 install() 清单，而 C6_ENABLE_TCC=OFF
+# 时光那条清单本身是空的（见 cmake/C6Install.cmake）。
+if(NOT C6_ENABLE_TCC)
+  message(STATUS "c6: C6_ENABLE_TCC=OFF —— 不生成打包配置（没有 tcc 安装清单）")
+  return()
+endif()
+
 set(C6_PACKAGE_RELEASE "1" CACHE STRING
     "DEB/RPM 的 Release 字段；CI 可注入构建号，例如 42.1a2b3c4")
 set(C6_PACKAGE_PRERELEASE "" CACHE STRING

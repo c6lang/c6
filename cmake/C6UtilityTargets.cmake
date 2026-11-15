@@ -4,21 +4,36 @@
 # 用 CMAKE_CURRENT_BINARY_DIR 而不是硬编码源码树里的 build/。
 set(_c6_tree_artifacts "${CMAKE_CURRENT_BINARY_DIR}/tests")
 
-add_custom_target(c6-clean
-  COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
-  COMMAND sh -c "rm -f '${C6_TCC_DIR}'/libtcc1-*.a"
-  COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6_TCC_DIR}" clean
-  COMMENT "c6: 清理自举/裸机/交叉产物与 tcc/ 目标文件"
-  VERBATIM USES_TERMINAL)
+if(C6_ENABLE_TCC)
+  add_custom_target(c6-clean
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
+    COMMAND sh -c "rm -f '${C6_TCC_DIR}'/libtcc1-*.a"
+    COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6_TCC_DIR}" clean
+    COMMENT "c6: 清理自举/裸机/交叉产物与 tcc/ 目标文件"
+    VERBATIM USES_TERMINAL)
 
-add_custom_target(clean-all
-  COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
-  COMMAND sh -c "rm -f '${C6_TCC_DIR}'/libtcc1-*.a"
-  COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6_TCC_DIR}" distclean
-  COMMAND "${CMAKE_COMMAND}" -E rm -f
-          "${CMAKE_CURRENT_BINARY_DIR}/tcc/generated/config.applied"
-  COMMENT "c6: 连生成的 config.mak/config.h 一起清理（之后需重新 cmake -S . -B build）"
-  VERBATIM USES_TERMINAL)
+  add_custom_target(clean-all
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
+    COMMAND sh -c "rm -f '${C6_TCC_DIR}'/libtcc1-*.a"
+    COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6_TCC_DIR}" distclean
+    COMMAND "${CMAKE_COMMAND}" -E rm -f
+            "${CMAKE_CURRENT_BINARY_DIR}/tcc/generated/config.applied"
+    COMMENT "c6: 连生成的 config.mak/config.h 一起清理（之后需重新 cmake -S . -B build）"
+    VERBATIM USES_TERMINAL)
+else()
+  # C6_ENABLE_TCC=OFF：没有 tcc 的目标文件可清，只清回归产物与 c6c 的构建目录。
+  add_custom_target(c6-clean
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_CURRENT_SOURCE_DIR}/c6c/build"
+    COMMENT "c6: 清理回归产物与 c6c/build（本次未构建 tcc）"
+    VERBATIM USES_TERMINAL)
+
+  add_custom_target(clean-all
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf ${_c6_tree_artifacts}
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_CURRENT_SOURCE_DIR}/c6c/build"
+    COMMENT "c6: 清理回归产物与 c6c/build（本次未构建 tcc）"
+    VERBATIM USES_TERMINAL)
+endif()
 add_custom_target(distclean)
 add_dependencies(distclean clean-all)
 

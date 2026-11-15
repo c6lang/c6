@@ -22,6 +22,15 @@
 
 cmake_minimum_required(VERSION 3.20)
 
+# 只要配置、不要构建：父项目 `-DC6_ENABLE_TCC=OFF`（tcc 退出工具链）时用它。
+# 这一步仍然生成 config.mak / config.h / config.texi —— c6c 的 build-tcc /
+# tests1 / tests2 把 tcc 的**源码**当语料编，缺了这些配置头就编不过；但
+# tcc-build / tcc-build-plain / tcc-clean 与 tcc::c6 / tcc::libtcc 都不定义，
+# 任何构建入口都不会去编 tcc 的二进制或库。
+option(TCC_CONFIGURE_ONLY
+  "只生成 config.mak/config.h/config.texi，不定义构建目标与 IMPORTED target"
+  OFF)
+
 set(TCC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 file(READ "${TCC_SOURCE_DIR}/VERSION" TCC_VERSION)
 string(STRIP "${TCC_VERSION}" TCC_VERSION)
@@ -429,22 +438,25 @@ else()
   set(TCC_PC_PRIVATE_LIBS "-lm -ldl -lpthread")
 endif()
 
-add_executable(tcc::c6 IMPORTED GLOBAL)
-set_target_properties(tcc::c6 PROPERTIES
-  IMPORTED_LOCATION "${TCC_OUTPUT_DIR}/c6${TCC_EXESUF}")
+if(NOT TCC_CONFIGURE_ONLY)
+  add_executable(tcc::c6 IMPORTED GLOBAL)
+  set_target_properties(tcc::c6 PROPERTIES
+    IMPORTED_LOCATION "${TCC_OUTPUT_DIR}/c6${TCC_EXESUF}")
 
-# 静态 / 共享在配置期就已确定，用精确的 IMPORTED 类型而不是 UNKNOWN，
-# 消费方才能拿到正确的链接语义（PIC、RPATH、传递依赖）。
-add_library(tcc::libtcc ${TCC_LIBTCC_KIND} IMPORTED GLOBAL)
-set_target_properties(tcc::libtcc PROPERTIES
-  IMPORTED_LOCATION "${TCC_OUTPUT_DIR}/${TCC_LIBTCC_FILENAME}"
-  INTERFACE_INCLUDE_DIRECTORIES "${TCC_SOURCE_DIR}"
-  INTERFACE_LINK_LIBRARIES "${TCC_INTERFACE_LINK_LIBS}")
+  # 静态 / 共享在配置期就已确定，用精确的 IMPORTED 类型而不是 UNKNOWN，
+  # 消费方才能拿到正确的链接语义（PIC、RPATH、传递依赖）。
+  add_library(tcc::libtcc ${TCC_LIBTCC_KIND} IMPORTED GLOBAL)
+  set_target_properties(tcc::libtcc PROPERTIES
+    IMPORTED_LOCATION "${TCC_OUTPUT_DIR}/${TCC_LIBTCC_FILENAME}"
+    INTERFACE_INCLUDE_DIRECTORIES "${TCC_SOURCE_DIR}"
+    INTERFACE_LINK_LIBRARIES "${TCC_INTERFACE_LINK_LIBS}")
+endif()
 
 # ---------------------------------------------------------------------------
-# 5. 构建 / 清理目标
+# 5. 构建 / 清理目标（TCC_CONFIGURE_ONLY 时整段跳过：只要配置，不要构建）
 # ---------------------------------------------------------------------------
 
+if(NOT TCC_CONFIGURE_ONLY)
 # Makefile 生成器下用 $(MAKE) 继承 CMake 的 jobserver；其它生成器没有
 # jobserver，退回显式 -j。这样 `cmake --build build --parallel N` 的并发度
 # 能一路传到子 make，而不是被硬编码的 -j 覆盖。
@@ -495,6 +507,7 @@ add_custom_target(tcc-distclean
   WORKING_DIRECTORY "${TCC_SOURCE_DIR}"
   COMMENT "tcc: 清理构建产物与生成的配置（需重新 cmake 配置）"
   VERBATIM USES_TERMINAL)
+endif()  # NOT TCC_CONFIGURE_ONLY
 
 # ---------------------------------------------------------------------------
 # 6. 导出给父项目：目标靠 IMPORTED target，其余只保留少量语义变量
