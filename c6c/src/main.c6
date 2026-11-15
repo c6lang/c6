@@ -18,7 +18,8 @@ enum {
     M_OBJ,      /* -c：单文件、freestanding、_start 直接调 main */
     M_EXE,      /* 默认：单文件 + 自带运行时 → 可执行文件 */
     M_RUN,      /* -run：编到临时 ELF，exec 它（不落盘、不留输出） */
-    M_LINK      /* 输入是 .o：调自己的静态链接器（ld.c6）链成可执行文件 */
+    M_LINK,     /* 输入是 .o：调自己的静态链接器（ld.c6）链成可执行文件 */
+    M_ASM       /* -S：只出汇编文本（asmout.c6），不写 ELF */
 };
 
 typedef struct Opts {
@@ -94,6 +95,7 @@ static void usage(FILE *fp)
         "                       PASS/FAIL 行 + \"N test(s), M failure(s)\" 收尾，\n"
         "                       失败数当退出码；给 -o 就只写文件不跑\n"
         "  -test-filter=子串     只跑描述里含这个子串的 test 块（-test 用）\n"
+        "  -S                   只出汇编文本（x86-64 / GNU as 语法，交给 as 或 cc 汇编）\n"
         "  -g                   调试信息：行号表 + DWARF 段（-c 出的 .o 里带上，\n"
         "                       用系统 cc/gcc 链接后可 gdb/addr2line）\n"
         "  -b                   数组下标边界检查（越界打印一行、退出码 2；\n"
@@ -498,6 +500,9 @@ static int parse_args(int argc, char **argv)
             O.mode = M_E;
         } else if (strcmp(a, "-c") == 0) {
             O.mode = M_OBJ;
+        } else if (strcmp(a, "-S") == 0) {
+            /* 出汇编文本（x86-64，GNU as 语法），不写 ELF */
+            O.mode = M_ASM;
         } else if (strcmp(a, "-g") == 0) {
             /* 调试信息：行号表 + DWARF 段（-c 出 .o 时带上，见 dw.c6） */
             O.debug = 1;
@@ -868,7 +873,8 @@ int main(int argc, char **argv)
     }
     case M_OBJ:
     case M_EXE:
-    case M_RUN: {
+    case M_RUN:
+    case M_ASM: {
         /* M_OBJ 出 ET_REL（真正的 .o，可重定位，见 obj.c6）；M_EXE / M_RUN 出
          * 可直接执行的静态 ELF。 */
         SrcFile *sf = NULL;
@@ -880,6 +886,9 @@ int main(int argc, char **argv)
 
         if (O.mode == M_OBJ && !O.out)
             out = obj_default_out(O.files[0], objname, sizeof(objname));
+        if (O.mode == M_ASM && !O.out)
+            out = obj_default_out(O.files[0], objname, sizeof(objname));
+        aso_set_mode(O.mode == M_ASM);
         if (O.mode == M_OBJ && O.nfiles > 1) {
             /* 一个 .o 对应一个 TU。多个输入要分别出 .o，那得把编译拆成多次
              * 跑（符号表 / 数据段 / 代码段都是整份镜像一份）。先如实拒绝，
@@ -915,8 +924,8 @@ int main(int argc, char **argv)
             int fi = 0;
 
             rc = pa_begin_multi(out, argv[0],
-                                (O.mode == M_EXE || O.mode == M_RUN || tmp_out)
-                                && !O.nostdlib);
+                                (O.mode == M_EXE || O.mode == M_RUN || O.mode == M_ASM
+                                 || tmp_out) && !O.nostdlib);
             for (fi = 0; rc == 0 && fi < O.nfiles; fi++) {
                 pp_reset();
                 sf = src_load(O.files[fi]);
@@ -950,7 +959,8 @@ int main(int argc, char **argv)
             pp_push_file(sf, -1);
             push_defines();
             rc = pa_compile_ex(out, argv[0],
-                               (O.mode == M_EXE || O.mode == M_RUN || tmp_out) && !O.nostdlib);
+                               (O.mode == M_EXE || O.mode == M_RUN || O.mode == M_ASM
+                                || tmp_out) && !O.nostdlib);
         }
         PA_QUIET_OUT = 0;
         if (O.verbose)

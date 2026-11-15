@@ -3911,3 +3911,45 @@ calc.c6  --c6c --emit-llvm -nostdlib-->  calc.ll
 只有 x86-64。要做 c6c 自己的 aarch64 后端，得新写一套 emit（寄存器分配沿用现有
 的"每个 vreg 一个栈槽"模型，但指令选择、调用约定、重定位类型全要重来），并且
 需要 qemu 之外的运行期验收（现在有 qemu-aarch64，验收这一环是通的）。
+
+## 第 205 轮：`-S` 汇编文本（④ 的最后一件）
+
+`src/asmout.c6`（新，~700 行）：把 IR 直接落成 x86-64 汇编文本（GNU as，Intel
+语法）。关键是**和 native 后端共用一套约定**，不另立一套语义：
+
+```
+每个 vreg 一个栈槽：[rbp-16*(n+1)]           （同 X64_SLOT）
+二元运算：a → rax，b → rcx，结果写 dst 槽
+比较：cmp + setcc，0/1 物化进 dst
+分支：BR 看槽里 0/非 0；JMP/LABEL → .L<函数序号>_<标签>
+调用：IR_ARG 收实参 → SysV 寄存器（>6 个压栈），CALL 后存 rax
+序言 push rbp / mov rbp,rsp / sub rsp,frame；IR_RET 里 leave / ret
+```
+
+文件是自足的：`.intel_syntax noprefix` 开头、带 `_start`、数据段用 `.byte`
+原样写出并按偏移插符号标签、末尾 `.note.GNU-stack`。
+
+踩的四个坑：
+1. **外层循环变量被内层覆盖**：`IR_CALL` 里装实参用了 `for (i = 0; ...)`，把
+   外层 op 游标 `i` 冲掉 → 死循环（编译 300 秒不返回）。
+2. **Intel 语法的内存操作数要写 `ptr`**：`movsxd rax, dword [rax]` 被 gas 当成
+   `[rax+dword]`，编出 `movslq 0x4(%rax),%rax`——症状是函数返回值全错
+   （`add(2,3)*10` 给出 0）。改成 `dword ptr [rax]` 就对了。
+3. **`.intel_syntax` 必须最先出现**，所以正文先攒在另一个缓冲里，最后拼前导。
+4. `-S` 一度落进 `main()` 里 scan 的兜底分支（switch 里没给它 case，后面那段
+   "M_E 否则 scan"直接接了）——症状是 `-S` 打出一份 token 统计。
+
+**实测**：
+
+```
+$ c6c -S -nostdlib prog.c6 -o prog.s
+c6c: prog.s（汇编文本：2 个函数 / 6166 字节）
+$ cc -x assembler -nostdlib -static -o prog prog.s && ./prog; echo $?
+91                     # 与 c6c -o 出的 native 程序一致
+$ make -C c6c asmcheck # 12/12（八个程序逐一对照 native 退出码）
+$ make -C c6c selfhost # fixpoint 逐字节相同（3767373 字节 / 5499 符号）
+```
+
+**范围**：整数/指针运算、控制流、调用、递归、结构体、全局数据都能出文本；浮点、
+变参、内联汇编、TLS 尚未实现——遇到会点名报错并拒绝写文件（所以现在还不能用
+`-S` 编带 `rt.c6` 的程序）。这是 ④ 的最后一件：`-g`/`-b`/`-S` 三样都落地了。

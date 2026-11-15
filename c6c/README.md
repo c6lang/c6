@@ -221,6 +221,34 @@ libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查�
 ET_EXEC / 两个 `PT_LOAD` / `PT_INTERP` / `PT_DYNAMIC` / `DT_NEEDED` /
 `BIND_NOW` / JUMP_SLOT 条数、`ldd` 认得 libc、默认静态仍会对未定义符号报错）。
 
+## 汇编文本：`-S`
+
+`-S` 出 **x86-64 汇编文本**（GNU as 的 Intel 语法），不写 ELF：
+
+```sh
+./c6c/build/c6c -S -nostdlib prog.c6 -o prog.s
+cc -x assembler -nostdlib -static -o prog prog.s && ./prog
+```
+
+* 从 IR 直接生成（`src/asmout.c6`），和 native 后端**同一套约定**：每个 vreg 一个
+  栈槽（`[rbp-16*(n+1)]`）、二元运算 a→rax / b→rcx、比较结果物化成 0/1、调用走
+  SysV 寄存器、`IR_RET` 里 `leave/ret`。所以两条路出的是同一串语义，只是这边交给
+  as 去编码；
+* 文件是**自足的**：`.intel_syntax noprefix` 开头，带 `_start`（`argc/argv` →
+  `main` → `exit`）、数据段用 `.byte` 原样写出并按偏移插符号标签，末尾还有
+  `.note.GNU-stack`；
+* 符号名里的 `$`（TU 私有名的后缀）会换成 `.`——gas 的符号名收不了 `$`，所有
+  引用都走同一个改名函数，所以是自洽的。
+
+范围（v1）：整数/指针的运算、控制流、调用、递归、结构体、全局数据都能出文本；
+**浮点、变参、内联汇编、TLS 还没写**，遇到会点名报错（`c6c: -S 暂不支持 i2f
+（函数 …）`）并**拒绝写文件**——不做"静默产出一份错的 .s"。也就是说现在还不能
+用 `-S` 编自带运行时（`rt.c6`）的程序，要用 `-nostdlib`。
+
+回归：`make -C c6c asmcheck`（12 条：循环/调用/数组/递归/结构体/switch/全局量/
+位运算八个程序都是"c6c → .s → 系统 as → 真跑"，退出码与 native 后端逐一对齐；
+`.intel_syntax` / `_start` / C 名符号都在；没实现的 op 会拒绝写文件）。
+
 ## 调试信息：`-g`
 
 `-g` 配 `-c` 出 .o，里面带一套 DWARF（v4 子集）：**函数名、函数地址范围、

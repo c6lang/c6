@@ -20857,6 +20857,10 @@ static int pa_finish(const char *out)
     }
     if (llvm_mode())
         return llvm_finish(out);
+    if (aso_on()) {                 /* -S：写汇编文本，不写 ELF */
+        aso_write(out);
+        return aso_had_error() ? 1 : 0;
+    }
     {
         /* 布局：[ELF 头 120][数据段][代码]。
          * 代码发在 CODE_IMG 里，**就地**回填、就地写出——不再把它和数据段

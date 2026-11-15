@@ -1338,6 +1338,13 @@ static void x64_dbg_line(u32 off, u32 line)
     X64_NDBGLN++;
 }
 
+/* -S：不出机器码，走 asmout.c6 的文本生成（同一份 IR、同一套槽位约定）。
+ * 定义在 asmout.c6（obj.c6 之后 include），这里先声明。 */
+static int aso_on(void);
+static void aso_compile(X64State *st, IrFn *f, u32 func_sym);
+static void aso_write(const char *path);
+static int aso_had_error(void);
+
 static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
 {
     u32 dbg_fn = 0xffffffffu;
@@ -1355,6 +1362,10 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
                 f->nparams, f->is_variadic, st->frame);
         for (q = 0; q < f->n; q++)
             ir_dump(stderr, &f->ops[q]);
+    }
+    if (aso_on()) {
+        aso_compile(st, f, func_sym);
+        return;
     }
     st->fn = f;
     st->va_bytes = f->is_variadic ? X64_VA_BYTES : 0;
