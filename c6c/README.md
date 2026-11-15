@@ -21,6 +21,10 @@
 
 ```sh
 cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --parallel
+cmake --build build --target check-c6c        # 验收 (1)(2)(3)（一条命令）
+cmake --build build --target check-c6c-perf   # 再加上验收 (4)
+
+# 等价的细粒度入口（CI 用这几个）：
 ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4) 性能/内存
 ```
