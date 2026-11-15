@@ -9,7 +9,7 @@
 | 文档 | 内容 |
 |---|---|
 | [docs/plan.md](docs/plan.md) | 目标、验收口径、实测基线、阶段计划、风险 |
-| [docs/design.md](docs/design.md) | 架构、流式 IR（16 字节/条）、三后端、类型表位分配、镜像与落盘 |
+| [docs/design.md](docs/design.md) | 架构、流式 IR（24 字节/条）、三后端、类型表位分配、镜像与落盘 |
 | [docs/concurrency.md](docs/concurrency.md) | 协程 / 线程 / 原子 / TLS |
 | [docs/modules.md](docs/modules.md) | 模块前缀、`import`、std/ 的 153 个模块 |
 | [docs/todo.md](docs/todo.md) | 逐轮账本：做过什么、结论是什么、哪些是硬限制 |
@@ -69,3 +69,21 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 回归：`make -C c6c runflag`。
 
 许可证：`LICENSE` 为 MIT，与 `tcc/`（LGPL-2.1）严格分离；若项目所有者另有安排，替换本文件即可。
+
+## 跑 `test "…" { }` 块：`-test`
+
+```sh
+./c6c/build/c6c -test my_test.c6                 # 跑全部 test 块（用户 main 不执行）
+./c6c/build/c6c -test -test-filter=切片 x.c6     # 只跑描述里含"切片"的块
+./c6c/build/c6c -test -o x my_test.c6 && ./x     # 只写文件，之后自己跑
+./c6c/build/c6c -test x.c6 tests/tu/x.c6         # 多 TU 的块一起登记
+```
+
+输出协议和 tcc 的 native 运行器（`tcc/tccrun.c` 的 `tcc_run_tests`）逐字一致，
+所以两个编译器可以互相替换：每块一行 `PASS: 描述` / `FAIL: 描述: 错误消息`
+（FAIL 行走 stderr），收尾一行 `N test(s), M failure(s)` 在 stdout 最后，
+**失败数当退出码**（全过是 0）。一个块都没有、或 `-test-filter` 过滤空了时
+静默退出 0。不给 `-o` 时编到 `$TMPDIR` 的临时 ELF 再 `exec`（和 `-run` 同一条
+路径），给了 `-o` 就只写文件不跑。只支持 native 后端；`-c`、`-E`、
+`-fsyntax-only`、`--emit-c`、`--emit-llvm`、`-nostdlib` 都跟它互斥。
+回归：`make -C c6c testflag`。

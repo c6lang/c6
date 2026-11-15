@@ -176,12 +176,12 @@ c6c -E ... tcc/tcc.c > pp.c  &&  tcc -c pp.c -o pp.o     # 必须 0 诊断
 
 ## 5. IR
 
-**编码**：16 字节定长记录，流式追加。
+**编码**：24 字节定长记录，流式追加。
 
 ```c
 typedef struct C6Ir {
     u8  op; u8 type; u8 narg; u8 flags;
-    u16 dst; u16 a; u16 b; u16 c;
+    u32 dst; u32 a; u32 b; u32 c;   /* vreg / label 编号：32 位 */
     u32 imm;                 /* 常量下标 / 标签 / 偏移 / 符号 id */
 } C6Ir;
 ```

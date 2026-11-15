@@ -43,6 +43,10 @@ typedef struct Opts {
      * 从那儿往后的所有参数原样交给程序（tcc 同款语义）。 */
     int run;
     int run_argi;
+    /* -test：跑 test 块、不跑用户 main；默认编到临时 ELF 再 exec（tcc 的
+     * -test 就是"跑起来"），给了 -o 就只写文件不跑。 */
+    int test;
+    const char *test_filter;
 } Opts;
 
 static Opts O;
@@ -69,6 +73,10 @@ static void usage(FILE *fp)
         "  -c                   单文件 freestanding 可执行文件（不带运行时）\n"
         "  -run 文件 [参数...]   编成临时 ELF 后立刻执行（参数原样传给 main；\n"
         "                       退出码照抄；不写输出文件，仅 native 后端）\n"
+        "  -test                跑所有 `test \"…\" { }` 块（用户 main 不执行）：\n"
+        "                       PASS/FAIL 行 + \"N test(s), M failure(s)\" 收尾，\n"
+        "                       失败数当退出码；给 -o 就只写文件不跑\n"
+        "  -test-filter=子串     只跑描述里含这个子串的 test 块（-test 用）\n"
         "  -nostdlib            不自动带上 c6c 自带运行时（lib/rt.c6）\n"
         "  -v                   详细输出\n"
         "  --version            版本\n"
@@ -461,6 +469,25 @@ static int parse_args(int argc, char **argv)
             O.mode = M_E;
         } else if (strcmp(a, "-c") == 0) {
             O.mode = M_OBJ;
+        } else if (strcmp(a, "-test") == 0 || strcmp(a, "--test") == 0) {
+            /* 和 tcc 的 -test 同一件事：跑 test 块、不跑用户 main。
+             * 不给 -o 就编到临时 ELF 再 exec（c6c 没有"进程内执行"那条路）。 */
+            O.test = 1;
+        } else if (strncmp(a, "-test-filter", 12) == 0
+                   && (a[12] == 0 || a[12] == '=')) {
+            const char *val = a + 12;
+
+            if (*val == '=') {
+                val++;
+            } else if (*val == 0) {
+                if (i + 1 >= argc) {
+                    diag_error_plain("-test-filter 需要参数");
+                    return -1;
+                }
+                i++;
+                val = argv[i];
+            }
+            O.test_filter = val;
         } else if (strcmp(a, "-run") == 0 || strcmp(a, "--run") == 0) {
             /* -run 后面的选项照常解析（"c6c -run -DDEBUG x.c6" 合法），
              * 第一个非选项是程序本体，它后面的参数全归程序。 */
@@ -534,7 +561,7 @@ static int parse_args(int argc, char **argv)
                 return -1;
             }
             O.files[O.nfiles++] = a;
-            if (O.run) {
+            if (O.run && !O.test) {
                 /* 它就是程序，argv[0] 用源文件名（和 tcc -run 一致）；
                  * 从这里往后的 argv 不再属于编译器。 */
                 O.run_argi = i;
@@ -542,7 +569,7 @@ static int parse_args(int argc, char **argv)
             }
         }
     }
-    if (O.run) {
+    if (O.run && !O.test) {
         if (O.mode != M_RUN) {
             diag_error_plain("-run 不能和 --scan/-fsyntax-only/-E/-c 一起用");
             return -1;
@@ -559,6 +586,32 @@ static int parse_args(int argc, char **argv)
             diag_error_plain("-run 需要一个源文件");
             return -1;
         }
+    }
+    if (O.test) {
+        if (O.mode == M_SCAN || O.mode == M_CHECK || O.mode == M_E || O.mode == M_OBJ) {
+            diag_error_plain("-test 不能和 --scan/-fsyntax-only/-E/-c 一起用");
+            return -1;
+        }
+        if (c99_mode() || llvm_mode()) {
+            diag_error_plain("-test 只支持 native 后端（--emit-c / --emit-llvm 要先落盘）");
+            return -1;
+        }
+        /* 报告的 PASS/FAIL 行走的是自带运行时的 __c6c_test_run()，没有它就没法
+         * 按 tcc 的口径报；与其静默跑成"没有输出"，不如直接说清楚。 */
+        if (O.nostdlib) {
+            diag_error_plain("-test 需要自带运行时的测试报告助手（去掉 -nostdlib）");
+            return -1;
+        }
+        if (O.nfiles == 0) {
+            diag_error_plain("-test 需要一个源文件");
+            return -1;
+        }
+        /* -test 自己就是"编完就跑"：清掉 -run 的痕迹（后面本来都是程序参数，
+         * 而测试入口不收参数），输出到临时 ELF 还是 -o 由 main() 决定。 */
+        O.run = 0;
+        O.run_argi = 0;
+        if (O.mode == M_RUN)
+            O.mode = M_EXE;
     }
     return 0;
 }
@@ -708,9 +761,11 @@ int main(int argc, char **argv)
          * 真正的 ET_REL 目标文件 + 自己的链接器在 P4 落地。 */
         SrcFile *sf = NULL;
         const char *out = O.out ? O.out : "a.out";
+        /* -run 和"没给 -o 的 -test"都走临时 ELF：编完就地 exec，退出码照抄 */
+        int tmp_out = (O.mode == M_RUN) || (O.test && !O.out);
         int rc = 0;
 
-        if (O.mode == M_RUN) {
+        if (tmp_out) {
             if (run_make_tmp() < 0)
                 return 2;
             out = RUN_PATH;
@@ -730,7 +785,7 @@ int main(int argc, char **argv)
                 if (!sf) {
                     diag_error_plain("打不开源文件 '%s'", O.files[fi]);
                     PA_QUIET_OUT = 0;
-                    if (O.mode == M_RUN)
+                    if (tmp_out)
                         unlink(RUN_PATH);
                     return 2;
                 }
@@ -738,14 +793,25 @@ int main(int argc, char **argv)
             }
         }
         push_defines();
+        if (O.test)
+            pa_set_test_mode(O.test_filter ? O.test_filter : "");
         rc = pa_compile_ex(out, argv[0],
-                           (O.mode == M_EXE || O.mode == M_RUN) && !O.nostdlib);
+                           (O.mode == M_EXE || O.mode == M_RUN || tmp_out) && !O.nostdlib);
         PA_QUIET_OUT = 0;
         if (O.verbose)
             mod_report();
-        if (O.mode == M_RUN) {
-            if (rc == 0)
-                rc = run_elf(argv + O.run_argi);
+        if (tmp_out) {
+            if (rc == 0) {
+                if (O.test) {
+                    /* 测试入口不收参数（tcc 的 -test 也一样） */
+                    char *targv[2] = {0};
+
+                    targv[0] = RUN_PATH;
+                    rc = run_elf(targv);
+                } else {
+                    rc = run_elf(argv + O.run_argi);
+                }
+            }
             unlink(RUN_PATH);
         }
         return rc;

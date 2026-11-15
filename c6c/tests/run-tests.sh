@@ -13,6 +13,19 @@ set -u
 C6C=${C6C:-./build/c6c}
 ROOT=${ROOT:-..}
 JOBS=${JOBS:-1}
+# 用例运行时统一按 **Linux 默认栈**（8 MB）跑：开发机常见 64 MB，会把"深递归
+# 吃栈"这类问题藏到 CI（8~16 MB）才炸一次——gc_field 的 20001 节点长链释放、
+# defer_scope 的深递归都这么在 CI 上失败过。C6C_TEST_STACK=0 关掉这项限制；
+# 非 Linux 平台自动关掉（`ulimit -s` 的单位不一样）。
+STACK_KB=${C6C_TEST_STACK:-8192}
+case "$(uname -s 2>/dev/null)" in
+Linux) ;;
+*) STACK_KB=0 ;;
+esac
+case "$STACK_KB" in
+''|*[!0-9]*) STACK_KB=8192 ;;
+esac
+[ "$STACK_KB" -ge 1 ] 2>/dev/null || STACK_KB=0
 while [ $# -gt 0 ]; do
     case "$1" in
     -j) shift; [ $# -gt 0 ] && JOBS=$1 ;;
@@ -78,8 +91,15 @@ one_file() {
         return
     fi
     # 超时保护：并发相关的用例在"同步线程桩"下可能死等，别把整个套件拖住
-    timeout "$tmo" "$TMP/$n" >>"$TMP/$n.log" 2>&1
-    rc=$?
+    if [ "$STACK_KB" -gt 0 ]; then
+        # 见文件头：按 Linux 默认栈跑，别让开发机的大栈掩盖深递归问题
+        ( ulimit -s "$STACK_KB" 2>/dev/null; timeout "$tmo" "$TMP/$n" ) \
+            >>"$TMP/$n.log" 2>&1
+        rc=$?
+    else
+        timeout "$tmo" "$TMP/$n" >>"$TMP/$n.log" 2>&1
+        rc=$?
+    fi
     case "$f" in
     */tests/exit/*)
         # tests/exit/*：**退出码就是断言**。文件里写了 `// EXIT n` 就按它比，

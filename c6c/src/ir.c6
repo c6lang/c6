@@ -1,4 +1,4 @@
-/* ir.c6 —— IR v1：16 字节定长记录、流式追加、显式小端编码。
+/* ir.c6 —— IR v1：24 字节定长记录、流式追加、显式小端编码。
  *
  * 为什么不是“结构体内存直投”：
  *   1. 三后端要吃到**同一串字节**（design.md §7 的差分要求），字节布局必须是契约，
@@ -6,13 +6,14 @@
  *   2. 逐字节 fixpoint（c6c 自举两遍输出完全一致）要能对 IR 直接取哈希；
  *   3. 编码/解码能独立自测（--ir-selftest），不需要等前端写完。
  *
- * 记录布局（16 B，全部小端）：
+ * 记录布局（24 B，全部小端）：
  *   0: op   1: type   2: narg   3: flags
- *   4: dst  6: a      8: b      10: c
- *  12: imm
- */
+ *   4: dst  8: a     12: b     16: c     20: imm
+ *
+ * vreg / label 编号是 32 位（dst/a/b/c）。以前是 16 位，一个函数超过 16384 个
+ * 同时活跃的 vreg 就静默绕回、结果错（tcc tests2/101_cleanup 就是这么错的）。 */
 
-#define IR_REC 16
+#define IR_REC 24
 #define IRK_N 55
 
 /* op 集合（v1）。顺序即编码，**只能追加，不能插队**（IR 哈希是验收的一部分）。 */
@@ -173,27 +174,18 @@ typedef struct IrOp {
     u8 type;
     u8 narg;
     u8 flags;
-    u16 dst, a, b, c;
+    u32 dst, a, b, c;   /* vreg / label 编号：32 位 */
     u32 imm;
 } IrOp;
 
-static void ir_put16(u8 *p, u32 v)
-{
-    p[0] = (u8)(v & 0xFF);
-    p[1] = (u8)((v >> 8) & 0xFF);
-}
-
+/* 小端读写。put16/get16 只给 narg/flags 之外的历史字段留着的地方用，
+ * 现在记录里 16 位字段只剩表头那 4 个 u8，故只留 32 位版本。 */
 static void ir_put32(u8 *p, u32 v)
 {
     p[0] = (u8)(v & 0xFF);
     p[1] = (u8)((v >> 8) & 0xFF);
     p[2] = (u8)((v >> 16) & 0xFF);
     p[3] = (u8)((v >> 24) & 0xFF);
-}
-
-static u32 ir_get16(const u8 *p)
-{
-    return (u32)p[0] | ((u32)p[1] << 8);
 }
 
 static u32 ir_get32(const u8 *p)
@@ -207,11 +199,11 @@ static void ir_encode(u8 *p, const IrOp *o)
     p[1] = o->type;
     p[2] = o->narg;
     p[3] = o->flags;
-    ir_put16(p + 4, o->dst);
-    ir_put16(p + 6, o->a);
-    ir_put16(p + 8, o->b);
-    ir_put16(p + 10, o->c);
-    ir_put32(p + 12, o->imm);
+    ir_put32(p + 4, o->dst);
+    ir_put32(p + 8, o->a);
+    ir_put32(p + 12, o->b);
+    ir_put32(p + 16, o->c);
+    ir_put32(p + 20, o->imm);
 }
 
 static void ir_decode(const u8 *p, IrOp *o)
@@ -220,11 +212,11 @@ static void ir_decode(const u8 *p, IrOp *o)
     o->type = p[1];
     o->narg = p[2];
     o->flags = p[3];
-    o->dst = (u16)ir_get16(p + 4);
-    o->a = (u16)ir_get16(p + 6);
-    o->b = (u16)ir_get16(p + 8);
-    o->c = (u16)ir_get16(p + 10);
-    o->imm = ir_get32(p + 12);
+    o->dst = ir_get32(p + 4);
+    o->a = ir_get32(p + 8);
+    o->b = ir_get32(p + 12);
+    o->c = ir_get32(p + 16);
+    o->imm = ir_get32(p + 20);
 }
 
 static const char *ir_name(u32 op)
@@ -292,7 +284,7 @@ static void irb_put(IrBuilder *b, const IrOp *o)
         b->sink(b->ctx, rec);
 }
 
-static void irb_op(IrBuilder *b, u8 op, u8 type, u16 dst, u16 a, u16 bb, u16 c, u32 imm)
+static void irb_op(IrBuilder *b, u8 op, u8 type, u32 dst, u32 a, u32 bb, u32 c, u32 imm)
 {
     IrOp o = {0};
 
@@ -325,7 +317,7 @@ static void ir_count_sink(void *ctx, const u8 *rec)
 }
 
 /* --- 自测：--ir-selftest ---
- * 1. 记录恰好 16 B；
+ * 1. 记录恰好 24 B；
  * 2. 每个 op 用“每个字段都独特”的值编码再解码，逐字段相等，且重编码字节相同；
  * 3. op 名表长度 == IRK_N，名字唯一、非空；
  * 4. 构建器：同一段 IR 两次哈希相同，改 imm 一位哈希必须不同。 */
@@ -337,7 +329,7 @@ static int ir_selftest(void)
 
     printf("ir: 记录大小 %d 字节（要求 %d）\n", (int)sizeof(IrOp), IR_REC);
     if ((int)sizeof(IrOp) != IR_REC) {
-        printf("ir: 失败：IrOp 布局不是 16 字节\n");
+        printf("ir: 失败：IrOp 布局不是 24 字节\n");
         return 1;
     }
     for (op = 0; op < IRK_N; op++) {
@@ -351,10 +343,11 @@ static int ir_selftest(void)
         o.type = (u8)(IRT_VOID + 1 + op % 12);
         o.narg = (u8)(op % 7);
         o.flags = (u8)(128 + op);
-        o.dst = (u16)(0x1000 + op * 3);
-        o.a = (u16)(0x2000 + op * 5);
-        o.b = (u16)(0x3000 + op * 7);
-        o.c = (u16)(0x4000 + op * 11);
+        /* 故意让每个操作数都越过 16 位：加宽以后必须原样往返 */
+        o.dst = 0x12340000u + op * 3;
+        o.a = 0x23450000u + op * 5;
+        o.b = 0x34560000u + op * 7;
+        o.c = 0x45670000u + op * 11;
         o.imm = 0xDEAD0000u + op;
         ir_encode(rec, &o);
         ir_decode(rec, &d);
@@ -419,7 +412,7 @@ static int ir_selftest(void)
         printf("ir: 自测失败 %d 项\n", bad);
         return 1;
     }
-    printf("ir: 自测通过（%d 条 op，16 B/记录，编解码往返 + 指纹稳定）\n", IRK_N);
+    printf("ir: 自测通过（%d 条 op，24 B/记录，编解码往返 + 指纹稳定）\n", IRK_N);
     return 0;
 }
 
@@ -453,7 +446,7 @@ typedef struct IrFn {
     u32 kcap;
 } IrFn;
 
-static void irfn_push(IrFn *f, u8 op, u8 type, u16 dst, u16 a, u16 b, u16 c, u32 imm);
+static void irfn_push(IrFn *f, u8 op, u8 type, u32 dst, u32 a, u32 b, u32 c, u32 imm);
 
 /* 在 at 处插入 n 条 op（switch 的分发链要插到语体之前） */
 static void irfn_insert(IrFn *f, u32 at, const IrOp *add, u32 n)
@@ -480,9 +473,10 @@ static void irfn_reset(IrFn *f, const char *name)
     f->nk = 0;
 }
 
-/* vreg/label 的编号在 IR 里是 16 位（一条 op 16 字节，四个字段各 16 位）。
- * 以前用超了会**静默绕回**——同一个函数里第 16385 个局部量开始就悄悄复用旧槽，
- * 程序不报错、结果错（tcc tests2/101_cleanup 就是这么错的）。现在超了就置位，
+/* vreg/label 的编号在 IR 里是 32 位（一条 op 24 字节，四个操作数字段各 32 位）。
+ * 以前是 16 位，超了会**静默绕回**——同一个函数里第 16385 个局部量开始就悄悄
+ * 复用旧槽，程序不报错、结果错（tcc tests2/101_cleanup 就是这么错的）。
+ * 加宽后阈值留在 0xFFFFFFF0：越界仍然是“不可能发生的量”，真发生了就置位，
  * 由前端在 TU 收尾时报一条明确的编译错误。 */
 static int IR_OVERFLOW;
 static void (*IR_ON_OVERFLOW)(void);
@@ -508,7 +502,7 @@ static void ir_mark_overflow(void)
 
 static u32 irfn_vreg(IrFn *f)
 {
-    if (f->nvreg >= 0xFFF0u)
+    if (f->nvreg >= 0xFFFFFFF0u)
         ir_mark_overflow();
     return f->nvreg++;
 }
@@ -536,12 +530,12 @@ static u32 irfn_kconst(IrFn *f, u64 v)
 
 static u32 irfn_label(IrFn *f)
 {
-    if (f->nlbl >= 0xFFF0u)
+    if (f->nlbl >= 0xFFFFFFF0u)
         ir_mark_overflow();
     return f->nlbl++;
 }
 
-static void irfn_push(IrFn *f, u8 op, u8 type, u16 dst, u16 a, u16 b, u16 c, u32 imm)
+static void irfn_push(IrFn *f, u8 op, u8 type, u32 dst, u32 a, u32 b, u32 c, u32 imm)
 {
     IrOp o = {0};
 
