@@ -15,8 +15,11 @@ static void diag_vreport(int is_err, SrcFile *f, u32 off, const char *fmt, va_li
 {
     if (f) {
         u32 line = src_line_of(f, off);
-        u32 col = off - f->lines[line - 1] + 1;
-        fprintf(stderr, "%s:%u:%u: %s: ", f->path, line, col, is_err ? "error" : "warning");
+        /* 列号必须按**物理**行走：`#line` 之后报出来的行号已经重映射过，
+         * 拿它去查行首表会取错（甚至越界）。 */
+        u32 col = off - f->lines[src_phys_line_of(f, off) - 1] + 1;
+        fprintf(stderr, "%s:%u:%u: %s: ", src_path_of(f), line, col,
+                is_err ? "error" : "warning");
     } else {
         fprintf(stderr, "c6c: %s: ", is_err ? "error" : "warning");
     }

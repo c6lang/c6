@@ -991,7 +991,7 @@ static void pa_error(const char *fmt, ...)
 
         if (!sf && FILES.head)
             sf = FILES.head;
-        fprintf(stderr, "c6c: %s:%u: ", sf ? sf->path : "<internal>",
+        fprintf(stderr, "c6c: %s:%u: ", sf ? src_path_of(sf) : "<internal>",
                 sf ? src_line_of(sf, t->off) : 0);
     }
     va_start(ap, fmt);
@@ -1024,7 +1024,7 @@ static void pa_warn_tcc(const char *fmt, ...)
 
     if (!sf && FILES.head)
         sf = FILES.head;
-    fprintf(stderr, "%s:%u: warning: ", sf ? sf->path : "<internal>",
+    fprintf(stderr, "%s:%u: warning: ", sf ? src_path_of(sf) : "<internal>",
             sf ? src_line_of(sf, t->off) : 0);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
