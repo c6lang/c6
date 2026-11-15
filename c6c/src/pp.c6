@@ -1085,7 +1085,49 @@ static void handle_directive(void)
         else
             COND = c->up;
     } else if (DIR_IS("line")) {
-        skip_line();
+        /* `#line N` / `#line N "文件"`（C99 6.10.4）。实参是 pp-tokens，
+         * **先宏展开**再看：`#define line 1000` + `#line line` 必须认成
+         * `#line 1000`（c-testsuite single-exec/00152 就是这条）。 */
+        Tok *line = NULL;
+        u32 n = 0;
+
+        dir_line(&line, &n);
+        if (!pp_active())
+            return;
+        {
+            Tok *ex = NULL;
+            u32 exn = 0;
+            u32 want = 0;
+            int have_num = 0;
+
+            if (n > 0) {
+                expand_array(line, n, &ex, &exn);
+                if (exn > 0 && ex[0].kind == TK_NUM) {
+                    char nb[24] = {0};
+                    u32 k = ex[0].len < 20 ? ex[0].len : 20;
+
+                    memcpy(nb, tok_data(&ex[0]), k);
+                    nb[k] = 0;
+                    want = (u32)strtoul(nb, NULL, 10);
+                    have_num = 1;
+                } else {
+                    diag_error(PP_TOP->f, line[0].off, "#line 后面要一个十进制行号");
+                }
+                if (exn > 1 && ex[1].kind == TK_STR && PP_TOP->f) {
+                    /* 去掉两边引号：`#line 7 "x.c"` 之后 __FILE__ 就是 x.c */
+                    const char *s = tok_data(&ex[1]);
+                    u32 sl = ex[1].len;
+
+                    if (sl >= 2 && s[0] == '"' && s[sl - 1] == '"') {
+                        s += 1;
+                        sl -= 2;
+                    }
+                    PP_TOP->f->disp = arena_strndup(&A_main, s, sl);
+                }
+            }
+            if (have_num && PP_TOP->f)
+                src_line_mark(PP_TOP->f, PP_TOP->lex.pos, want);
+        }
     } else if (DIR_IS("pragma")) {
         Tok *line = NULL;
         u32 n = 0;
@@ -1239,9 +1281,10 @@ static int pp_next(Tok *out)
         }
         if (TOK_EQ(out, "__FILE__")) {
             SrcFile *f = file_by_id(out->file);
-            size_t len = strlen(f->path) + 3;
+            const char *fn = src_path_of(f);
+            size_t len = strlen(fn) + 3;
             char *buf = arena_alloc(&A_main, len);
-            int n = snprintf(buf, len, "\"%s\"", f->path);
+            int n = snprintf(buf, len, "\"%s\"", fn);
             *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
             return TK_STR;
         }
