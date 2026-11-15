@@ -1,12 +1,17 @@
 # 只有 LLVM IR 后端要跳的用例（c99 后端能跑）。
-# 现象：静态数据的初值在 LLVM 后端读出来全是 0——数据段里那份常量块
-# `@__c6l_D0` 和符号的偏移对不上（`static int a[3] = {7,8,9}` 的字节落在
-# 数据段末尾 154620 处，而代码里读的是 32840），所以任何"读静态初值"的程序
-# 在 LLVM 后端都跑出 0。这是**既有**的后端缺陷，和这两条用例本身无关。
-init_bound
+#
+# 现在只剩 cleanup_attr 一条：它生成的 IR 里有个基本块缺终结指令，
+# `llc -O0` 直接报 "expected instruction opcode"（指着 `L5:` 那一行），程序
+# 根本跑不起来。是 LLVM 后端在 cleanup/goto 密集的代码上的既有缺陷，和用例
+# 本身的语义无关。
+#
+# 历史上这里还挂着 init_bound / alloca_runtime / qualifier_types —— 理由是
+# "静态数据的初值在 LLVM 后端读出来全是 0"（数据段里那份常量块 @__c6l_D0
+# 和符号偏移对不上）。那条已经好了，三条都回到 LLVM 的跑批里。
+#
+# 整个变参也曾经是坏的：va_start/va_arg 都落在"函数入口自己的 %ap"上，前端
+# 那个 va_list 对象从没被初始化，于是 `printf("%d", 7)` 印 0、把 va_list 传给
+# 别的函数（printf → vfprintf）直接崩。现在 va_start 作用在前端对象上，
+# va_arg 手写 SysV 取字（不用 llvm.va_arg：-O0 下它对"传进来的 va_list 指针"
+# 会退化成空指针）。细节见 tests/c/varargs.c 的文件头。
 cleanup_attr
-# 运行期大小的 alloca 在 LLVM 后端也读不到值（整份程序打印出来全是 0/null，
-# 和上面那条静态数据缺陷同源：数据段那份常量块与符号偏移对不上）。
-# native 与 C99 后端都能跑对，这里只跳 LLVM。
-alloca_runtime
-qualifier_types
