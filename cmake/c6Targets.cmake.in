@@ -12,12 +12,29 @@ if(NOT TARGET c6::compiler)
     IMPORTED_LOCATION "${C6_EXECUTABLE}")
 endif()
 
+if(NOT TARGET c6::c6lib AND DEFINED C6_C6LIB_LIBRARY AND EXISTS "${C6_C6LIB_LIBRARY}")
+  # c6c 自己的嵌入库（c6_* API + tcc_* 兼容层），不依赖 tcc。
+  add_library(c6::c6lib STATIC IMPORTED)
+  set_target_properties(c6::c6lib PROPERTIES
+    IMPORTED_LOCATION "${C6_C6LIB_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${C6_INCLUDE_DIR}")
+endif()
+
 if(NOT TARGET c6::libtcc)
-  add_library(c6::libtcc @C6_LIBTCC_KIND@ IMPORTED)
-  set_target_properties(c6::libtcc PROPERTIES
-    IMPORTED_LOCATION "${C6_LIBTCC_LIBRARY}"
-    INTERFACE_INCLUDE_DIRECTORIES "${C6_INCLUDE_DIR}"
-    INTERFACE_LINK_LIBRARIES "@C6_INTERFACE_LINK_LIBS@")
+  if(EXISTS "${C6_LIBTCC_LIBRARY}")
+    add_library(c6::libtcc @C6_LIBTCC_KIND@ IMPORTED)
+    set_target_properties(c6::libtcc PROPERTIES
+      IMPORTED_LOCATION "${C6_LIBTCC_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${C6_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES "@C6_INTERFACE_LINK_LIBS@")
+  elseif(TARGET c6::c6lib)
+    # 没装 tcc：用 c6c 的嵌入库顶上。头文件是装成 libtcc.h 的兼容层，
+    # 所以 `find_package(c6 COMPONENTS libtcc)` + `#include <libtcc.h>` 照旧。
+    add_library(c6::libtcc INTERFACE IMPORTED)
+    set_target_properties(c6::libtcc PROPERTIES
+      INTERFACE_LINK_LIBRARIES c6::c6lib
+      INTERFACE_INCLUDE_DIRECTORIES "${C6_INCLUDE_DIR}")
+  endif()
 endif()
 
 set(c6_LIBRARIES c6::libtcc)

@@ -3609,3 +3609,91 @@ make -C c6c fast                            # 全绿（objcheck + ldcheck 都在
   调试信息的重定位。
 * 硬缺口②的另半（**可嵌入的编译库**：`libtcc` 那种"编到内存里再执行"的
   API）、③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。
+
+## 第 199 轮：库形态（`libc6c`）+ 没有 tcc 的安装契约
+
+硬缺口②的另半（**可嵌入的编译库**）和⑤（**库形态与安装契约**）一起做：
+这两件本来就互相咬合——库没有安装契约就没人用得上，安装契约没有库就没东西可装。
+
+### (1) 嵌入 API：`src/embed.c6` + `include/c6lib.h`
+
+同一份源码（`src/c6c-lib.c6` = `-DC6C_NO_MAIN` + `#include "c6c.c6"`）编成
+`libc6c.a` / `libc6c.so`，导出 `c6_new` / `c6_delete` / `c6_error` /
+`c6_add_include_path` / `c6_set_runtime_path` / `c6_define_symbol` /
+`c6_compile_file` / `c6_compile_string` / `c6_relocate` / `c6_get_symbol` /
+`c6_run` / `c6_output_file`。
+
+三个坑（都是踩过才写下来的）：
+
+1. **库形态没有 `argv[0]`**：命令行那套靠 `argv[0]` 推自带 `include/` 和
+   `lib/rt.c6`，库形态下这条线索不存在。解决办法是编译期塞宏
+   （`C6_DEFAULT_RT` / `C6_DEFAULT_INC`），第一次编译时惰性
+   `setup_incdirs()`；`parse.c6` 加了 `PA_RT_OVERRIDE` + `pa_set_runtime()`
+   让 `find_runtime()` 先看这个覆盖值。
+2. **镜像装到哪儿**：native 后端的地址是绝对的（`ELF_BASE_VA = 0x400000`），
+   所以 `c6_relocate()` 用 `mmap(MAP_FIXED_NOREPLACE)` 把镜像钉回原位；
+   被占了就如实报错，而不是"跑起来崩在别处"。
+3. **`va_list` 没法给初始化器**：c6 要求局部对象带初始化器，而 x86-64 的
+   `va_list` 是数组类型。与其和语法较劲，`c6_set_err` 改成收已经格式化好的
+   字符串——调用点也没几个。
+
+`c6_get_symbol()` 会顺手 `c6_relocate()`：忘了那一步的调用方拿到 `NULL`
+会以为是"没有这个符号"，这种误解比多一次 relocate 贵得多。
+
+### (2) `tcc_*` 兼容层：`include/tcc-compat.h`
+
+声明 tcc 那套名字（`tcc_new` / `tcc_compile_string` / `tcc_relocate` /
+`tcc_run` / `tcc_get_symbol` / `tcc_output_file` / `tcc_set_options` /
+`tcc_add_include_path` / `tcc_define_symbol`），实现一一接到 `c6_*` 上。
+原本用 tcc 嵌入库的程序换掉头文件和库就能编过、跑出一样的结果。
+
+差异如实写进注释而不是藏着：一个 `C6State` 只编一次；`tcc_set_error_func`
+收了回调但诊断仍走 stderr；`tcc_add_file` 只收源文件；`tcc_set_options`
+只认 `-I/-D/-U`。
+
+### (3) 没有 tcc 的安装契约（`cmake -DC6_ENABLE_TCC=OFF`）
+
+以前 `C6Install.cmake` 和 `C6LibraryConfig.cmake` 在 OFF 时直接 `return()`
+——"没有 tcc 就没有库可描述"。库形态落地以后这个前提不成立了，所以补齐：
+
+```
+bin/c6                                  编译器
+include/c6lib.h  include/libtcc.h       宿主用的头（兼容层装成 libtcc.h）
+lib/libc6c.a     lib/libc6c.so          嵌入库
+lib/c6/rt.c6     lib/c6/include/*.h     编译器自带的运行时与头文件
+lib/cmake/c6/c6Config.cmake             find_package(c6)
+lib/pkgconfig/{c6,c6lib}.pc             pkgconf
+```
+
+两个刻意的决定：
+
+* **自带头文件放 `lib/c6/include`，不放 `include/`**。放 `include/` 会把
+  c6 自己的 `stdio.h` 塞进宿主程序的搜索路径（`pkgconf --cflags` 一条
+  `-I` 就盖掉系统头，`-Wbuiltin-declaration-mismatch` 立刻出现）。配套给
+  `setup_incdirs()` 加了 `<bin>/../lib/c6/include`、给 `find_runtime()` 加了
+  `<bin>/../lib/c6/rt.c6` 两个候选——和 tcc 的 `<prefix>/lib/tcc` 一个意思。
+* **`find_package(c6 COMPONENTS libtcc)` 在 OFF 下由 `libc6c` 顶上**：
+  `c6Targets.cmake.in` 里没有真 libtcc 时把 `c6::libtcc` 做成指向
+  `c6::c6lib` 的 INTERFACE target，头文件是装成 `libtcc.h` 的兼容层。
+  有 tcc 的构建里一切照旧（兼容头不装，免得抢同一个 `libtcc.h`）。
+
+### 实测
+
+```
+make -C c6c libc6c         # build/libc6c.a (1198488) + libc6c.so (740184)
+make -C c6c embedcheck     # 6/6
+make -C c6c pkgcheck       # 7/7
+cmake -S . -B b -DC6_ENABLE_TCC=OFF && cmake --install b --prefix /tmp/p9inst
+  → bin/c6, include/{c6lib.h,libtcc.h}, lib/libc6c.{a,so}, lib/c6/{rt.c6,include/},
+    lib/cmake/c6/c6Config.cmake, lib/pkgconfig/{c6,c6lib}.pc
+find_package(c6 COMPONENTS libtcc) 消费者 → "from libtcc component"，退出 0
+pkgconf --cflags --libs c6lib      → -I…/include -L…/lib -lc6c（-Wall -Werror 过）
+/tmp/p9inst/bin/c6 -o /tmp/h /tmp/h.c6 && /tmp/h    # → "hdrs ok 5"
+make -C c6c selfhost               # fixpoint 逐字节相同（3607607 字节，5113 符号）
+make -C c6c fast                   # 全绿（embedcheck + pkgcheck 都在里面）
+```
+
+**还差的**：硬缺口①的尾巴（`.a` 静态库、`--gc-sections`、`-shared`/`-fPIC`）、
+②的另一半（**动态链接**：`DT_NEEDED` + `.plt`/`.got.plt` + `PT_INTERP`，
+让 `rt.o` 那 23 个 libc 名字从 libc.so.6 解析、不用 `--allow-undefined`）、
+③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。

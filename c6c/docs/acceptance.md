@@ -86,6 +86,8 @@ G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个�
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
 | 自己的静态链接器 | `make ldcheck` | 13/13：两个自足 `.o` 真链真跑（退出码 45）、`rt.o` 的 **564 条重定位**全部应用后 hello 输出与退出码都对、构造函数在 `main` 之前、跨 `.o` TLS 记账格、缺符号退出码 2、`readelf` 结构（ET_EXEC / 两个 PT_LOAD / 栈不可执行） | ✅ |
 | `-c` 出可重定位目标文件 | `make objcheck` | 11/11：单/多 TU 真编、系统链接器真链、真跑；ET_REL 类型 / 段表 / `PLT32+UND` / `R_X86_64_64` / `LOCAL` 绑定逐条核对 | ✅ |
+| 可嵌入的编译库（`libc6c`） | `make embedcheck` | 6/6：宿主程序链 `.a` 与 `.so` 都能把 c6 源码编进内存、就地跑 `main`（`printf` 走自带运行时）、`c6_get_symbol` 取到地址、`c6_output_file` 落盘的程序独立跑通（退出码 42）、编译失败经 `c6_error` 如实报告、二次编译被拒绝、`tcc_*` 兼容层一条龙 | ✅ |
+| 库形态与安装契约 | `make pkgcheck` | 7/7：`C6_ENABLE_TCC=OFF` 也能 configure + install（`bin/c6` / `libc6c.a`+`.so` / `include/c6lib.h`+`libtcc.h` / `lib/c6/rt.c6`+自带头 / `c6.pc`+`c6lib.pc` / `c6Config.cmake` 逐项核对）、`include/` 不盖系统头、`find_package(c6 COMPONENTS libtcc)` 的 `c6::libtcc` 真编真跑、`pkgconf --cflags --libs c6lib` 的旗子 `-Wall -Werror` 编得过、换成别的前缀装出来的 `c6` 自找 include 与 rt | ✅ |
 | tests/ 语料 | `make test` | 前端 124/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
 | 编译期诊断 | `make diagtest` | 316/316 | ✅ |
