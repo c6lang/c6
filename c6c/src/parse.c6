@@ -1119,6 +1119,7 @@ typedef struct Declarator {
     u8 pshared[PA_ARG_MAX];     /* 该参数写了 `shared @T` */
     u8 pconst[PA_ARG_MAX];      /* 该参数的**对象**是只读的（`int *const p`） */
     u8 obj_const;       /* 这个声明符声明的对象本身带 const（`*const p`） */
+    u8 arrqual;         /* `int x[const 5]` 方括号里的限定符（形参：归调整后的指针） */
     u8 vla;             /* C99 变长数组：长度是运行期表达式 */
     u32 vla_cnt;        /* 长度（vreg） */
     u32 vla_esz;        /* 元素大小（字节） */
@@ -5404,6 +5405,11 @@ static u32 parse_typespec(void)
      * `int byte = 3;` 曾经被解析成"类型 byte、名叫 3"，于是参数/局部变量
      * 想遮蔽同名 typedef 全都报错。 */
     int saw_int = 0;
+    /* 说明符里出现的 const/volatile/restrict 掩码。c6c 里限定符对多数类型只是
+     * 标记（对象的只读性走 Sym.is_const），但**数组**上的限定符必须落到元素上
+     * （C11 6.7.3p9）——`typedef int *restrict rp; typedef restrict int *arr[2];`
+     * 里 restrict 归元素，`rp[2]` 才能和它同 id（tests2/100_c99array-decls）。 */
+    u8 qm = 0;
 
     /* typeof(expr) / __typeof__(type)：类型取自表达式（不求值） */
     if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof"))
@@ -5646,14 +5652,24 @@ static u32 parse_typespec(void)
             PA_TLS = 1;
             continue;
         }
-        if (PA_ACCEPT_IDENT("const") || PA_ACCEPT_IDENT("volatile") ||
-            PA_ACCEPT_IDENT("register") || PA_ACCEPT_IDENT("inline") ||
-            PA_ACCEPT_IDENT("auto")) {
+        if (PA_ACCEPT_IDENT("const") || PA_ACCEPT_IDENT("__const")) {
+            qm = (u8)(qm | TQ_CONST);
+            SAW_TYPE_QUAL = 1;
+            continue;
+        }
+        if (PA_ACCEPT_IDENT("volatile") || PA_ACCEPT_IDENT("__volatile__")) {
+            qm = (u8)(qm | TQ_VOLATILE);
+            SAW_TYPE_QUAL = 1;
+            continue;
+        }
+        if (PA_ACCEPT_IDENT("register") || PA_ACCEPT_IDENT("inline") ||
+            PA_ACCEPT_IDENT("auto") || PA_ACCEPT_IDENT("__extension__")) {
             SAW_TYPE_QUAL = 1;
             continue;
         }
         if (PA_ACCEPT_IDENT("restrict") || PA_ACCEPT_IDENT("__restrict")
-            || PA_ACCEPT_IDENT("__restrict__") || PA_ACCEPT_IDENT("__extension__")) {
+            || PA_ACCEPT_IDENT("__restrict__")) {
+            qm = (u8)(qm | TQ_RESTRICT);
             SAW_TYPE_QUAL = 1;
             continue;
         }
@@ -5800,8 +5816,21 @@ typespec_done:
      * 语义上 qualifier 对 c6c 只是标记，吃掉即可。 */
     while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
            || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")
-           || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__"))
+           || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__")) {
+        if (PA_IS_IDENT("const") || PA_IS_IDENT("__const"))
+            qm = (u8)(qm | TQ_CONST);
+        else if (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__"))
+            qm = (u8)(qm | TQ_VOLATILE);
+        else
+            qm = (u8)(qm | TQ_RESTRICT);
         pa_advance();
+    }
+    /* 数组上的限定符按 C11 6.7.3p9 落到元素上。别的类型不动：c6c 里
+     * `const int` 仍然是 int（对象只读性走 Sym.is_const），只有数组这一条
+     * 必须真的改类型 id（`typedef restrict int *arr[2]` 要和 `int *restrict [2]`
+     * 同 id）。ty_qual 对数组正是往下推的。 */
+    if (qm && base && ty_is_array(base))
+        base = ty_qual(base, qm);
     /* 注意：`*` 归声明符管，不在这里吃。parse_typespec 是**每个声明语句**
      * 调一次的，而 `int *a, *b;` 里每个声明符都要自己再吃一遍 `*`——
      * 在这里吃会让第二个声明符多出一层指针。 */
@@ -5964,6 +5993,13 @@ static void skip_attributes(void)
 
 static u32 parse_declarator(u32 base, Declarator *d);
 
+/* 现在解析的是不是**形参**声明符：决定了 `[` 里的限定符往哪放。
+ * 形参：C11 6.7.6.3p7「形参声明成数组时调整成**带限定符的指针**」——
+ * 限定符归调整后的指针（`int ca[const 2]` → `int *const`，
+ * tests2/149_parameter_qualifiers）。非形参：C11 6.7.3p9「数组上的限定符
+ * 修饰的是元素」。 */
+static int PA_IN_PARAMS;
+
 static u32 parse_param_list(u32 fnret, Declarator *d)
 {
     /* 声明符对象可能被复用，`...` 的标记不能从上一个声明符漏进来 */
@@ -5982,6 +6018,7 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
     for (;;) {
         Declarator pd = {0};
         u32 pt = 0;
+        int save_inparams = PA_IN_PARAMS;
 
         skip_attributes();
         if (d->nparams >= PA_ARG_MAX) {
@@ -5992,9 +6029,18 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
         pt = parse_typespec();
         if (!pt)
             d->knr = 1;         /* 裸标识符形参：旧式（K&R）参数表 */
+        PA_IN_PARAMS = 1;
         pt = parse_declarator(pt, &pd);
-        if (ty_is_array(pt))
-            pt = ty_ptr(ty_target(pt));   /* 形参里的数组按指针传 */
+        PA_IN_PARAMS = save_inparams;
+        if (ty_is_array(pt)) {
+            /* 形参里的数组按指针传；`[` 里的限定符贴到这个指针上
+             * （C11 6.7.6.3p7：`int ca[const 2]` 的形参类型是 `int *const`） */
+            pt = ty_ptr(ty_target(pt));
+            if (pd.arrqual)
+                pt = ty_qual(pt, pd.arrqual);
+        } else if (pd.arrqual) {
+            pt = ty_qual(pt, pd.arrqual);
+        }
         d->ptype[d->nparams] = pt;
         d->pmgd[d->nparams] = (u8)(pd.mgd ? (pd.mgd_kind == 1 ? 2 : 1) : 0);
         d->pshared[d->nparams] = pd.mgd_shared;
@@ -6040,6 +6086,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
     while (pa_is_ch('(') || pa_is_ch('[')) {
         if (pa_is_ch('[')) {
             u32 cnt = 0;
+            u8 bq = 0;
 
             pa_advance();
             if (pa_is_ch(':')) {
@@ -6055,8 +6102,26 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
             /* C99 数组形参：`int x[const 5]`、`int x[static 5]`、`int x[volatile 5]` */
             while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
                    || PA_IS_IDENT("static") || PA_IS_IDENT("__restrict")
-                   || PA_IS_IDENT("__restrict__"))
+                   || PA_IS_IDENT("__restrict__")
+                   || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
+                if (PA_IS_IDENT("const") || PA_IS_IDENT("__const"))
+                    bq = (u8)(bq | TQ_CONST);
+                else if (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__"))
+                    bq = (u8)(bq | TQ_VOLATILE);
+                else if (PA_IS_IDENT("restrict") || PA_IS_IDENT("__restrict")
+                         || PA_IS_IDENT("__restrict__"))
+                    bq = (u8)(bq | TQ_RESTRICT);
                 pa_advance();
+            }
+            if (bq && d) {
+                if (PA_IN_PARAMS) {
+                    /* 形参：留给 parse_param_list 在数组退化时贴到指针上 */
+                    d->arrqual = (u8)(d->arrqual | bq);
+                } else {
+                    /* 非形参：下推到元素（`int a[const 5]` 是 5 个 const int） */
+                    t = ty_qual(t, bq);
+                }
+            }
             if (pa_is_ch(']')) {
                 cnt = 0;
             } else if (pa_is_ch('*')) {
@@ -6112,7 +6177,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
 /* 内层声明符解出来的类型里，原始 base 藏在某一串 ptr/array/func 壳的最里面
  * （那个位置就是“洞”）。把外层的指针和外层后缀填进去：从洞里往外重建。 */
 #define DH_MAX 24
-static u32 decl_fill_hole(u32 ty, u32 nptr, Declarator *d)
+static u32 decl_fill_hole(u32 ty, u32 nptr, Declarator *d, const u8 *pq)
 {
     u8 kind[DH_MAX] = {0};
     u32 num[DH_MAX] = {0};
@@ -6147,11 +6212,13 @@ static u32 decl_fill_hole(u32 ty, u32 nptr, Declarator *d)
         }
     }
     for (i = 0; i < nptr; i++)
-        t = ty_ptr(t);
+        t = ty_ptr_q(t, pq ? pq[i] : 0);
     t = decl_apply_suffix(t, d, 0);
     for (i = dep; i > 0; i--) {
         if (kind[i - 1] == 0) {
-            t = ty_ptr(t);
+            /* 内层那层指针自己带的限定符（`int (* const f)(void)` 的 const）
+             * 在 keep[] 里，套回去的时候要带上 */
+            t = ty_ptr_q(t, TY_AT(keep[i - 1])->qual);
         } else if (kind[i - 1] == 1) {
             t = ty_array(t, num[i - 1]);
         } else {
@@ -6170,11 +6237,17 @@ static u32 decl_fill_hole(u32 ty, u32 nptr, Declarator *d)
     return t;
 }
 
+/* 一个声明符里最多记多少层指针的限定符（超出就不记，只丢限定符不炸） */
+#define PQ_MAX DH_MAX
+
 static u32 parse_declarator(u32 base, Declarator *d)
 {
     u32 ty = base;
     u32 nptr = 0;
     u32 i = 0;
+    /* 每层指针的限定符掩码，按**扫描顺序**存（第 0 个就是最先读到的那层，
+     * 也就是最里面、最先套到 base 上的那层）。决定类型 id 的那一份。 */
+    u8 pq[PQ_MAX] = {0};
 
     memset(d, 0, sizeof(*d));
     d->type = base;
@@ -6197,13 +6270,24 @@ static u32 parse_declarator(u32 base, Declarator *d)
          * 赋值，`const int *p` 的 p 可以。所以每进一层指针就重置一次标记，
          * 循环结束时留下的是最外层的。tests2/149_parameter_qualifier_errors.c。 */
         d->obj_const = 0;
+        {
+            u8 q = 0;
 
-        while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
-               || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__")
-               || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
-            if (PA_IS_IDENT("const") || PA_IS_IDENT("__const"))
-                d->obj_const = 1;
-            pa_advance();
+            while (PA_IS_IDENT("const") || PA_IS_IDENT("volatile") || PA_IS_IDENT("restrict")
+                   || PA_IS_IDENT("__restrict") || PA_IS_IDENT("__restrict__")
+                   || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
+                if (PA_IS_IDENT("const") || PA_IS_IDENT("__const")) {
+                    d->obj_const = 1;
+                    q = (u8)(q | TQ_CONST);
+                } else if (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")) {
+                    q = (u8)(q | TQ_VOLATILE);
+                } else {
+                    q = (u8)(q | TQ_RESTRICT);
+                }
+                pa_advance();
+            }
+            if (nptr < PQ_MAX)
+                pq[nptr] = q;
         }
         nptr++;
         skip_attributes();
@@ -6223,7 +6307,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
         pa_advance();                 /* ( */
         inner = parse_declarator(base, d);
         pa_expect_ch(')');
-        d->type = decl_fill_hole(inner, nptr, d);
+        d->type = decl_fill_hole(inner, nptr, d, pq);
         d->is_func = ty_is_func(d->type);
         return d->type;
     }
@@ -6244,7 +6328,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
     }
     ty = base;
     for (i = 0; i < nptr; i++)
-        ty = ty_ptr(ty);
+        ty = ty_ptr_q(ty, i < PQ_MAX ? pq[i] : 0);
     skip_attributes();
     /* 普通声明符：后缀套在**整个**类型上（`int *f(int)` = 返回指针的函数）；
      * 只有嵌套声明符 `(*f)(…)` 才套到指针目标上。 */
