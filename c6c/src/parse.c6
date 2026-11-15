@@ -9179,6 +9179,30 @@ static u32 gen_postfix(void)
         pa_expect_ch(')');
         return gen_postfix_ops(v);
     }
+    /* `__builtin_types_compatible_p(type, type)`：以前只有常量上下文（静态断言、
+     * 枚举值）能用，写进普通表达式就报"未声明的标识符"。类型在解析期就定了，
+     * 所以运行期这条路也只是发一条常量。 */
+    if (TOK_EQ(t, "__builtin_types_compatible_p") && pa_peek(1)->kind == TK_PUNCT
+        && TOK_EQ(pa_peek(1), "(")) {
+        u32 a = 0;
+        u32 b = 0;
+        u32 d = 0;
+
+        pa_advance();
+        pa_advance();
+        a = parse_typename();
+        pa_expect_punct(",");
+        b = parse_typename();
+        pa_expect_punct(")");
+        d = irfn_vreg(&FN);
+        /* C11 6.2.7p1：**顶层**限定符不参与兼容性判断（`int *` 与 `int *const`
+         * 兼容），嵌套层的参与（`int **` 与 `int *restrict *` 不兼容）。
+         * 常量上下文那条路一直就是这么做的，这里对齐。 */
+        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0,
+                  ty_unqual(a) == ty_unqual(b) ? 1 : 0);
+        GEN_TY = ty_int();
+        return gen_postfix_ops(d);
+    }
     if (TOK_EQ(t, "__builtin_constant_p")) {
         u32 d = 0;
 

@@ -9,3 +9,4 @@ cleanup_attr
 # 和上面那条静态数据缺陷同源：数据段那份常量块与符号偏移对不上）。
 # native 与 C99 后端都能跑对，这里只跳 LLVM。
 alloca_runtime
+qualifier_types
