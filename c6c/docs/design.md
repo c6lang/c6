@@ -541,3 +541,83 @@ DATA_IMG  数据段（字符串、全局、跳板、TLS 副本）
 
 跳板的 8 字节对齐要对齐**镜像坐标**而不是段内坐标，否则落点会跟着数据段长度
 漂移，两个编译器编同一份源码就不再逐字节相同（fixpoint 会挂）。
+
+## 17 多 TU：一次编多个输入文件
+
+`c6c a.c b.c -o out` 把每个输入文件当成**一个翻译单元**，全部塞进同一份镜像，
+最后合成一个可执行文件。动因是 tcc tests2 的两条用例：`146_tls_extern`（同一个
+文件编两遍，一遍 `-DDEFS` 给 `__thread` 定义、一遍只引用）和 `120_alias`
+（`__attribute__((alias))` + 第二个 TU）。上游是"分别 `-c` 出 .o，再交给系统
+链接器"；c6c 没有目标文件和链接器，但**它本来就只有一个符号表、一个数据段、
+一个代码段**，多编几个文件就是在同一份镜像上多跑几遍声明层——比引入链接器
+便宜得多。
+
+### 17.1 谁是"一个 TU"
+
+```
+pa_begin_multi(out, argv0, with_rt)   ① 一次性初始化：符号表/类型表/arena/
+   ├─ pa_push_rt(argv0); pa_parse_new_tu()   后端打开；有运行时源码就先当 TU 0 编
+   ├─ 对每个输入文件：
+   │     pp_reset(); src_load; pp_push_file;
+   │     push_defines_at(该文件位置上的 -D/-U);      ← 宏不跨 TU 泄漏
+   │     pa_parse_new_tu();
+   └─ pa_finish(out)                  ② 收尾：别名、TLS 回填、GC 环检查、
+                                          合成 test main、三个后端的落盘
+```
+
+* `pa_parse_new_tu()` 做三件事：`PA_TU++`、`sym_tu_begin(PA_TU)`、清掉
+  `NSRC`/`PA_HEAD`（include 栈）后跑一遍 `pa_parse_tu()`。
+* **`-D`/`-U` 是按位置生效的**：`-D` 记在当前文件的下标上，只作用于它后面的
+  文件。`146_tls_extern` 正是靠这个写成 `f.c -DDEFS f.c`——"同一个文件编两遍，
+  第二遍带上 `-DDEFS`"。
+* 单文件路径（`O.nfiles == 1`）走的还是原来那条 `pa_compile_ex()`，一个字节都
+  没变，自举的 fixpoint 因此不受影响。
+
+### 17.2 共享什么、隔离什么
+
+| | 行为 | 为什么 |
+|---|---|---|
+| 外部符号（函数/全局量） | **共享**。符号表按名字 intern，TU1 的定义和 TU2 的引用是同一条 `Sym`，链接期口径（引用了没人定义 → `c6c: 未定义的符号 'x'`，不写输出） | 这正是"多个 TU 一个镜像"的意思 |
+| 同名外部符号的重复声明 | 合并（和单 TU 里重新声明一样），最后写的定义说了算 | 不引入链接器，就没有"重复定义"这个阶段 |
+| 文件作用域的 `static` | **按 TU 隔离**：`sym_tu_begin()` 在换 TU 时把上一个 TU 的 static 符号从哈希桶和 scope 链上摘掉，发射名加 `$<TU>` 后缀（`helper$0` / `helper$1`） | 两份 `static int helper` 必须谁都不碰谁 |
+| 块作用域的 `static` | 不变（`<函数名>.<序号>`） | 它在单个函数里唯一，跟 TU 无关 |
+| 类型表 | **共享**（hash-consing，跨 TU 同构的类型就是同一个 id） | GC 环检查要跨 TU 看引用链（`tests/errors/gc_cycle_cross_tu.c6`） |
+| 宏 | **隔离**（每个 TU 重新 `pp_reset()`） | 不然 `-DDEFS` 那一遍会漏到下一遍 |
+
+那块作用域里重声明一个文件作用域 `static` 函数（`{ int f6(int); … }`）时，
+新符号的落点名要跟文件作用域那条声明走，也是带后缀的那个名字——否则就指向一个
+镜像里不存在的 ELF 符号（`129_scopes`）。数据段初始化器里写函数名
+（`static struct Big (*p)(int) = big;`）同理：非 static 走源码名（方法是弱别名，
+纯 C 的 TU 按它调），static 走符号自己的 `val`。
+
+### 17.3 跨 TU 的 `__thread`
+
+TLS 变量的偏移是**布局之后**才定的（§14.1），而引用它的 TU 可能先编完，那时
+目标还没定义。所以 `extern __thread` 不占存储、也没有可用的 `goff`：签名里记
+`is_tls + is_extern + tls_ref`，同时在数据段开 8 字节的槽
+`__c6_tlsoff.<名字>`。取地址变成"**读那个槽**（运行期填）+ `%fs` 基址"：
+
+```
+ident_addr(s):  tls_ref ? [IR_ADDR 槽][IR_LOAD u64] : IR_CONST s->goff
+                → IR_ADD fsbase, off
+```
+
+`tls_finish()` 在所有 TU 都解析完之后，沿着 `TLS_REF[]` 找同名定义
+（`sym_find_def`，跳过纯引用），把 `goff` 写进槽里。没人定义就按链接期的口径
+报 `未定义的符号`、并且不落盘（否则会生成一个读 0 偏移的产物，比编不过更坏）。
+
+### 17.4 `alias` 属性
+
+`__attribute__((alias("target")))` 和 `__asm__("target")` 两个写法都认（C 里
+标签和属性是同一个意思）。属性扫描只在**声明位置**（`PA_AT_DECL`）认这两个，
+免得把语句位置的 `asm("…")` 当成重命名。名字**在声明时**登记到
+`(别名, 目标)` 表里，收尾时 `alias_apply()` 统一接上：
+
+* 目标的偏移那时才定下来，所以必须延后；
+* `x64_alias_idx()` 连 `is_data` 一起从目标抄过来（以前固定按代码算，数据别名
+  的 `off` 会差一个 ELF 头）；
+* 目标没定义 → 报未定义、不落盘（上游 `120_alias` 的注释也写着"不在同一个
+  单元里定义就不该编过"）。
+
+`120_alias` 的 `inunit2` 在 `120+_alias.c` 里（上游 `tests2/Makefile` 的
+`FLAGS += $(subst 120,120+,$1)`），所以那条用例是两个输入文件一起编。
