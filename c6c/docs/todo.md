@@ -3287,6 +3287,26 @@ printf 的用例都过不了 LLVM 后端——复数那个用例因此只用退�
 | 单字符常量的符号（6.4.4.4p10） | `'\377'` 给 255，应为 -1（按 `char` 求值再转 int，c6c 的 char 是 signed）。`char_lit_val` 对单字符做符号扩展；多字符常量 `'ab'` 保持实现定义的 0x6162 |
 | 一元 `+` 的整型提升（6.5.3.3p2 / 6.3.1.1p2） | `sizeof(+c)`（c 是 signed char）给 1，应为 4；`_Bool` 也要提升（`sizeof(+b)` 是 4）。`sizeof(-c)`、`c + 0` 两条路本来就有提升，只有一元 `+` 那条漏了 |
 
+### 已知（偶发，未修）：`tests/async.c6` 的 "err / return 路径回收" 块会段错误
+
+`tests/async.c6` 里 `test "task 句柄在 err / return 路径上都会被回收（超过池
+容量）"` 这一块**偶发**段错误（本机 8 MB 栈下约 1/40~1/150，CI 上见过一次），
+崩在协程自己的栈上：`rip = 0`、`rsp` 落在 mmap 出来的协程栈里——说明某个已经
+回收/清零的任务帧又被 `resume` 了一次（跳到了 0 地址）。
+
+复现（单块循环）：
+
+```sh
+c6c/build/c6c -test -test-filter="err / return" -I. -Istd -Itests tests/async.c6 -o /tmp/ab.bin
+( ulimit -s 8192; ulimit -c unlimited; for i in $(seq 1 300); do /tmp/ab.bin || echo "第 $i 次崩"; done )
+```
+
+它挡的是 `make -C c6c check-all` 里的 `test` 那一环（也会让 CI 的 `c6c` job
+偶发红）。排查方向：`tcc/lib/libtcc1.c` 的 `__c6_co_abort` / `tcc_co_step_once` /
+任务帧的回收时序——"已 DONE 的任务句柄在作用域退出时再 abort 一次"或"被 wait
+过又落在 err 路径上的子任务"这两条路里，有一处没有把 `body`/`pc` 与 `state`
+同步好。
+
 ### 已知（没修）：只剩一条库层面的问题
 
 1. **runtime printf 的 `%f`（定点）在 |值| ≥ 2^64 时印 `0.0`**：同一个值用
