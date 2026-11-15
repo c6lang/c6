@@ -3147,3 +3147,11 @@ gdb: c6c_vfmt(rdi=fmt, rsi=cap, rdx=fmt2, rcx=0x7fffffffc110)   ← va_list 指�
 不在前端、不在数据段、不在调用约定、也不在 `IR_VAARG` 的读法（这三条都已用
 gdb 逐一证伪）。下一步该拿一份**手写 .ll**（在 `va_start` 之前放一个大的
 alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
+
+**第四次（组合）也试了**：`va_start` 放到函数第一条指令 + `IR_VASTART`/`IR_VAARG`
+按契约实现，两个改动一起上——仍然 SIGSEGV 在 `c6c_vfmt` 的 `va_arg`。所以可以确定
+**`llvm.va_start(%ap)` 在 c6c 生成的这种帧上产出的 va_list 本身就是坏的**（指针对、
+内容里的 `reg_save_area` 是垃圾），跟 `IR_VAARG` 的读法无关。留给以后的最后一招：
+别用 `va_start` 的 intrinsic，改成在 `printf` 这一层**自己摊参数**（c6c 有
+`__builtin_syscall` 那种 6 参数上限的做法，可以扩展成一个 `__c6_va_arr` 数组 +
+计数，`c6c_vfmt` 按数组取）——土，但一定能通，而且不影响 native 后端。
