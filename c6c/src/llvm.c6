@@ -251,7 +251,7 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
                 -16 * (int)(k + 1));
     if (f->is_variadic) {
         fprintf(out, "  %%ap = alloca [1 x %%struct.__va_list_tag]\n");
-        fprintf(out, "  call void @llvm.va_start.p0(ptr %%ap)\n");
+        fprintf(out, "  call void @llvm.va_start(ptr %%ap)\n");
     }
     /* 形参落槽：函数体里对参数的引用是"取槽地址再 load" */
     for (k = 0; k < f->nparams; k++)
@@ -677,7 +677,7 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
             ll_get(out, o->a, a1, sizeof(a1));
             snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
             fprintf(out, "  %s = inttoptr i64 %s to ptr\n", t1, a1);
-            fprintf(out, "  call void @llvm.va_start.p0(ptr %s)\n", t1);
+            fprintf(out, "  call void @llvm.va_start(ptr %s)\n", t1);
             break;
         case IR_VAARG: {
             char ps[64] = {0};
@@ -830,8 +830,12 @@ static void llvm_prologue(FILE *cf, u32 dn)
             "\n"
             "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"
             "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
-            "declare void @llvm.va_start.p0(ptr)\n"
-            "declare void @llvm.va_end.p0(ptr)\n"
+            /* 注意别写 `.p0`：那是 LLVM 19 起的重载后缀，CI 上的
+             * `/usr/lib/llvm-18/bin/llc` 不认，会把它当成普通外部函数发出去，
+             * 链接时报 `undefined reference to 'llvm.va_start.p0'`（51 条用例
+             * 全挂链接阶段）。老名字 `llvm.va_start` 在 18 和 19 上都认。 */
+            "declare void @llvm.va_start(ptr)\n"
+            "declare void @llvm.va_end(ptr)\n"
             "declare void @llvm.trap()\n"
             "declare i64 @syscall(i64, ...)\n"
             "\n"
