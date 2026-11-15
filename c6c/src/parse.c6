@@ -1127,6 +1127,7 @@ typedef struct Declarator {
     u8 mgd;             /* `@T`：托管引用（机器层面还是 T *，但要插引用计数） */
     u8 mgd_kind;        /* 0=强引用 1=weak（不加计数） 2=own（同强引用） */
     u8 mgd_shared;      /* `shared @T`：这个槽/形参按跨线程共享处理 */
+    u8 own_params_taken;    /* 标识符自己那层参数表已经解析过（见 parse_param_list） */
 } Declarator;
 
 /* 发射层加模块前缀（docs/modules.md 的 M2'）：
@@ -6004,18 +6005,38 @@ static int PA_IN_PARAMS;
 
 static u32 parse_param_list(u32 fnret, Declarator *d)
 {
+    /* 一个声明符里可以有好几层参数表：
+     *   `int (*f1(int a, int b))(int c, int b)`
+     * 前一个是 f1 自己的，后一个属于**返回类型**那层函数类型。以前两层都往
+     * d->nparams 尾巴上堆，于是这个定义被当成 4 个形参去绑帧，而且同名形参
+     * （内层的 `b`）直接把外层 `b` 的槽位顶掉——`a != b` 读到的是垃圾，
+     * 返回的函数指针一调就段错误（c-testsuite single-exec/00124）。
+     *
+     * 现在每层只认自己那一段 d->ptype[base_n ..]；只有"标识符自己那层"
+     * （这个声明符里**第一个**解析到的参数表）的参数留在 d 上，因为
+     * pa_func_def 要靠它绑帧。 */
+    u32 base_n = d->nparams;
+    int own_layer = d->own_params_taken ? 0 : 1;
+    int save_knr = d->knr;
+    int save_variadic = d->variadic;
+    u32 r = 0;
+
+    d->own_params_taken = 1;
     /* 声明符对象可能被复用，`...` 的标记不能从上一个声明符漏进来 */
     d->variadic = 0;
     /* 先嗅一下是不是旧式（K&R）参数表：真正的原型一定以类型名开头，
      * 而以裸标识符开头的只能是 `int f(a, b)` 这种。 */
     if (pa_cur()->kind == TK_IDENT && !is_typename_tok(pa_cur()))
         d->knr = 1;
-    if (pa_accept_ch(')'))
-        return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
+    if (pa_accept_ch(')')) {
+        r = ty_func(fnret, d->ptype + base_n, 0, 0);
+        goto fin;
+    }
     if (PA_IS_IDENT("void") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ")")) {
         pa_advance();
         pa_advance();
-        return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
+        r = ty_func(fnret, d->ptype + base_n, 0, 0);
+        goto fin;
     }
     for (;;) {
         Declarator pd = {0};
@@ -6026,7 +6047,8 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
         if (d->nparams >= PA_ARG_MAX) {
             pa_error("形参太多（上限 64）");
             skip_paren_group();
-            return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
+            r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
+            goto fin;
         }
         pt = parse_typespec();
         if (!pt)
@@ -6060,7 +6082,16 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
             break;
     }
     pa_expect_ch(')');
-    return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
+    r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
+fin:
+    if (!own_layer) {
+        /* 不是自己那层：用完就退回，别把返回类型/形参类型里的形参名字
+         * 混进这个函数定义的形参表里。 */
+        d->nparams = base_n;
+        d->knr = (u8)save_knr;
+        d->variadic = save_variadic;
+    }
+    return r;
 }
 
 /* 后缀套在最里层的类型上（C 声明符的就近绑定规则）：
