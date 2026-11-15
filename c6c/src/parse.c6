@@ -2785,6 +2785,7 @@ static i64 char_lit_val(Tok *t)
     const char *s = tok_data(t);
     const char *end = s + t->len;
     i64 v = 0;
+    int nch = 0;
 
     while (s < end && *s != '\'')
         s++;
@@ -2803,7 +2804,13 @@ static i64 char_lit_val(Tok *t)
             s++;
         }
         v = (v << 8) | (i64)(ch & 0xFF);
+        nch++;
     }
+    /* C99 6.4.4.4p10：单字符常量的值就是"那个字符按 `char` 解释再转 int"。
+     * c6c 的 char 是 signed，所以 `'\377'` 是 -1（gcc 也是），不是 255。
+     * 多字符常量是实现定义（`'ab'` = 0x6162，和 gcc 一致），不动。 */
+    if (nch == 1 && (v & 0x80))
+        v = (i64)(signed char)(u8)(v & 0xFF);
     return v;
 }
 
@@ -8277,6 +8284,7 @@ static u32 gen_postfix_ops(u32 v)
             u32 slice_src = 0;
             int was_slice = 0;
             u32 idx = 0;
+            u32 ity = 0;               /* 下标表达式的类型（`1[a]` 要交换律） */
             u32 elem = 0;
             u32 esz = 0;
             u32 off = 0;
@@ -8421,6 +8429,7 @@ static u32 gen_postfix_ops(u32 v)
                 }
             }
             idx = value_of(gen_expr());
+            ity = GEN_TY;
             if (pa_is_ch(':')) {
                 /* `s[lo:hi]`：把刚算出来的 lo 交给子切片那条路 */
                 u32 lo = idx;
@@ -8488,8 +8497,21 @@ static u32 gen_postfix_ops(u32 v)
             }
             pa_expect_ch(']');
             if (!ty_is_ptr(bty) && !ty_is_array(bty)) {
-                pa_error("下标访问的对象不是数组也不是指针");
-                bty = ty_ptr(ty_int());
+                /* C99 6.5.2.1p2：`E1[E2]` 和 `*(E1+E2)` 等价，加法交换，
+                 * 所以 `1[a]`、`i[a]` 和 `a[i]` 一样合法——左边不是指针、
+                 * 右边是的时候把两边对调再按指针下标算。 */
+                if (ty_is_ptr(ity) || ty_is_array(ity)) {
+                    u32 tv = base;
+                    u32 tt = bty;
+
+                    base = idx;
+                    bty = ity;
+                    idx = tv;
+                    (void)tt;
+                } else {
+                    pa_error("下标访问的对象不是数组也不是指针");
+                    bty = ty_ptr(ty_int());
+                }
             }
             elem = ty_target(bty);
             esz = ty_size(elem);
@@ -11932,14 +11954,18 @@ static u32 gen_unary(void)
             /* sizeof("abc") 同 sizeof "abc"：括号里就一个字符串字面量 */
             pa_advance();
             (void)str_lit_data();
-            ty = ty_array(ty_char(), STR_LIT_N + 1);
+            /* 宽字面量（`L"…"`/`U"…"`）的元素是 4 字节的 wchar_t：sizeof 要
+             * 按元素宽度算（`sizeof(L"abc")` 是 16 不是 4）。c6c 里宽字面量
+             * 的退化类型就是 `ty_ptr(ty_int())`（见 str_lit_data 之后那行），
+             * 这里跟着用 int 当元素类型。 */
+            ty = ty_array(WIDE_LIT ? ty_int() : ty_char(), STR_LIT_N + 1);
             pa_expect_ch(')');
         } else if (!is_align && pa_cur()->kind == TK_STR) {
             /* sizeof "abc" 是 4 不是 8：字符串字面量的类型是 char[N]（含结尾 0），
              * 按表达式求值只会拿到退化后的 char *。tcc 的
              * `file_offset = sizeof ARMAG - 1` 就靠这个，错了整份 .a 都读歪。 */
             (void)str_lit_data();
-            ty = ty_array(ty_char(), STR_LIT_N + 1);
+            ty = ty_array(WIDE_LIT ? ty_int() : ty_char(), STR_LIT_N + 1);
         } else {
             u32 save = FN.n;
             u32 v2 = 0;
@@ -12046,7 +12072,9 @@ static u32 gen_unary(void)
                 PEND_TY = ty_array(et, INIT_CNT_OK ? INIT_COUNT : 1);
                 PEND_ADDR = addr;
                 GEN_TY = ty_ptr(et);
-                return addr;
+                /* 复合字面量是后缀表达式的一部分：`(int[]){7,8}[1]`、
+                 * `(struct P){1,2}.y` 都要接着走后缀链（C99 6.5.2）。 */
+                return gen_postfix_ops(addr);
             }
             slot = frame_slots_for(ty_size(ty));
             irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
@@ -12055,7 +12083,8 @@ static u32 gen_unary(void)
             PEND_TY = ty;
             PEND_ADDR = addr;
             GEN_TY = ty_is_array(ty) ? ty_ptr(ty_target(ty)) : ty;
-            return addr;
+            /* 同上：复合字面量后面可以直接跟 `.成员`/`[下标]` */
+            return gen_postfix_ops(addr);
         }
         v = gen_unary();
         {
