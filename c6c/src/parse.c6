@@ -17468,6 +17468,7 @@ static void gen_one_global(u32 ty, Declarator *d)
     int was_big = 0;
     int ate_eq = 0;      /* `[] = {…}` 那条路已经把 `=` 吃掉、把体重新压回源栈了 */
     u32 was_min = 0;     /* 收缩时不许低于这个长度（前面那条声明写死了长度时用） */
+    u32 goff = 0;        /* 分配好的数据段偏移；初始化器解析期间符号表可能搬家 */
 
     if (!d->name)
         return;
@@ -17567,6 +17568,12 @@ static void gen_one_global(u32 ty, Declarator *d)
     sz = ty_size(ty) ? ty_size(ty) : 8;
     s->goff = data_alloc(sz, ty_align_of(ty));
     s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+    /* `s` 指向符号表里的槽：解析初始化器的过程中只要再 `sym_add` 一次
+     * （字符串字面量、枚举、匿名聚合……），符号表就可能扩容搬家，`s` 就成了
+     * 悬垂指针。之前就是这样把 `static int g = 42` 的 42 写到了别的偏移上，
+     * 于是代码读 `D+83` 拿到 0（LLVM 后端上一整类"静态初值读出来是 0"的
+     * 现象都出自这里）。分配到的 goff 先抄进局部量，后面只用它。 */
+    goff = s->goff;
     /* `__thread`：存储照旧在数据段里（初始化器一条都不用改），只是访问换成
      * `%fs + goff`，并把 [goff, goff+sz) 记进 TLS 影像范围。 */
     if (PA_TLS) {
@@ -17583,17 +17590,19 @@ static void gen_one_global(u32 ty, Declarator *d)
         u32 et = ty_is_array(ty) ? ty_target(ty) : 0;
         u32 end_alloc = DATA_IMG.n;
 
-        gen_glob_braced_new(s->goff, ty, 0);
+        gen_glob_braced_new(goff, ty, 0);
         if (was_inc && et && ty_is_array(s->type)) {
             u32 real = INIT_CNT_OK ? INIT_COUNT : 1;
 
             if (real < was_min)
                 real = was_min;
-            s->type = ty_array(et, real);
+            s = sym_find(d->name, d->nlen);
+            if (s)
+                s->type = ty_array(et, real);
             /* 预留的尾巴收回来。只有当它仍是数据段末尾时才安全（初始化器里
              * 要是有字符串字面量，字面量已经排在后面了，那就留着这块空地）。 */
             if (was_big && DATA_IMG.n == end_alloc) {
-                u32 real = s->goff + ty_size(s->type);
+                u32 real = goff + ty_size(s->type);
 
                 if (real < DATA_IMG.n)
                     DATA_IMG.n = real;
@@ -17619,14 +17628,14 @@ static void gen_one_global(u32 ty, Declarator *d)
         if (ty_is_array(ty)) {
             u32 k = n + 1 < sz ? n + 1 : sz;
 
-            memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off, k);
+            memcpy(DATA_IMG.p + goff, DATA_IMG.p + off, k);
         } else if (ty_is_ptr(ty)) {
             u64 va = (u64)DATA_VA(off);
             u32 i2 = 0;
 
             for (i2 = 0; i2 < 8; i2++)
-                DATA_IMG.p[s->goff + i2] = (u8)(va >> (8 * i2));
-            c99_reloc_add(s->goff, off);
+                DATA_IMG.p[goff + i2] = (u8)(va >> (8 * i2));
+            c99_reloc_add(goff, off);
         } else {
             pa_error("字符串初始化器只能给数组或指针");
         }
@@ -17769,14 +17778,14 @@ static void gen_one_global(u32 ty, Declarator *d)
                 *(double *)&bits = dv;
             }
         }
-        glob_store(s->goff, 0, ty, bits);
+        glob_store(goff, 0, ty, bits);
         return;
     }
     {
         i64 v = 0;
 
         v = const_expr();
-        glob_store(s->goff, 0, ty, (u64)v);
+        glob_store(goff, 0, ty, (u64)v);
     }
 }
 
