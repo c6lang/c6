@@ -1,0 +1,39 @@
+/* c6 编译期诊断：C 预处理器的实参个数检查（C99 6.10.3p4）
+ *
+ * `#define` 出来的宏，调用时实参个数必须跟形参个数对得上——对不上是
+ * "shall diagnose"，gcc/tcc 都报。以前 c6c 多给少给都照展开：
+ * `#define S(x) #x` 写成 `S(a,b)` 只悄悄丢掉多余的那个。
+ *
+ * 三个不算错的边界（都按 C99 6.10.3p10 的"空实参"处理）：
+ *   - `E()`：零形参宏的空调用；
+ *   - `F()`：单形参宏，括号里什么都没有 = 一个空实参；
+ *   - `V(x)`：变参宏不给可变部分。
+ */
+// EXPECT test_too_many: error: 宏 'S' 只收 1 个参数，这里给了 2 个
+// EXPECT test_too_few: error: 宏 'T' 要 2 个参数，这里只给了 1 个
+
+#if defined test_too_many
+#define S(x) #x
+int main(void) { return S(a, b)[0]; }
+#elif defined test_too_few
+#define T(a, b) ((a) + (b))
+int main(void) { return T(1); }
+#else
+#define S(x) x
+#define E() 42
+#define F(x) (0 + 0)          /* 空实参照样能展开 */
+#define T(a, b) ((a) + (b))
+#define V(x, ...) x
+int main(void)
+{
+    if (E() != 42)
+        return 1;
+    if (F() != 0)
+        return 2;
+    if (V(1) != 1)
+        return 3;
+    if (T(1, 2) != 3)
+        return 4;
+    return S(5) - 5;
+}
+#endif

@@ -203,6 +203,50 @@ static void src_note_modhdr(SrcFile *f)
         mod_add_import(mod_intern(MODHDR.imports[i]));
 }
 
+/* 三字符组（C99 6.4.6，翻译阶段 1）：`??X` 在**词法分析之前**就要换成单个
+ * 字符。这里就地改写源缓冲（左移，文件变短）：后面的行长拼接、注释、字符串
+ * 字面量、`#` 指令、诊断行号看到的都已经是换好的文本，不用在每个读字符的
+ * 地方再判断一次。换行没有动，所以行号不受影响；只有同一行里三字符组之后的
+ * 列号会往前挪两个字节，可以接受。
+ *
+ * gcc 默认把三字符组当"忽略的扩展"（-std=c99 下才开），但 C99 6.4.6 是
+ * 标准要求，所以按标准做。没有 `?` 的文件只多一趟 strchr，几乎不要钱。 */
+static void src_trigraphs(char *p, size_t *size)
+{
+    size_t r = 0;
+    size_t w = 0;
+    size_t n = *size;
+
+    if (!p || n == 0 || !strchr(p, '?'))
+        return;
+    while (r < n) {
+        if (p[r] == '?' && r + 2 < n && p[r + 1] == '?') {
+            char m = 0;
+
+            switch (p[r + 2]) {
+            case '=':  m = '#';  break;
+            case '(':  m = '[';  break;
+            case ')':  m = ']';  break;
+            case '<':  m = '{';  break;
+            case '>':  m = '}';  break;
+            case '/':  m = '\\'; break;
+            case '\'': m = '^';  break;
+            case '!':  m = '|';  break;
+            case '-':  m = '~';  break;
+            default:   m = 0;
+            }
+            if (m) {
+                p[w++] = m;
+                r += 3;
+                continue;
+            }
+        }
+        p[w++] = p[r++];
+    }
+    p[w] = 0;
+    *size = w;
+}
+
 static SrcFile *src_load(const char *path)
 {
     int fd = open(path, O_RDONLY);
@@ -231,6 +275,12 @@ static SrcFile *src_load(const char *path)
         while (k < (size_t)st.st_size && p[k] != '\n')
             k++;
         memset(p, ' ', k);
+    }
+    {
+        size_t tsz = (size_t)st.st_size;
+
+        src_trigraphs(p, &tsz);        /* 翻译阶段 1，必须在一切之前 */
+        st.st_size = (off_t)tsz;
     }
     {
         /* `.c6` 文件先把 c6 的 module/import 改写成预处理指令 */

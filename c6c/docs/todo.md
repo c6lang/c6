@@ -3029,6 +3029,12 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 | `sizeof` 变长数组 | 运行期 `cnt * esz`（长度在声明时已经算成 vreg，记在 `Sym.vla_cnt` 上） |
 | VLA 形参 `int a[n]` | 只当"VLA 形参"记号，长度表达式跳过不求值（以前按常量表达式求，报"未知名字 n"） |
 | `-std=` / `__STDC_VERSION__` | 收 `c89/c99/c11` 及 gnu 变体（语法不变）：`__STDC_VERSION__` 按级别给，c89 里不定义 |
+| 三字符组 `??X`（6.4.6，翻译阶段 1） | 以前完全不认，`??=define` 直接编不过。现在在**读文件那一刻**就地改写源缓冲（左移、文件变短）：后面的行长拼接、注释、字符串字面量、`#` 指令看到的都已经是换好的文本，不用在每个读字符的地方再判一次。`??/` 换成真正的 `\\` 之后，行尾拼接也自然对了。换行没动 → 行号不变（同行列号会前移两字节） |
+| 宏实参个数（6.10.3p4） | 多给少给都照展开，`#define S(x) #x` 写成 `S(a,b)` 只悄悄丢掉多余的。现在报诊断（"shall diagnose"）。三个边界按 6.10.3p10 的空实参处理：零形参宏的 `E()`、单形参宏的 `F()`、变参宏不给可变部分 |
+| `sizeof` 变长数组不带括号（6.5.3.4p2） | `pa_vla_sizeof` 用 1/2 区分"带括号/不带括号"，调用点却写成 `paren > 0`——2 也大于 0，于是多啃一个 token 再要 `)`，`sizeof v` 直接编不过（`sizeof(v)` 一直是好的） |
+| `_Bool` 转换（6.3.1.2） | 以前只当"窄化成 1 字节"：`_Bool b = 5;` 存 5、`_Bool c = 300;` 存 44、`_Bool t = 0.5;` 是 0。现在 `gen_convert` 里先跟 0 比（浮点源用浮点比较），结果 0/1。**只对 `.c` 生效**：`.c6` 里 `bool` 的转换和托管引用（`@T` 的 retain/release）缠在一起，套上这条 `tests/fstr.c6` 的 `@f".."` 循环用例当场漏引用、整个程序段错误——c6 的语言规则保持原样 |
+| 位域初始化器（6.7.8p13） | `struct {unsigned a:3, b:5;} x = {5, 17};` 以前两个成员各写一次**整个 4 字节字**，后写的盖掉先写的（读出来 a=1 b=2）；指定初始化器 `.b = 3` 永远落到同字节的第一个位域上（写进 `.a`）。现在按位宽/位偏移走 `store_lval_bits`，设计符再按位偏移挑叶子 |
+| `_Complex`（C99 6.2.5p11 / 6.5.5p5） | 表示成两个分量的普通结构体（`__c6_cplx_f/d/l`，见 `BUILTIN_DEFS`），所以 sizeof／对齐／按值传参／返回／整体拷贝全走现成的聚合路径，三个后端一行没改；只有算术/比较/转换在 `cplx_*` 里拆成标量。带 `__real__`/`__imag__`（GNU，读写分量） |
 
 ### 还没做的 C99 语言特性（都不挡现在的闸门，但都是真缺口）
 
@@ -3037,7 +3043,6 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 | 多维变长数组 | **明确报错**（以前静默算错）：行 stride 是运行期的，要走"指针到 VLA"那条路 | `int b[n][m];` |
 | 指向变长数组的指针 | 静默算错（同上那条路的另一半）。`int (*p)[n];` 现在会把 `p` 当 VLA 对象分配 | `int (*p)[n]; int a[3][2]; p = a;` |
 | VLA 的 `goto`/`continue` 跨作用域 | `79_vla_continue`（test3）、`vla_test`（test2）仍挂 | 见 tests2 的 n/a 清单 |
-| `_Complex` / `_Imaginary` | 当实数处理（加减小对、乘除静默错）。C99 只强制 `_Complex`，`_Imaginary` 是可选的 | `double _Complex z = 1.0; z *= z;` |
 | `_Alignas(N)` | 只被 `skip_paren_group()` 吃掉，没真对齐（C11 特性，不属 C99） | `_Alignas(16) int x;` |
 | `_Generic` | 缺 C11 的类型合并细则（限定符要进嵌套层级 type id），卡 `94_generic`、`100_c99array-decls` | — |
 | `inline` | 只置 `PA_INLINE_SEEN`，没有 C99 的 inline/extern inline 语义（单 TU 行为是对的） | — |
@@ -3213,3 +3218,33 @@ alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
 别用 `va_start` 的 intrinsic，改成在 `printf` 这一层**自己摊参数**（c6c 有
 `__builtin_syscall` 那种 6 参数上限的做法，可以扩展成一个 `__c6_va_arr` 数组 +
 计数，`c6c_vfmt` 按数组取）——土，但一定能通，而且不影响 native 后端。
+
+### 顺手发现（没修）：LLVM 后端的变参没把 double 放进 XMM
+
+`printf("%g", 3.0)` 走 `--emit-llvm` 出来的程序打出来是 `0`，native 和 C99
+后端都对（用 `HEAD` 的二进制复现过，是**既有**问题，和复数无关）。LLVM 那边
+把 double 实参按 i64 传了，被调方从 XMM 读不到值。所以 `tests/c/` 里但凡要
+printf 的用例都过不了 LLVM 后端——复数那个用例因此只用退出码判对错。
+
+### 聚合按值返回：拿的是被调方帧里的地址（既有缺陷，会踩坏 C99 后端的 -O1）
+
+`struct S f(void) { struct S s; … return s; }` 这条路上，`IR_RET` 的实参是
+`s` 的**地址**（`return (T){…}` 也一样，返回那个临时对象的地址）。调用方拿到
+这个指针再 `IR_COPY` 拷走——可被调方的帧在 `ret` 时就没了。
+
+* native 后端：拷得早，实测一直是好的（运气，不是保证）。
+* C99 后端：`c99-diff.sh` 用 `-O1` 编它生成的 C，`FR` 是 `unsigned char[]`
+  局部数组，内容一失效就是读到别的变量的栈——**稳定失败**：
+
+```
+struct S { double a, b; };
+static struct S mk(double x) { struct S s; s.a = x; s.b = x + 1; return s; }
+int main(void) { struct S t = mk(3.0); return t.a == 3.0 ? 0 : 1; }
+```
+  → native 0、`--emit-c` + `gcc -O0` 0、`gcc -O1` **1**。用 `HEAD` 的二进制
+  复现过，不是这一轮引入的。
+
+正解是"聚合返回走隐藏指针"（调用方开槽、把地址当第一个实参传，被调方写进去）：
+三后端都不用改（那就是个普通指针形参），但前端要同时动**函数定义、每个调用点、
+函数指针类型**三处，属于"该排期"的活。`tests/c/complex.c` 因此写成出参形式，
+不靠这条不保证的路径。

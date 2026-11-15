@@ -932,6 +932,19 @@ static int parse_const_u64(u64 *out);
 static u32 cur_op_ty(void);
 static u32 gen_convert(u32 v, u32 from, u32 to);
 static void gen_block(void);
+/* C99 复数（_Complex）：类型层在 parse_typespec 前面，值运算在 gen_mul 前面 */
+static int ty_is_cplx(u32 ty);
+static u32 cplx_comp(u32 cty);
+static u32 cplx_temp(u32 cty);
+static u32 cplx_load(u32 addr, u32 ct, u32 off);
+static void cplx_store(u32 addr, u32 ct, u32 off, u32 v);
+static u32 cplx_from_real(u32 v, u32 vty, u32 cty);
+static u32 cplx_zero(u32 ct);
+static u32 cplx_bin(u8 op, u32 a, u32 aty, u32 b, u32 bty);
+static u32 cplx_cmp(u8 cc, u32 a, u32 aty, u32 b, u32 bty);
+static u32 cplx_neg(u32 a, u32 cty);
+static u32 gen_int_lit(u64 c, u32 ty);
+static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty);
 
 /* 上限可调：环境变量 C6C_MAX_ERRORS（默认 20），调大是为了能一次看清
  * 大文件（比如 tcc.h）里所有独立的错误点。 */
@@ -5487,6 +5500,63 @@ static int pa_bracket_vla_follows(void)
     return 0;
 }
 
+/* --- C99 复数（_Complex）-------------------------------------------------
+ * 表示：两个分量的**普通结构体**（`__c6_cplx_f/d/l`，定义在 main.c6 的
+ * BUILTIN_DEFS 里），布局就是 `{re, im}`。于是 sizeof、对齐、整体赋值、
+ * 按值传参、返回全都走现成的聚合路径，三个后端一行都不用改——只有算术、
+ * 比较、转换在这里被拆成两个标量。
+ *
+ * 分量类型：float _Complex → float；double/long double _Complex → double
+ * （c6c 里 long double 本来就算 double）。 */
+static u32 TY_CPLX_F;
+static u32 TY_CPLX_D;
+static u32 TY_CPLX_L;
+
+static void cplx_types_init(void)
+{
+    Sym *s = NULL;
+
+    if (TY_CPLX_F && TY_CPLX_D && TY_CPLX_L)
+        return;
+    /* 结构体标签把类型 id 存在 `val` 里（不是 `type`，见 parse_agg_spec） */
+    s = sym_find_tag("__c6_cplx_f", 11);
+    TY_CPLX_F = s ? (u32)s->val : 0;
+    s = sym_find_tag("__c6_cplx_d", 11);
+    TY_CPLX_D = s ? (u32)s->val : 0;
+    s = sym_find_tag("__c6_cplx_l", 11);
+    TY_CPLX_L = s ? (u32)s->val : 0;
+}
+
+static int ty_is_cplx(u32 ty)
+{
+    if (!ty)
+        return 0;
+    if (!TY_CPLX_D)
+        cplx_types_init();
+    return ty == TY_CPLX_F || ty == TY_CPLX_D || ty == TY_CPLX_L;
+}
+
+/* 复数类型的分量类型 */
+static u32 cplx_comp(u32 cty)
+{
+    (void)cty;
+    return ty_is_cplx(cty) && cty == TY_CPLX_F ? ty_float() : ty_double();
+}
+
+/* 基础类型 → 对应的复数类型；0 = 这个基础类型不能加 `_Complex` */
+static u32 ty_cplx_of_base(u32 base)
+{
+    if (!TY_CPLX_D)
+        cplx_types_init();
+    if (base == ty_float())
+        return TY_CPLX_F;
+    if (base == ty_double())
+        return TY_CPLX_D;
+    if (base == ty_ldouble())
+        return TY_CPLX_L;
+    return 0;
+}
+
 /* 类型说明符（含指针） */
 static u32 parse_closure_type(void)
 {
@@ -5540,6 +5610,8 @@ static u32 parse_typespec(void)
      * （C11 6.7.3p9）——`typedef int *restrict rp; typedef restrict int *arr[2];`
      * 里 restrict 归元素，`rp[2]` 才能和它同 id（tests2/100_c99array-decls）。 */
     u8 qm = 0;
+    /* 见过 `_Complex`（C99 6.7.2.5）：最后要把基础类型换成对应的复数结构体 */
+    int saw_complex = 0;
 
     /* typeof(expr) / __typeof__(type)：类型取自表达式（不求值） */
     if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof"))
@@ -5665,7 +5737,16 @@ static u32 parse_typespec(void)
         if (PA_ACCEPT_IDENT("enum")) { base = parse_enum_spec(); continue; }
         if (PA_ACCEPT_IDENT("void")) { base = ty_void(); continue; }
         if (PA_ACCEPT_IDENT("_Bool")) { base = ty_bool(); continue; }
-        if (PA_ACCEPT_IDENT("_Complex")) { continue; }   /* 复数：当实数处理 */
+        if (PA_ACCEPT_IDENT("_Complex")) {
+            saw_complex = 1;
+            continue;
+        }
+        /* `_Imaginary`（C99 6.2.5p11 是**可选**的）没有实现：和 gcc 一样明确
+         * 报错，别静默当实数用。 */
+        if (PA_ACCEPT_IDENT("_Imaginary")) {
+            pa_error("'_Imaginary' 类型没有实现（C99 允许实现不提供）");
+            continue;
+        }
         if (PA_ACCEPT_IDENT("_Noreturn")) { continue; }
         if (PA_IS_IDENT("_Atomic") && pa_peek(1)->kind == TK_PUNCT
             && tok_eq(pa_peek(1), "(")) {
@@ -5931,6 +6012,28 @@ static u32 parse_typespec(void)
                 }
             }
         }
+    }
+    if (saw_complex) {
+        /* C99 6.7.2p4/p5：`_Complex` 只能修饰 float/double/long double；
+         * 单写 `_Complex` 就是 `double _Complex`（`int _Complex` 是约束违背）。 */
+        u32 cb = base ? base : (saw_int ? 0 : ty_double());
+
+        if (cb) {
+            u32 ct = ty_cplx_of_base(cb);
+
+            if (!ct) {
+                /* `long _Complex` 之类：long 单独不是 long double */
+                pa_error("'_Complex' can only be applied to float, double or "
+                         "long double (C99 6.7.2p4)");
+                ct = TY_CPLX_D;
+            }
+            base = ct;
+        } else {
+            pa_error("'_Complex' can only be applied to float, double or "
+                     "long double (C99 6.7.2p4)");
+            base = TY_CPLX_D;
+        }
+        saw_complex = 0;
     }
     if (!base) {
         if (nlong >= 2)
@@ -7153,6 +7256,44 @@ static void store_conv(u32 addr, u32 ty, u32 v, u32 vty)
 {
     u32 ifx = 0;
     u32 cft = 0;
+
+    /* 复数（C99 6.5.16.1 的简单赋值转换）：
+     *   实数 → 复数：实部 = 值，虚部 = 0；
+     *   float _Complex ↔ double _Complex：逐分量转换；
+     *   复数 → 实数：C99 要求显式 cast，这里按 cast 的口径取实部（gcc 也只在
+     *   显式 cast 时才认；隐式的那条路留给 gen_convert 报"不能转换"）。 */
+    if (ty_is_cplx(ty) || ty_is_cplx(vty)) {
+        u32 dct = cplx_comp(ty);
+        u32 dsz = ty_size(dct);
+
+        if (ty_is_cplx(ty) && ty_is_cplx(vty)) {
+            if (ty != vty) {
+                u32 sct = cplx_comp(vty);
+
+                store_lval(gen_addr_off(addr, 0), dct,
+                           gen_convert(cplx_load(v, sct, 0), sct, dct));
+                store_lval(gen_addr_off(addr, dsz), dct,
+                           gen_convert(cplx_load(v, sct, ty_size(sct)), sct, dct));
+            } else {
+                store_lval(addr, ty, v);      /* 同类型：整块拷 */
+            }
+            return;
+        }
+        if (ty_is_cplx(ty)) {
+            if (vty != dct)
+                v = gen_convert(v, vty, dct);
+            store_lval(gen_addr_off(addr, 0), dct, v);
+            store_lval(gen_addr_off(addr, dsz), dct, cplx_zero(dct));
+            return;
+        }
+        /* 复数 → 实数 */
+        {
+            u32 sct = cplx_comp(vty);
+
+            v = cplx_load(v, sct, 0);
+            vty = sct;
+        }
+    }
 
     /* 结构体 → 接口的隐式转换（`Shape s = q;`）：胖指针是 {self, vt}，
      * self 存源对象的地址、vt 存静态 vtable 的地址。
@@ -10380,12 +10521,45 @@ static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
         return 0;
     *cnt_out = sy->vla_cnt;
     *esz_out = sy->vla_esz ? sy->vla_esz : 1;
+    /* 1 = 源码写成 `sizeof(v)`；2 = 写成 `sizeof v`（不带括号） */
     return paren ? 1 : 2;
 }
 
 
 static u32 gen_unary(void)
 {
+    /* GNU 的 `__real__ z` / `__imag__ z`：取复数的实部/虚部。C99 里没有直接
+     * 取分量的语法（那是 <complex.h> 的 creal/cimag，属于库），但这两个是
+     * gcc 扩展，几乎所有复数代码都在用，实现起来就是一次分量 load。 */
+    if (PA_IS_IDENT("__real__") || PA_IS_IDENT("__imag__")) {
+        int imag = PA_IS_IDENT("__imag__");
+        u32 cv = 0;
+        u32 cty = 0;
+        u32 ct = 0;
+
+        pa_advance();
+        cv = value_of(gen_unary());
+        cty = GEN_TY;
+        if (!ty_is_cplx(cty)) {
+            /* 操作数不是复数：`__real__ 3.0` 就是 3.0，`__imag__ 3.0` 是 0 */
+            if (!imag) {
+                GEN_TY = cty;
+                return cv;
+            }
+            GEN_TY = cty;
+            return cplx_zero(cty);
+        }
+        ct = cplx_comp(cty);
+        GEN_TY = ct;
+        /* 分量本身是个左值（`__imag__ z = 4.0;` 要能赋值）：给地址而不是值，
+         * 读的时候由 value_of 走一次 load。 */
+        {
+            u32 caddr = gen_addr_off(cv, imag ? ty_size(ct) : 0);
+
+            mark_lval(caddr, ct);
+            return caddr;
+        }
+    }
     /* 表达式位置上的 c6 角色宏：`imax(a + 1, b * 2)`。展开成 `( 体 )` 之后
      * 直接重进 gen_unary 解析它。 */
     if (NCM > 0 && CM_EXPR_DEPTH < 64 && cm_at_call(CM_ROLE_EXPR)) {
@@ -11308,6 +11482,11 @@ static u32 gen_unary(void)
     }
     if (pa_accept_ch('-')) {
         u32 a = value_of(gen_unary());
+        u32 cty = GEN_TY;
+
+        if (ty_is_cplx(cty))
+            return cplx_neg(a, cty);
+        {
         u32 ty = ty_promote(GEN_TY);
         u32 z = irfn_vreg(&FN);
         u32 d = irfn_vreg(&FN);
@@ -11329,6 +11508,7 @@ static u32 gen_unary(void)
         }
         GEN_TY = ty;
         return d;
+        }
     }
     if (pa_accept_ch('+'))
         return gen_unary();
@@ -11411,10 +11591,13 @@ static u32 gen_unary(void)
                 u32 kk = 0;
                 u32 vv = 0;
 
-                if (paren > 0)
+                /* 返回值 1 = 源码里带括号（`sizeof(v)`），2 = 不带（`sizeof v`）。
+                 * 别写成 `paren > 0`：2 也大于 0，会多啃一个 token 再要 `)`，
+                 * `sizeof v` 就直接编不过（踩过）。 */
+                if (paren == 1)
                     pa_advance();               /* `(` */
                 pa_advance();                   /* 数组名 */
-                if (paren > 0)
+                if (paren == 1)
                     pa_expect_ch(')');
                 kk = irfn_vreg(&FN);
                 irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, vesz);
@@ -11592,6 +11775,41 @@ static u32 gen_unary(void)
             u32 src = cur_op_ty();
 
             v = value_of(v);
+            /* 复数（C99 6.3.1.7）：显式 cast 时复数↔实数才合法；实数 → 复数
+             * 是 `(double _Complex)3` 这种写法，复数 → 实数取实部。 */
+            if (ty_is_cplx(ty) || ty_is_cplx(src)) {
+                if (ty_is_cplx(ty)) {
+                    u32 out = 0;
+
+                    if (ty_is_cplx(src)) {
+                        u32 dct = cplx_comp(ty);
+                        u32 sct = cplx_comp(src);
+
+                        out = (ty == src) ? v : cplx_temp(ty);
+                        if (ty != src) {
+                            cplx_store(out, dct, 0,
+                                       gen_convert(cplx_load(v, sct, 0), sct, dct));
+                            cplx_store(out, dct, ty_size(dct),
+                                       gen_convert(cplx_load(v, sct, ty_size(sct)),
+                                                   sct, dct));
+                        }
+                    } else {
+                        out = cplx_from_real(v, src, ty);
+                    }
+                    GEN_TY = ty;
+                    PEND_LVAL = 1;
+                    PEND_ADDR = out;
+                    PEND_TY = ty;
+                    return gen_postfix_ops(out);
+                }
+                /* 复数 → 实数：取实部，再走普通的算术转换 */
+                {
+                    u32 sct = cplx_comp(src);
+
+                    v = cplx_load(v, sct, 0);
+                    src = sct;
+                }
+            }
             /* 空指针常量再转一道指针：类型名里带限定符就不再是 NPC */
             if (E_NPC && (!ty_is_ptr(ty) || CAST_QUAL))
                 E_NPC = 0;
@@ -11657,6 +11875,24 @@ static u32 gen_convert(u32 v, u32 from, u32 to)
             pa_error("a closure cannot be converted to 'void *': closures are opaque");
     }
 
+    /* C99 6.3.1.2：任何标量转 `_Bool` 都是"跟 0 比"，结果是 0 或 1。
+     * 少了这条就按"窄化成 1 字节"处理：`_Bool b = 5;` 存的是 5、
+     * `_Bool c = 300;` 存 44（踩过，gcc 两边都是 1）。浮点源同理
+     * （`_Bool t = 0.5;` 是 1，不是 0）。 */
+    /* 只管纯 C 的 TU（`.c`）。c6 的 `.c6` 世界里 `bool` 的转换和托管引用
+     * （`@T` 的 retain/release）缠在一起，套上"和 0 比"会把生命周期算乱
+     * ——tests/fstr.c6 的 `@f".."` 循环用例当场漏引用、整个程序段错误。
+     * C99 的转换规则是给 C 用的，`.c6` 保持原样。 */
+    if (!in_c6_tu() && ty_kind(to) == TY_BOOL && ty_kind(from) != TY_BOOL
+        && ty_is_scalar(from)) {
+        u32 z = gen_convert(gen_int_lit(0, ty_int()), ty_int(), from);
+        /* 浮点源要按**浮点**比：gen_cmp3 只有在 cty 是浮点类型时才吐浮点
+         * 比较，给 ty_int() 会把 double 的位模式当整数看（`_Bool t = 0.5`
+         * 于是得到 0）。 */
+        u32 ct = ty_is_float(from) ? from : ty_int();
+
+        return gen_cmp3(v, from, z, from, IRCC_NE, ct);
+    }
     if (ff && ft) {
         if (ty_size(from) == ty_size(to))
             return v;
@@ -11815,6 +12051,145 @@ static u32 gen_cmp2(u32 a, u32 b, u8 cc)
     return d;
 }
 
+/* --- 复数的值运算 ---------------------------------------------------------
+ * 聚合的约定是"值 = 地址"，所以每次运算开一块帧槽当临时对象，两个分量分别
+ * 算好再存回去。分量运算是普通的 f32/f64 加减乘除和转换，走 gen_bin2 /
+ * gen_convert —— 三个后端本来就处理这些，不需要任何新 IR。
+ *
+ * 分量布局就是 `__c6_cplx_*` 的 `{__re, __im}`：实部在 0，虚部在 sizeof(分量)。 */
+static u32 cplx_temp(u32 cty)
+{
+    u32 sz = ty_size(cty) ? ty_size(cty) : 16;
+    u32 slot = frame_slots_for(sz);
+    u32 addr = irfn_vreg(&FN);
+
+    irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
+    return addr;
+}
+
+static u32 cplx_load(u32 addr, u32 ct, u32 off)
+{
+    return load_lval(gen_addr_off(addr, off), ct);
+}
+
+static void cplx_store(u32 addr, u32 ct, u32 off, u32 v)
+{
+    store_lval(gen_addr_off(addr, off), ct, v);
+}
+
+static u32 cplx_zero(u32 ct)
+{
+    return gen_convert(gen_int_lit(0, ty_int()), ty_int(), ct);
+}
+
+/* 实数 → 复数：`{v, 0}` */
+static u32 cplx_from_real(u32 v, u32 vty, u32 cty)
+{
+    u32 ct = cplx_comp(cty);
+    u32 addr = cplx_temp(cty);
+
+    if (vty != ct)
+        v = gen_convert(v, vty, ct);
+    cplx_store(addr, ct, 0, v);
+    cplx_store(addr, ct, ty_size(ct), cplx_zero(ct));
+    GEN_TY = cty;
+    return addr;
+}
+
+/* `a op b`（op = IR_ADD / IR_SUB / IR_MUL / IR_DIV）。一边是实数就先提升成
+ * 复数（C99 6.3.1.8 的常用算术转换）。返回临时对象的地址。 */
+static u32 cplx_bin(u8 op, u32 a, u32 aty, u32 b, u32 bty)
+{
+    u32 cty = ty_is_cplx(aty) ? aty : bty;
+    u32 ct = cplx_comp(cty);
+    u32 csz = ty_size(ct);
+    u32 out = 0;
+    u32 ar = 0;
+    u32 ai = 0;
+    u32 br = 0;
+    u32 bi = 0;
+
+    if (!ty_is_cplx(aty))
+        a = cplx_from_real(a, aty, cty);
+    if (!ty_is_cplx(bty))
+        b = cplx_from_real(b, bty, cty);
+    ar = cplx_load(a, ct, 0);
+    ai = cplx_load(a, ct, csz);
+    br = cplx_load(b, ct, 0);
+    bi = cplx_load(b, ct, csz);
+    out = cplx_temp(cty);
+    if (op == IR_ADD || op == IR_SUB) {
+        cplx_store(out, ct, 0, gen_bin2(ar, ct, op, br, ct));
+        cplx_store(out, ct, csz, gen_bin2(ai, ct, op, bi, ct));
+    } else if (op == IR_MUL) {
+        /* (ar+ai i)(br+bi i) = (ar*br - ai*bi) + (ar*bi + ai*br) i */
+        u32 t1 = gen_bin2(ar, ct, IR_MUL, br, ct);
+        u32 t2 = gen_bin2(ai, ct, IR_MUL, bi, ct);
+        u32 t3 = gen_bin2(ar, ct, IR_MUL, bi, ct);
+        u32 t4 = gen_bin2(ai, ct, IR_MUL, br, ct);
+
+        cplx_store(out, ct, 0, gen_bin2(t1, ct, IR_SUB, t2, ct));
+        cplx_store(out, ct, csz, gen_bin2(t3, ct, IR_ADD, t4, ct));
+    } else {
+        /* 除法按 C99 6.5.5p5 的公式：分母 br²+bi² */
+        u32 den = 0;
+        u32 nr = 0;
+        u32 ni = 0;
+
+        den = gen_bin2(gen_bin2(br, ct, IR_MUL, br, ct), ct, IR_ADD,
+                       gen_bin2(bi, ct, IR_MUL, bi, ct), ct);
+        nr = gen_bin2(gen_bin2(ar, ct, IR_MUL, br, ct), ct, IR_ADD,
+                      gen_bin2(ai, ct, IR_MUL, bi, ct), ct);
+        ni = gen_bin2(gen_bin2(ai, ct, IR_MUL, br, ct), ct, IR_SUB,
+                      gen_bin2(ar, ct, IR_MUL, bi, ct), ct);
+        cplx_store(out, ct, 0, gen_bin2(nr, ct, IR_DIV, den, ct));
+        cplx_store(out, ct, csz, gen_bin2(ni, ct, IR_DIV, den, ct));
+    }
+    GEN_TY = cty;
+    return out;
+}
+
+/* 复数比较（只允许 == / !=）：两个分量都比，再与起来。 */
+static u32 cplx_cmp(u8 cc, u32 a, u32 aty, u32 b, u32 bty)
+{
+    u32 cty = ty_is_cplx(aty) ? aty : bty;
+    u32 ct = cplx_comp(cty);
+    u32 csz = ty_size(ct);
+    u32 r1 = 0;
+    u32 r2 = 0;
+
+    if (!ty_is_cplx(aty))
+        a = cplx_from_real(a, aty, cty);
+    if (!ty_is_cplx(bty))
+        b = cplx_from_real(b, bty, cty);
+    r1 = gen_cmp3(cplx_load(a, ct, 0), ct, cplx_load(b, ct, 0), ct, cc, ct);
+    r2 = gen_cmp3(cplx_load(a, ct, csz), ct, cplx_load(b, ct, csz), ct, cc, ct);
+    GEN_TY = ty_int();
+    /* `==` 要两个分量都相等（与）；`!=` 只要有一个不等（或）。
+     * 两边都用"与"的话 `w != z` 只在两个分量的不等同时成立时才真（踩过）。 */
+    return gen_bin2(r1, ty_int(), cc == IRCC_NE ? IR_OR : IR_AND, r2, ty_int());
+}
+
+/* 一元负号：两个分量都取反 */
+static u32 cplx_neg(u32 a, u32 cty)
+{
+    u32 ct = cplx_comp(cty);
+    u32 csz = ty_size(ct);
+    u32 out = cplx_temp(cty);
+
+    {
+        u32 d = irfn_vreg(&FN);
+
+        irfn_push(&FN, IR_FNEG, ir_ty_of(ct), d, cplx_load(a, ct, 0), 0, 0, 0);
+        cplx_store(out, ct, 0, d);
+        d = irfn_vreg(&FN);
+        irfn_push(&FN, IR_FNEG, ir_ty_of(ct), d, cplx_load(a, ct, csz), 0, 0, 0);
+        cplx_store(out, ct, csz, d);
+    }
+    GEN_TY = cty;
+    return out;
+}
+
 static u32 gen_mul(void)
 {
     u32 a = gen_unary();
@@ -11824,18 +12199,26 @@ static u32 gen_mul(void)
         if (pa_accept_ch('*')) {
             u32 av = value_of(a);
             u32 b = value_of(gen_unary());
+            u32 bty = GEN_TY;
 
-            a = gen_bin2(av, aty, IR_MUL, b, GEN_TY);
+            if (ty_is_cplx(aty) || ty_is_cplx(bty))
+                a = cplx_bin(IR_MUL, av, aty, b, bty);
+            else
+                a = gen_bin2(av, aty, IR_MUL, b, bty);
             aty = GEN_TY;
         } else if (pa_accept_ch('/')) {
             u32 av = value_of(a);
             u32 aty2 = ty_promote(aty);
             u32 b = value_of(gen_unary());
+            u32 bty = GEN_TY;
             u32 bty2 = ty_promote(GEN_TY);
             /* 无符号操作数要走 div（idiv 会算成有符号） */
             u8 op = (!ty_is_signed(aty2) || !ty_is_signed(bty2)) ? IR_UDIV : IR_DIV;
 
-            a = gen_bin2(av, aty2, op, b, bty2);
+            if (ty_is_cplx(aty2) || ty_is_cplx(bty2))
+                a = cplx_bin(IR_DIV, av, aty2, b, bty2);
+            else
+                a = gen_bin2(av, aty2, op, b, bty2);
             aty = GEN_TY;
         } else if (pa_accept_ch('%')) {
             u32 av = value_of(a);
@@ -11878,7 +12261,11 @@ static u32 gen_add(void)
             int aptr = ty_is_ptr(aty) || ty_is_array(aty);
             int bptr = ty_is_ptr(bty) || ty_is_array(bty);
 
-            if (aptr && !bptr) {
+            if (ty_is_cplx(aty) || ty_is_cplx(bty)) {
+                /* 复数加减：分量各自加减（一边是实数就先提升） */
+                a = cplx_bin(is_sub ? IR_SUB : IR_ADD, av, aty, b, bty);
+                aty = GEN_TY;
+            } else if (aptr && !bptr) {
                 /* 指针 + 整数：按元素大小缩放 */
                 u32 elem = ty_target(aty);
                 u32 esz = ty_size(elem);
@@ -12022,9 +12409,16 @@ static u32 gen_eq(void)
             u32 aty2 = aty;
             u32 av = value_of(a);
             u32 b = value_of(gen_rel());
-            u32 cty = cmp_common_ty(aty2, GEN_TY);
+            u32 bty2 = GEN_TY;
 
-            a = gen_cmp3(av, aty2, b, GEN_TY, cc, cty);
+            if (ty_is_cplx(aty2) || ty_is_cplx(bty2)) {
+                /* C99 6.5.9p2：复数只有 == 和 !=，两个分量都得相等 */
+                a = cplx_cmp(cc, av, aty2, b, bty2);
+            } else {
+                u32 cty = cmp_common_ty(aty2, bty2);
+
+                a = gen_cmp3(av, aty2, b, bty2, cc, cty);
+            }
             aty = GEN_TY;
         }
     }
@@ -12501,6 +12895,21 @@ static u32 gen_assign(void)
                         irfn_push(&FN, IR_MUL, IRT_U64, m, r, k, 0, 0);
                         r = m;
                     }
+                }
+                /* 复数复合赋值（`z *= w`）：等价于 `z = z * w`，走 cplx_bin。
+                 * gen_bin2 只会按标量算，拿聚合类型下去就是垃圾。
+                 * 左操作数是**地址**（聚合的"值"就是它的地址）。 */
+                if (ty_is_cplx(ty) || ty_is_cplx(GEN_TY)) {
+                    u32 res = 0;
+
+                    if (op != IR_ADD && op != IR_SUB && op != IR_MUL && op != IR_DIV) {
+                        pa_error("'%s' is not allowed on complex values", opbuf);
+                        return r;
+                    }
+                    res = cplx_bin((u8)op, addr, ty, r, GEN_TY);
+                    store_conv(addr, ty, res, GEN_TY);
+                    GEN_TY = ty;
+                    return res;
                 }
                 d = gen_bin2(old_v, ty, (u8)op, r, GEN_TY);
 
@@ -13144,6 +13553,14 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
         pa_expect_ch('}');
         return;
     }
+    /* 复数：`static double _Complex g = 2.0;`（C99 6.7.8p13 允许拿实数初始化
+     * 复数对象）。实部按分量类型落到数据段，虚部是数据段本来就有的 0。
+     * 不能走下面"聚合只填第一个成员"那条通用路：它按标量常量的**整数字面量**
+     * 落盘，`2.0` 会变成 9.88e-324。 */
+    if (ty_is_cplx(ty) && !pa_is_ch('{')) {
+        gen_glob_obj(goff, cplx_comp(ty), off);
+        return;
+    }
     if (ty_is_agg(ty) || ty_is_array(ty)) {
         if (pa_is_ch('{')) {
             gen_glob_braced_new(goff, ty, off);
@@ -13727,6 +14144,17 @@ static void init_store(u32 off, u32 ty, u32 bits, u32 boff)
         gen_glob_obj(INIT_GOFF, ty, off);
         GLOB_BF_BITS = 0;
         GLOB_BF_BITOFF = 0;
+    } else if (bits) {
+        /* 位域成员的初始化器不能"按字节写整个字"：`struct {unsigned a:3, b:5;}
+         * x = {5, 17};` 两个成员落在同一个 4 字节字里，后写的会把先写的整个
+         * 盖掉——读出来是 a=1 b=2（踩过）。按位宽/位偏移塞进去才和赋值一致
+         * （赋值那条路走的就是 store_lval_bits）。 */
+        u32 v = value_of(gen_assign());
+        u32 vty = GEN_TY;
+
+        if (vty != ty)
+            v = gen_convert(v, vty, ty);
+        store_lval_bits(gen_addr_off(INIT_ADDR, off), ty, bits, boff, v);
     } else {
         gen_init_obj(INIT_ADDR, ty, off);
     }
@@ -13777,8 +14205,12 @@ static void init_sync(u32 top)
 /* 设计符链：`[i]` / `.name` 任意串联，返回最终目标的类型与绝对偏移 */
 static int INIT_COLON;     /* 上一次设计符用的是上古 `name:` 写法（不需要 '='） */
 
-static int init_desig(u32 *ty, u32 *off)
+/* `bits`/`boff`：设计符指到的是位域成员时带出位宽和位偏移——同字节里的几个
+ * 位域 LF_OFF 一样，光按字节偏移找叶子会永远落到第一个（`.b = 3` 写进 `.a`）。 */
+static int init_desig(u32 *ty, u32 *off, u32 *bits, u32 *boff)
 {
+    *bits = 0;
+    *boff = 0;
     INIT_COLON = 0;
     for (;;) {
         /* 上古 GNU 写法：`{ a: 1, b: 2 }`（成员名 + 冒号） */
@@ -13797,6 +14229,8 @@ static int init_desig(u32 *ty, u32 *off)
             }
             *ty = mty;
             *off += moff;
+            *bits = AGG_FOUND_BITS;
+            *boff = AGG_FOUND_BITOFF;
             INIT_COLON = 1;
             continue;
         }
@@ -13815,6 +14249,8 @@ static int init_desig(u32 *ty, u32 *off)
                 return 0;
             *ty = et;
             *off += i * ty_size(et);
+            *bits = 0;
+            *boff = 0;
             continue;
         }
         if (pa_accept_ch('.')) {
@@ -13834,6 +14270,8 @@ static int init_desig(u32 *ty, u32 *off)
             }
             *ty = mty;
             *off += moff;
+            *bits = AGG_FOUND_BITS;
+            *boff = AGG_FOUND_BITOFF;
             continue;
         }
         break;
@@ -14016,13 +14454,20 @@ static void init_body(u32 top)
                 && TOK_EQ(pa_peek(1), ":"))) {
             u32 dty = LV_TY[top];
             u32 doff = LV_OFF[top];
+            u32 dbits = 0;
+            u32 dboff = 0;
             u32 li = 0;
 
-            if (!init_desig(&dty, &doff)) {
+            if (!init_desig(&dty, &doff, &dbits, &dboff)) {
                 init_skip_value();
                 continue;
             }
             li = init_leaf_at(doff);
+            if (dbits) {
+                /* 位域：同字节的叶子要按**位偏移**再挑一次（见 init_desig 注释） */
+                while (li < LF_N && LF_OFF[li] == doff && LF_BOFF[li] != dboff)
+                    li++;
+            }
             if (li < LF_N && LF_OFF[li] != doff)
                 li = LF_N;
             INIT_CUR = li;
@@ -14344,6 +14789,14 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
             init_skip_value();
         }
         pa_expect_ch('}');
+        return;
+    }
+    /* 复数：右值不是花括号时按 C99 6.7.8p13 处理——实数就填 `{v, 0}`，
+     * 复数就整块拷。走 store_conv 是为了和赋值共用一套转换规则。 */
+    if (ty_is_cplx(ty) && !pa_is_ch('{')) {
+        u32 cv = value_of(gen_assign());
+
+        store_conv(gen_addr_off(addr, off), ty, cv, GEN_TY);
         return;
     }
     if (ty_is_agg(ty) || ty_is_array(ty)) {
@@ -18305,6 +18758,14 @@ static void gen_one_global(u32 ty, Declarator *d)
         else
             pa_error("a slice cannot be initialized from an array in a static "
                      "initializer; use '{ data, len }'");
+    }
+    if (ty_is_cplx(ty)) {
+        /* 复数全局：`static double _Complex g = 2.0;`（C99 6.7.8p13 允许拿实数
+         * 初始化复数对象）。交给 gen_glob_obj 的复数分支：实部按分量类型落盘，
+         * 虚部保持数据段本来就有的 0。不走下面那些标量分支——它们按整数的
+         * const_expr 取值，`2.0` 会以位模式 2 落地（读出来 9.88e-324）。 */
+        gen_glob_obj(goff, ty, 0);
+        return;
     }
     if (ty_is_float(ty)) {
         /* 全局浮点初始化器：字面量（或整型常量）→ IEEE-754 位模式。

@@ -1466,6 +1466,28 @@ have_macro:
                 }
                 cur[cn++] = a;
             }
+            /* C99 6.10.3p4：实参个数要跟形参个数对得上，对不上**必须**报
+             * 诊断。以前多给少给都照展开（`#define S(x) #x` 写成 `S(a,b)`
+             * 也不吭声），gcc/tcc 都会报。`F()` 对单形参宏来说是一个"空实参"
+             * （6.10.3p10），所以只有 0 个实参时按 1 个算。 */
+            if (!m->variadic) {
+                int na = nargs;
+                int have = 0;
+
+                /* `E()`（零形参宏，括号里什么都没有）收上来的是"一个空实参"，
+                 * 对它来说就是 0 个实参。 */
+                if (na == 1 && argn[0] == 0 && m->nparams == 0)
+                    na = 0;
+                have = na + (na == 0 ? 1 : 0);   /* 单形参宏的 `F()` 算一个空实参 */
+                if (na > m->nparams)
+                    diag_error(CUR_FILE, out->off,
+                               "宏 '%s' 只收 %d 个参数，这里给了 %d 个",
+                               m->name, m->nparams, na);
+                else if (have < m->nparams)
+                    diag_error(CUR_FILE, out->off,
+                               "宏 '%s' 要 %d 个参数，这里只给了 %d 个",
+                               m->name, m->nparams, na);
+            }
             if (m->variadic && nargs == m->nparams && nargs < maxargs + 1) {
                 args[nargs] = tok_list_alloc(1);
                 argn[nargs] = 0;
