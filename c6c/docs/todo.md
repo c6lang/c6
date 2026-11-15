@@ -3885,3 +3885,29 @@ $ make -C c6c selfhost   # fixpoint 逐字节相同（3711463 字节 / 5252 符�
 是空的）；只对 `-c` 的产物生效（`-o` 出的可执行文件没有段表）。
 
 **这一项还剩**：独立 `.s` 汇编输出（native 后端直接出字节，没有文本汇编器层）。
+
+## 第 204 轮：跨到 aarch64（实测），以及 ③ 的真实状态
+
+硬缺口③要的是"x86-64 之外的 **native** 后端"——即 c6c 自己发别的架构的机器码。
+这件事的规模是一个新代码生成器（x86-64 后端 ~2000 行），本轮没做。但有一件事
+值得先钉死并量出来：**IR 是与目标无关的**，它经 LLVM 能落到别的架构并真跑。
+
+链（`make -C c6c archcheck`，4/4）：
+
+```
+calc.c6  --c6c --emit-llvm -nostdlib-->  calc.ll
+         --grep -v '^module asm'-->      calc.pure.ll   # 运行时跳板是 x86-64 内联汇编
+         --llc -march=aarch64 -filetype=obj--> calc.o
+         --clang --target=aarch64-linux-gnu -c start.s (自己写的 _start: bl main / svc #0)
+         --ld.lld -m aarch64elf -e _start--> calc.elf
+         --qemu-aarch64 --> 退出码 91（和 x86-64 后端一样）
+```
+
+踩到的两件事（都写进 README 了）：`module asm` 里是 x86-64 跳板，跨目标过不去
+（所以要过滤，且这条链只覆盖"不碰运行时"的程序）；`llc` 把零初始化变成
+`memset` 调用，宿主侧得补一个 aarch64 的 `memset` 才能链接。
+
+**③ 的真实状态**：跨目标**代码生成**已实测可用（经 LLVM）；**native** 后端仍然
+只有 x86-64。要做 c6c 自己的 aarch64 后端，得新写一套 emit（寄存器分配沿用现有
+的"每个 vreg 一个栈槽"模型，但指令选择、调用约定、重定位类型全要重来），并且
+需要 qemu 之外的运行期验收（现在有 qemu-aarch64，验收这一环是通的）。
