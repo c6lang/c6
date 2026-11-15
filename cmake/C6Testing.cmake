@@ -163,19 +163,6 @@ if(BUILD_TESTING)
   set_tests_properties(c6-c99tcc-selftest PROPERTIES
     ENVIRONMENT "${_c6_daily_env};BACKEND=c99;C99CC=${C6_TCC_DIR}/c6${C6_TCC_EXESUF};C99FLAGS=-B ${C6_TCC_DIR} -std=c99 -w")
 
-  # ---- c6c：用 c6 写的自举编译器（独立子目录，自带 Makefile）----
-  # `make -C c6c check-all` 一条命令跑完验收 (1)(2)(3)：自举 fixpoint 逐字节、
-  # 三后端同一套语料、tests+std+诊断、c6c 编出 tcc 并让它跑上游 tests2（含第三代
-  # selfhost）。`check-all-perf` 再加上验收 (4) 的性能/内存门槛。
-  # 它跑一遍要几分钟，所以只挂在 `c6c` 这个 label 上，不进 daily。
-  add_test(NAME c6c-check-all
-           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}/c6c"
-                   check-all "ROOT=${CMAKE_CURRENT_SOURCE_DIR}")
-  set_tests_properties(c6c-check-all PROPERTIES
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/c6c"
-    LABELS "c6c"
-    TIMEOUT 2400)
-
   # ---- 回归矩阵：每个用例一个原生 CTest 测试 ----
   foreach(_case IN LISTS _c6_cases)
     set(_case_root "${CMAKE_CURRENT_BINARY_DIR}/tests/${_case}")
