@@ -16198,7 +16198,7 @@ static void gen_stmt(void)
                  * has/next，循环一次都不跑）。 */
                 u32 ipty = ty_is_ptr(ivty) ? ivty : ty_ptr(ivty);
                 u32 sty_it = ty_is_ptr(ivty) ? ty_target(ivty) : ivty;
-                /* 参考实现（tcc/tccgen.c 的 c6_iter_proto_of）找的是**这个
+                /* 参考实现（tcc 那边的 c6_iter_proto_of）找的是**这个
                  * 类型的方法表项**（`c6_method_of(tag, has)`）——首形参是
                  * `T *` 的普通函数也算方法，所以先查方法表；查不到才退回
                  * 按名字 + 首形参类型挑重载。 */

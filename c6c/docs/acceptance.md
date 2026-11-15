@@ -6,6 +6,10 @@
 ```sh
 # CMake 入口（仓库根，CI 走这条）
 cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --parallel
+cmake --build build --target check-c6c         # 验收 (1)(2)(3)，一条命令（实测 132 s）
+cmake --build build --target check-c6c-perf    # 再加验收 (4)
+
+# 细粒度入口（CI 用这几个）
 ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4)
 

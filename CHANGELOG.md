@@ -50,10 +50,18 @@
 缺这几个宏就编不过；补上定义（值本身无关紧要，不带 `C6_EXT` 时没有任何宏会被
 标成 expr 角色）。
 
-### `cmake/C6Testing.cmake`：注册 `c6c-check-all` 测试
+### 构建与 CI：c6c 接进 CMake，并进流水线
 
-`ctest -R c6c` 会跑 `make -C c6c check-all`（label `c6c`，不进 daily），
-一条命令覆盖上面那套验收。
+- 新增 `cmake/C6C.cmake`：`cmake --build` 顺带把 c6c 编出来（目标 `c6c`，挂在
+  `ALL` 上、依赖 `tcc-build` 产出的引导编译器 `tcc/c6`）；验收注册成 4 条
+  CTest（`c6c-build` / `c6c-check-all` / `c6c-tests2` / `c6c-tests1`，label
+  `c6c`），性能门槛单独一条（label `perf`）。一条命令的入口：
+  `cmake --build build --target check-c6c`（再加 `check-c6c-perf` 就是验收 4）。
+- `c6c/Makefile` 保留：验收本身是"跑测试、对输出、算 fixpoint"的脚本集合，
+  Make 里的二十多个目标不是"编译一个目标"能表达的，所以 CMake 只管编译与入口。
+- CI 新增 `c6c` job（push/PR 都跑）：`cmake --build` → `ctest -L c6c -LE perf`，
+  外加一条 `continue-on-error` 的 `ctest -L perf`；`release` 的 `needs` 加上
+  它，c6c 的验收挂了就不发版。
 
 ## 0.1.0 — 2026-11-13
 
