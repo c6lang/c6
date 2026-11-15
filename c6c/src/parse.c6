@@ -18475,6 +18475,15 @@ static void gen_decl_from_spec(u32 base)
                     pa_advance();
                     break;
                 }
+                /* `int f(int a), g(int a), x;`：函数声明符后面跟 ','，这一条是
+                 * **声明**而不是定义（C99 6.7 的 init-declarator-list）。以前
+                 * 这里直接掉进 pa_func_def，于是报"这里要 '{'"。剩下的声明符和
+                 * 本条共用同一个基础类型，递归回去接着按声明表处理。 */
+                if (pa_is_ch(',')) {
+                    pa_advance();
+                    gen_decl_from_spec(base);
+                    break;
+                }
                 /* 首形参是"有名字的结构体指针"时，**再补一个**
                  * `<结构体>_<函数名>` 的符号指向同一份代码（模板实例叫
                  * `<实例名>_<函数名>`，比如 `Vect_int_vect_sum`）。C 层面
