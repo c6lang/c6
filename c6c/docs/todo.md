@@ -3220,3 +3220,26 @@ alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
 后端都对（用 `HEAD` 的二进制复现过，是**既有**问题，和复数无关）。LLVM 那边
 把 double 实参按 i64 传了，被调方从 XMM 读不到值。所以 `tests/c/` 里但凡要
 printf 的用例都过不了 LLVM 后端——复数那个用例因此只用退出码判对错。
+
+### 聚合按值返回：拿的是被调方帧里的地址（既有缺陷，会踩坏 C99 后端的 -O1）
+
+`struct S f(void) { struct S s; … return s; }` 这条路上，`IR_RET` 的实参是
+`s` 的**地址**（`return (T){…}` 也一样，返回那个临时对象的地址）。调用方拿到
+这个指针再 `IR_COPY` 拷走——可被调方的帧在 `ret` 时就没了。
+
+* native 后端：拷得早，实测一直是好的（运气，不是保证）。
+* C99 后端：`c99-diff.sh` 用 `-O1` 编它生成的 C，`FR` 是 `unsigned char[]`
+  局部数组，内容一失效就是读到别的变量的栈——**稳定失败**：
+
+```
+struct S { double a, b; };
+static struct S mk(double x) { struct S s; s.a = x; s.b = x + 1; return s; }
+int main(void) { struct S t = mk(3.0); return t.a == 3.0 ? 0 : 1; }
+```
+  → native 0、`--emit-c` + `gcc -O0` 0、`gcc -O1` **1**。用 `HEAD` 的二进制
+  复现过，不是这一轮引入的。
+
+正解是"聚合返回走隐藏指针"（调用方开槽、把地址当第一个实参传，被调方写进去）：
+三后端都不用改（那就是个普通指针形参），但前端要同时动**函数定义、每个调用点、
+函数指针类型**三处，属于"该排期"的活。`tests/c/complex.c` 因此写成出参形式，
+不靠这条不保证的路径。
