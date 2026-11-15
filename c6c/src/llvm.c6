@@ -263,6 +263,16 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
         char p1[48] = {0};
         char t1[48] = {0};
 
+        /* 上一块已经被终结（br/ret/trap），这里却又冒出指令：那是 IR 里
+         * "紧跟在无条件跳转后面的死代码"（前端在 `return`/cleanup 那些边界上
+         * 会留几段）。native 后端线性摆放无所谓，LLVM 不允许终结指令后面直接
+         * 接指令——`llc` 报 "expected instruction opcode" 指着下一个标签。
+         * 开一个没人跳进来的死块把它接住就行。 */
+        if (term && o->op != IR_LABEL) {
+            fprintf(out, "  br label %%Ldead%u\n", (unsigned)i);
+            fprintf(out, "Ldead%u:\n", (unsigned)i);
+            term = 0;
+        }
         switch (o->op) {
         case IR_NOP:
         case IR_SETRSP:
