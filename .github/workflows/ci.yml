@@ -20,8 +20,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CMAKE_INSTALL_PREFIX: /usr
+# 别在这里放全局 `CMAKE_INSTALL_PREFIX: /usr`：CMake 把同名环境变量当作
+# **默认值**，而用例里还有"再 configure 一遍自己"的（c6c/tests/pkgcheck.sh 装
+# 一棵临时前缀的树、check-install 装 stage）。环境变量漏进去会让那些嵌套配置
+# 也按 /usr 算——Debian 系的 GNUInstallDirs 在 prefix=/usr 时把 libdir 定成
+# lib/x86_64-linux-gnu，于是用例断言里的 lib/… 全部对不上（CI 上 pkgcheck 就
+# 是这么红的：安装树"缺 lib/libc6c.a …"、pkgconf 找不到 c6lib.pc）。
+# 每个真正需要 /usr 的 configure 都在自己的命令行里显式 -DCMAKE_INSTALL_PREFIX。
 
 jobs:
   # -------------------------------------------------------------------------
@@ -153,6 +158,7 @@ jobs:
       - name: Configure and build without tcc
         run: |
           cmake -S . -B build-notcc \
+            -DCMAKE_INSTALL_PREFIX=/usr \
             -DC6_ENABLE_TCC=OFF \
             -DCMAKE_C_COMPILER=gcc \
             -DBUILD_TESTING=ON

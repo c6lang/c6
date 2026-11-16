@@ -31,7 +31,12 @@ if [ ! -x "$ROOT/build/c6c" ]; then
 fi
 
 PREFIX="$WORK/prefix"
+# libdir 显式钉成 lib：下面断言的就是这套布局。不钉的话它跟着环境走——CMake 把
+# `CMAKE_INSTALL_PREFIX` 环境变量当默认前缀，Debian 系的 GNUInstallDirs 一看
+# prefix=/usr 就把 libdir 定成 lib/x86_64-linux-gnu，安装树里的 lib/libc6c.a、
+# lib/pkgconfig/c6lib.pc 全换了地方，断言和 pkgconf 就一起假红（CI 上见过）。
 if ! cmake -S "$ROOT/.." -B "$WORK/build" -DC6_ENABLE_TCC=OFF \
+        -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_BUILD_TYPE=Release >"$WORK/cfg.log" 2>&1; then
     bad "没有 tcc 也能 configure" "$(tail -3 "$WORK/cfg.log")"
     echo "c6c 安装契约：通过 $pass / 失败 $fail"
