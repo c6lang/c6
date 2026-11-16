@@ -2954,6 +2954,12 @@ static i64 char_lit_val(Tok *t)
  * 这里走一条独立的递归下降，只做整数运算（不产生 IR）。 */
 static i64 const_expr(void);
 static i64 const_cast_to(i64 v, u32 ty);
+/* 上一次 str_lit_data() 写出的字节/码元数、以及元素宽度（1 = char、
+ * 2 = u""、4 = L""）。常量层的 `sizeof("…")` 要用它们：`sizeof("abc")` 是 4，
+ * `sizeof(L"abc")` 是 16。定义在 str_lit_data() 那一节。 */
+static u32 STR_LIT_N;
+static u32 STR_LIT_ESZ = 1;
+static u32 str_lit_data(void);
 static int CONST_LAX;
 /* 常量求值刚返回的值是**符号下标**（全局量/函数名）而不是整数：
  * 全局初始化器据此决定要不要生成一条重定位。 */
@@ -3260,6 +3266,78 @@ static i64 const_unary(void)
         CONST_TY = (w == 2) ? ty_ushort() : (w == 4) ? ty_uint() : ty_ulong();
         return (i64)r;
     }
+    if (PA_IS_IDENT("__builtin_strlen") && pa_peek(1)->kind == TK_PUNCT
+        && tok_eq(pa_peek(1), "(")) {
+        /* `__builtin_strlen("…")` 的**常量**形态。内核
+         * include/linux/moduleparam.h 的 MODULE_INFO 用它做
+         *     _Static_assert(sizeof(s) - 1 == strlen(s), "…contains embedded NUL byte")
+         * lib/btree.c 的 MODULE_AUTHOR 展开就撞在这条上。 */
+        u64 ln = 0;
+
+        pa_advance();
+        pa_advance();
+        if (pa_cur()->kind == TK_STR) {
+            /* 字面量长度：去掉两侧引号，相邻串要连着算 */
+            while (pa_cur()->kind == TK_STR) {
+                Tok *t = pa_cur();
+                const char *d = tok_data(t);
+                u32 i = 0;
+                u32 n = t->len;
+
+                while (i < n && d[i] != '"')
+                    i++;                 /* 跳过 L/u/U/u8 前缀 */
+                if (i < n) {
+                    i++;
+                }
+                if (n > i && d[n - 1] == '"')
+                    n--;
+                ln += (u64)(n - i);
+                pa_advance();
+            }
+        } else {
+            /* 非常量：整组实参跳过，值给 0 */
+            int d0 = 0;
+
+            while (pa_cur()->kind != TK_EOF) {
+                if (pa_is_ch('(') || pa_is_ch('['))
+                    d0++;
+                else if (pa_is_ch(')') || pa_is_ch(']')) {
+                    if (d0 == 0)
+                        break;
+                    d0--;
+                }
+                pa_advance();
+            }
+        }
+        pa_expect_ch(')');
+        CONST_TY = ty_ulong();
+        return (i64)ln;
+    }
+    if ((PA_IS_IDENT("__func__") || PA_IS_IDENT("__FUNCTION__")
+         || PA_IS_IDENT("__PRETTY_FUNCTION__"))
+        && !(pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "("))) {
+        /* `__func__` 在**常量**上下文里的形态。内核 lib/maple_tree.c:67 的
+         *     #define TP_FCT tracepoint_string(__func__)
+         * 把它塞进静态 tracepoint 的字符串字段。这里给出该字符串在数据段里
+         * 的偏移（和字符串字面量的值同一个口径），由调用方按地址常量处理。 */
+        u32 off = 0;
+        u32 ln = FN.name ? (u32)strlen(FN.name) : 0;
+
+        pa_advance();
+        if (ln == 0) {
+            CONST_TY = ty_int();
+            return 0;
+        }
+        off = data_alloc(ln + 1, 1);
+        memcpy(DATA_IMG.p + off, FN.name, ln);
+        DATA_IMG.p[off + ln] = 0;
+        CONST_TY = ty_ptr(ty_char());
+        /* 给的是数据段偏移，和地址常量同一个口径：调用方要按"符号 + 偏移"
+         * 处理就得知道这不是普通整数。这里没有符号表项，直接报成非常量，
+         * 让上层走字符串字面量那条路。 */
+        CONST_SYM = 0;
+        return (i64)off;
+    }
     if (PA_IS_IDENT("__builtin_constant_p") && pa_peek(1)->kind == TK_PUNCT
         && tok_eq(pa_peek(1), "(")) {
         /* `__builtin_constant_p(x)`：编译期能不能把 x 折成常量。
@@ -3459,6 +3537,31 @@ static i64 const_unary(void)
             ty = parse_typename();
             pa_expect_ch(')');
             return (i64)(is_align ? (u32)ty_align_of(ty) : ty_size(ty));
+        }
+        /* `sizeof("…")` / `sizeof L"…"`：字符串字面量的类型是**数组**
+         * （`char[4]` / `wchar_t[4]`），不能像下面那样借 gen_unary() 求值——
+         * 那条路会把它退化成 `char *`，于是 `sizeof("abc")` 给出 8 而不是 4。
+         * 内核 include/linux/moduleparam.h 的 MODULE_INFO 正是拿
+         * `sizeof(__stringify(s)) - 1 == strlen(__stringify(s))` 做断言，
+         * 差 4 就直接假失败（lib/btree.c 的 MODULE_AUTHOR）。 */
+        {
+            u32 look = 0;
+
+            if (pa_is_ch('('))
+                look = 1;
+            if (pa_peek(look)->kind == TK_STR) {
+                u32 esz = 1;
+                u32 cnt = 0;
+
+                if (look)
+                    pa_advance();          /* `sizeof (` 的左括号 */
+                (void)str_lit_data();      /* 顺带把相邻字面量拼好、设好 STR_LIT_N */
+                cnt = STR_LIT_N;
+                esz = STR_LIT_ESZ ? STR_LIT_ESZ : 1;
+                if (look)
+                    pa_expect_ch(')');
+                return (i64)(is_align ? esz : (cnt + 1) * esz);
+            }
         }
         {
             /* `sizeof (表达式)` / `sizeof 表达式`（常量表达式里）：借普通表达式
@@ -7848,6 +7951,7 @@ static u32 parse_typename(void);
 static void parse_static_assert_rest(void)
 {
     i64 v = 1;
+    const char *msg = NULL;
 
     pa_expect_ch('(');
     v = const_expr();
@@ -7858,13 +7962,14 @@ static void parse_static_assert_rest(void)
          * 展开出来就是 `"BUILD_BUG_ON failed" " is true"` 两个相邻的串——
          * 只吃第一个的话，那个 " is true" 会被当成 `)` 之后的多余 token，
          * 报"这里要 ')'（当前是 '" is true"'）"。 */
+        msg = (const char *)tok_data(pa_cur());
         while (pa_cur()->kind == TK_STR)
             pa_advance();
     }
     pa_expect_ch(')');
     pa_expect_ch(';');
     if (!v)
-        pa_error("_Static_assert 失败");
+        pa_error("_Static_assert 失败%s%s", msg ? ": " : "", msg ? msg : "");
 }
 
 static void gen_stmt(void);
@@ -8647,7 +8752,7 @@ static u32 LIT_SYM;
 static int WIDE_LIT;
 /* 上一次 str_lit_data() 写出的字节数（不含结尾 0），用来推 `char s[] = "…"`
  * 的元素个数——拼接后的长度只有解码完才知道。 */
-static u32 STR_LIT_N;
+
 
 /* 相邻字符串字面量拼接时的一段（用链表，段数不设上限：tcc 的
  * tcctok.h 一个数组就拼了上百段） */
@@ -8759,6 +8864,7 @@ static u32 str_lit_data(void)
         }
         DATA_IMG.p[off + at] = 0;
         WIDE_LIT = 0;
+        STR_LIT_ESZ = 1;
     } else {
         /* u"" 是 2 字节元素（UTF-16），U""/L"" 是 4 字节元素（UTF-32） */
         off = data_alloc((total + 1) * (u32)kind, (u32)kind);
@@ -8791,6 +8897,7 @@ static u32 str_lit_data(void)
             }
         }
         WIDE_LIT = 1;
+        STR_LIT_ESZ = (u32)kind;
     }
     /* 每个字面量一个数据符号，命名 .LC<n>（调试/符号表可见，链接器可合并） */
     {
@@ -11326,6 +11433,80 @@ static u32 gen_postfix(void)
         irfn_push(&FN, IR_CONST, IRT_U64, d0, 0, 0, 0, 0);
         GEN_TY = ty_ulong();
         return gen_postfix_ops(d0);
+    }
+    if (TOK_EQ(t, "__builtin_strlen")) {
+        /* `__builtin_strlen(s)`。
+         *
+         * 实参是字符串字面量时折成常数——内核 include/linux/moduleparam.h 的
+         * MODULE_INFO 里有一条
+         *     _Static_assert(sizeof(s) - 1 == strlen(s),
+         *                    "MODULE_INFO(...) contains embedded NUL byte")
+         * 而 include/linux/string.h 在非 FORTIFY 下把 strlen 指到
+         * __builtin_strlen（`#define strlen __builtin_strlen`）。
+         * lib/btree.c 的 MODULE_AUTHOR("Joern Engel <…>") 就撞在这条断言上。
+         *
+         * 非字面量实参**必须退化成真正的 strlen() 调用**：c6c 以前是在
+         * 预定义宏表里写 `#define __builtin_strlen(a) strlen(a)` 把它整个
+         * 改写掉的，去掉那条宏以后运行期语义要在这里原样保住。
+         */
+        u32 ln = 0;
+        int folded = 0;
+
+        if (pa_peek(1) && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "(")
+            && pa_peek(2) && pa_peek(2)->kind == TK_STR) {
+            pa_advance();              /* 名字 */
+            pa_advance();              /* ( */
+            while (pa_cur()->kind == TK_STR) {
+                Tok *t0 = pa_cur();
+                const char *d = tok_data(t0);
+                u32 i = 0;
+                u32 nn = t0->len;
+
+                while (i < nn && d[i] != '"')
+                    i++;               /* 跳过 L/u/U/u8 前缀 */
+                if (i < nn)
+                    i++;               /* 跳过开引号 */
+                if (nn > i && d[nn - 1] == '"')
+                    nn--;              /* 去掉闭引号 */
+                ln += nn - i;
+                pa_advance();
+            }
+            pa_expect_ch(')');
+            folded = 1;
+        }
+        if (!folded) {
+            Sym *fs = sym_find("strlen", 6);
+
+            if (fs && fs->is_func) {
+                pa_advance();          /* 名字，游标停在 '(' 上 */
+                return gen_postfix_ops(gen_call(fs));
+            }
+            /* 连 strlen 都没有：跳过实参、值给 0（不把整条表达式打死） */
+            {
+                int d0 = 0;
+
+                pa_advance();
+                while (pa_cur()->kind != TK_EOF) {
+                    if (pa_is_ch('(') || pa_is_ch('['))
+                        d0++;
+                    else if (pa_is_ch(')') || pa_is_ch(']')) {
+                        d0--;
+                        if (d0 == 0) {
+                            pa_advance();
+                            break;
+                        }
+                    }
+                    pa_advance();
+                }
+            }
+        }
+        {
+            u32 d = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, ln);
+            GEN_TY = ty_ulong();
+            return gen_postfix_ops(d);
+        }
     }
     if (TOK_EQ(t, "__builtin_object_size")) {
         /* `__builtin_object_size(ptr, type)`。
