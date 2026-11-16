@@ -134,6 +134,20 @@ static const u8 ASM_FSBASE[11] = {
  * 16 个线程的 spinlock 用例能拖到分钟级（tests2/124 第三个用例）。 */
 static const u8 ASM_XCHG8[8] = { 0x89, 0xf0, 0x86, 0x07, 0x0f, 0xb6, 0xc0, 0xc3 };
 
+/* void *__c6_memcpy_rep(void *dst, const void *src, long n)：大块拷贝。
+ *   48 89 f8         mov  %rdi,%rax     ; 返回值 = dst
+ *   fc               cld                ; DF 归零（SysV ABI 本来就要求 0，防一手）
+ *   48 89 d1         mov  %rdx,%rcx     ; rep 的计数
+ *   f3 a4            rep movsb
+ *   c3               ret
+ * 为什么要一块机器码：c6c 没有优化器，C 里写的逐字节/8 字节块循环每个元素都
+ * 要过一次帧槽，实测只有 0.083 / 0.62 GB/s；这一条 rep 在 ERMSB 的机器上能跑
+ * 到内存带宽（本机 6.8 GB/s，同口径 glibc 是 8.0 GB/s）。小拷贝不划算（rep 的
+ * 启动开销约 14 ns），阈值在 lib/rt.c6 的 c6c_mem_copy 里。 */
+static const u8 ASM_MEMCPY_REP[10] = {
+    0x48, 0x89, 0xf8, 0xfc, 0x48, 0x89, 0xd1, 0xf3, 0xa4, 0xc3
+};
+
 #define ASM_REL1(a) { (a), 0 }
 
 static const AsmBlob ASMBLOBS[] = {
@@ -169,6 +183,9 @@ static const AsmBlob ASMBLOBS[] = {
       "\tmov %esi, %eax\n\txchg %al, (%rdi)\n\tmovzbl %al, %eax\n\tret\n" },
     { "__c6_fsbase", ASM_FSBASE, 10, 0, { { 0, 0 } },
       ".text\n.globl __c6_fsbase\n__c6_fsbase:\n\tmov %fs:0, %rax\n\tret\n" },
+    { "__c6_memcpy_rep", ASM_MEMCPY_REP, 10, 0, { { 0, 0 } },
+      ".text\n.globl __c6_memcpy_rep\n__c6_memcpy_rep:\n"
+      "\tmov %rdi, %rax\n\tcld\n\tmov %rdx, %rcx\n\trep movsb\n\tret\n" },
 };
 
 #define NASMBLOB ((u32)(sizeof(ASMBLOBS) / sizeof(ASMBLOBS[0])))
