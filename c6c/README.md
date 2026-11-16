@@ -467,11 +467,15 @@ cmake --build build --target regression-c6c         # 已全绿的那批（列�
 * selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
   仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
 
-当前基线（第 209 轮实测）：**42 / 92 全绿**，还差 50 个。缺口分四类，都在
-`c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面还缺 `getaddrinfo` /
-`opendir` / `tcsetattr` / `getrusage`；`-lm` 还没有对应的动态依赖；模板成员函数
-与 `static` 函数跨 TU 的符号（`Iter_int_has`、`p_atom$2` 那种）；以及若干
-`test` 块的**行为**差异（浮点打印、`cfmakeraw` 后的 termios 细节）。
+当前基线（第 210 轮实测）：**45 / 92 全绿**，还差 47 个。缺口分四类，都在
+`c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面（`getgrgid`、真信号投递、
+真 DNS）；`-lm` 还没有对应的动态依赖；模板成员函数与 `static`/`$2` 函数跨 TU
+的符号（`Iter_int_has`、`p_atom$2` 那种）；以及若干 `test` 块的**行为**差异
+（浮点打印、hexdump 宽度、AES 向量）。
+
+顺带一个容易掉进去的坑：`rt.c6` 的 syscall 薄壳现在会**设 `errno`**（返回值
+仍是 `-errno`）。在这之前 `errno == EINPROGRESS` / `EAGAIN` / `EINTR` 这类分支
+永远走失败那条路——`std/net/tcp.c6` 的非阻塞 connect 就是这么被卡死的。
 
 ## 第二套 native 后端：aarch64
 
