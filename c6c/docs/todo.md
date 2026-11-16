@@ -4112,3 +4112,70 @@ cmake --build build --target check-install   # 通过
 
 **还差的**：共享库里的外部数据符号（GOT 间接寻址）、符号版本
 （`.gnu.version`）、`.a` 静态库、`--gc-sections`、`-Wl,-soname=` 别名。
+
+## 第 209 轮：per-TU C 后端（`--emit-ctu`）——rtos-c6 的 S3 交叉构建接上 c6c
+
+rtos-c6 的 Makefile 写死了 `C6CC := $(C6_ROOT)/tcc/c6`，它要的是 cc 那种口径：
+**一个 TU 出一个 .c**，再交给目标平台的 cc 出机器码。
+
+```
+$(C6CC) -B $(C6_ROOT)/tcc -Iinclude -I$(C6_ROOT) $(S3_C6FLAGS) -c -o $(BUILD)/c99/ $(1)
+$(XTGCC) $(XTFLAGS) -Iinclude -c $(BUILD)/c99/os.c -o $(BUILD)/obj/os.o
+```
+
+c6c 原来的两个文本后端都顶不上，三条硬伤：**粒度**（`--emit-c`/`--emit-llvm`
+是整程序虚拟机翻译，一份输出、还要求有 main）、**ABI**（出来的函数是
+`uint64_t f(uint64_t, ...)`，C 侧按真 C ABI 调用全对不上）、**指针宽度**
+（宿主 LP64 vs Xtensa ILP32）。
+
+这一轮加的是第三个文本后端：`--emit-ctu`（`src/ctu.c6`，~110 行）。
+
+- **per TU**：一个 `.c6` 出一个 `.c`，不做整程序合成，**不要求 main**；
+- **真 C ABI**：交出去的是 C 源码，ABI 由目标 cc 决定；
+- **不带运行时**：进了这个模式根本不进 `pa_compile_ex`，所以既不会去找
+  `lib/rt.c6`，也不会报"没有 main"；
+- **行号保真**：复用 `-E` 的发射器（`main.c6` 的 `emit_one`），预处理后的
+  token 流按源文件行号重排（`# 行 "文件"`），目标 cc 报错的位置仍是原始 `.c6`。
+
+对 c6 的 **C 子集**这是恒等翻译（预处理完的 token 流本身就是合法 C）；用了
+c6 扩展（`fn`/`let`/`defer`/切片/泛型/`async`）的源会原样落到输出里、由目标
+cc 报错——**不会静默产出一份语义不对的 C**。rtos-c6 的 `kernel/` 实测 0 个扩展
+（struct 17 / typedef 25 / static 59 / 函数指针 6 / 变参 2，全是普通 C），所以
+这条主路现在就是通的。
+
+**CLI**：`--emit-ctu -c -o <dir>/`（`-c` 不会把模式改回 `-c`）；`-o` 以 `/`
+结尾当目录、否则当文件名（多输入必须给目录）；写失败**非 0 退出**。
+
+**实测**（`-mabi=call0`，xtensa-esp32s3-elf-gcc）：
+
+```
+$ C6C=build/c6c sh c6c/tests/ctu/run.sh
+ctu: 通过（a_run(6)=65|swap: d=5 x=9 y=4|）        # 与"同一份源直接当 C 编"逐字节相同
+
+$ C6C=build/c6c sh c6c/tests/ctu/rtos-smoke.sh
+rtos-smoke: OK   os.c → os.o        （panic/log/tick/timer/timeout 同）
+rtos-smoke: 已知 task.c6（port_cur_ctx 隐式声明，rtos-c6 源码问题）
+rtos-smoke: OK   heap.c → heap.o
+rtos-smoke: 编译通过 7 / 失败 0
+
+$ cd ~/rtos-c6 && make C6CC=<c6c> C6_ROOT=<c6c 仓库> S3_C6FLAGS=--emit-ctu BUILD=/tmp/s3 …
+xtensa-esp32s3-elf-gcc … -c /tmp/s3/c99/os.c -o /tmp/s3/obj/os.o     # 六个 .o 落地
+kernel/task.c6:315:32: error: implicit declaration of function 'port_cur_ctx'
+```
+
+`task.c6` 那条不是后端的问题：`port_cur_ctx()` 定义在 `port/s3/ctx.c`、没有头文件
+声明，老 c6（C89 口径）收下了隐式声明，gcc 与 c6c 都报。属于 rtos-c6 源码要补的
+一行声明。
+
+**速度**：正常路径（native / `--emit-c` / `--emit-llvm` / `-E` / `-c`）一行没动，
+只多了模式分派点上一个 `ctu_mode()` 分支。同机同源 best-of-5：
+
+```
+native:tcc.c      128 ms → 127 ms
+self:src/c6c.c6   115 ms → 114 ms
+-E tcc.c          与改前逐字节一致（864059 字节）
+```
+
+**已知（不在本轮）**：`-c -o <目录>/` 这类"目标不是文件"的写出失败在 native
+路径上仍然打印错误但退出码为 0（`elf.c6:203` 等几处 `fprintf` 后没有把错误
+回传给 `main`）；ctu 路径已经是非 0 退出。

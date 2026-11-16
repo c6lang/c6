@@ -19,7 +19,8 @@ enum {
     M_EXE,      /* 默认：单文件 + 自带运行时 → 可执行文件 */
     M_RUN,      /* -run：编到临时 ELF，exec 它（不落盘、不留输出） */
     M_LINK,     /* 输入是 .o：调自己的静态链接器（ld.c6）链成可执行文件 */
-    M_ASM       /* -S：只出汇编文本（asmout.c6），不写 ELF */
+    M_ASM,      /* -S：只出汇编文本（asmout.c6），不写 ELF */
+    M_CTU       /* --emit-ctu：per-TU C 文本（ctu.c6），一个输入一个 .c */
 };
 
 typedef struct Opts {
@@ -94,6 +95,8 @@ static void usage(FILE *fp)
         "  --ir-demo            打印 hello 形态的 IR dump\n"
         "  -fsyntax-only        只查错不出码（语法在 P3）\n"
         "  -E                   预处理输出到 stdout\n"
+        "  --emit-ctu           per-TU C：一个输入出一个 .c（真 C ABI、不要 main、\n"
+        "                       不带运行时；交叉编译用，见 ctu.c6）\n"
         "  -c                   只编不链：输出可重定位目标文件（ET_REL，.o），\n"
         "                       不带运行时、不查 main；一个输入出一个 .o\n"
         "  -run 文件 [参数...]   编成临时 ELF 后立刻执行（参数原样传给 main；\n"
@@ -119,6 +122,13 @@ static void usage(FILE *fp)
         "  -h                   这份帮助\n",
         progname);
 }
+
+/* ctu.c6 排在 main.c6 后面 include（它要用这里的 OUTBUF / emit_one /
+ * obj_default_out），这里先给三个入口一个前置声明：正常路径只有模式分派点
+ * 上一个 `ctu_mode()` 分支，别的什么都不碰。 */
+static void ctu_set_mode(void);
+static int ctu_mode(void);
+static int ctu_emit(const char *src, const char *out, int nfiles);
 
 static double now_ms(void)
 {
@@ -511,8 +521,13 @@ static int parse_args(int argc, char **argv)
             O.mode = M_CHECK;
         } else if (strcmp(a, "-E") == 0) {
             O.mode = M_E;
+        } else if (strcmp(a, "--emit-ctu") == 0) {
+            /* per-TU C 后端（ctu.c6）：模式一旦定下来，后面的 -c 不再把它改回去 */
+            O.mode = M_CTU;
+            ctu_set_mode();
         } else if (strcmp(a, "-c") == 0) {
-            O.mode = M_OBJ;
+            if (!ctu_mode())
+                O.mode = M_OBJ;
         } else if (strcmp(a, "--target=aarch64") == 0) {
             /* 第二套 native 后端：出 aarch64 汇编文本（必须配 -S） */
             O.target_a64 = 1;
@@ -1096,6 +1111,23 @@ int main(int argc, char **argv)
     }
 
     t0 = now_ms();
+    if (O.mode == M_CTU) {
+        /* per-TU C（ctu.c6）：一个输入一个 .c，写失败必须非 0 退出 */
+        if (O.nfiles < 1) {
+            diag_error_plain("没有输入文件");
+            return 2;
+        }
+        for (i = 0; i < O.nfiles; i++) {
+            pp_reset();
+            if (ctu_emit(O.files[i], O.out, O.nfiles) != 0)
+                return 1;
+        }
+        if (DG.errors) {
+            fprintf(stderr, "c6c: %d 个错误\n", DG.errors);
+            return 1;
+        }
+        return 0;
+    }
     if (O.mode == M_E) {
         for (i = 0; i < O.nfiles; i++) {
             pp_reset();
