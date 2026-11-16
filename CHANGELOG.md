@@ -5,7 +5,54 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
-## 未发布 — 2026-11-15
+## 0.6.1 — 2026-11-16
+
+### 修 `async` / `async_frame` 的段错误：退役的协程槽把还在用的栈给了下一个协程
+
+- 现象：CI 的 `no-tcc` job 和 Arch 打包的 `check()` 都在 `c6c-check-all` 上红，
+  `c6c: 跑不通的： async async_frame`；core 里 `rip = 0`，崩点落在一段协程栈上。
+- 根因：`c6c_co_retire()` 只看 `exited` 标志——那是协程线程自己在 epilogue 里置
+  的，置完它还要**站在自己的栈上**跑 `c6c_co_give()` 和 `exit`。这时候槽已经挂回
+  空闲链，下一个协程把同一份栈从顶上铺开，旧线程 `ret` 出去的返回地址就成了 0。
+  负载越高越容易撞上（多任务抢 CPU 时，"置完标志"到"真的退出"这个窗口被拉长）。
+  0.6.0 里把它当成"限流没做好"的次生现象，其实限流只影响撞上的概率。
+- 复现：本机 20 个实例并发跑 `tests/async.c6` → 8/20 段错误（顺序跑 20/20 通
+  过）；把"退役时先不复用槽"当实验 → 40/40 通过，确认就是栈复用。
+- 修法：
+  - `__c6_co_spawn` 多收一个 `ctid`，同时当 clone 的 ptid/ctid：协程线程带
+    `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID` 起，线程一退出内核就把 `c->tid`
+    清零并 futex 唤醒。
+  - `c6c_co_retire()` 等 `c->tid` 变 0（每轮最多 10 ms、上限 200 轮）才把槽挂回
+    空闲链；等不到就不挂回——漏一个槽好过两个线程共用一份栈。
+  - `__c6_co_entry` 交令牌前先把 `resumer` 存进本地，不再读可能已被复用的槽字段。
+- 验证：48 个实例并发跑 `tests/async.c6` → 48/48；CPU 打满时顺序跑 12/12；
+  `async_frame` 32 并发 → 32/32；`ctest -L c6c -LE perf` 全绿（含 `c6c-check-all`）。
+
+### CI：两条"只在一台机器上红"的假失败
+
+- `dyn-check.sh` 解析 `readelf` 的 `Elf file type is` 时没锁 locale：开发机是
+  `zh_CN.UTF-8`（输出 `Elf 文件类型为 EXEC`），runner 是 C locale，同一条断言在
+  一处红一处绿。现在 `readelf` 走 `LC_ALL=C` 包装，正则只认英文口径。
+- `ci.yml` 把 `CMAKE_INSTALL_PREFIX: /usr` 设成了**全局环境变量**：CMake 会把它
+  当默认 prefix 带进 `pkgcheck` 的嵌套 configure，Debian 的 GNUInstallDirs 于是把
+  libdir 算成 `lib/x86_64-linux-gnu`（期望 `lib`），`pkgcheck` 报"安装树缺 7 个
+  文件"。现在每个 job 在自己的 configure 里显式传 `-DCMAKE_INSTALL_PREFIX`，
+  `pkgcheck` 里再钉一个 `-DCMAKE_INSTALL_LIBDIR=lib`。
+
+### 打包侧：失败要能查，门槛要留余量
+
+- `tests/tcc-tests2.sh` 的"意外失败 N"原来只有 `VERBOSE=1` 才打名字，AUR 的日志
+  里就只剩一个数字。现在无条件打出每条的名字和结论（`LINK` / `CERR` / `FAIL`）。
+- `bench/thresholds.json` 的 `max_rss_mb` 32 → 40：32 是在 Ubuntu/gcc 13 上定的
+  绝对口径，Arch（gcc 15 -O3 + glibc 2.42）实测 `native:tcc.c` 33 MB 直接假红。
+  40 MB 仍能挡住 2 倍级别的真退步。
+
+### 构建：`c6c/Makefile` 全部转成 CMake target
+
+- `make -C c6c check-all` 这一套入口没了，改成 `cmake --build build --target
+  fast` / `--target check-all-c6c` / `--target dyncheck` …：脚本、数字、失败口径
+  都不变，只是入口收敛到 CMake。打包脚本按 target 名调用即可（下面两条新门禁就是
+  这批 target 的聚合）。
 
 ### 新增 `fast` / `check-all-c6c`：c6c 替换 c6 的两条门禁（含第三方语料）
 
@@ -23,8 +70,8 @@
     第三代 selfhost）再加 `tests1-check`、`tests2-check`。
 - 第三方测试集是这两条门禁的一部分，不是可选装饰：c-testsuite（`c99suite`）、
   tcc 上游 `tests1` / `tests2`，以及 c6c 编出的 tcc 再跑上游 tests2。
-- 实现：`c6c/Makefile` 增 `fast`（`check-all` 依赖的子集，注释里列了挪出去
-  哪几条及各自耗时），CMake 两条目标直调它，所以 `make -C c6c fast` 与
+- 实现：CMake 的 `fast` target（`check-all` 依赖的子集，注释里列了挪出去
+  哪几条及各自耗时；0.6.0 时是 `c6c/Makefile` 的 `fast`，见上面"构建"一节），所以 `make -C c6c fast` 与
   `--target fast` 跑的是同一套脚本、同一批数字；`ctest -R '^c6c-'` 那套
   （`check-c6c`）不变。
 
