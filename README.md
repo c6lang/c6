@@ -244,6 +244,24 @@ cc $(pkgconf --cflags --libs c6) app.c -o app
 
 `c6.pc` 的 `prefix` 由 `${pcfiledir}` 反推，装到 `DESTDIR` 暂存目录里再搬走也照样能用。
 
+自举编译器 `c6c` 与嵌入库 `libc6c` 用**自己的包名**，和 `c6` 并列（`c6` 是 tcc
+分支的 libtcc 接口，`c6c` 是自举编译器本身）：
+
+```cmake
+find_package(c6c 0.9 REQUIRED COMPONENTS compiler libc6c)
+target_link_libraries(app PRIVATE c6c::libc6c)  # 静态；要动态链接用 c6c::libc6c_shared
+# c6c::compiler 是 bin/c6c 的 IMPORTED target
+```
+
+```sh
+pkgconf --cflags --libs c6c     # -I<includedir> -L<libdir> -lc6c
+```
+
+可用变量：`c6c_EXECUTABLE`、`c6c_LIBC6C_STATIC` / `c6c_LIBC6C_SHARED`、
+`c6c_INCLUDE_DIR`、`c6c_VERSION`。两个名字不打架：`c6.pc` 在两种 flavour 下内容
+不同（有 tcc 时 `-ltcc`、没有时 `-lc6c`），而 `c6c.pc` 只描述自举编译器、只在装
+了 c6c 时出现——消费者按自己真正依赖的东西选名字即可。
+
 ### 打包与发布
 
 CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除 tcc 版 `c6` 与
