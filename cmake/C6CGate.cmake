@@ -13,13 +13,13 @@
 
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
           c99suite llvmtest test-c6c build-tcc tests1-check tests2-check regression-c6c
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")

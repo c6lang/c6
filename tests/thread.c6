@@ -17,12 +17,19 @@
 int tu_add(int a, int b);
 int tu_last_sum(void);
 
-/* 空转等待，有上界：出错时报失败而不是挂住 */
+/* 空转等待，有上界：出错时报失败而不是挂住。
+ *
+ * 上界别按"本机跑得多快"定：20M 次空转在开发机上几十毫秒就过去了，可 CI 的
+ * 2 vCPU runner 有 cfs quota，线程可能整段时间都没被调度上——`thread` 就这么
+ * 在 CI 上偶发失败过（同一份二进制本地 20/20 通过）。放大 10 倍，正常路径
+ * 一有值就跳出，只有真出错时才多等这一会儿。 */
+#define SPIN_MAX 200000000
+
 static int wait_nonzero(volatile int *p)
 {
     int i = 0;
 
-    for (i = 0; i < 20000000 && *p == 0; i++)
+    for (i = 0; i < SPIN_MAX && *p == 0; i++)
         ;
     return *p;
 }
@@ -36,7 +43,7 @@ static int wait_for_gate(int marker)
 {
     int i = 0;
 
-    for (i = 0; i < 20000000 && !gate; i++)
+    for (i = 0; i < SPIN_MAX && !gate; i++)
         ;
     seen = gate ? marker : -1;
     return 0;

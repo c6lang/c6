@@ -128,6 +128,10 @@ one_file() {
         if [ "$rc" -eq 0 ]; then echo "ROK" >>"$out"; return; fi
         ;;
     esac
+    # 失败原因只有用例自己的输出里才有（断言文案 / 信号）。CI 上只看到
+    # "跑不通的：xxx" 等于没有信息，这里把最后几行捎上。
+    echo "c6c: $(basename "$f" .c6) 退出码 $rc，输出最后几行：" >&2
+    tail -3 "$TMP/$n.log" >&2 2>/dev/null
     echo "RBAD $(basename "$f" .c6)" >>"$out"
 }
 

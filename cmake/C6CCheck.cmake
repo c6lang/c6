@@ -61,6 +61,9 @@ c6c_target(printfcheck ENV C6C=${C6C_BIN} COMMAND ./tests/printf-check.sh)
 # 二进制转义（`"\xde"` 是**一个字节**，不是 UTF-8 的 0xc3 0x9e）：窄字面量里
 # 只有 `\u` 和源码里的 UTF-8 才该重新编码，这条线曾经把 std 的 5 个用例带偏。
 c6c_target(esccheck ENV C6C=${C6C_BIN} COMMAND ./tests/esc-check.sh)
+# 嵌套模板实例化：A@T 的方法里用到 B@T 时，B 的方法体要真发出来（否则链接期
+# 报 `<实例名>_<方法>` 未定义）。std 的 `Vect@T.iter()` 返回 `Iter@T` 就是这个形状。
+c6c_target(tmplcheck ENV C6C=${C6C_BIN} COMMAND ./tests/tmpl-check.sh)
 # 用 c6c 跑根目录 tests/regression.sh 里已经全绿的那批用例（列表单一数据源：
 # c6c/tests/regression-c6c.list）。交付物要能不带 tcc，这批回归就得能只靠 c6c 跑。
 c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)

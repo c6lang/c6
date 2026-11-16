@@ -7,6 +7,36 @@
 
 ## 未发布
 
+### 跨 TU 的模板/方法符号：回归 52 → 57 / 92
+
+`std-*` 里有一整类用例挂在「未定义的符号」上，名字分两副面孔：`p_atom$2`
+这种带 TU 后缀的，和 `std__container__vec__Iter_int_has` 这种带模块前缀的。
+查下来是同一个区域的两处：
+
+- **方法式函数的前向声明**（`static int poke(Bucket *b);` 先声明、后面才定义）：
+  声明时按短名建了一条 ELF 符号，调用点已经按它发过重定位；定义时发射名换成
+  `<接收者>_<方法>`（再套模块前缀 / TU 后缀），旧的那条就悬空了。定义处现在
+  记一笔账（`meth_alias_register`），等所有 TU 解析完、代码都发出来了，
+  由 `alias_apply()` 统一接到真名上——**不能当场接**：`x64_alias_idx` 复制的是
+  偏移，定义处这会儿代码还没生成，接过去的是 0（先按当场接写的第一版就让
+  c6c 编出来的 tcc 一启动就段错误：tests2 从 118 掉到 0）。这一处收掉了 `std-async3`
+  （`co_step$2`）、`std-ub`（`ps_typespec$2`）、`std-text`（`p_atom$2`）、
+  `std-box`（`jp_value$2`）、`std-mw`（`take_n`）、`std-more`（`next_set`）、
+  `std-mesh`（`next`）、`std-docs`（`add_irregular`）。
+- **嵌套的模板实例化**：模板 A 的方法签名里出现 `B@T`，A 的"只登记签名"那一遍
+  就会把 B 实例化（只有签名）；外层第二遍重放同样的实参时缓存直接短路，B 的
+  方法体再没机会展开。现在嵌套实例在自己的那一遍里一次展开完
+  （`PA_SIG_ONLY` 在嵌套重放期间清零）。`Vect@T.iter()` 返回 `Iter@T` 正是这个
+  形状，`std-demo`/`std-kit`/`std-tour` 从"链接不上"变成"能跑但段错误"——
+  离全绿还差运行期那一步（实例身份/布局），留到下一轮。
+- 新 check：`tmplcheck`（两 TU 的模块 fixture：编译链接、无未定义符号、跑对结果、
+  模块 `-c` 单编）。
+- CI 稳定：`tests/thread.c6` 的两处空转上界从 20M 提到 200M。同一份二进制本地
+  20/20 通过，CI 的 2 vCPU runner（cfs quota）上线程可能整段时间没被调度上，
+  `thread` 因此报过一次"跑不通"。`run-tests.sh` 现在还会把跑不通用例的最后几行
+  输出捎到 stderr，CI 上不用再猜。
+- 回归：52 → 57 / 92（`std-async3`、`std-docs`、`std-mesh`、`std-mw`、`std-ub`），
+  没有一条从绿变红。
 ### 构建：c6 与 c6c 的安装元数据收敛到 `cmake/C6Metadata.cmake`
 
 - `.pc` 生成、`find_package(...)` 包配置、`LD_LIBRARY_PATH` 注入三件事原本各自
