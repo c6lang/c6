@@ -1694,7 +1694,7 @@ static Tok cm_syn_punct(const char *s, u32 n)
     t.len = n;
     t.hash = tok_hash(s, n);
     t.flags = TF_SYN;
-    t.syn = (char *)s;
+    t.syn = s;
     return t;
 }
 
@@ -3285,8 +3285,10 @@ static void pa_dbg_counts(void)
             (unsigned)DATA_IMG.n, (unsigned)NSTATIC);
 }
 
-/* struct/union 定义体：成员类型 + 成员名 + 位宽 */
-#define AGG_CAP0 64
+/* struct/union 定义体：成员类型 + 成员名 + 位宽。
+ * 名字不要跟上面的 AGG_CAP0（聚合成员表容量）撞——那两个是不同的初始容量，
+ * 同名会被预处理器告警，而且改一个的后果会悄悄落到另一个身上。 */
+#define AGG_MEM_CAP0 64
 
 static void *agg_grow(void *old, u32 n, u32 cap, u32 esz)
 {
@@ -3526,7 +3528,7 @@ static void pa_push_tokens(Tok *t, u32 n)
 
 static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
 {
-    u32 cap = AGG_CAP0;
+    u32 cap = AGG_MEM_CAP0;
     u32 *mem = arena_alloc(&A_main, (size_t)cap * sizeof(u32));
     u32 *bits = arena_alloc(&A_main, (size_t)cap * sizeof(u32));
     const char **names = arena_alloc(&A_main, (size_t)cap * sizeof(char *));
@@ -10627,7 +10629,7 @@ static u32 fstr_str_addr(const char *lit)
     t->kind = TK_STR;
     t->len = (u32)strlen(lit);
     t->flags = TF_SYN;
-    t->syn = (char *)lit;
+    t->syn = lit;
     if (save_n > 0) {
         Tok *sv = arena_alloc(&A_main, (size_t)save_n * sizeof(Tok));
         u32 q = 0;

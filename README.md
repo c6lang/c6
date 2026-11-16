@@ -250,7 +250,10 @@ cpack --config build/CPackConfig.cmake -G RPM -B packages  # 需要 rpmbuild
 GitHub Actions（`.github/workflows/ci.yml`）在 push / PR 上做两版 Ubuntu × 静态/共享
 `libtcc` 的编译、CTest daily 与安装校验，并产出三种包；手动触发 `full_regression`
 或打 `v*` tag 时跑完整回归（CI 补齐 qemu/clang/go 依赖，避免用例静默跳过）。
-发布 job 的 `needs` 包含 `regression`，回归不通过不会发 Release。
+发版说明取自**版本提交**的正文：发版时提交一条主题为 `c6 <VERSION>` 的提交，正文
+写这一版改了什么、怎么验收的，release job 直接拿它当 Release 正文（末尾自动追加
+产物清单与校验方法），tag 注解只作兜底。发布 job 的 `needs` 包含 `regression`，
+回归不通过不会发 Release。
 
 ### Arch Linux 安装
 

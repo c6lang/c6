@@ -154,7 +154,7 @@ static Tok *tok_list_alloc_t(u32 n, int tag)
     return arena_zalloc_t(&A_main, (size_t)(n ? n : 1) * sizeof(Tok), tag);
 }
 
-static Tok tok_syn(int kind, char *text, u32 len, SrcFile *at, u32 off)
+static Tok tok_syn(int kind, const char *text, u32 len, SrcFile *at, u32 off)
 {
     Tok t = {0};
     t.kind = (u16)kind;
