@@ -9183,7 +9183,23 @@ static u32 gen_postfix_ops(u32 v)
                 /* s.m：左值就取地址；聚合**值**（函数返回的结构体、复合字面量）
                  * 在我们的约定里本来就是"用地址代表值"，直接当基址用。 */
                 if (!PEND_LVAL && ty_is_agg(GEN_TY)) {
-                    addr = v;
+                    /* 聚合值按约定"用地址代表"，但**函数返回的结构体**那个地址
+                     * 在**被调方的栈帧里**：方法调用糖把它当接收者指针传出去，
+                     * 被调方一进栈就把那块内存盖掉（`mkp().get()` 拿到垃圾，
+                     * 而 `mkp().x` 立刻读还是对的）。先拷进调用者的临时槽，
+                     * 再用它的地址。 */
+                    u32 asz = ty_size(GEN_TY);
+
+                    if (asz > 0 && asz <= 4096) {
+                        u32 aslot = frame_slots_for(asz);
+                        u32 aaddr = irfn_vreg(&FN);
+
+                        irfn_push(&FN, IR_ADDR, IRT_PTR, aaddr, 0, 0, 0, X64_SLOT(aslot));
+                        irfn_push(&FN, IR_COPY, IRT_U8, aaddr, v, 0, 0, asz);
+                        addr = aaddr;
+                    } else {
+                        addr = v;
+                    }
                     bty = GEN_TY;
                 } else if (!PEND_LVAL) {
                     /* 标量上的方法调用：`dec_parse(...).round(2)` 里接收者是个

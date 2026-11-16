@@ -61,6 +61,7 @@ std-mw
 std-net
 std-next
 std-node
+std-num
 std-ops
 std-ordered
 std-pack
