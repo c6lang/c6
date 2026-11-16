@@ -4614,3 +4614,30 @@ fetch(SS("GET"), (Str){ (char[:]){ url, (int)5 } }, SS(""), ...);
 
 剩下 28 个：libc 面（信号投递 / 真 DNS / 非阻塞边角）、若干模块的数值细节、
 以及 `std-client` 的解析坑（见第 218 轮）。
+
+## 第 220 轮：`static struct E t[] = {…}` 的 sizeof 是 0
+
+std-web / std-serve 的 mime 断言全挂在"查不到类型"上，根子在**不完整数组的
+长度没按初始化器补全**（数组元素是**结构体**时才有，标量数组正常）：
+
+```c
+struct E { char *ext; char *type; };
+static struct E etab[] = { {"html","text/html"}, {"gz","application/gzip"}, … };
+static int n(void) { return (int)(sizeof etab / sizeof etab[0]); }  /* 0，应该是 3 */
+```
+
+调试数据（`init_count_of` 打印）：`ty=313 lpe=2 max=0 cur=6` —— 叶子数、元素叶子数
+都对，`INIT_CUR` 也走到了 6，但 **`INIT_MAX` 一直是 0**。`INIT_MAX` 只在
+`init_store` → `init_mark()` 里更新；而结构体元素那几层 `{…}` 是走嵌套
+`init_brace` 收尾的（`INIT_CUR = init_leaf_at(末尾)`），一次 `init_store` 都没
+调到，所以"填过的最大叶子"没被记账，`(INIT_MAX + lpe - 1) / lpe` 得 0，数组长度
+就成了 0。
+
+试过但**没有**用的改法（已回退）：把 `init_count_of` 里的 `lpe` 从
+`init_leaf_at(元素大小)` 换成 `init_leaf_walk(元素类型)`——lpe 本来就算对了，
+问题在 `INIT_MAX`。下一步从 `init_brace` 收尾处补一次记账（按本层写到的最后
+一个叶子更新 `INIT_MAX`），或者让结构体元素的嵌套 `init_brace` 也走
+`init_mark()`。
+
+影响面：凡是"表 + `sizeof 表 / sizeof 表[0]`"数条目、且元素是结构体的 std 模块
+都会数成 0（mime 的扩展名表就是典型），std-web / std-serve 因此各有 2 条断言红。
