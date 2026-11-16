@@ -2955,6 +2955,9 @@ static i64 char_lit_val(Tok *t)
 static i64 const_expr(void);
 static i64 const_cast_to(i64 v, u32 ty);
 static int CONST_LAX;
+/* 常量求值刚返回的值是**符号下标**（全局量/函数名）而不是整数：
+ * 全局初始化器据此决定要不要生成一条重定位。 */
+static u32 CONST_SYM;
 /* 枚举措名既是类型名又是常量名。`(CT_STATE_MAX - 1)` 这种写法里，括号
  * **不是**强制转换——把枚举成员当类型名去 parse_typename，就会在 `-` 上
  * 报"这里要 ')'"。内核 include/linux/log2.h 的 bits_per() 正好这么用。 */
@@ -3566,6 +3569,8 @@ static i64 const_unary(void)
                 /* 地址常量里的偏移不能引用全局对象：它的值是运行期的 */
                 pa_error("'%.*s' 不是常量：静态初始化器里的偏移要整数常量表达式",
                          (int)pa_cur()->len, tok_data(pa_cur()));
+            if (s->kind == SC_GLOBAL)
+                CONST_SYM = 1;
             pa_advance();
             return s->val;
         }
@@ -15718,6 +15723,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
     if (ty_is_ptr(ty)) {
         int amp = 0;
         int ak = 0;
+        u32 amp_paren = 0;
+
 
 
         /* 剥掉外面那层**标量强制转换**再认地址常量：`(void *)(uintptr_t)&sym`
@@ -15776,15 +15783,108 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
                 pa_advance();
         }
         amp = pa_accept_ch('&');
+        /* `&(name)`：取的是**自己**。内核 include/linux/list.h:27 的
+         *     #define LIST_HEAD_INIT(name) { &(name), &(name) }
+         * 展开后是 `static struct list_head x = { &(x), &(x) };`——
+         * 完全合法的自引用静态初始化（gcc 一直支持）。多出来的那对括号
+         * 让 glob_addr_start 只看见 `(`，直接落到"只支持 &全局/函数"。
+         *
+         * 这里把 `(` 剥掉，数量记在 amp_paren，值解析完再补右括号。 */
+        {
+            u32 pd = 0;
+
+            for (; amp; ) {
+                u32 k = 1;
+
+                if (!pa_is_ch('(') || pa_peek(k)->kind != TK_IDENT)
+                    break;
+                /* 括号里是 `名字 (.成员 | [常量])*`，且整体只有一层括号 */
+                while (pa_peek(k)->kind == TK_IDENT
+                       || (pa_peek(k)->kind == TK_PUNCT
+                           && (TOK_EQ(pa_peek(k), ".") || TOK_EQ(pa_peek(k), "[")))) {
+                    if (pa_peek(k)->kind == TK_IDENT) {
+                        k++;
+                        continue;
+                    }
+                    if (TOK_EQ(pa_peek(k), ".")) {
+                        k++;
+                        if (pa_peek(k)->kind != TK_IDENT)
+                            break;
+                        continue;
+                    }
+                    /* `[`：跳到配对 `]` */
+                    {
+                        int d2 = 0;
+
+                        while (pa_peek(k)->kind != TK_EOF) {
+                            if (TOK_EQ(pa_peek(k), "["))
+                                d2++;
+                            else if (TOK_EQ(pa_peek(k), "]")) {
+                                d2--;
+                                if (d2 == 0) {
+                                    k++;
+                                    break;
+                                }
+                            }
+                            k++;
+                        }
+                    }
+                }
+                if (!(pa_peek(k)->kind == TK_PUNCT && TOK_EQ(pa_peek(k), ")")))
+                    break;
+                pa_advance();
+                amp_paren++;
+                (void)pd;
+            }
+        }
         if (amp && gen_glob_compound_addr(goff + off))
             return;
         ak = glob_addr_start(amp);
         if (ak) {
             glob_addr_parse(goff + off, amp, ak == 2);
+            while (amp_paren > 0 && pa_is_ch(')')) {
+                pa_advance();
+                amp_paren--;
+            }
+            amp_paren = 0;
             return;
         }
+        amp_paren = 0;
         if (amp)
             pa_error("全局地址初始化器只支持 &全局/函数");
+        /* 三元 `cond ? f1 : f2` 挑函数指针：整条是个常量表达式
+         * （内核 include/linux/debugfs.h:59 的
+         *  `.write = (__is_signed) ? debugfs_attr_write_signed : debugfs_attr_write`）。
+         * 上面那套地址常量只认单个符号，落到这里就交给通用常量求值。
+         *
+         * 注意判据用 `pa_is_ch('(')` 而**不是** `pa_is_ch('?')`：走到这里时
+         * 游标还在 `(` 上，`?` 在括号后面看不见。 */
+        if (pa_cur()->kind != TK_EOF
+            && (pa_is_ch('(') || pa_is_ch('?') || pa_is_ch('!')
+                || (pa_cur()->kind == TK_NUM))) {
+            u32 save = FN.n;
+            u32 save_sym = CONST_SYM;
+            i64 cv = 0;
+            int is_sym = 0;
+
+            CONST_SYM = 0;
+            cv = const_expr();
+            is_sym = (int)CONST_SYM;
+            CONST_SYM = save_sym;
+            FN.n = save;
+            PEND_LVAL = 0;
+            if (is_sym) {
+                /* 值是个**符号下标**（三元挑出来的函数名/全局对象），
+                 * 要像地址常量那样补一条重定位，不能把下标当整数写进去——
+                 * 内核 include/linux/debugfs.h:59 的 `.write = cond ? a : b`
+                 * 以前会编成 0x194 这种"下标"。 */
+                glob_store(goff, off, ty, 0);
+                data_fixup_add(goff + off, (u32)cv);
+                return;
+            }
+            glob_store(goff, off, ty, (u64)cv);
+            return;
+        }
     }
     if (ty_is_float(ty)) {
         u64 bits = 0;
@@ -17576,6 +17676,19 @@ static void gen_local_decl(int need_semi)
         fprintf(stderr, "[dbgL] 声明起点 %.*s\n", (int)pa_cur()->len, tok_data(pa_cur()));
     u32 base = 0;
 
+    /* `__label__ name1, name2;`：GNU 的**局部标签声明**。
+     *
+     * 内核 include/linux/uaccess.h:668 的 unsafe_get_user()/unsafe_put_user()
+     * 宏用它把 asm goto 的目标限定在块作用域里。c6c 的标签本来就是函数
+     * 作用域、名字直接可用，所以这条声明只是把名字吃干净。 */
+    if (PA_ACCEPT_IDENT("__label__")) {
+        while (pa_cur()->kind == TK_IDENT
+               || (pa_cur()->kind == TK_PUNCT && TOK_EQ(pa_cur(), ",")))
+            pa_advance();
+        if (need_semi)
+            pa_expect_ch(';');
+        return;
+    }
     if (PA_ACCEPT_IDENT("typedef")) {
         /* 块作用域的 typedef（`typedef enum { e, f } h;` 写在函数里很常见）。 */
         Declarator d2 = {0};
@@ -18711,6 +18824,23 @@ static u32 iface_slot(u32 ifx, const char *nm, u32 nl)
 
 static void gen_stmt(void)
 {
+    /* `__label__ name1, name2;`：GNU 的**局部标签声明**，只声明标签的
+     * 作用域，本身不产生代码。内核 include/linux/uaccess.h:668 的
+     * unsafe_get_user()/unsafe_put_user() 宏第一条就是它
+     * （`do { __label__ local_label; … } while (0)`），用来保证 asm goto 的
+     * 目标落在局部作用域里。
+     *
+     * 放在最前面：它不参与"是不是声明"的那套前瞻判定，那些判定只看
+     * 类型名/关键字，`__label__` 一个都不沾。c6c 的标签本来就是函数作用域、
+     * 名字直接可用，所以吃干净就行。 */
+    if (PA_IS_IDENT("__label__")) {
+        pa_advance();
+        while (pa_cur()->kind == TK_IDENT
+               || (pa_cur()->kind == TK_PUNCT && TOK_EQ(pa_cur(), ",")))
+            pa_advance();
+        (void)pa_accept_ch(';');
+        return;
+    }
     /* -g：语句开头更新当前行，后面每条 IR 记录都会带上它（见 irfn_push）。
      * 放在这一层是因为它是"语句"的唯一入口：表达式里再怎么跨行，行号也只会
      * 前进到语句粒度——调试时按语句停就够了，不必精确到子表达式。 */
