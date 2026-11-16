@@ -1,0 +1,1610 @@
+/* protoc6.protofile：.proto 源文件的词法与语法分析（proto2 / proto3 的常用子集）。
+ *
+ *     import protoc6.protofile;
+ *
+ *     static ProtoFile pf;
+ *     pf_open(&pf, src, n);
+ *     if (parse(&pf) == 0) {
+ *         for (int i = 0; i < pf.nmsgs; i++)
+ *             ... pf.msgs[i].cname, pf.msgs[i].first_field ...
+ *     }
+ *
+ * 这是 `tools/protoc6` 的前端：把 .proto 读成一张**扁平的描述表**（消息、字段、
+ * 枚举、oneof 各一个数组），代码生成器只认这张表。零分配：所有名字是源文件
+ * 上的视图（合成名从 `pool` 里切），调用方给 `ProtoFile` 这块静态存储。
+ *
+ * 支持（与 protoc 的线格式行为一致）：
+ *
+ * - `syntax = "proto2" / "proto3"`、`package`、`import`（只记下，不展开）、
+ *   `option`（丢弃）；
+ * - `message`（可嵌套）、`enum`（含负值）、`oneof`、`map<K,V>`、
+ *   `repeated` / `optional` / `required` 标签；
+ * - 标量类型全套：double float int32 int64 uint32 uint64 sint32 sint64
+ *   fixed32 fixed64 sfixed32 sfixed64 bool string bytes；
+ * - 字段选项里的 `packed` 与 `default`（default 保留原始字面量，由生成器落成
+ *   C6 的初始化语句）；
+ * - `reserved` / `extensions` / `extend` / `service` / `rpc` 跳过（不影响线格式）。
+ *
+ * 不支持（明确报错，不静默吞）：
+ *
+ * - `group`（proto2 已废弃的语法；线格式层能跳过 group，但 schema 不生成）；
+ * - `editions`（新版本语法）与扩展字段的 C6 侧生成。
+ *
+ * 名字解析是后置的一遍：字段先记类型名，全文件读完后按 proto 的作用域规则
+ * （从内到外、包名、全名）解析成消息或枚举下标。
+ */
+#include <string.h>
+
+module protoc6.protofile;
+import std.core.types;
+import std.text.str;
+
+enum PfTok {
+    PF_EOF = 0,
+    PF_IDENT = 1,
+    PF_INT = 2,
+    PF_FLOAT = 3,
+    PF_STR = 4,
+    PF_SYM = 5,
+};
+
+enum PfKind {
+    PK_UNRESOLVED = 0,
+    PK_DOUBLE = 1,
+    PK_FLOAT = 2,
+    PK_INT64 = 3,
+    PK_UINT64 = 4,
+    PK_INT32 = 5,
+    PK_FIXED64 = 6,
+    PK_FIXED32 = 7,
+    PK_BOOL = 8,
+    PK_STRING = 9,
+    PK_BYTES = 10,
+    PK_UINT32 = 11,
+    PK_SFIXED32 = 12,
+    PK_SFIXED64 = 13,
+    PK_SINT32 = 14,
+    PK_SINT64 = 15,
+    PK_ENUM = 16,
+    PK_MESSAGE = 17,
+};
+
+enum PfErr {
+    PFE_OK = 0,
+    PFE_TOKEN = 1,
+    PFE_SYNTAX = 2,
+    PFE_TYPE = 3,
+    PFE_FIELD = 4,
+    PFE_DUP = 5,
+    PFE_LIMIT = 6,
+    PFE_UNSUPPORTED = 7,
+};
+
+enum PfCaps {
+    PF_MAX_MSG = 64,
+    PF_MAX_FIELD = 1024,
+    PF_MAX_ENUM = 64,
+    PF_MAX_VAL = 512,
+    PF_MAX_ONEOF = 64,
+    PF_POOL = 65536,
+};
+
+struct PfField {
+    Str name;
+    Str type_name;      /* 未解析的类型名（点号全名或短名） */
+    int number;
+    int kind;           /* PK_* */
+    int repeated;
+    int required;
+    int optional;       /* proto3 的 optional / proto2 的 optional */
+    int packed;         /* -1 跟语法默认 / 0 不打包 / 1 打包 */
+    int oneof;          /* -1 不在 oneof 里 */
+    int msg;            /* kind 为 PK_MESSAGE / PK_ENUM 时的下标 */
+    int is_map;
+    int map_key;        /* map 的键 kind */
+    int map_val;        /* map 的值 kind */
+    Str map_val_type;   /* 值不是标量时的原始类型名 */
+    int has_default;
+    int def_neg;
+    Str def_text;       /* default 的原始字面量（字符串已解转义） */
+    int owner;          /* 属于哪个消息（作用域解析用） */
+    int next;           /* 同一消息里的下一个字段（-1 结尾） */
+    int line;
+};
+
+struct PfMsg {
+    Str name;
+    Str full;           /* 点号全名：demo.Person.Phone */
+    Str cname;          /* C6 名字：demo_Person_Phone */
+    int parent;         /* -1 顶层 */
+    int first_field;    /* 字段用 next 串成链，嵌套消息不会打断 */
+    int last_field;
+    int nfields;
+    int line;
+};
+
+struct PfEnumVal {
+    Str name;
+    Str full;           /* demo.Color.RED */
+    Str cname;          /* demo_Color_RED */
+    int value;
+    int line;
+};
+
+struct PfEnum {
+    Str name;
+    Str full;
+    Str cname;
+    int parent;
+    int first_val;
+    int nvals;
+    int line;
+};
+
+struct PfOneof {
+    Str name;
+    int msg;
+    int line;
+};
+
+struct ProtoFile {
+    const char *src;
+    int n;
+    int pos;
+    int line;
+    int error;
+    int error_at;
+    Str why;
+
+    int syntax;         /* 2 / 3 */
+    Str package;
+    int nimports;
+
+    int nmsgs;
+    int nfields;
+    int nenums;
+    int nvals;
+    int noneofs;
+    PfMsg msgs[PF_MAX_MSG];
+    PfField fields[PF_MAX_FIELD];
+    PfEnum enums[PF_MAX_ENUM];
+    PfEnumVal vals[PF_MAX_VAL];
+    PfOneof oneofs[PF_MAX_ONEOF];
+
+    char pool[PF_POOL];
+    int npool;
+
+    int tok;
+    Str tok_text;
+    int tok_line;
+};
+
+/* ---- 小工具 ---- */
+
+static void pf_fail(ProtoFile *self, int code, const char *msg)
+{
+    if (!self || self->error)
+        return;
+    self->error = code;
+    self->error_at = self->pos;
+    self->why = (Str){ (char[:]){ (char *)msg, (int)strlen(msg) } };
+}
+
+int error_code(ProtoFile *self) { return self ? self->error : PFE_SYNTAX; }
+
+int error_at(ProtoFile *self) { return self ? self->error_at : -1; }
+
+Str why(ProtoFile *self)
+{
+    Str s = { (char[:]){ (char *)"", 0 } };
+
+    if (self)
+        s = self->why;
+    return s;
+}
+
+static int pf_eq(Str a, const char *b)
+{
+    int n = (int)strlen(b);
+    int i = 0;
+
+    if (!a.s.data || a.s.len != n)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (a.s.data[i] != b[i])
+            return 0;
+    return 1;
+}
+
+static Str pf_pool_copy(ProtoFile *self, const char *s, int n)
+{
+    Str r = { (char[:]){ (char *)"", 0 } };
+
+    if (!self || n < 0 || self->npool + n > PF_POOL) {
+        pf_fail(self, PFE_LIMIT, "名字池不够");
+        return r;
+    }
+    if (n > 0)
+        memcpy(self->pool + self->npool, s, (usize)n);
+    r.s = (char[:]){ self->pool + self->npool, n };
+    self->npool += n;
+    return r;
+}
+
+/* 拼 a + sep + b（sep 为 0 时直接接） */
+static Str pf_join(ProtoFile *self, Str a, char sep, Str b)
+{
+    Str r = { (char[:]){ (char *)"", 0 } };
+    int need = a.s.len + (sep ? 1 : 0) + b.s.len;
+
+    if (!self || need > PF_POOL - self->npool) {
+        pf_fail(self, PFE_LIMIT, "名字池不够");
+        return r;
+    }
+    if (a.s.len > 0)
+        memcpy(self->pool + self->npool, a.s.data, (usize)a.s.len);
+    if (sep)
+        self->pool[self->npool + a.s.len] = sep;
+    if (b.s.len > 0)
+        memcpy(self->pool + self->npool + a.s.len + (sep ? 1 : 0), b.s.data,
+               (usize)b.s.len);
+    r.s = (char[:]){ self->pool + self->npool, need };
+    self->npool += need;
+    return r;
+}
+
+static int pf_alpha(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int pf_digit(int c) { return c >= '0' && c <= '9'; }
+
+static int pf_alnum(int c) { return pf_alpha(c) || pf_digit(c); }
+
+static int pf_hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* ---- 词法 ---- */
+
+static void pf_skip_ws(ProtoFile *self)
+{
+    for (;;) {
+        int c = 0;
+
+        if (self->pos >= self->n)
+            return;
+        c = (u8)self->src[self->pos];
+        if (c == '\n') {
+            self->line++;
+            self->pos++;
+        } else if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') {
+            self->pos++;
+        } else if (c == '/' && self->pos + 1 < self->n
+                   && self->src[self->pos + 1] == '/') {
+            while (self->pos < self->n && self->src[self->pos] != '\n')
+                self->pos++;
+        } else if (c == '/' && self->pos + 1 < self->n
+                   && self->src[self->pos + 1] == '*') {
+            self->pos += 2;
+            while (self->pos + 1 < self->n
+                   && !(self->src[self->pos] == '*'
+                        && self->src[self->pos + 1] == '/')) {
+                if (self->src[self->pos] == '\n')
+                    self->line++;
+                self->pos++;
+            }
+            if (self->pos + 1 < self->n)
+                self->pos += 2;
+        } else {
+            return;
+        }
+    }
+}
+
+/* 字符串字面量：解常见转义，结果从名字池里切（`\u`/`\x` 也解成 UTF-8/字节）。 */
+static Str pf_string_tok(ProtoFile *self)
+{
+    Str r = { (char[:]){ (char *)"", 0 } };
+    int quote = 0;
+    int start = 0;
+    int len = 0;
+    char *out = 0;
+
+    if (self->pos >= self->n)
+        return r;
+    quote = self->src[self->pos++];
+    start = self->npool;
+    out = self->pool + self->npool;
+    for (;;) {
+        int c = 0;
+
+        if (self->pos >= self->n) {
+            pf_fail(self, PFE_TOKEN, "字符串没有结束引号");
+            return r;
+        }
+        c = (u8)self->src[self->pos++];
+        if (c == quote)
+            break;
+        if (c == '\n') {
+            pf_fail(self, PFE_TOKEN, "字符串里不能有裸换行");
+            return r;
+        }
+        if (c != '\\') {
+            if (self->npool + len + 1 > PF_POOL) {
+                pf_fail(self, PFE_LIMIT, "字符串太长");
+                return r;
+            }
+            out[len++] = (char)c;
+            continue;
+        }
+        if (self->pos >= self->n) {
+            pf_fail(self, PFE_TOKEN, "转义没有收尾");
+            return r;
+        }
+        c = (u8)self->src[self->pos++];
+        if (c == 'n')
+            c = '\n';
+        else if (c == 't')
+            c = '\t';
+        else if (c == 'r')
+            c = '\r';
+        else if (c == '0')
+            c = 0;
+        else if (c == 'x') {
+            int hi = 0;
+            int lo = 0;
+
+            if (self->pos + 2 > self->n
+                || (hi = pf_hexval((u8)self->src[self->pos])) < 0
+                || (lo = pf_hexval((u8)self->src[self->pos + 1])) < 0) {
+                pf_fail(self, PFE_TOKEN, "坏的 \\x 转义");
+                return r;
+            }
+            self->pos += 2;
+            c = hi * 16 + lo;
+        } else if (c == 'u' || c == 'U') {
+            int want = c == 'u' ? 4 : 8;
+            u32 cp = 0;
+            int i = 0;
+
+            for (i = 0; i < want; i++) {
+                int h = 0;
+
+                if (self->pos >= self->n
+                    || (h = pf_hexval((u8)self->src[self->pos])) < 0) {
+                    pf_fail(self, PFE_TOKEN, "坏的 \\u 转义");
+                    return r;
+                }
+                cp = cp * 16 + (u32)h;
+                self->pos++;
+            }
+            /* UTF-8 编码（代理区不特殊处理：proto 的 default 极少用到） */
+            if (cp < 0x80) {
+                out[len++] = (char)cp;
+            } else if (cp < 0x800) {
+                out[len++] = (char)(0xc0 | (cp >> 6));
+                out[len++] = (char)(0x80 | (cp & 0x3f));
+            } else if (cp < 0x10000) {
+                out[len++] = (char)(0xe0 | (cp >> 12));
+                out[len++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+                out[len++] = (char)(0x80 | (cp & 0x3f));
+            } else {
+                out[len++] = (char)(0xf0 | (cp >> 18));
+                out[len++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+                out[len++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+                out[len++] = (char)(0x80 | (cp & 0x3f));
+            }
+            continue;
+        }
+        if (self->npool + len + 1 > PF_POOL) {
+            pf_fail(self, PFE_LIMIT, "字符串太长");
+            return r;
+        }
+        out[len++] = (char)c;
+    }
+    r.s = (char[:]){ self->pool + start, len };
+    self->npool += len;
+    return r;
+}
+
+/* 读下一个 token；出错时 self->error 非 0、tok = PF_EOF。 */
+static int pf_next(ProtoFile *self)
+{
+    int c = 0;
+    int start = 0;
+
+    if (!self)
+        return PF_EOF;
+    if (self->error) {
+        self->tok = PF_EOF;
+        return self->tok;
+    }
+    pf_skip_ws(self);
+    self->tok_line = self->line;
+    if (self->pos >= self->n) {
+        self->tok = PF_EOF;
+        self->tok_text.s = (char[:]){ (char *)"", 0 };
+        return self->tok;
+    }
+    c = (u8)self->src[self->pos];
+    if (pf_alpha(c)) {
+        start = self->pos;
+        while (self->pos < self->n && pf_alnum((u8)self->src[self->pos]))
+            self->pos++;
+        self->tok = PF_IDENT;
+        self->tok_text.s = (char[:]){ (char *)(self->src + start),
+                                      self->pos - start };
+        return self->tok;
+    }
+    if (pf_digit(c) || (c == '.' && self->pos + 1 < self->n
+                        && pf_digit((u8)self->src[self->pos + 1]))) {
+        int is_float = 0;
+
+        start = self->pos;
+        if (c == '0' && self->pos + 1 < self->n
+            && (self->src[self->pos + 1] == 'x'
+                || self->src[self->pos + 1] == 'X')) {
+            self->pos += 2;
+            while (self->pos < self->n
+                   && pf_hexval((u8)self->src[self->pos]) >= 0)
+                self->pos++;
+        } else {
+            while (self->pos < self->n
+                   && pf_digit((u8)self->src[self->pos]))
+                self->pos++;
+            if (self->pos < self->n && self->src[self->pos] == '.') {
+                is_float = 1;
+                self->pos++;
+                while (self->pos < self->n
+                       && pf_digit((u8)self->src[self->pos]))
+                    self->pos++;
+            }
+            if (self->pos < self->n
+                && (self->src[self->pos] == 'e' || self->src[self->pos] == 'E')) {
+                is_float = 1;
+                self->pos++;
+                if (self->pos < self->n
+                    && (self->src[self->pos] == '+' || self->src[self->pos] == '-'))
+                    self->pos++;
+                while (self->pos < self->n
+                       && pf_digit((u8)self->src[self->pos]))
+                    self->pos++;
+            }
+        }
+        self->tok = is_float ? PF_FLOAT : PF_INT;
+        self->tok_text.s = (char[:]){ (char *)(self->src + start),
+                                      self->pos - start };
+        return self->tok;
+    }
+    if (c == '"' || c == '\'') {
+        self->tok_text = pf_string_tok(self);
+        self->tok = self->error ? PF_EOF : PF_STR;
+        return self->tok;
+    }
+    self->pos++;
+    self->tok = PF_SYM;
+    self->tok_text.s = (char[:]){ (char *)(self->src + self->pos - 1), 1 };
+    return self->tok;
+}
+
+static int pf_sym(ProtoFile *self, const char *s)
+{
+    return self->tok == PF_SYM && pf_eq(self->tok_text, s);
+}
+
+static int pf_ident(ProtoFile *self, const char *s)
+{
+    return self->tok == PF_IDENT && pf_eq(self->tok_text, s);
+}
+
+static int pf_accept_sym(ProtoFile *self, const char *s)
+{
+    if (pf_sym(self, s)) {
+        pf_next(self);
+        return 1;
+    }
+    return 0;
+}
+
+static int pf_accept_ident(ProtoFile *self, const char *s)
+{
+    if (pf_ident(self, s)) {
+        pf_next(self);
+        return 1;
+    }
+    return 0;
+}
+
+static int pf_expect_sym(ProtoFile *self, const char *s)
+{
+    if (!pf_accept_sym(self, s)) {
+        pf_fail(self, PFE_SYNTAX, "这里缺一个符号");
+        return 0;
+    }
+    return 1;
+}
+
+static int pf_expect_ident(ProtoFile *self)
+{
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "这里缺一个标识符");
+        return 0;
+    }
+    return 1;
+}
+
+/* ---- 数字与类型名 ---- */
+
+static int pf_to_i64(Str text, i64 *out)
+{
+    i64 v = 0;
+    int i = 0;
+    int base = 10;
+
+    if (!out || !text.s.data || text.s.len == 0)
+        return 0;
+    if (text.s.len > 2 && text.s.data[0] == '0'
+        && (text.s.data[1] == 'x' || text.s.data[1] == 'X')) {
+        base = 16;
+        i = 2;
+    }
+    for (; i < text.s.len; i++) {
+        int d = base == 16 ? pf_hexval((u8)text.s.data[i])
+                           : (pf_digit((u8)text.s.data[i])
+                                  ? (u8)text.s.data[i] - '0'
+                                  : -1);
+
+        if (d < 0 || d >= base)
+            return 0;
+        if (v > (9223372036854775807ll - d) / base)
+            return 0;
+        v = v * base + d;
+    }
+    *out = v;
+    return 1;
+}
+
+static int pf_scalar_kind(Str name)
+{
+    if (pf_eq(name, "double"))
+        return PK_DOUBLE;
+    if (pf_eq(name, "float"))
+        return PK_FLOAT;
+    if (pf_eq(name, "int64"))
+        return PK_INT64;
+    if (pf_eq(name, "uint64"))
+        return PK_UINT64;
+    if (pf_eq(name, "int32"))
+        return PK_INT32;
+    if (pf_eq(name, "fixed64"))
+        return PK_FIXED64;
+    if (pf_eq(name, "fixed32"))
+        return PK_FIXED32;
+    if (pf_eq(name, "bool"))
+        return PK_BOOL;
+    if (pf_eq(name, "string"))
+        return PK_STRING;
+    if (pf_eq(name, "bytes"))
+        return PK_BYTES;
+    if (pf_eq(name, "uint32"))
+        return PK_UINT32;
+    if (pf_eq(name, "sfixed32"))
+        return PK_SFIXED32;
+    if (pf_eq(name, "sfixed64"))
+        return PK_SFIXED64;
+    if (pf_eq(name, "sint32"))
+        return PK_SINT32;
+    if (pf_eq(name, "sint64"))
+        return PK_SINT64;
+    return PK_UNRESOLVED;
+}
+
+/* 类型名：`Foo` / `pkg.Foo` / `.pkg.Foo`；标量直接给 kind。 */
+static int pf_parse_type(ProtoFile *self, Str *name, int *kind)
+{
+    Str r = { (char[:]){ (char *)"", 0 } };
+    const char *start = 0;
+    const char *end = 0;
+    int abs = 0;
+    int k = PK_UNRESOLVED;
+
+    if (!self || !name || !kind)
+        return 0;
+    if (pf_accept_sym(self, "."))
+        abs = 1;
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "这里缺一个类型名");
+        return 0;
+    }
+    start = self->tok_text.s.data;
+    end = start + self->tok_text.s.len;
+    k = pf_scalar_kind(self->tok_text);
+    pf_next(self);
+    while (pf_sym(self, ".")) {
+        if (k != PK_UNRESOLVED) {
+            pf_fail(self, PFE_TYPE, "标量类型后面不能带点");
+            return 0;
+        }
+        pf_next(self);
+        if (self->tok != PF_IDENT) {
+            pf_fail(self, PFE_SYNTAX, "点后面缺一个名字");
+            return 0;
+        }
+        if (self->tok_text.s.data != end) {
+            pf_fail(self, PFE_TYPE, "点两侧不能有空白");
+            return 0;
+        }
+        end = end + self->tok_text.s.len;
+        pf_next(self);
+    }
+    if (abs)
+        start--;
+    r.s = (char[:]){ (char *)start, (int)(end - start) };
+    *name = r;
+    *kind = k;
+    return 1;
+}
+
+/* ---- 语句跳过 ---- */
+
+static void pf_skip_to_semicolon(ProtoFile *self)
+{
+    int depth = 0;
+
+    while (self->tok != PF_EOF && !self->error) {
+        if (pf_sym(self, "{"))
+            depth++;
+        else if (pf_sym(self, "}")) {
+            if (depth == 0)
+                return;         /* 让上层看到 } */
+            depth--;
+        } else if (pf_sym(self, ";") && depth == 0) {
+            pf_next(self);
+            return;
+        }
+        pf_next(self);
+    }
+}
+
+static void pf_skip_block(ProtoFile *self)
+{
+    int depth = 0;
+
+    if (!pf_expect_sym(self, "{"))
+        return;
+    depth = 1;
+    while (self->tok != PF_EOF && depth > 0 && !self->error) {
+        if (pf_sym(self, "{"))
+            depth++;
+        else if (pf_sym(self, "}"))
+            depth--;
+        if (depth > 0)
+            pf_next(self);
+    }
+    pf_next(self);
+}
+
+/* ---- 字段选项 ---- */
+
+static void pf_parse_options(ProtoFile *self, PfField *f)
+{
+    if (!pf_accept_sym(self, "["))
+        return;
+    for (;;) {
+        Str key = { (char[:]){ (char *)"", 0 } };
+        Str val = { (char[:]){ (char *)"", 0 } };
+        int neg = 0;
+        int vkind = 0;
+
+        if (self->tok != PF_IDENT) {
+            pf_fail(self, PFE_SYNTAX, "字段选项缺名字");
+            return;
+        }
+        key = self->tok_text;
+        pf_next(self);
+        /* `(custom.option)` 形式：整个跳过 */
+        if (pf_accept_sym(self, "(")) {
+            while (self->tok != PF_EOF && !pf_sym(self, ")"))
+                pf_next(self);
+            pf_accept_sym(self, ")");
+            if (pf_accept_sym(self, "="))
+                pf_skip_to_semicolon(self);   /* 值不关心 */
+            if (pf_accept_sym(self, "]"))
+                return;
+            if (!pf_accept_sym(self, ",")) {
+                pf_fail(self, PFE_SYNTAX, "字段选项之间缺逗号");
+                return;
+            }
+            continue;
+        }
+        if (!pf_expect_sym(self, "="))
+            return;
+        if (self->tok == PF_SYM) {
+            if (pf_eq(self->tok_text, "-")) {
+                neg = 1;
+                pf_next(self);
+            } else if (pf_eq(self->tok_text, "+")) {
+                pf_next(self);
+            }
+        }
+        if (self->tok == PF_IDENT) {
+            const char *start = self->tok_text.s.data;
+            const char *end = start + self->tok_text.s.len;
+
+            val.s = (char[:]){ (char *)start, (int)(end - start) };
+            pf_next(self);
+            while (pf_sym(self, ".")) {
+                pf_next(self);
+                if (self->tok != PF_IDENT) {
+                    pf_fail(self, PFE_SYNTAX, "选项值里的点名不完整");
+                    return;
+                }
+                end = self->tok_text.s.data + self->tok_text.s.len;
+                val.s = (char[:]){ (char *)start, (int)(end - start) };
+                pf_next(self);
+            }
+            vkind = PF_IDENT;
+        } else if (self->tok == PF_STR) {
+            val = self->tok_text;       /* 已解转义，在池里 */
+            vkind = PF_STR;
+            pf_next(self);
+        } else if (self->tok == PF_INT || self->tok == PF_FLOAT) {
+            val = self->tok_text;
+            vkind = self->tok;
+            pf_next(self);
+        } else {
+            pf_fail(self, PFE_SYNTAX, "选项值看不懂");
+            return;
+        }
+        if (pf_eq(key, "packed")) {
+            if (vkind == PF_IDENT)
+                f->packed = pf_eq(val, "true") ? 1 : 0;
+        } else if (pf_eq(key, "default")) {
+            f->has_default = 1;
+            f->def_neg = neg;
+            f->def_text = val;
+        }
+        if (pf_accept_sym(self, "]"))
+            return;
+        if (!pf_accept_sym(self, ",")) {
+            pf_fail(self, PFE_SYNTAX, "字段选项之间缺逗号");
+            return;
+        }
+    }
+}
+
+/* ---- 字段 / map / oneof / 消息 / 枚举 ---- */
+
+
+/* map 的合成入口消息名：字段名的 PascalCase + "Entry"（proto 的命名约定）。 */
+static Str pf_entry_name(ProtoFile *self, Str name)
+{
+    Str r = { (char[:]){ (char *)"", 0 } };
+    char *out = 0;
+    int n = 0;
+    int i = 0;
+    int up = 1;
+
+    if (!self || !name.s.data)
+        return r;
+    if (self->npool + name.s.len * 2 + 8 > PF_POOL) {
+        pf_fail(self, PFE_LIMIT, "名字池不够");
+        return r;
+    }
+    out = self->pool + self->npool;
+    for (i = 0; i < name.s.len; i++) {
+        int c = (u8)name.s.data[i];
+
+        if (c == '_') {
+            up = 1;
+            continue;
+        }
+        if (up && c >= 'a' && c <= 'z')
+            c = c - 'a' + 'A';
+        out[n++] = (char)c;
+        up = 0;
+    }
+    out[n++] = 'E';
+    out[n++] = 'n';
+    out[n++] = 't';
+    out[n++] = 'r';
+    out[n++] = 'y';
+    r.s = (char[:]){ out, n };
+    self->npool += n;
+    return r;
+}
+
+/* C6 标识符里不能有点：把池子里的 '.' 就地换成 '_'。 */
+static Str pf_identify(Str s)
+{
+    int i = 0;
+
+    for (i = 0; i < s.s.len; i++)
+        if (s.s.data[i] == '.')
+            s.s.data[i] = '_';
+    return s;
+}
+
+static int pf_add_msg(ProtoFile *self, int parent, Str name)
+{
+    PfMsg *m = 0;
+    int idx = self->nmsgs;
+
+    if (self->nmsgs >= PF_MAX_MSG) {
+        pf_fail(self, PFE_LIMIT, "消息太多（上限 64）");
+        return -1;
+    }
+    m = &self->msgs[idx];
+    memset(m, 0, sizeof *m);
+    m->name = name;
+    m->parent = parent;
+    m->line = self->tok_line;
+    m->first_field = -1;
+    m->last_field = -1;
+    if (parent >= 0) {
+        m->full = pf_join(self, self->msgs[parent].full, '.', name);
+        m->cname = pf_identify(pf_join(self, self->msgs[parent].cname, '_', name));
+    } else {
+        m->full = self->package.s.len > 0
+                      ? pf_join(self, self->package, '.', name)
+                      : name;
+        /* 包名里的点也要落成下划线：demo.v1.Person -> demo_v1_Person */
+        m->cname = self->package.s.len > 0
+                       ? pf_identify(pf_join(self, self->package, '_', name))
+                       : name;
+    }
+    self->nmsgs++;
+    return idx;
+}
+
+static int pf_add_field(ProtoFile *self, int msg, int oneof, int label)
+{
+    PfField *f = 0;
+    int idx = self->nfields;
+
+    if (self->nfields >= PF_MAX_FIELD) {
+        pf_fail(self, PFE_LIMIT, "字段太多（上限 1024）");
+        return -1;
+    }
+    f = &self->fields[idx];
+    memset(f, 0, sizeof *f);
+    f->oneof = oneof;
+    f->owner = msg;
+    f->next = -1;
+    f->packed = -1;
+    f->line = self->tok_line;
+    f->repeated = label == 1;
+    f->required = label == 2;
+    f->optional = label == 3;
+    if (self->msgs[msg].last_field >= 0)
+        self->fields[self->msgs[msg].last_field].next = idx;
+    else
+        self->msgs[msg].first_field = idx;
+    self->msgs[msg].last_field = idx;
+    self->nfields++;
+    self->msgs[msg].nfields++;
+    return idx;
+}
+
+static int pf_finish_field(ProtoFile *self, int idx, Str type, int kind)
+{
+    PfField *f = &self->fields[idx];
+    i64 num = 0;
+
+    f->type_name = type;
+    f->kind = kind;
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "字段名看不懂");
+        return 0;
+    }
+    f->name = self->tok_text;
+    pf_next(self);
+    if (!pf_expect_sym(self, "="))
+        return 0;
+    {
+        int neg = 0;
+
+        if (pf_sym(self, "-")) {
+            neg = 1;
+            pf_next(self);
+        }
+        if (self->tok != PF_INT) {
+            pf_fail(self, PFE_FIELD, "字段号必须是整数");
+            return 0;
+        }
+        if (!pf_to_i64(self->tok_text, &num) || neg || num <= 0
+            || num > 536870911ll) {
+            pf_fail(self, PFE_FIELD, "字段号超出 1..536870911");
+            return 0;
+        }
+        f->number = (int)num;
+        pf_next(self);
+    }
+    if (pf_sym(self, "["))
+        pf_parse_options(self, f);
+    return pf_expect_sym(self, ";");
+}
+
+static int pf_parse_map(ProtoFile *self, int msg, int oneof)
+{
+    Str key_type = { (char[:]){ (char *)"", 0 } };
+    Str val_type = { (char[:]){ (char *)"", 0 } };
+    int key_kind = PK_UNRESOLVED;
+    int val_kind = PK_UNRESOLVED;
+    Str fname = { (char[:]){ (char *)"", 0 } };
+    Str entry = { (char[:]){ (char *)"", 0 } };
+    int entry_msg = -1;
+    int fidx = -1;
+    int kidx = -1;
+    int vidx = -1;
+
+    if (!pf_expect_sym(self, "<") || !pf_parse_type(self, &key_type, &key_kind))
+        return 0;
+    if (!pf_expect_sym(self, ",") || !pf_parse_type(self, &val_type, &val_kind))
+        return 0;
+    if (!pf_expect_sym(self, ">"))
+        return 0;
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "map 字段缺名字");
+        return 0;
+    }
+    fname = self->tok_text;
+    if (key_kind == PK_UNRESOLVED || key_kind == PK_DOUBLE || key_kind == PK_FLOAT
+        || key_kind == PK_BYTES) {
+        pf_fail(self, PFE_TYPE, "map 的键只能是整数/bool/string");
+        return 0;
+    }
+    /* 合成入口消息：<Message>.<Field>Entry，字段 1 = key、2 = value */
+    entry = pf_entry_name(self, fname);
+    if (!entry.s.data)
+        return 0;
+    /* 先占住外层消息里的字段位（保证每个消息的字段链在创建顺序上连续），
+       再建合成的入口消息，最后回填外层字段。 */
+    fidx = pf_add_field(self, msg, oneof, 1);
+    if (fidx < 0)
+        return 0;
+    entry_msg = pf_add_msg(self, msg, entry);
+    if (entry_msg < 0)
+        return 0;
+    kidx = pf_add_field(self, entry_msg, -1, 0);
+    if (kidx < 0)
+        return 0;
+    self->fields[kidx].name = (Str){ (char[:]){ (char *)"key", 3 } };
+    self->fields[kidx].number = 1;
+    self->fields[kidx].kind = key_kind;
+    vidx = pf_add_field(self, entry_msg, -1, 0);
+    if (vidx < 0)
+        return 0;
+    self->fields[vidx].name = (Str){ (char[:]){ (char *)"value", 5 } };
+    self->fields[vidx].number = 2;
+    self->fields[vidx].kind = val_kind;
+    self->fields[vidx].type_name = val_type;
+    self->fields[fidx].name = fname;
+    self->fields[fidx].is_map = 1;
+    self->fields[fidx].map_key = key_kind;
+    self->fields[fidx].map_val = val_kind;
+    self->fields[fidx].map_val_type = val_type;
+    self->fields[fidx].kind = PK_MESSAGE;
+    self->fields[fidx].msg = entry_msg;
+    self->fields[fidx].packed = 0;
+
+    pf_next(self);
+    if (!pf_expect_sym(self, "="))
+        return 0;
+    {
+        i64 num = 0;
+
+        if (self->tok != PF_INT || !pf_to_i64(self->tok_text, &num) || num <= 0
+            || num > 536870911ll) {
+            pf_fail(self, PFE_FIELD, "map 字段号超出 1..536870911");
+            return 0;
+        }
+        self->fields[fidx].number = (int)num;
+        pf_next(self);
+    }
+    if (pf_sym(self, "["))
+        pf_parse_options(self, &self->fields[fidx]);
+    return pf_expect_sym(self, ";");
+}
+
+static int pf_parse_enum(ProtoFile *self, int parent);
+static int pf_parse_message(ProtoFile *self, int parent);
+
+static int pf_parse_oneof(ProtoFile *self, int msg)
+{
+    PfOneof *o = 0;
+    int idx = self->noneofs;
+
+    if (self->noneofs >= PF_MAX_ONEOF) {
+        pf_fail(self, PFE_LIMIT, "oneof 太多");
+        return 0;
+    }
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "oneof 缺名字");
+        return 0;
+    }
+    o = &self->oneofs[idx];
+    memset(o, 0, sizeof *o);
+    o->name = self->tok_text;
+    o->msg = msg;
+    o->line = self->tok_line;
+    self->noneofs++;
+    pf_next(self);
+    if (!pf_expect_sym(self, "{"))
+        return 0;
+    while (self->tok != PF_EOF && !pf_sym(self, "}") && !self->error) {
+        if (pf_ident(self, "option")) {
+            pf_next(self);
+            pf_skip_to_semicolon(self);
+            continue;
+        }
+        {
+            Str type = { (char[:]){ (char *)"", 0 } };
+            int kind = PK_UNRESOLVED;
+            int fidx = 0;
+
+            if (!pf_parse_type(self, &type, &kind))
+                return 0;
+            fidx = pf_add_field(self, msg, idx, 0);
+            if (fidx < 0)
+                return 0;
+            self->fields[fidx].optional = 1;
+            if (!pf_finish_field(self, fidx, type, kind))
+                return 0;
+        }
+    }
+    return pf_expect_sym(self, "}");
+}
+
+static int pf_parse_message_body(ProtoFile *self, int msg)
+{
+    while (self->tok != PF_EOF && !pf_sym(self, "}") && !self->error) {
+        if (pf_ident(self, "message")) {
+            pf_next(self);
+            if (!pf_parse_message(self, msg))
+                return 0;
+            continue;
+        }
+        if (pf_ident(self, "enum")) {
+            pf_next(self);
+            if (!pf_parse_enum(self, msg))
+                return 0;
+            continue;
+        }
+        if (pf_ident(self, "oneof")) {
+            pf_next(self);
+            if (!pf_parse_oneof(self, msg))
+                return 0;
+            continue;
+        }
+        if (pf_ident(self, "map")) {
+            pf_next(self);
+            if (!pf_parse_map(self, msg, -1))
+                return 0;
+            continue;
+        }
+        if (pf_ident(self, "option") || pf_ident(self, "reserved")
+            || pf_ident(self, "extensions")) {
+            pf_next(self);
+            pf_skip_to_semicolon(self);
+            continue;
+        }
+        if (pf_ident(self, "extend")) {
+            pf_next(self);
+            while (self->tok != PF_EOF && !pf_sym(self, "{"))
+                pf_next(self);
+            pf_skip_block(self);
+            continue;
+        }
+        if (pf_ident(self, "group")) {
+            pf_fail(self, PFE_UNSUPPORTED, "不支持 proto2 的 group，请改用 message 字段");
+            return 0;
+        }
+        if (pf_sym(self, ";")) {
+            pf_next(self);
+            continue;
+        }
+        {
+            int label = 0;
+            Str type = { (char[:]){ (char *)"", 0 } };
+            int kind = PK_UNRESOLVED;
+            int fidx = 0;
+
+            if (pf_ident(self, "repeated")) {
+                label = 1;
+                pf_next(self);
+            } else if (pf_ident(self, "required")) {
+                label = 2;
+                pf_next(self);
+            } else if (pf_ident(self, "optional")) {
+                label = 3;
+                pf_next(self);
+            }
+            if (label == 0 && self->syntax == 2) {
+                pf_fail(self, PFE_SYNTAX,
+                        "proto2 的字段要有 required / optional / repeated");
+                return 0;
+            }
+            if (label == 2 && self->syntax == 3) {
+                pf_fail(self, PFE_SYNTAX, "proto3 不允许 required");
+                return 0;
+            }
+            if (!pf_parse_type(self, &type, &kind))
+                return 0;
+            fidx = pf_add_field(self, msg, -1, label);
+            if (fidx < 0)
+                return 0;
+            if (!pf_finish_field(self, fidx, type, kind))
+                return 0;
+        }
+    }
+    return pf_expect_sym(self, "}");
+}
+
+static int pf_parse_message(ProtoFile *self, int parent)
+{
+    int msg = -1;
+
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "message 缺名字");
+        return 0;
+    }
+    msg = pf_add_msg(self, parent, self->tok_text);
+    if (msg < 0)
+        return 0;
+    pf_next(self);
+    if (!pf_expect_sym(self, "{"))
+        return 0;
+    return pf_parse_message_body(self, msg);
+}
+
+static int pf_parse_enum(ProtoFile *self, int parent)
+{
+    PfEnum *e = 0;
+    int idx = self->nenums;
+
+    if (self->nenums >= PF_MAX_ENUM) {
+        pf_fail(self, PFE_LIMIT, "枚举太多");
+        return 0;
+    }
+    if (self->tok != PF_IDENT) {
+        pf_fail(self, PFE_SYNTAX, "enum 缺名字");
+        return 0;
+    }
+    e = &self->enums[idx];
+    memset(e, 0, sizeof *e);
+    e->name = self->tok_text;
+    e->parent = parent;
+    e->line = self->tok_line;
+    e->first_val = self->nvals;
+    self->nenums++;
+    {
+        Str scope = { (char[:]){ (char *)"", 0 } };
+
+        if (parent >= 0)
+            scope = self->msgs[parent].full;
+        else
+            scope = self->package;
+        e->full = scope.s.len > 0 ? pf_join(self, scope, '.', e->name) : e->name;
+        if (parent >= 0)
+            e->cname = pf_identify(
+                pf_join(self, self->msgs[parent].cname, '_', e->name));
+        else if (self->package.s.len > 0)
+            e->cname = pf_identify(pf_join(self, self->package, '_', e->name));
+        else
+            e->cname = e->name;
+    }
+    pf_next(self);
+    if (!pf_expect_sym(self, "{"))
+        return 0;
+    while (self->tok != PF_EOF && !pf_sym(self, "}") && !self->error) {
+        if (pf_ident(self, "option") || pf_ident(self, "reserved")) {
+            pf_next(self);
+            pf_skip_to_semicolon(self);
+            continue;
+        }
+        if (pf_sym(self, ";")) {
+            pf_next(self);
+            continue;
+        }
+        if (self->tok != PF_IDENT) {
+            pf_fail(self, PFE_SYNTAX, "枚举值缺名字");
+            return 0;
+        }
+        {
+            Str vname = self->tok_text;
+            PfEnumVal *v = 0;
+            i64 num = 0;
+            int neg = 0;
+
+            if (self->nvals >= PF_MAX_VAL) {
+                pf_fail(self, PFE_LIMIT, "枚举值太多");
+                return 0;
+            }
+            pf_next(self);
+            if (!pf_expect_sym(self, "="))
+                return 0;
+            if (pf_sym(self, "-")) {
+                neg = 1;
+                pf_next(self);
+            }
+            if (self->tok != PF_INT || !pf_to_i64(self->tok_text, &num)) {
+                pf_fail(self, PFE_SYNTAX, "枚举值必须是整数");
+                return 0;
+            }
+            if (num > 2147483647ll) {
+                pf_fail(self, PFE_SYNTAX, "枚举值超出 int 范围");
+                return 0;
+            }
+            v = &self->vals[self->nvals];
+            memset(v, 0, sizeof *v);
+            v->name = vname;
+            v->value = neg ? -(int)num : (int)num;
+            v->line = self->tok_line;
+            v->full = pf_join(self, e->full, '.', vname);
+            v->cname = pf_join(self, e->cname, '_', vname);
+            self->nvals++;
+            e->nvals++;
+            pf_next(self);
+        }
+        /* `[deprecated = true]` 之后可选的 `;` */
+        if (pf_sym(self, "["))
+            pf_skip_to_semicolon(self);
+        if (!pf_accept_sym(self, ";")) {
+            pf_fail(self, PFE_SYNTAX, "枚举值后面缺分号");
+            return 0;
+        }
+    }
+    return pf_expect_sym(self, "}");
+}
+
+/* ---- 名字解析与校验 ---- */
+
+static int pf_find_msg(ProtoFile *self, Str full)
+{
+    int i = 0;
+
+    for (i = 0; i < self->nmsgs; i++)
+        if (self->msgs[i].full.s.len == full.s.len
+            && (full.s.len == 0
+                || memcmp(self->msgs[i].full.s.data, full.s.data,
+                          (usize)full.s.len) == 0))
+            return i;
+    return -1;
+}
+
+static int pf_find_enum(ProtoFile *self, Str full)
+{
+    int i = 0;
+
+    for (i = 0; i < self->nenums; i++)
+        if (self->enums[i].full.s.len == full.s.len
+            && (full.s.len == 0
+                || memcmp(self->enums[i].full.s.data, full.s.data,
+                          (usize)full.s.len) == 0))
+            return i;
+    return -1;
+}
+
+static int pf_lookup_scope(ProtoFile *self, Str cand, int *kind)
+{
+    int m = pf_find_msg(self, cand);
+    int e = pf_find_enum(self, cand);
+
+    if (m >= 0 && e >= 0) {
+        pf_fail(self, PFE_TYPE, "类型名同时对上消息与枚举");
+        return -1;
+    }
+    if (m >= 0) {
+        *kind = PK_MESSAGE;
+        return m;
+    }
+    if (e >= 0) {
+        *kind = PK_ENUM;
+        return e;
+    }
+    return -2;
+}
+
+/* 按 proto 的作用域规则解析一个字段的类型名。 */
+static int pf_resolve_field(ProtoFile *self, PfField *f)
+{
+    Str name = f->type_name;
+    int abs = 0;
+    int scope = f->owner;
+    int kind = PK_UNRESOLVED;
+    int idx = -2;
+
+    if (f->kind != PK_UNRESOLVED || !name.s.data)
+        return 1;                   /* 标量 / 已经解析过 */
+    if (name.s.len > 0 && name.s.data[0] == '.') {
+        abs = 1;
+        name.s = (char[:]){ name.s.data + 1, name.s.len - 1 };
+    }
+    if (abs) {
+        idx = pf_lookup_scope(self, name, &kind);
+        if (idx < 0)
+            goto not_found;
+        f->kind = kind;
+        f->msg = idx;
+        return 1;
+    }
+    for (; scope >= 0; scope = self->msgs[scope].parent) {
+        Str cand = pf_join(self, self->msgs[scope].full, '.', name);
+
+        if (!cand.s.data)
+            return 0;
+        idx = pf_lookup_scope(self, cand, &kind);
+        if (idx == -1)
+            return 0;
+        if (idx >= 0) {
+            f->kind = kind;
+            f->msg = idx;
+            return 1;
+        }
+    }
+    if (self->package.s.len > 0) {
+        Str cand = pf_join(self, self->package, '.', name);
+
+        if (!cand.s.data)
+            return 0;
+        idx = pf_lookup_scope(self, cand, &kind);
+        if (idx == -1)
+            return 0;
+        if (idx >= 0) {
+            f->kind = kind;
+            f->msg = idx;
+            return 1;
+        }
+    }
+    idx = pf_lookup_scope(self, name, &kind);
+    if (idx == -1)
+        return 0;
+    if (idx >= 0) {
+        f->kind = kind;
+        f->msg = idx;
+        return 1;
+    }
+not_found:
+    pf_fail(self, PFE_TYPE, "类型名解析不出来");
+    return 0;
+}
+
+static int pf_resolve(ProtoFile *self)
+{
+    int i = 0;
+
+    for (i = 0; i < self->nfields; i++)
+        if (!pf_resolve_field(self, &self->fields[i]))
+            return 0;
+    for (i = 0; i < self->nfields; i++) {
+        PfField *f = &self->fields[i];
+
+        if (f->is_map && f->map_val == PK_UNRESOLVED) {
+            /* map 的值不是标量：入口消息的 value 字段已经带着类型名，解析过了 */
+            if (f->msg >= 0 && self->msgs[f->msg].first_field >= 0) {
+                PfField *k = &self->fields[self->msgs[f->msg].first_field];
+
+                if (k->next >= 0)
+                    f->map_val = self->fields[k->next].kind;
+            }
+        }
+    }
+    return 1;
+}
+
+static int pf_check_msg(ProtoFile *self, int mi)
+{
+    PfMsg *m = &self->msgs[mi];
+    int i = 0;
+
+    for (i = m->first_field; i >= 0; i = self->fields[i].next) {
+        PfField *a = &self->fields[i];
+        int j = 0;
+
+        if (a->number >= 19000 && a->number <= 19999) {
+            pf_fail(self, PFE_FIELD, "字段号落在保留区间 19000..19999");
+            return 0;
+        }
+        for (j = m->first_field; j >= 0 && j != i; j = self->fields[j].next) {
+            PfField *b = &self->fields[j];
+
+            if (a->number == b->number) {
+                pf_fail(self, PFE_DUP, "同一消息里字段号重复");
+                return 0;
+            }
+            if (a->name.s.len == b->name.s.len
+                && memcmp(a->name.s.data, b->name.s.data,
+                          (usize)a->name.s.len) == 0) {
+                pf_fail(self, PFE_DUP, "同一消息里字段名重复");
+                return 0;
+            }
+        }
+        if (self->syntax == 3 && a->has_default) {
+            pf_fail(self, PFE_UNSUPPORTED, "proto3 不允许字段默认值");
+            return 0;
+        }
+        if (a->kind == PK_UNRESOLVED) {
+            pf_fail(self, PFE_TYPE, "字段类型没有解析出来");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int pf_validate(ProtoFile *self)
+{
+    int i = 0;
+
+    for (i = 0; i < self->nmsgs; i++)
+        if (!pf_check_msg(self, i))
+            return 0;
+    for (i = 0; i < self->nenums; i++) {
+        PfEnum *e = &self->enums[i];
+        int j = 0;
+        int k = 0;
+
+        if (e->nvals == 0) {
+            pf_fail(self, PFE_SYNTAX, "枚举一个值都没有");
+            return 0;
+        }
+        if (self->syntax == 3 && self->vals[e->first_val].value != 0) {
+            pf_fail(self, PFE_SYNTAX, "proto3 的枚举第一个值必须是 0");
+            return 0;
+        }
+        for (j = 0; j < e->nvals; j++)
+            for (k = 0; k < j; k++) {
+                PfEnumVal *a = &self->vals[e->first_val + j];
+                PfEnumVal *b = &self->vals[e->first_val + k];
+
+                if (a->name.s.len == b->name.s.len
+                    && memcmp(a->name.s.data, b->name.s.data,
+                              (usize)a->name.s.len) == 0) {
+                    pf_fail(self, PFE_DUP, "枚举值名字重复");
+                    return 0;
+                }
+            }
+    }
+    return 1;
+}
+
+/* ---- 入口 ---- */
+
+int pf_open(ProtoFile *self, const char *src, int n)
+{
+    if (!self)
+        return -1;
+    memset(self, 0, sizeof *self);
+    self->src = src;
+    self->n = n;
+    self->line = 1;
+    self->syntax = 2;
+    if (!src || n < 0) {
+        pf_fail(self, PFE_SYNTAX, "空的 .proto 输入");
+        return -1;
+    }
+    return 0;
+}
+
+int parse(ProtoFile *self)
+{
+    if (!self)
+        return -1;
+    if (self->error)
+        return -1;
+    pf_next(self);
+    while (self->tok != PF_EOF && !self->error) {
+        if (pf_ident(self, "syntax")) {
+            pf_next(self);
+            if (!pf_expect_sym(self, "=") || self->tok != PF_STR) {
+                pf_fail(self, PFE_SYNTAX, "syntax 缺 = \"protoN\"");
+                break;
+            }
+            if (pf_eq(self->tok_text, "proto2"))
+                self->syntax = 2;
+            else if (pf_eq(self->tok_text, "proto3"))
+                self->syntax = 3;
+            else {
+                pf_fail(self, PFE_UNSUPPORTED, "只认 proto2 / proto3");
+                break;
+            }
+            pf_next(self);
+            if (!pf_expect_sym(self, ";"))
+                break;
+            continue;
+        }
+        if (pf_ident(self, "package")) {
+            Str first = { (char[:]){ (char *)"", 0 } };
+            const char *start = 0;
+            const char *end = 0;
+
+            pf_next(self);
+            if (self->tok != PF_IDENT) {
+                pf_fail(self, PFE_SYNTAX, "package 缺名字");
+                break;
+            }
+            start = self->tok_text.s.data;
+            end = start + self->tok_text.s.len;
+            pf_next(self);
+            while (pf_sym(self, ".")) {
+                pf_next(self);
+                if (self->tok != PF_IDENT) {
+                    pf_fail(self, PFE_SYNTAX, "package 的点后面缺名字");
+                    break;
+                }
+                end = self->tok_text.s.data + self->tok_text.s.len;
+                pf_next(self);
+            }
+            if (self->error)
+                break;
+            first.s = (char[:]){ (char *)start, (int)(end - start) };
+            self->package = pf_pool_copy(self, first.s.data, first.s.len);
+            if (!pf_expect_sym(self, ";"))
+                break;
+            continue;
+        }
+        if (pf_ident(self, "import")) {
+            pf_next(self);
+            self->nimports++;
+            pf_skip_to_semicolon(self);
+            continue;
+        }
+        if (pf_ident(self, "option")) {
+            pf_next(self);
+            pf_skip_to_semicolon(self);
+            continue;
+        }
+        if (pf_ident(self, "message")) {
+            pf_next(self);
+            if (!pf_parse_message(self, -1))
+                break;
+            continue;
+        }
+        if (pf_ident(self, "enum")) {
+            pf_next(self);
+            if (!pf_parse_enum(self, -1))
+                break;
+            continue;
+        }
+        if (pf_ident(self, "service")) {
+            pf_next(self);
+            while (self->tok != PF_EOF && !pf_sym(self, "{"))
+                pf_next(self);
+            pf_skip_block(self);
+            continue;
+        }
+        if (pf_ident(self, "extend")) {
+            pf_next(self);
+            while (self->tok != PF_EOF && !pf_sym(self, "{"))
+                pf_next(self);
+            pf_skip_block(self);
+            continue;
+        }
+        if (pf_ident(self, "editions")) {
+            pf_fail(self, PFE_UNSUPPORTED, "不支持 editions 语法");
+            break;
+        }
+        if (pf_sym(self, ";")) {
+            pf_next(self);
+            continue;
+        }
+        pf_fail(self, PFE_SYNTAX, "文件顶层出现看不懂的语句");
+        break;
+    }
+    if (!self->error && self->tok != PF_EOF)
+        pf_fail(self, PFE_SYNTAX, "文件在中间结束了");
+    if (!self->error)
+        pf_resolve(self);
+    if (!self->error)
+        pf_validate(self);
+    return self->error ? -1 : 0;
+}
