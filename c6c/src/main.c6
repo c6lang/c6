@@ -60,6 +60,11 @@ typedef struct Opts {
     /* -Wl,--dynamic：链接出动态可执行文件（DT_NEEDED libc.so.6 + PLT/GOT），
      * 未定义的**函数**从 libc 解析，不再按 0 处理。 */
     int dyn_link;
+    /* -shared：链接出 ET_DYN 共享库（ld.c6 的 LD_SHARED）。native 后端出来的
+     * 代码本来就是位置无关的（全局地址走 lea rip+rel32 + 重定位），数据里的
+     * 绝对地址由 .rela.dyn 的 RELATIVE 兜住，所以这里不需要"PIC 代码生成"
+     * 那一套；-fPIC 只是接住 GCC/clang 风格的命令行。 */
+    int so_out;     /* 叫 so_out 不叫 shared：shared 是 c6 的关键字（@shared） */
     /* -b：数组下标边界检查（越界就打印一行并退出码 2） */
     int bcheck;
     /* -g：调试信息（行号表 + DWARF 段，-c 出的 .o 里带上） */
@@ -104,6 +109,11 @@ static void usage(FILE *fp)
         "  -b                   数组下标边界检查（越界打印一行、退出码 2；\n"
         "                       只查编译期知道长度的数组）\n"
         "  -nostdlib            不自动带上 c6c 自带运行时（lib/rt.c6）\n"
+        "  -Wl,--dynamic        链接出动态可执行文件（DT_NEEDED libc.so.6 + PLT/GOT）\n"
+        "  -shared              链接出共享库 .so（ET_DYN：没有入口与 PT_INTERP，\n"
+        "                       定义的全局符号进 .dynsym，数据里的绝对地址交给\n"
+        "                       .rela.dyn 的 RELATIVE；输入得是 .o）\n"
+        "  -fPIC                位置无关代码（native 后端本来就位置无关，收下不用改）\n"
         "  -v                   详细输出\n"
         "  --version            版本\n"
         "  -h                   这份帮助\n",
@@ -602,6 +612,13 @@ static int parse_args(int argc, char **argv)
             O.allow_undef = 1;
         } else if (strcmp(a, "-Wl,--dynamic") == 0) {
             O.dyn_link = 1;
+        } else if (strcmp(a, "-shared") == 0) {
+            O.so_out = 1;
+            O.dyn_link = 1;         /* 共享库必然是动态的（PT_DYNAMIC） */
+        } else if (strcmp(a, "-fPIC") == 0 || strcmp(a, "-fpic") == 0) {
+            /* 位置无关代码：native 后端一直是位置无关的（见上面 shared 那条
+             * 注释），所以这里收下就够——别让 `-fPIC` 落进未知选项把构建打死。 */
+            continue;
         } else if (strncmp(a, "-Wl,", 4) == 0) {
             /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
              * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
@@ -658,6 +675,10 @@ static int parse_args(int argc, char **argv)
             }
             O.mode = M_LINK;
         }
+    }
+    if (O.so_out && O.mode != M_LINK) {
+        diag_error_plain("-shared 的输入得是 .o：先 -c 编出目标文件，再 -shared 链成 .so");
+        return -1;
     }
     if (O.run && !O.test) {
         if (O.mode != M_RUN) {
@@ -875,10 +896,12 @@ int main(int argc, char **argv)
     switch (O.mode) {
     case M_LINK: {
         /* 只做链接：所有输入都是 ET_REL 目标文件，产出静态可执行文件。
-         * 退出码 0 = 成功，2 = 链接失败（ld.c6 里已经把原因写到 stderr 了）。 */
+         * 退出码 0 = 成功，2 = 链接失败（ld.c6 里已经把原因写到 stderr 了）。
+         * `-shared` 时改成 ET_DYN 共享库。 */
         ld_set_allow_undef(O.allow_undef);
         ld_set_dynamic(O.dyn_link);
-        return ld_link(O.files, O.nfiles, O.out ? O.out : "a.out");
+        ld_set_shared(O.so_out);
+        return ld_link(O.files, O.nfiles, O.out ? O.out : (O.so_out ? "a.so" : "a.out"));
     }
     case M_OBJ:
     case M_EXE:

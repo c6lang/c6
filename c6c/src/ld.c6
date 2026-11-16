@@ -17,9 +17,12 @@
  *     -Wl,--allow-undefined 才按 0 处理并打一条汇总警告。
  *   * 入口：合成 `_start`——取 argc/argv/envp、依次跑 .init_array、调 main、
  *     跑 .fini_array、syscall 60 退出（退出码 = main 返回值）。
- *   * 不做：动态链接（DT_NEEDED / PLT / GOT）、TLS 段、`.a` 静态库、
- *     --gc-sections、符号版本、-shared/-fPIC、重定位到调试信息。
- *     这些是硬缺口②（动态链接 + 可嵌入的编译库）的事，见 docs/todo.md。
+ *   * 动态链接：`-Wl,--dynamic` 出 ET_EXEC（PT_INTERP + DT_NEEDED libc.so.6 +
+ *     PLT/GOT + COPY 重定位）；`-shared` 出 ET_DYN 共享库（基址 0、没有入口
+ *     与 PT_INTERP、导出符号进 .dynsym、数据里的绝对地址走 RELATIVE）。
+ *   * 不做：TLS 段跨产物合并、`.a` 静态库、--gc-sections、符号版本、
+ *     共享库里的外部**数据**符号（那要走 GOT 间接寻址）、重定位到调试信息。
+ *     这些是硬缺口②的尾巴，见 docs/todo.md。
  *
  * 两个容易踩的线，改的时候留意：
  *   1. 文件偏移与虚拟地址**恒等映射**（VA = 基址 + 偏移）：PT_LOAD 的
@@ -55,9 +58,12 @@
 #define LD_R_64           1u
 #define LD_R_PC32         2u
 #define LD_R_PLT32        4u
+#define LD_R_RELATIVE     8u
 #define LD_R_32           10u
 #define LD_R_32S          11u
-#define LD_BASE_VA        0x400000u
+/* 基址是**变量**：静态链接沿用 0x400000（和 elf.c6 那个固定基址一致），
+ * `-shared` 时是 0——ET_DYN 的 st_value/VA 就是段内偏移，加载基址由 ld.so 选。 */
+static u64 LD_BASE_VA = 0x400000u;
 #define LD_PAGE           0x1000u
 #define LD_EHDR           64u
 #define LD_PHDR           56u
@@ -81,6 +87,38 @@ static u32 LD_NUNDEF;           /* 按 0 处理掉的未定义符号个数 */
 static char LD_UNDEF_NAMES[256];/* 前几个名字（汇总警告里列出来） */
 
 static void ld_set_allow_undef(int on) { LD_ALLOW_UNDEF = on; }
+
+/* ---- -shared：ET_DYN 共享库 ----
+ *
+ * 和动态可执行文件的区别就三处：基址 0（VA 全是段内偏移）、没有 PT_INTERP 与
+ * _start、定义出来的全局符号进 .dynsym 供 dlopen/dlsym 以及别的产物链接时用。
+ * 代码本来就是位置无关的（全局地址走 lea rip+rel32 + 重定位，见 x64.c6），
+ * 剩下的绝对地址全在数据里（指针、字符串、初始化器），它们变成 .rela.dyn 的
+ * R_X86_64_RELATIVE ——ld.so 加载时统一加上基址。
+ *
+ * 外部**数据**符号（`environ` 那种）在共享库里要 GOT 间接寻址，这一版如实
+ * 拒绝；外部函数走 PLT，和可执行文件那条路完全一样。
+ *
+ * 声明放在文件顶部是因为重定位阶段（ld_apply）就要记账。
+ */
+static int LD_SHARED;
+static void ld_set_shared(int on) { LD_SHARED = on; }
+
+#define LD_MAXEXP 8192
+static u32 LD_NEXP;
+static const char *LD_EXPN[LD_MAXEXP];
+static u32 LD_EXPG[LD_MAXEXP];          /* 全局符号表下标（地址写的时候再问） */
+static u8 LD_EXPT[LD_MAXEXP];           /* 0 = 函数，1 = 数据 */
+static u32 LD_EXPOFF[LD_MAXEXP];        /* 名字在 .dynstr 里的偏移 */
+
+/* .rela.dyn 里的 RELATIVE 条目：尺寸在 plan 里按下条数定，重定位时逐条填 */
+static u32 LD_NREL;
+static u32 LD_NRELFILL;
+static u64 *LD_RELOFF;
+static u64 *LD_RELADD;
+static char LD_SONAME[256];
+static u32 LD_SONAMEOFF;
+
 
 /* ---- 小工具：从映像里按小端读字段（不假设对齐，输入文件是任意字节流） ---- */
 static u16 ld_rd16(const u8 *p, u32 off) { return (u16)(p[off] | ((u16)p[off + 1] << 8)); }
@@ -612,6 +650,18 @@ static int ld_apply(u8 *where, u32 woff, u64 P, u32 type, u64 S, i64 A, const ch
     switch (type) {
     case LD_R_64:
         ld_wr64(where, woff, S + (u64)A);
+        if (LD_SHARED) {
+            /* ET_DYN：这个绝对地址得由 ld.so 加上加载基址，记一条 RELATIVE
+             * （写进去的值就是 addend——基址 0 时它就是"偏移"） */
+            if (LD_NRELFILL >= LD_NREL) {
+                fprintf(stderr, "c6c: RELATIVE 重定位比预计的多（%u，%s）\n",
+                        (unsigned)LD_NREL, what);
+                return 1;
+            }
+            LD_RELOFF[LD_NRELFILL] = P;
+            LD_RELADD[LD_NRELFILL] = S + (u64)A;
+            LD_NRELFILL++;
+        }
         return 0;
     case LD_R_PC32:
     case LD_R_PLT32: {
@@ -1077,9 +1127,19 @@ static int ld_tls_fixup(void)
 #define LD_DT_JMPREL    23u
 #define LD_DT_PLTREL    20u
 #define LD_DT_BIND_NOW  24u
+#define LD_DT_INIT_ARRAY    25u
+#define LD_DT_FINI_ARRAY    26u
+#define LD_DT_INIT_ARRAYSZ  27u
+#define LD_DT_FINI_ARRAYSZ  28u
+#define LD_DT_SONAME    14u
 #define LD_DT_FLAGS     30u
 #define LD_DF_BIND_NOW  8u
-#define LD_DT_NUM       18u             /* .dynamic 预留槽数（含结尾 DT_NULL） */
+/* .dynamic 预留槽数（含结尾 DT_NULL）。共享库要多放 SONAME 与 init/fini_array
+ * 这两对，所以按 22 留：多出来的槽写成 DT_NULL，ld.so 看到就停。 */
+#define LD_DT_NUM       22u
+
+/* ---- -shared 的状态在文件顶部声明（重定位阶段要用），这里只补实现 ---- */
+
 
 /* 数据符号的 COPY 重定位：非 PIC 代码里 `environ` 是绝对地址，只有把 libc
  * 里那份定义拷进本程序的 .bss 才成立（ELF 的 R_X86_64_COPY 干的就是这件事）。 */
@@ -1226,7 +1286,17 @@ static int ld_dyn_collect(void)
         if (s->defined || !s->name || !s->name[0])
             continue;
         if (s->type == LD_STT_OBJECT) {
-            u64 csz = ld_libc_size(s->name);
+            u64 csz = 0;
+
+            if (LD_SHARED) {
+                /* 共享库里的外部数据得走 GOT 间接寻址（COPY 重定位是给可执行
+                 * 文件那种"固定基址 + 就地拷一份"用的），这一版如实拒绝，别
+                 * 悄悄写成 0 到运行期才崩。 */
+                fprintf(stderr, "c6c: -shared 还不支持外部数据符号 '%s'"
+                                "（共享库里的外部数据要走 GOT 间接寻址）\n", s->name);
+                return 1;
+            }
+            csz = ld_libc_size(s->name);
 
             if (csz == 0) {
                 /* libc 里没有这个名字：没法 COPY，按 0 处理并点名 */
@@ -1256,6 +1326,72 @@ static int ld_dyn_collect(void)
         LD_NIMP++;
     }
     return 0;
+}
+
+/* 共享库要导出的符号：定义出来的全局/弱符号（函数与数据都算）。这里只记
+ * 名字和全局表下标——地址要等布局定下来（plan 末尾）才问得出来。 */
+static int ld_shared_exports(void)
+{
+    u32 g = 0;
+
+    LD_NEXP = 0;
+    if (!LD_SHARED)
+        return 0;
+    for (g = 0; g < LD_NG; g++) {
+        LdGSym *s = &LD_G[g];
+
+        if (!s->defined || !s->name || !s->name[0])
+            continue;
+        if (s->bind == LD_STB_LOCAL)
+            continue;
+        if (LD_NEXP >= LD_MAXEXP) {
+            fprintf(stderr, "c6c: 共享库要导出的符号太多（上限 %d）\n", LD_MAXEXP);
+            return 1;
+        }
+        LD_EXPN[LD_NEXP] = s->name;
+        LD_EXPG[LD_NEXP] = g;
+        LD_EXPT[LD_NEXP] = (s->type == LD_STT_OBJECT) ? 1 : 0;
+        LD_NEXP++;
+    }
+    return 0;
+}
+
+/* 输入里 R_X86_64_64 的条数：共享库把它们全变成 .rela.dyn 的 RELATIVE，
+ * plan 时得先知道要留多长（那时地址还没定，只能数条数）。
+ *
+ * 字段偏移必须和 ld_relocate_all 一模一样（尺寸是 sh_size 的 8 字节那个，
+ * 不是 sh_flags 的低半截）：数多了会多留一堆空槽，数少了重定位阶段直接报
+ * "比预计的多"——两种都是当场能看出来的错，但别指望它自己对齐。 */
+static u32 ld_count_abs_relocs(void)
+{
+    u32 n = 0;
+    int k = 0;
+
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+
+        for (i = 1; i < o->shnum; i++) {
+            u32 base = o->shoff + i * 64u;
+            u32 ty = ld_rd32(o->img, base + 4);
+            u32 info = ld_rd32(o->img, base + 44);
+            u64 sz = ld_rd64(o->img, base + 32);
+            u32 off = (u32)ld_rd64(o->img, base + 24);
+            u32 cnt = (u32)(sz / 24u);
+            u32 j = 0;
+
+            if (ty != LD_SHT_RELA)
+                continue;
+            if (info >= o->shnum)
+                continue;
+            if (!ld_out_buf(o->sec_out[info]))
+                continue;               /* 目标段被丢了：重定位阶段也会跳过 */
+            for (j = 0; j < cnt; j++)
+                if ((ld_rd64(o->img, off + j * 24u + 8u) & 0xffffffffu) == (u64)LD_R_64)
+                    n++;
+        }
+    }
+    return n;
 }
 
 /* 未定义符号 → 它的 PLT 桩子地址（0 = 不是动态导入） */
@@ -1302,13 +1438,28 @@ static int ld_dyn_plan(void)
      * 症状是 .dynamic 落进了 .data 中间、文件尾部多出一截） */
     if (ld_dyn_collect())
         return 1;
+    if (ld_shared_exports())
+        return 1;
     plt_n = (u64)LD_NIMP * 6u;
     got_n = 8u * (3u + (u64)LD_NIMP);
     relapl_n = 24u * (u64)LD_NIMP;
-    /* .dynsym 里 PLT 导入之后接着放 COPY 的数据符号（它们是**有定义**的） */
-    dynsym_n = 24u * (1u + (u64)LD_NIMP + (u64)LD_NCOPY);
-    hash_n = 4u * (4u + (u64)LD_NIMP + (u64)LD_NCOPY);
-    reladyn_n = 24u * (u64)LD_NCOPY;
+    /* -shared：数据里的绝对地址全变成 .rela.dyn 的 RELATIVE（条数先数出来，
+     * 这时地址还没定，只能按输入里的 R_X86_64_64 数） */
+    LD_NREL = LD_SHARED ? ld_count_abs_relocs() : 0u;
+    LD_NRELFILL = 0;
+    if (LD_NREL) {
+        LD_RELOFF = (u64 *)calloc((size_t)LD_NREL, sizeof(u64));
+        LD_RELADD = (u64 *)calloc((size_t)LD_NREL, sizeof(u64));
+        if (!LD_RELOFF || !LD_RELADD) {
+            fprintf(stderr, "c6c: 内存不够（.rela.dyn 要记 %u 条）\n", (unsigned)LD_NREL);
+            return 1;
+        }
+    }
+    /* .dynsym 里 PLT 导入之后接着放 COPY 的数据符号（它们是**有定义**的），
+     * 共享库再把导出的符号接在后面 */
+    dynsym_n = 24u * (1u + (u64)LD_NIMP + (u64)LD_NCOPY + (u64)LD_NEXP);
+    hash_n = 4u * (4u + (u64)LD_NIMP + (u64)LD_NCOPY + (u64)LD_NEXP);
+    reladyn_n = 24u * ((u64)LD_NCOPY + (u64)LD_NREL);
     copy_n = 0;
     for (i = 0; i < LD_NCOPY; i++) {
         copy_n = ld_align_up(copy_n, 16);
@@ -1316,17 +1467,22 @@ static int ld_dyn_plan(void)
         copy_n += ld_align_up(LD_COPYSZ[i], 8);
     }
     copy_n = ld_align_up(copy_n, 16);
-    LD_INTERP_N = (u32)strlen(LD_DYN_INTERP) + 1u;
+    LD_INTERP_N = LD_SHARED ? 0u : (u32)strlen(LD_DYN_INTERP) + 1u;
     for (i = 0; i < LD_NIMP; i++)
         dynstr_n += (u64)strlen(LD_IMPN[i]) + 1u;
     dynstr_n += (u64)strlen(LD_DYN_LIBC) + 1u;
     for (i = 0; i < LD_NCOPY; i++)
         dynstr_n += (u64)strlen(LD_COPYN[i]) + 1u;
+    for (i = 0; i < LD_NEXP; i++)
+        dynstr_n += (u64)strlen(LD_EXPN[i]) + 1u;
+    if (LD_SHARED && LD_SONAME[0])
+        dynstr_n += (u64)strlen(LD_SONAME) + 1u;
     LD_DYNSTR_N = (u32)dynstr_n;
 
     /* 文件布局：头+程序头 → .interp → .text → .rodata → 动态只读段
-     * →（翻页）→ .got.plt → .data → .init_array → .fini_array → .dynamic */
-    LD_NPH = 5u;
+     * →（翻页）→ .got.plt → .data → .init_array → .fini_array → .dynamic。
+     * 共享库没有 .interp，程序头少一个。 */
+    LD_NPH = LD_SHARED ? 4u : 5u;
     off = LD_EHDR + (u64)LD_NPH * LD_PHDR;
     LD_OFF_INTERP = ld_align_up(off, 8);
     off = LD_OFF_INTERP + LD_INTERP_N;
@@ -1391,6 +1547,11 @@ static int ld_dyn_plan(void)
             LD_COPYNOFF[i] = n;
             n += (u32)strlen(LD_COPYN[i]) + 1u;
         }
+        for (i = 0; i < LD_NEXP; i++) {
+            LD_EXPOFF[i] = n;
+            n += (u32)strlen(LD_EXPN[i]) + 1u;
+        }
+        LD_SONAMEOFF = LD_SONAME[0] ? n : 0u;
     }
     return 0;
 }
@@ -1400,6 +1561,66 @@ static void ld_pad_to(ObjBuf *f, u64 off)
 {
     while (f->n < off)
         ob_u8(f, 0);
+}
+
+/* ---- 共享库的节头表 ----
+ *
+ * ld.so 不看节头，但 **GNU ld 把别的 .so 当输入时只认节头**：没有节头就报
+ * "file in wrong format"，readelf --dyn-syms / nm -D / objdump -T 也全都没
+ * 法用。所以 -shared 的产物末尾补一张 16 项的表（空段也照发，索引就固定，
+ * 不用在各处重算 sh_link）。
+ */
+#define LD_SHT_PROGBITS  1u
+#define LD_SHT_SYMTAB    2u
+#define LD_SHT_STRTAB    3u
+#define LD_SHT_RELA      4u
+#define LD_SHT_HASH      5u
+#define LD_SHT_DYNAMIC   6u
+#define LD_SHT_NOBITS    8u
+#define LD_SHT_DYNSYM    11u
+#define LD_SHT_INIT_ARRAY 14u
+#define LD_SHT_FINI_ARRAY 15u
+
+/* 节号：固定分配，空段也占位 */
+#define LD_SI_TEXT      1u
+#define LD_SI_RODATA    2u
+#define LD_SI_DYNSTR    3u
+#define LD_SI_DYNSYM    4u
+#define LD_SI_HASH      5u
+#define LD_SI_RELAPLT   6u
+#define LD_SI_PLT       7u
+#define LD_SI_RELADYN   8u
+#define LD_SI_GOTPLT    9u
+#define LD_SI_DATA      10u
+#define LD_SI_INIT      11u
+#define LD_SI_FINI      12u
+#define LD_SI_BSS       13u
+#define LD_SI_DYNAMIC   14u
+#define LD_SI_SHSTRTAB  15u
+#define LD_SI_NUM       16u
+
+static u32 ld_str_add(ObjBuf *s, const char *nm)
+{
+    u32 off = (u32)s->n;
+
+    ob_copy(s, nm, (u32)strlen(nm));
+    ob_u8(s, 0);
+    return off;
+}
+
+static void ld_shdr(ObjBuf *f, u32 nameoff, u32 type, u64 flags, u64 addr, u64 off,
+                    u64 size, u32 link, u32 info, u64 align, u64 entsize)
+{
+    ob_u32(f, nameoff);
+    ob_u32(f, type);
+    ob_u64(f, flags);
+    ob_u64(f, addr);
+    ob_u64(f, off);
+    ob_u64(f, size);
+    ob_u32(f, link);
+    ob_u32(f, info);
+    ob_u64(f, align);
+    ob_u64(f, entsize);
 }
 
 /* 写出动态段 + 动态可执行文件 */
@@ -1433,6 +1654,14 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
         ob_copy(&f, LD_COPYN[i], (u32)strlen(LD_COPYN[i]));
         ob_u8(&f, 0);
     }
+    for (i = 0; i < LD_NEXP; i++) {
+        ob_copy(&f, LD_EXPN[i], (u32)strlen(LD_EXPN[i]));
+        ob_u8(&f, 0);
+    }
+    if (LD_SHARED && LD_SONAME[0]) {
+        ob_copy(&f, LD_SONAME, (u32)strlen(LD_SONAME));
+        ob_u8(&f, 0);
+    }
     /* .dynsym：0 号是空项，之后每个导入一项（UND + FUNC） */
     ld_pad_to(&f, LD_OFF_DYNSYM);
     ob_zero(&f, 24);
@@ -1454,13 +1683,41 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
         ob_u64(&f, LD_VA_COPY + LD_COPYOFF[i]);  /* st_value */
         ob_u64(&f, LD_COPYSZ[i]);                /* st_size */
     }
-    /* .hash：SysV 哈希。只查本程序自己的符号时才会被用到，做成"一个桶串全链" */
-    ld_pad_to(&f, LD_OFF_HASH);
-    ob_u32(&f, 1);                                 /* nbucket */
-    ob_u32(&f, 1u + LD_NIMP + LD_NCOPY);           /* nchain */
-    ob_u32(&f, (LD_NIMP + LD_NCOPY) ? 1u : 0u);    /* bucket[0] */
-    for (i = 0; i < LD_NIMP + LD_NCOPY; i++)
-        ob_u32(&f, (i + 2u < 1u + LD_NIMP + LD_NCOPY) ? i + 2u : 0u);
+    /* 共享库导出的符号：dlopen/dlsym 与链接期都靠这张表。st_value 是段内偏移
+     * （基址 0），st_shndx 既不能是 UNDEF 也不能是 ABS——ld.so 只对非 ABS 的
+     * 符号加加载基址；产物没有节头表，这里给个"某一节"的号就够它判断了。 */
+    for (i = 0; i < LD_NEXP; i++) {
+        u64 v = ld_gsym_addr(LD_EXPG[i]);
+        /* 段号按"函数在 .text、数据在 .data、bss 里在 .bss"填：ld.so 只用它
+         * 判断"是不是 ABS"（ABS 不加基址），但 nm -D / objdump -T 会照着它
+         * 打 T/D/B 那个字母——填 1 的话数据符号会显示成 T，容易看糊涂。 */
+        u16 shndx = 1;
+
+        if (LD_EXPT[i])
+            shndx = (u16)(v >= LD_VA_BSS ? LD_SI_BSS : LD_SI_DATA);
+        ob_u32(&f, LD_EXPOFF[i]);                       /* st_name */
+        ob_u8(&f, (u8)(0x10 | (LD_EXPT[i] ? 0x1 : 0x2)));  /* GLOBAL|OBJECT/FUNC */
+        ob_u8(&f, 0);
+        ob_u16(&f, shndx);
+        ob_u64(&f, v);                                  /* st_value */
+        ob_u64(&f, 0);                                  /* st_size（.o 里没填） */
+    }
+    /* .hash：SysV 哈希。做成"一个桶串全链"：bucket[0] 指向 1 号符号，chain[j]
+     * 指向桶里的下一个符号（j+1），最后一个指 0 收尾。chain[] 是**按符号号
+     * 索引**的，所以一共要写 nchain 个字、chain[0] 留 0——以前少写一个字、
+     * 而且每位写成 j+2，静态可执行文件没人查这张表所以一直没露馅，直到
+     * `-shared` 让 dlopen/dlsym 真去查才炸（dlsym 返回 NULL）。 */
+    {
+        u32 nsym = 1u + LD_NIMP + LD_NCOPY + LD_NEXP;
+
+        ld_pad_to(&f, LD_OFF_HASH);
+        ob_u32(&f, 1);                                  /* nbucket */
+        ob_u32(&f, nsym);                               /* nchain = 符号总数 */
+        ob_u32(&f, nsym > 1u ? 1u : 0u);                /* bucket[0] */
+        ob_u32(&f, 0);                                  /* chain[0]（0 号符号） */
+        for (i = 1; i < nsym; i++)
+            ob_u32(&f, (i + 1u < nsym) ? i + 1u : 0u);
+    }
     /* .rela.plt：每个导入一条 JUMP_SLOT，落在它自己的 GOT 格子上 */
     ld_pad_to(&f, LD_OFF_RELAPLT);
     for (i = 0; i < LD_NIMP; i++) {
@@ -1468,12 +1725,18 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
         ob_u64(&f, (((u64)(i + 1u)) << 32) | (u64)LD_R_JUMP_SLOT);
         ob_u64(&f, 0);                                   /* r_addend */
     }
-    /* .rela.dyn：每个 COPY 数据符号一条 R_X86_64_COPY */
+    /* .rela.dyn：每个 COPY 数据符号一条 R_X86_64_COPY；共享库再补上数据里
+     * 那些绝对地址的 R_X86_64_RELATIVE（ld.so 加载时统一加基址） */
     ld_pad_to(&f, LD_OFF_RELADYN);
     for (i = 0; i < LD_NCOPY; i++) {
         ob_u64(&f, LD_VA_COPY + LD_COPYOFF[i]);                   /* r_offset */
         ob_u64(&f, (((u64)(1u + LD_NIMP + i)) << 32) | 5u);       /* COPY */
         ob_u64(&f, 0);
+    }
+    for (i = 0; i < LD_NRELFILL; i++) {
+        ob_u64(&f, LD_RELOFF[i]);                        /* r_offset */
+        ob_u64(&f, (u64)LD_R_RELATIVE);                  /* 符号号 0，类型 RELATIVE */
+        ob_u64(&f, LD_RELADD[i]);                        /* r_addend = 段内偏移 */
     }
     /* .plt：每个导入一条 jmp QWORD PTR [rip+rel32] */
     ld_pad_to(&f, LD_OFF_PLT);
@@ -1522,13 +1785,31 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
     ob_u64(&f, 7u);                    /* DT_RELA */
     ob_u64(&f, LD_DT_JMPREL);
     ob_u64(&f, LD_VA_RELAPLT);
-    if (LD_NCOPY) {
+    if (LD_NCOPY + LD_NRELFILL) {
         ob_u64(&f, LD_DT_RELA);
         ob_u64(&f, LD_VA_RELADYN);
         ob_u64(&f, LD_DT_RELASZ);
-        ob_u64(&f, 24u * (u64)LD_NCOPY);
+        ob_u64(&f, 24u * ((u64)LD_NCOPY + (u64)LD_NRELFILL));
         ob_u64(&f, LD_DT_RELAENT);
         ob_u64(&f, 24u);
+    }
+    /* 共享库：SONAME 与 init/fini_array。可执行文件那两块的调用点已经由
+     * 合成的 _start 直接 call 了，用不到这两对标签。 */
+    if (LD_SHARED && LD_SONAME[0]) {
+        ob_u64(&f, LD_DT_SONAME);
+        ob_u64(&f, LD_SONAMEOFF);
+    }
+    if (LD_SHARED && LD_INIT.n) {
+        ob_u64(&f, LD_DT_INIT_ARRAY);
+        ob_u64(&f, LD_VA_INIT);
+        ob_u64(&f, LD_DT_INIT_ARRAYSZ);
+        ob_u64(&f, LD_INIT.n);
+    }
+    if (LD_SHARED && LD_FINI.n) {
+        ob_u64(&f, LD_DT_FINI_ARRAY);
+        ob_u64(&f, LD_VA_FINI);
+        ob_u64(&f, LD_DT_FINI_ARRAYSZ);
+        ob_u64(&f, LD_FINI.n);
     }
     ob_u64(&f, LD_DT_FLAGS);
     ob_u64(&f, LD_DF_BIND_NOW);
@@ -1548,10 +1829,10 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
     f.p[4] = 2;
     f.p[5] = 1;
     f.p[6] = 1;
-    ob_patch16(&f, 16, 2);                          /* ET_EXEC */
+    ob_patch16(&f, 16, LD_SHARED ? 3 : 2);          /* ET_DYN / ET_EXEC */
     ob_patch16(&f, 18, 0x3E);                       /* EM_X86_64 */
     ob_patch32(&f, 20, 1);
-    ob_patch64(&f, 24, entry);
+    ob_patch64(&f, 24, LD_SHARED ? 0 : entry);      /* 共享库没有入口 */
     ob_patch64(&f, 32, LD_EHDR);
     ob_patch64(&f, 40, 0);
     ob_patch32(&f, 48, 0);
@@ -1588,39 +1869,130 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
         ob_patch64(&f, p + 40, mem_sz);
         ob_patch64(&f, p + 48, LD_PAGE);
     }
-    /* 程序头 2：PT_INTERP */
+    /* 程序头 2 起：PT_INTERP（只有可执行文件有——共享库是被别的产物链进去
+     * 或 dlopen 起来的，不自己起进程，所以少这一个头）、PT_DYNAMIC、
+     * PT_GNU_STACK。用计数器排，省得两种形态各写一份。 */
     {
-        u32 p = LD_EHDR + 2u * LD_PHDR;
+        u32 n = 2;
 
-        ob_patch32(&f, p, 3);
-        ob_patch32(&f, p + 4, 4);                   /* R */
-        ob_patch64(&f, p + 8, LD_OFF_INTERP);
-        ob_patch64(&f, p + 16, LD_VA_INTERP);
-        ob_patch64(&f, p + 24, LD_VA_INTERP);
-        ob_patch64(&f, p + 32, LD_INTERP_N);
-        ob_patch64(&f, p + 40, LD_INTERP_N);
-        ob_patch64(&f, p + 48, 1);
+        if (!LD_SHARED) {
+            u32 p = LD_EHDR + n * LD_PHDR;
+
+            ob_patch32(&f, p, 3);
+            ob_patch32(&f, p + 4, 4);               /* R */
+            ob_patch64(&f, p + 8, LD_OFF_INTERP);
+            ob_patch64(&f, p + 16, LD_VA_INTERP);
+            ob_patch64(&f, p + 24, LD_VA_INTERP);
+            ob_patch64(&f, p + 32, LD_INTERP_N);
+            ob_patch64(&f, p + 40, LD_INTERP_N);
+            ob_patch64(&f, p + 48, 1);
+            n++;
+        }
+        /* PT_DYNAMIC */
+        {
+            u32 p = LD_EHDR + n * LD_PHDR;
+
+            ob_patch32(&f, p, 2);
+            ob_patch32(&f, p + 4, 6);               /* R|W */
+            ob_patch64(&f, p + 8, LD_OFF_DYN);
+            ob_patch64(&f, p + 16, LD_VA_DYN);
+            ob_patch64(&f, p + 24, LD_VA_DYN);
+            ob_patch64(&f, p + 32, (u64)LD_DT_NUM * 16u);
+            ob_patch64(&f, p + 40, (u64)LD_DT_NUM * 16u);
+            ob_patch64(&f, p + 48, 8);
+            n++;
+        }
+        /* PT_GNU_STACK（不可执行栈） */
+        {
+            u32 p = LD_EHDR + n * LD_PHDR;
+
+            ob_patch32(&f, p, 0x6474e551u);
+            ob_patch32(&f, p + 4, 6);
+            ob_patch64(&f, p + 48, 16);
+        }
     }
-    /* 程序头 3：PT_DYNAMIC */
-    {
-        u32 p = LD_EHDR + 3u * LD_PHDR;
 
-        ob_patch32(&f, p, 2);
-        ob_patch32(&f, p + 4, 6);                   /* R|W */
-        ob_patch64(&f, p + 8, LD_OFF_DYN);
-        ob_patch64(&f, p + 16, LD_VA_DYN);
-        ob_patch64(&f, p + 24, LD_VA_DYN);
-        ob_patch64(&f, p + 32, (u64)LD_DT_NUM * 16u);
-        ob_patch64(&f, p + 40, (u64)LD_DT_NUM * 16u);
-        ob_patch64(&f, p + 48, 8);
-    }
-    /* 程序头 4：PT_GNU_STACK（不可执行栈） */
-    {
-        u32 p = LD_EHDR + 4u * LD_PHDR;
+    /* 共享库：补节头表（理由见上面 ld_shdr 那段注释） */
+    if (LD_SHARED) {
+        ObjBuf str = {0};
+        u32 nm_text = 0;
+        u32 nm_ro = 0;
+        u32 nm_dynstr = 0;
+        u32 nm_dynsym = 0;
+        u32 nm_hash = 0;
+        u32 nm_relaplt = 0;
+        u32 nm_plt = 0;
+        u32 nm_reladyn = 0;
+        u32 nm_got = 0;
+        u32 nm_data = 0;
+        u32 nm_init = 0;
+        u32 nm_fini = 0;
+        u32 nm_bss = 0;
+        u32 nm_dynamic = 0;
+        u32 nm_shstr = 0;
+        u32 nsym = 1u + LD_NIMP + LD_NCOPY + LD_NEXP;
+        u32 reladyn_sz = 24u * (LD_NCOPY + LD_NRELFILL);
+        u64 stroff = 0;
+        u64 shoff = 0;
 
-        ob_patch32(&f, p, 0x6474e551u);
-        ob_patch32(&f, p + 4, 6);
-        ob_patch64(&f, p + 48, 16);
+        ld_str_add(&str, "");                   /* 0 号：空串 */
+        nm_text = ld_str_add(&str, ".text");
+        nm_ro = ld_str_add(&str, ".rodata");
+        nm_dynstr = ld_str_add(&str, ".dynstr");
+        nm_dynsym = ld_str_add(&str, ".dynsym");
+        nm_hash = ld_str_add(&str, ".hash");
+        nm_relaplt = ld_str_add(&str, ".rela.plt");
+        nm_plt = ld_str_add(&str, ".plt");
+        nm_reladyn = ld_str_add(&str, ".rela.dyn");
+        nm_got = ld_str_add(&str, ".got.plt");
+        nm_data = ld_str_add(&str, ".data");
+        nm_init = ld_str_add(&str, ".init_array");
+        nm_fini = ld_str_add(&str, ".fini_array");
+        nm_bss = ld_str_add(&str, ".bss");
+        nm_dynamic = ld_str_add(&str, ".dynamic");
+        nm_shstr = ld_str_add(&str, ".shstrtab");
+
+        stroff = ld_align_up(f.n, 8);
+        ld_pad_to(&f, stroff);
+        ob_copy(&f, str.p, str.n);
+        shoff = ld_align_up(f.n, 8);
+        ld_pad_to(&f, shoff);
+
+        ld_shdr(&f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        ld_shdr(&f, nm_text, LD_SHT_PROGBITS, 0x6, LD_VA_TEXT, LD_OFF_TEXT,
+                LD_TEXT.n, 0, 0, 16, 0);
+        ld_shdr(&f, nm_ro, LD_SHT_PROGBITS, 0x2, LD_VA_RO, LD_OFF_RO,
+                LD_RO.n, 0, 0, 16, 0);
+        ld_shdr(&f, nm_dynstr, LD_SHT_STRTAB, 0x2, LD_VA_DYNSTR, LD_OFF_DYNSTR,
+                (u64)LD_DYNSTR_N, 0, 0, 1, 0);
+        ld_shdr(&f, nm_dynsym, LD_SHT_DYNSYM, 0x2, LD_VA_DYNSYM, LD_OFF_DYNSYM,
+                24u * (u64)nsym, LD_SI_DYNSTR, 1, 8, 24);
+        ld_shdr(&f, nm_hash, LD_SHT_HASH, 0x2, LD_VA_HASH, LD_OFF_HASH,
+                4u * (u64)(2u + 1u + nsym), LD_SI_DYNSYM, 0, 8, 4);
+        ld_shdr(&f, nm_relaplt, LD_SHT_RELA, 0x2, LD_VA_RELAPLT, LD_OFF_RELAPLT,
+                24u * (u64)LD_NIMP, LD_SI_DYNSYM, 0, 8, 24);
+        ld_shdr(&f, nm_plt, LD_SHT_PROGBITS, 0x6, LD_VA_PLT, LD_OFF_PLT,
+                (u64)LD_NIMP * 6u, 0, 0, 16, 16);
+        ld_shdr(&f, nm_reladyn, LD_SHT_RELA, 0x2, LD_VA_RELADYN, LD_OFF_RELADYN,
+                24u * (u64)LD_NCOPY + (u64)reladyn_sz, LD_SI_DYNSYM, 0, 8, 24);
+        ld_shdr(&f, nm_got, LD_SHT_PROGBITS, 0x3, LD_VA_GOT, LD_OFF_GOT,
+                8u * (3u + (u64)LD_NIMP), 0, 0, 8, 8);
+        ld_shdr(&f, nm_data, LD_SHT_PROGBITS, 0x3, LD_VA_DATA, LD_OFF_DATA,
+                LD_DATA.n, 0, 0, 16, 0);
+        ld_shdr(&f, nm_init, LD_SHT_INIT_ARRAY, 0x3, LD_VA_INIT, LD_OFF_INIT,
+                LD_INIT.n, 0, 0, 8, 8);
+        ld_shdr(&f, nm_fini, LD_SHT_FINI_ARRAY, 0x3, LD_VA_FINI, LD_OFF_FINI,
+                LD_FINI.n, 0, 0, 8, 8);
+        ld_shdr(&f, nm_bss, LD_SHT_NOBITS, 0x3, LD_VA_BSS, LD_OFF_FINI + LD_FINI.n,
+                LD_BSS, 0, 0, 8, 0);
+        ld_shdr(&f, nm_dynamic, LD_SHT_DYNAMIC, 0x3, LD_VA_DYN, LD_OFF_DYN,
+                (u64)LD_DT_NUM * 16u, LD_SI_DYNSTR, 0, 8, 16);
+        ld_shdr(&f, nm_shstr, LD_SHT_STRTAB, 0, 0, stroff, str.n, 0, 0, 1, 0);
+
+        ob_patch64(&f, 40, shoff);              /* e_shoff */
+        ob_patch16(&f, 60, LD_SI_NUM);          /* e_shnum */
+        ob_patch16(&f, 62, LD_SI_SHSTRTAB);     /* e_shstrndx */
+        free(str.p);
     }
 
     {
@@ -1633,14 +2005,39 @@ static void ld_write_exe_dyn(const char *path, u64 entry)
                 fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
             fclose(out);
             chmod(path, 0755);
-            printf("c6c: %s（动态链接 %s：导入 %u 个函数 / %u 个数据 COPY / "
-                   "代码 %u 字节 / 只读 %u / 数据 %u / bss %llu / 入口 0x%llx）\n",
-                   path, LD_DYN_LIBC, (unsigned)LD_NIMP, (unsigned)LD_NCOPY,
-                   LD_TEXT.n, LD_RO.n, (u32)data_sz,
-                   (unsigned long long)LD_BSS, (unsigned long long)entry);
+            if (LD_SHARED) {
+                printf("c6c: %s（共享库 %s：导出 %u 个符号 / 导入 %u 个函数 / "
+                       "RELATIVE %u 条 / 代码 %u 字节 / 只读 %u / 数据 %u / bss %llu）\n",
+                       path, LD_SONAME[0] ? LD_SONAME : "?", (unsigned)LD_NEXP,
+                       (unsigned)LD_NIMP, (unsigned)LD_NRELFILL, LD_TEXT.n, LD_RO.n,
+                       (u32)data_sz, (unsigned long long)LD_BSS);
+            } else {
+                printf("c6c: %s（动态链接 %s：导入 %u 个函数 / %u 个数据 COPY / "
+                       "代码 %u 字节 / 只读 %u / 数据 %u / bss %llu / 入口 0x%llx）\n",
+                       path, LD_DYN_LIBC, (unsigned)LD_NIMP, (unsigned)LD_NCOPY,
+                       LD_TEXT.n, LD_RO.n, (u32)data_sz,
+                       (unsigned long long)LD_BSS, (unsigned long long)entry);
+            }
         }
     }
     free(f.p);
+    free(LD_RELOFF);
+    free(LD_RELADD);
+    LD_RELOFF = NULL;
+    LD_RELADD = NULL;
+}
+
+/* SONAME 就是输出文件名（不带目录）。ld.so 记的是这个名字，别的产物链接时
+ * 写进 DT_NEEDED 的也是它，所以只取 basename。 */
+static void ld_shared_soname(const char *out)
+{
+    const char *slash = NULL;
+
+    LD_SONAME[0] = 0;
+    if (!out || !out[0])
+        return;
+    slash = strrchr(out, '/');
+    snprintf(LD_SONAME, sizeof(LD_SONAME), "%s", slash ? slash + 1 : out);
 }
 
 /* ---- 入口：把 files[] 链成 out ---- */
@@ -1673,14 +2070,22 @@ static int ld_link(const char **files, int nfiles, const char *out)
     if (ld_collect_symbols())
         return 2;
 
-    /* 找 main：_start 要靠它；没有就如实说清 */
-    gmain = ld_gfind("main", 0);
-    if (gmain == 0xffffffffu || !LD_G[gmain].defined) {
-        fprintf(stderr, "c6c: 找不到 'main'（链接一个可执行文件需要入口）\n");
-        return 2;
+    if (LD_SHARED) {
+        /* 共享库：基址 0（VA 就是段内偏移，加载基址由 ld.so 选），没有入口，
+         * 也没有合成的 _start——它是被 dlopen 或者别的产物链进去用的。 */
+        LD_BASE_VA = 0;
+        ld_set_dynamic(1);
+        ld_shared_soname(out);
+    } else {
+        LD_BASE_VA = 0x400000u;
+        /* 找 main：_start 要靠它；没有就如实说清 */
+        gmain = ld_gfind("main", 0);
+        if (gmain == 0xffffffffu || !LD_G[gmain].defined) {
+            fprintf(stderr, "c6c: 找不到 'main'（链接一个可执行文件需要入口）\n");
+            return 2;
+        }
+        ld_emit_stub();
     }
-
-    ld_emit_stub();
 
     /* 定最终地址：文件头 + 代码 + 只读 是第一个 PT_LOAD，数据是第二个。
      * 动态链接时整张地图（动态只读段 + .got.plt + .dynamic）由 ld_dyn_plan 定。 */
@@ -1710,28 +2115,30 @@ static int ld_link(const char **files, int nfiles, const char *out)
                 (unsigned)LD_NUNDEF, LD_UNDEF_NAMES, LD_NUNDEF > 6u ? " …" : "");
 
     /* 构造/析构函数在 .init_array 里已经是绝对地址了（上面刚重定位过），
-     * 逐条取回来补进 _start 的 call。 */
-    for (i = 0; i < ld_stub_nctor; i++) {
-        u64 fn = ld_rd64(LD_INIT.p, i * 8u);
-        u32 field = ld_stub_nctor_off + i * 5u + 1u;
+     * 逐条取回来补进 _start 的 call。共享库没有 _start——那两块由 ld.so 按
+     * DT_INIT_ARRAY / DT_FINI_ARRAY 调，所以这里跳过。 */
+    if (!LD_SHARED) {
+        for (i = 0; i < ld_stub_nctor; i++) {
+            u64 fn = ld_rd64(LD_INIT.p, i * 8u);
+            u32 field = ld_stub_nctor_off + i * 5u + 1u;
 
-        if (!fn) {
-            fprintf(stderr, "c6c: .init_array 第 %u 项是空指针\n", (unsigned)i);
-            return 2;
+            if (!fn) {
+                fprintf(stderr, "c6c: .init_array 第 %u 项是空指针\n", (unsigned)i);
+                return 2;
+            }
+            ld_patch_call(field, fn);
         }
-        ld_patch_call(field, fn);
-    }
-    for (i = 0; i < ld_stub_ndtor; i++) {
-        u64 fn = ld_rd64(LD_FINI.p, (ld_stub_ndtor - 1u - i) * 8u);
-        u32 field = ld_stub_ndtor_off + i * 5u + 1u;
+        for (i = 0; i < ld_stub_ndtor; i++) {
+            u64 fn = ld_rd64(LD_FINI.p, (ld_stub_ndtor - 1u - i) * 8u);
+            u32 field = ld_stub_ndtor_off + i * 5u + 1u;
 
-        if (!fn)
-            continue;
-        ld_patch_call(field, fn);
+            if (!fn)
+                continue;
+            ld_patch_call(field, fn);
+        }
+        ld_patch_call(ld_stub_main_field, ld_gsym_addr(gmain));
+        entry = LD_VA_TEXT + ld_stub_off;
     }
-    ld_patch_call(ld_stub_main_field, ld_gsym_addr(gmain));
-
-    entry = LD_VA_TEXT + ld_stub_off;
     if (LD_DYN) {
         if (LD_NUNDEF_DATA)
             fprintf(stderr, "c6c: 警告：%u 个数据符号在 libc 里查不到（按 0 处理）："
