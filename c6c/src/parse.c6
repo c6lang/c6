@@ -15748,6 +15748,15 @@ static int glob_addr_start(int amp)
             return 0;
         return 2;
     }
+    /* `&(name)` / `&(name).entry` / `&(name[2])`：名字外面套了成组的括号。
+     * 这里只做前瞻（游标不动），真正跳过左括号、关掉右括号的是
+     * glob_addr_parse() 里那个 grp 计数。内核里这几种写法很常见——
+     *     ASSERT_STATIC_STORAGE(name) → static typeof(name) * const … = &(name)
+     *     __WORK_INITIALIZER(n, f)    → { .entry = { &(n).entry, &(n).entry }, … }
+     * 不认就报"全局地址初始化器只支持 &全局/函数"（15 个文件）。 */
+    if (amp && t && t->kind == TK_PUNCT && TOK_EQ(t, "(") && pa_peek(1)
+        && pa_peek(1)->kind == TK_IDENT)
+        return 1;
     if (!(t && t->kind == TK_IDENT))
         return 0;
     s = sym_find(tok_data(t), t->len);
@@ -15798,13 +15807,14 @@ static void glob_addr_skip_rest(void)
 /* 真读一遍：吃掉整段地址常量，记一条带加数的重定位。
  * 读不动的（非常量下标、`->`、`&局部变量`）就地报准确诊断、丢掉尾巴后返回，
  * 调用点直接结束这个初始化器——不再往下掉到"常量表达式"那条路上二次报错。 */
-static void glob_addr_parse(u32 data_off, int amp, int num_first)
+static void glob_addr_parse(u32 data_off, int amp, int num_first, int pclose)
 {
     Tok *t = pa_cur();
     Sym *s = NULL;
     GlobAddr ga = {0, 0, 0, 0};
     u32 ty = 0;
     i64 lead = 0;      /* `2 + A` 里左边那个整数 */
+    int grp = 0;       /* 名字外面套了几层成组的括号（`&(name).entry`） */
 
     /* 偏移必须是整数常量表达式：这一段里 const_primary 见到全局变量就报错 */
     CONST_NOREF = 1;
@@ -15814,6 +15824,19 @@ static void glob_addr_parse(u32 data_off, int amp, int num_first)
         pa_advance();                    /* `+`（glob_addr_start 已经验过） */
         t = pa_cur();
     }
+    /* 名字外面可以套成组的括号：`&(name)`、`&(name).entry`、`&(name[2])`。
+     * 内核里这两种写法到处都是——
+     *     LIST_HEAD_INIT(name)        → { &(name), &(name) }
+     *     __WORK_INITIALIZER(n, f)    → { .entry = { &(n).entry, &(n).entry }, … }
+     *     ASSERT_STATIC_STORAGE(name) → static typeof(name) * const … = &(name)
+     * 不认括号就报"全局地址初始化器只支持 &全局/函数"（15 个文件）或者
+     * "这里要 '}'（当前是 '.'）"（括号被当成一个完整初始化器吃掉，后面的
+     * `.entry` 没人接）。先记下开了几层，名字消费掉以后再逐个关掉。 */
+    while (pa_is_ch('(')) {
+        pa_advance();
+        grp++;
+    }
+    t = pa_cur();
     if (!(t && t->kind == TK_IDENT)) {
         pa_error("全局地址初始化器只支持 &全局/函数");
         goto bad;
@@ -15833,6 +15856,15 @@ static void glob_addr_parse(u32 data_off, int amp, int num_first)
     ga.sym = addr_sym_of(s);
     ty = s->type;
     pa_advance();
+    /* 关掉包住名字的成组括号。两处来源：这里自己跳过的左括号（grp），
+     * 以及调用方为了绕开"强转 vs 成组括号"的判别先剥掉的那几层（pclose，
+     * 见 gen_glob_obj / 标量初始化器那两处）。不关掉的话后面的 `.成员`
+     * 链会被 `)` 挡住——`&(n).entry` 就成了"只取到 n"，报
+     * "这里要 '}'（当前是 '.'）"。 */
+    while (grp > 0 && pa_accept_ch(')'))
+        grp--;
+    while (pclose > 0 && pa_accept_ch(')'))
+        pclose--;
     if (amp) {
         /* `&obj` 指向对象本身，然后可以逐段走 `.成员` / `[常量]` */
         ga.pty = ty;
@@ -16149,7 +16181,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             return;
         ak = glob_addr_start(amp);
         if (ak) {
-            glob_addr_parse(goff + off, amp, ak == 2);
+            glob_addr_parse(goff + off, amp, ak == 2, (int)amp_paren);
             while (amp_paren > 0 && pa_is_ch(')')) {
                 pa_advance();
                 amp_paren--;
@@ -21607,7 +21639,7 @@ static void gen_one_global(u32 ty, Declarator *d)
             return;
         ak = glob_addr_start(amp);
         if (ak) {
-            glob_addr_parse(s->goff, amp, ak == 2);
+            glob_addr_parse(s->goff, amp, ak == 2, 0);
             return;
         }
         if (amp)
