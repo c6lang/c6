@@ -46,6 +46,11 @@
   没有一条从绿变红。
 - 已知没动的：`float_lit_bits` 的十进制→double 还差 1 ulp（`1e300` 的位模式末位
   与 glibc 不同），这是解析侧正确舍入的问题，不是打印侧。
+- 顺带：`...` 在声明符的形参表里被当成"隐式 int 的形参"，每个变参原型都多一条
+  `type defaults to int` 警告（c6c 自己的 `stdio.h` 4 条、`unistd.h` 还有）。在
+  `parse_typespec` 之前把省略号拦下来，编译干净了，`testflag` 的"全部通过时
+  stderr 干净 / 过滤空 / 没有 test 块"三条也一起转绿（16/3 → 19/0）——CI 的
+  `c6c-check-all` 就是被这三条挂着的。
 
 ### 许可：仓库根新增 `LICENSE`（LGPL-2.1，逐字继承 tcc）
 

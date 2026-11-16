@@ -6645,6 +6645,15 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
             r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
             goto fin;
         }
+        /* `...` 是**一个** token，不是形参。必须在 parse_typespec 之前拦下来：
+         * 它在说明符位置没有类型，会被当成"隐式 int 的形参"，于是每个变参
+         * 原型都多一条 `type defaults to int` 警告——c6c 自己的 stdio.h 就有
+         * 4 条、unistd.h 还有，把 `-test` 那批"stderr 干净"的检查全打挂了。 */
+        if (pa_is_punct("...")) {
+            pa_advance();
+            d->variadic = 1;
+            break;
+        }
         pt = parse_typespec();
         if (!pt)
             d->knr = 1;         /* 裸标识符形参：旧式（K&R）参数表 */

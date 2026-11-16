@@ -4310,3 +4310,11 @@ IO（`std-util`）。下一轮先挑跨 TU 符号这一类把成因弄清楚。
 **已知没动的**：`float_lit_bits` 的十进制→double 差 1 ulp（`1e300` 的位模式末位
 与 glibc 不同）。`%f` 现在能把那个 double 一位不差地印出来，错在解析侧的
 正确舍入，是另一件事。
+
+**顺带清掉的一处噪声**：`...` 在声明符的形参表里先经过 `parse_typespec`，在
+说明符位置没有类型，于是被当成"隐式 int 的形参"——每个变参原型多一条
+`type defaults to int` 警告（c6c 自己的 `stdio.h` 4 条、`unistd.h` 还有）。
+在 `parse_typespec` 之前把省略号拦下来（它本来就是一个 token），`#include
+<stdio.h>` 的编译输出就只剩产物那一行了。连带效果：`testflag` 的
+「全部通过时 stderr 干净」「-test-filter 过滤空」「没有 test 块」三条同时转绿
+（16/3 → 19/0），CI 的 `c6c-check-all` 不再红。回归基线不动（仍 52 / 92）。
