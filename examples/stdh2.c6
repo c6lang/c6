@@ -1,0 +1,389 @@
+/* stdh2：标准库第九十二批（hpack / http2 / http2c / http2d）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这一批是**HTTP/2**：`std.encoding.hpack`（RFC 7541 头压缩）、`std.net.http2`
+ * （帧层 + preface + 设置/窗口/GOAWAY）、`std.net.http2c`（h2c 客户端）、
+ * `std.net.http2d`（h2c 服务端）。四节：
+ *
+ *   1. 头压缩：静态表命中、整数编解码、Huffman、动态表往返；
+ *   2. 帧层：帧头、SETTINGS / WINDOW_UPDATE / RST_STREAM / PING / GOAWAY 往返；
+ *   3. 端到端：`fork` 起一个 h2c 服务端，用 h2c 客户端在同一条连接上打
+ *      GET / POST / GET（三条流），再验一次「请求体超首窗」被本地拒绝；
+ *   4. 错误路径：对端发 HTTP/1 报文（没有 preface）时服务端拒绝。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdh2 \
+ *         examples/stdh2.c6 std/core/types.c6 std/text/str.c6 \
+ *         std/net/tcp.c6 std/net/http2.c6 std/encoding/hpack.c6 \
+ *         std/net/http2c.c6 std/net/http2d.c6
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+import std.core.types;
+import std.text.str;
+import std.encoding.hpack;
+import std.net.http2;
+import std.net.http2c;
+import std.net.http2d;
+import std.net.tcp;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int str_is(Str s, char *lit)
+{
+    int n = (int)strlen(lit);
+
+    return s.s.len == n && (n == 0 || memcmp(s.s.data, lit, (size_t)n) == 0);
+}
+
+/* 1. 头压缩 */
+static void section_hpack(void)
+{
+    Hpack enc = { 0 };
+    char etb[4096] = { 0 }, earena[2048] = { 0 };
+    Hpack dec = { 0 };
+    char dtb[4096] = { 0 }, darena[2048] = { 0 };
+    HpackField f[4] = { 0 };
+    HpackField out[8] = { 0 };
+    char blk[512] = { 0 };
+    int blen = 0;
+    int cnt = 0;
+    char ib[8] = { 0 };
+
+    hpack_init(&enc, etb, (int)sizeof etb, 4096, earena, (int)sizeof earena);
+    hpack_init(&dec, dtb, (int)sizeof dtb, 4096, darena, (int)sizeof darena);
+
+    /* 静态表：名字命中 :method，值走 literal（编码器不插动态表） */
+    f[0].name = SS(":method");
+    f[0].value = SS("GET");
+    blen = hpack_put_block(&enc, f, 1, blk, (int)sizeof blk);
+    check(blen > 0, "单字段头块压得出来");
+    check(hpack_count(&enc) == 0 || hpack_size(&enc) == 0,
+          "编码器不往动态表里插东西");
+    check(hpack_decode_block(&dec, blk, blen, out, 8, &cnt) == 1 && cnt == 1,
+          "单字段头块解得出来");
+    check(out[0].value.s.len == 3, "解出来的值长度对");
+    check(str_is(out[0].name, ":method") && str_is(out[0].value, "GET"),
+          "静态表 + 字面值往返");
+
+    /* 整数：64 / 1337 / 0 三种边界 */
+    check(hpack_int_put(ib, (int)sizeof ib, 5, 0, 10) == 1 && ib[0] == 10,
+          "整数 10 直接放进前缀");
+    check(hpack_int_put(ib, (int)sizeof ib, 5, 0, 1337) == 3,
+          "1337 用 3 字节（1 + 2）");
+    {
+        u32 v = 0;
+        int used = 0;
+
+        check(hpack_int_get(ib, 4, 5, &v, &used) == 1 && v == 1337
+                  && used == 3,
+              "整数往返");
+    }
+
+    /* Huffman：128 字节混合数据编码后再解回来 */
+    {
+        char src[128] = { 0 };
+        char henc[512] = { 0 };
+        char hdec[512] = { 0 };
+        int i = 0;
+        int hn = 0;
+        int dn = 0;
+
+        for (i = 0; i < (int)sizeof src; i++)
+            src[i] = (char)('a' + (i * 7) % 26);
+        hn = hpack_huff_encode((Str){ (char[:]){ src, (int)sizeof src } },
+                               henc, (int)sizeof henc);
+        check(hn > 0 && hn < (int)sizeof src, "Huffman 能压缩 ASCII 小写");
+        dn = hpack_huff_decode(henc, hn, hdec, (int)sizeof hdec, &dn);
+        check(dn == (int)sizeof src
+                  && memcmp(hdec, src, (size_t)sizeof src) == 0,
+              "Huffman 往返一致");
+    }
+    check(hpack_huff_len(SS("www.example.com")) > 0, "Huffman 长度能预算");
+
+    /* 四个字段一整块，含 Huffman 值 */
+    f[0].name = SS(":status");
+    f[0].value = SS("200");
+    f[1].name = SS("content-type");
+    f[1].value = SS("text/plain; charset=utf-8");
+    f[2].name = SS("cache-control");
+    f[2].value = SS("no-cache");
+    f[3].name = SS("x-trace");
+    f[3].value = SS("abcdefghijklmnopqrstuvwxyz0123456789");
+    blen = hpack_put_block(&enc, f, 4, blk, (int)sizeof blk);
+    check(blen > 0, "四字段头块压得出来");
+    check(hpack_decode_block(&dec, blk, blen, out, 8, &cnt) == 1 && cnt == 4,
+          "四字段头块解得出来");
+    check(str_is(out[0].name, ":status") && str_is(out[0].value, "200"),
+          ":status 对");
+    check(str_is(out[1].value, "text/plain; charset=utf-8"), "content-type 对");
+    check(str_is(out[3].value, "abcdefghijklmnopqrstuvwxyz0123456789"),
+          "长值（Huffman + 动态表）对");
+    /* 编码器一律「逐字面量不插表」，所以解码器的动态表这时还是空的；
+     * 对端用增量索引时解码器才会往里放（模块自测里按 RFC C.4 验过）。 */
+    check(hpack_count(&dec) == 0 && hpack_size(&dec) == 0, "动态表按约定没被编码端写脏");
+    {
+        Str n1 = { 0 }, v1 = { 0 };
+
+        check(hpack_index(&dec, 8, &n1, &v1) == 1 && str_is(n1, ":status")
+                  && str_is(v1, "200"),
+              "静态表第 8 项是 :status 200");
+    }
+}
+
+/* 2. 帧层 */
+static void section_frames(void)
+{
+    char buf[256] = { 0 };
+    H2Frame f = { 0 };
+    H2Setting st[3] = { 0 };
+    H2Setting back[8] = { 0 };
+    int cnt = 0;
+    int n = 0;
+    u32 inc = 0;
+    int code = 0;
+    u64 ping = 0;
+
+    check(h2_preface_check(H2_PREFACE, H2_PREFACE_LEN) == 1, "preface 认得");
+    check(h2_preface_check("GET / HTTP/1.1\r\n", 16) == -1, "HTTP/1 报文不是 preface");
+
+    n = h2_frame_write(buf, (int)sizeof buf, H2_DATA, H2_END_STREAM, 1, "abc", 3);
+    check(n == H2_HEAD_LEN + 3, "帧长 = 9 + 负载");
+    check(h2_frame_head(buf, n, &f) == 1 && f.len == 3
+              && f.type == H2_DATA && (f.flags & H2_END_STREAM)
+              && f.stream == 1,
+          "帧头往返");
+    check(h2_payload_off(buf + H2_HEAD_LEN, 3, f.flags, 0, &n) == 3 && n == 0,
+          "无填充时负载整段有效");
+
+    st[0].id = H2_SET_HEADER_TABLE;
+    st[0].value = 4096;
+    st[1].id = H2_SET_INITIAL_WINDOW;
+    st[1].value = 131072;
+    st[2].id = H2_SET_MAX_FRAME;
+    st[2].value = 16384;
+    n = h2_settings_write(buf, (int)sizeof buf, st, 3);
+    check(n == 18, "三对 SETTINGS 是 18 字节");
+    check(h2_settings_parse((u8 *)buf, n, back, 8, &cnt) == 1 && cnt == 3,
+          "SETTINGS 解析");
+    {
+        u32 win = 0;
+
+        check(h2_setting_find(back, cnt, H2_SET_INITIAL_WINDOW, &win) == 1
+                  && win == 131072,
+              "SETTINGS 查找");
+        check(h2_setting_find(back, cnt, H2_SET_ENABLE_PUSH, &win) == 0,
+              "没出现过的 SETTINGS 返回 0");
+    }
+
+    n = h2_window_write(buf, (int)sizeof buf, 3, 12345);
+    check(n == 4 && h2_window_parse(buf, 4, &inc) == 1 && inc == 12345,
+          "WINDOW_UPDATE 往返（流 3 的增量在帧头里）");
+    n = h2_rst_write(buf, (int)sizeof buf, 1, H2_REFUSED_STREAM);
+    check(n == 4 && h2_rst_parse(buf, 4, &code) == 1
+              && code == H2_REFUSED_STREAM,
+          "RST_STREAM 往返");
+    n = h2_ping_write(buf, (int)sizeof buf, 0x0102030405060708ull);
+    check(n == 8 && h2_ping_parse(buf, 8, &ping) == 1
+              && ping == 0x0102030405060708ull,
+          "PING 8 字节负载往返");
+    n = h2_goaway_write(buf, (int)sizeof buf, 3, H2_NO_ERROR, SS("bye"));
+    check(n == 11, "GOAWAY = 8 + 调试串");
+}
+
+/* 3. 端到端：本机 h2c 服务端 + h2c 客户端 */
+static int serve_loop(Server *srv)
+{
+    char hb[16384] = { 0 }, tb[4096] = { 0 }, ar[4096] = { 0 };
+    char body[512] = { 0 };
+    char echo[512] = { 0 };
+    HpackField hdrs[32] = { 0 };
+    Conn c = h2d_accept(srv, hb, (int)sizeof hb, tb, (int)sizeof tb, ar,
+                        (int)sizeof ar);
+    int i = 0;
+
+    if (!h2d_conn_ok(&c))
+        return 1;
+    /* 一条连接上收三个请求：GET /hi、POST /echo、GET /nope */
+    for (i = 0; i < 3; i++) {
+        Request req = { 0 };
+        int rc = h2d_next_request(&c, &req, body, (int)sizeof body, hdrs, 32);
+
+        if (rc != 1)
+            return 2;
+        if (str_is(req.path, "/hi")) {
+            if (h2d_respond_text(&c, &req, 200, "hello h2\n") != 1)
+                return 3;
+        } else if (str_is(req.path, "/echo")) {
+            memcpy(echo, req.body.s.data, (size_t)req.body.s.len);
+            echo[req.body.s.len] = 0;
+            if (h2d_respond_text(&c, &req, 200, echo) != 1)
+                return 4;
+        } else {
+            if (h2d_respond_text(&c, &req, 404, "nope\n") != 1)
+                return 5;
+        }
+    }
+    /* 客户端试发超窗 body 时已经在本地拒绝了，这里只会读到半条流然后 EOF */
+    {
+        Request req = { 0 };
+
+        if (h2d_next_request(&c, &req, body, (int)sizeof body, hdrs, 32) != 0)
+            return 6;
+    }
+    close_conn(&c);
+    return 0;
+}
+
+static void section_end_to_end(void)
+{
+    Server srv = h2d_listen("127.0.0.1", 0, 8);
+    H2Client c = { 0 };
+    char hb[16384] = { 0 }, tb[4096] = { 0 }, ar[4096] = { 0 };
+    char body[256] = { 0 };
+    HpackField hdrs[32] = { 0 };
+    H2Response r = { 0 };
+    HpackField extra[1] = { 0 };
+    int pid = 0;
+    int port = 0;
+
+    if (!srv.ok() || (port = srv.port()) <= 0) {
+        check(0, "监听 127.0.0.1 失败");
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        int rc = serve_loop(&srv);
+
+        srv.close_socket();
+        _exit(rc);
+    }
+    check(pid > 0, "fork 出服务端");
+    if (pid <= 0)
+        return;
+    c = h2c_connect("127.0.0.1", port, 2000, hb, (int)sizeof hb, tb,
+                    (int)sizeof tb, ar, (int)sizeof ar);
+    check(h2c_ok(&c), "h2c 客户端连上了");
+
+    /* 流 1：GET /hi */
+    check(h2c_get(&c, SS("127.0.0.1"), SS("/hi"), &r, hdrs, 32, body,
+                  (int)sizeof body) == 9,
+          "GET /hi 拿到 9 字节");
+    check(r.status == 200 && str_is(r.body, "hello h2\n"), "GET /hi 的响应对");
+
+    /* 流 3：POST /echo，自动补 content-length */
+    extra[0].name = SS("content-type");
+    extra[0].value = SS("text/plain");
+    check(h2c_request(&c, SS("POST"), SS("127.0.0.1"), SS("/echo"), extra, 1,
+                      SS("ping"), &r, hdrs, 32, body, (int)sizeof body) == 4,
+          "POST /echo 拿到 4 字节");
+    check(r.status == 200 && str_is(r.body, "ping"), "POST 的 body 被回显");
+    check(str_is(h2c_header(&r, SS("content-type")), "text/plain; charset=utf-8"),
+          "响应 content-type 取得出来");
+
+    /* 流 5：GET /nope -> 404，连接还能用 */
+    check(h2c_get(&c, SS("127.0.0.1"), SS("/nope"), &r, hdrs, 32, body,
+                  (int)sizeof body) == 5,
+          "GET /nope 拿到 5 字节");
+    check(r.status == 404 && str_is(r.body, "nope\n"), "404 的响应对");
+    check(h2c_requests(&c) == 3, "同一条连接上跑了三个请求");
+
+    /* 首窗之外的请求体：本地就拒绝，不会挂在等 WINDOW_UPDATE 上 */
+    {
+        static char big[70000] = { 0 };
+
+        check(h2c_request(&c, SS("POST"), SS("127.0.0.1"), SS("/echo"),
+                          (HpackField *)0, 0,
+                          (Str){ (char[:]){ big, (int)sizeof big } }, &r,
+                          hdrs, 32, body, (int)sizeof body) == -1,
+              "超首窗的请求体被拒绝");
+        check(strstr(h2c_why(&c), "首窗") != 0, "拒绝原因是首窗限制");
+    }
+    h2c_close(&c);
+    srv.close_socket();
+    {
+        int status = 0;
+
+        check(waitpid(pid, &status, 0) == pid && WIFEXITED(status)
+                  && WEXITSTATUS(status) == 0,
+              "服务端子进程正常退出");
+    }
+}
+
+/* 4. 错误路径：对端根本不是 h2 */
+static void section_reject_http1(void)
+{
+    Server srv = h2d_listen("127.0.0.1", 0, 4);
+    char hb[16384] = { 0 }, tb[4096] = { 0 }, ar[4096] = { 0 };
+    char body[64] = { 0 };
+    HpackField hdrs[8] = { 0 };
+    Conn conn = { { -1 } };
+    Request req = { 0 };
+    int pid = 0;
+    int port = 0;
+
+    if (!srv.ok() || (port = srv.port()) <= 0) {
+        check(0, "监听 127.0.0.1 失败");
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        Tcp cli = tcp_connect("127.0.0.1", port, 2000);
+
+        if (!cli.ok())
+            _exit(2);
+        if (write(cli.fd, "GET / HTTP/1.1\r\nHost: h\r\n\r\n", 27) != 27)
+            _exit(3);
+        cli.close_socket();
+        _exit(0);
+    }
+    check(pid > 0, "fork 出 HTTP/1 客户端");
+    if (pid <= 0)
+        return;
+    conn = h2d_accept(&srv, hb, (int)sizeof hb, tb, (int)sizeof tb, ar,
+                      (int)sizeof ar);
+    check(h2d_conn_ok(&conn), "服务端 accept 到连接");
+    check(h2d_next_request(&conn, &req, body, (int)sizeof body, hdrs, 8) == -1,
+          "HTTP/1 报文被当成协议错");
+    check(strstr(h2d_why(&conn), "preface") != 0, "失败原因提到 preface");
+    close_conn(&conn);
+    srv.close_socket();
+    {
+        int status = 0;
+
+        check(waitpid(pid, &status, 0) == pid, "HTTP/1 客户端进程收工");
+    }
+}
+
+int main(void)
+{
+    printf("== 1. 头压缩（HPACK）\n");
+    section_hpack();
+    printf("== 2. 帧层\n");
+    section_frames();
+    printf("== 3. 端到端（h2c 服务端 + h2c 客户端）\n");
+    section_end_to_end();
+    printf("== 4. 错误路径\n");
+    section_reject_http1();
+    printf("%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
