@@ -23,7 +23,12 @@
 # 其余验收都与 stage0 无关。
 
 PYTHON ?= python3
-BOOTSTRAP ?= tcc             # tcc | host（见上面的说明）
+# 取值 tcc | host（见上面的说明）。同样不能写成行尾注释：GNU make 只丢掉 `#`
+# 后面的文字、把注释前的空格**留在变量值里**，默认值就成了 "tcc" 加一串空格，
+# 下面两个 ifeq 谁也匹配不上，直接掉进"不认识"的报错分支（CI 五个 build 作业
+# 就是这么红的）。赋值后统一 strip 一次，防止以后再有人顺手加行尾注释。
+BOOTSTRAP ?= tcc
+BOOTSTRAP := $(strip $(BOOTSTRAP))
 # CMAKE 只在需要生成 tcc 的配置头时用到（见 build-tcc）；不要写成行尾注释，
 # GNU make 会把注释前的空格留在变量值里，`"$(CMAKE)"` 就找不到命令了。
 CMAKE  ?= cmake
