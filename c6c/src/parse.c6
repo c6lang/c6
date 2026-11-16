@@ -8381,6 +8381,9 @@ static u32 gen_call(Sym *fs)
     E_CALL_FALLIBLE = (fs && fs->fallible) ? 1 : 2;
     u32 args[16] = {0};
     u32 narg = 0;
+    u32 aty0[PA_ARG_MAX] = {0};   /* 实参**转换前**的类型（重载重选后要从原值重转） */
+    u32 av0[PA_ARG_MAX] = {0};    /* 实参转换前的值 */
+    u8 argfix[PA_ARG_MAX] = {0};  /* 走接口/切片/聚合特殊路径的实参不再动 */
 
     if (fs && drop_is_sym((u32)fs->val))
         pa_error("析构函数不能直接调用：最后一个引用放掉时它自己会跑（`p = NULL` 就够了）");
@@ -8401,6 +8404,7 @@ static u32 gen_call(Sym *fs)
                 u32 av = gen_assign();
                 u32 aty = cur_op_ty();
                 u32 pty = ty_func_param(fs->type, narg);
+                int special = 0;
 
                 if (ty_has_mgd(aty)) {
                     char dnm[160] = {0};
@@ -8430,6 +8434,8 @@ static u32 gen_call(Sym *fs)
                         mgdmask2 |= 1u << narg;
                     }
                 }
+                aty0[narg] = aty;
+                av0[narg] = av;
                 /* c6 切片形参 + 数组实参：隐式转成 `{ptr, len}`（两个机器字）。
                  * 拷进调用者的临时槽，再把地址当实参传（聚合按值传参的既有约定）。 */
                 {
@@ -8451,6 +8457,7 @@ static u32 gen_call(Sym *fs)
                                    ty_ptr(ty_void()));
                         av = ta2;
                         aty = pty;
+                        special = 1;
                     }
                 }
                 if (pty != 0 && ty_is_slice(pty) && ty_is_array(aty)) {
@@ -8467,6 +8474,7 @@ static u32 gen_call(Sym *fs)
                     irfn_push(&FN, IR_STORE, IRT_U64, a8, lv, 0, 0, 0);
                     av = taddr;
                     aty = pty;
+                    special = 1;
                 }
                 /* 实参按形参类型转换；没有原型（或落在变参部分）时做默认实参
                  * 提升：float → double，否则 printf("%f", f) 拿到 4 字节位模式。 */
@@ -8488,7 +8496,10 @@ static u32 gen_call(Sym *fs)
                     irfn_push(&FN, IR_ADDR, IRT_PTR, taddr, 0, 0, 0, X64_SLOT(tslot));
                     irfn_push(&FN, IR_COPY, IRT_U8, taddr, av, 0, 0, sz);
                     av = taddr;
+                    aty = pty;
+                    special = 1;
                 }
+                argfix[narg] = (u8)special;
                 args[narg] = av;
             }
             narg++;
@@ -8503,14 +8514,34 @@ static u32 gen_call(Sym *fs)
      * 类型注册的那一条覆盖掉。 */
     {
         Sym *fb = sym_find_fn(fs->name, fs->len, narg, a0ty);
+        Sym *fnew = fs;
 
         if (fb && fb != fs) {
-            fs = fb;
+            fnew = fb;
         } else if (narg > 0 && a0ty && ty_is_ptr(a0ty)) {
             Sym *mo = meth_find(ty_target(a0ty), fs->name, fs->len);
 
             if (mo && mo != fs && mo->is_func)
-                fs = mo;
+                fnew = mo;
+        }
+        if (fnew != fs) {
+            u32 k4 = 0;
+
+            /* 形参表换了：先前按旧原型转过的实参要按新的再转一遍。否则
+             * `init(&r, buf, 14, 0)`（endian 的 4 参数版）会先按同名 2 参数版
+             * 把 buf 当 `int` 截断，指针只剩低 32 位——std-util 的 endian
+             * 一段就是这么段错误的。 */
+            for (k4 = 0; k4 < narg && k4 < PA_ARG_MAX; k4++) {
+                u32 np4 = ty_func_param(fnew->type, k4);
+
+                if (!np4 || argfix[k4] || ty_is_agg(np4))
+                    continue;
+                if (aty0[k4] != np4)
+                    args[k4] = gen_convert(av0[k4], aty0[k4], np4);
+                else
+                    args[k4] = av0[k4];
+            }
+            fs = fnew;
         }
     }
     /* 少传的实参按 C 惯例补 0：不补的话，那个寄存器/栈槽留着上一个表达式的
