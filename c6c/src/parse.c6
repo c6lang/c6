@@ -962,6 +962,21 @@ static int agg_ret_abi(u32 fty, u32 rty)
     return 1;
 }
 static u32 ty_promote(u32 ty);
+/* `sizeof("a" "b" …)`：括号里是一串（至少一个）相邻字符串字面量、后面紧跟
+ * `)`。以前只认"恰好一个"字面量，拼接的（`sizeof("39°" "54'15\"N")`）掉进
+ * 表达式分支，拿到的是退化后的 `char *`，sizeof 变成 8——stdgeo 的
+ * `S(...)` 这类拼接字面量长度全错（DMS 的秒位被截掉，to_deg 少算 15 角秒）。 */
+static int sizeof_lit_run(void)
+{
+    int k = 1;
+
+    if (!pa_is_ch('(') || !pa_peek(1) || pa_peek(1)->kind != TK_STR)
+        return 0;
+    while (k < 64 && pa_peek(k) && pa_peek(k)->kind == TK_STR)
+        k++;
+    return pa_peek(k) && pa_peek(k)->kind == TK_PUNCT && tok_eq(pa_peek(k), ")");
+}
+
 static u32 gen_unary(void);
 static int parse_const_u64(u64 *out);
 static u32 cur_op_ty(void);
@@ -12306,8 +12321,7 @@ static u32 gen_unary(void)
                 ty = ty_tuple_chk(tys, tn);
             }
             pa_expect_ch(')');
-        } else if (!is_align && pa_is_ch('(') && pa_peek(1)->kind == TK_STR
-                   && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), ")")) {
+        } else if (!is_align && sizeof_lit_run()) {
             /* sizeof("abc") 同 sizeof "abc"：括号里就一个字符串字面量 */
             pa_advance();
             (void)str_lit_data();

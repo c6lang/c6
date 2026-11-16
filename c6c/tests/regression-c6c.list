@@ -25,6 +25,7 @@ std-bwt
 std-calc
 std-cfg2
 std-check
+std-clean
 std-cont
 std-creds
 std-crypto
@@ -37,7 +38,9 @@ std-ds
 std-enc
 std-exec
 std-font
+std-form
 std-fsx
+std-geo
 std-gfx
 std-graph2
 std-h2
@@ -70,6 +73,8 @@ std-sec
 std-ser
 std-serve
 std-subs
+std-text
+std-textan
 std-time
 std-tour
 std-transcode
