@@ -7,6 +7,27 @@
 
 ## 未发布
 
+### 运行期：`memcpy` 走 `rep movsb`（1 GiB 吞吐 0.083 → 6.95 GB/s）
+
+- `src/asmblob.c6` 加一块 10 字节跳板 `__c6_memcpy_rep`
+  （`mov %rdi,%rax; cld; mov %rdx,%rcx; rep movsb; ret`），三个后端按各自办法嵌入：
+  native 直接发字节，C99 / LLVM 发同一段 GAS 文本（`c99_blobs` / `llvm_blobs` 早就
+  支持，这是第十一个 blob）。
+- `lib/rt.c6` 的 `c6c_mem_copy`（`memcpy` / `realloc` / `strdup` 的共同口子）按
+  `C6C_MEMCPY_REP_MIN = 16` 分叉：小块走 8 字节块循环，大块走 `rep movsb`。
+- 为什么要机器码：c6c 没有优化器，locals 全在帧槽里，C 写的拷贝循环每个元素都要过栈
+  ——逐字节 0.083 GB/s、8 字节块 0.62 GB/s、32 字节展开 0.69 GB/s，只有 `rep movsb`
+  能跑满内存带宽（本机 6.95 GB/s，同口径 glibc `memcpy` 7.96 GB/s）。443 KB 的镜像
+  拷贝从 5.3 ms 降到 0.065 ms。
+- 小拷贝不划算（`rep` 有约 14 ns 启动开销），阈值取实测交叉点 16 字节。
+- **编译速度不变慢**（硬要求）：stage0 `-o` hello 56.2 → 55.6 ms、自编译 585.9 → 581.0 ms
+  （都在噪声内、略快）；**自举版编译器（`c6c2`，libc 就是 `rt.c6`）自编译 2684 → 2070 ms，
+  快 22.9%**。
+- 门禁：`selfhost` fixpoint 逐字节相同、`c99-diff` 51–0、`llvm-diff` 51–0、
+  `run-flag` 15–0、`bcheck` 9–0、`embedcheck` 6–0、`lint` 全绿。
+- 还没做的：`memset`（0.10 GB/s）与 `memcmp` / `strlen` / `strcmp` 仍是逐字节循环，
+  `data_alloc` 每次分配都要 `memset`，量级可能比 `memcpy` 更大，另开一项处理。
+
 ### 共享库：`c6c -shared`（ET_DYN）
 
 - `c6c -shared a.o b.o -o libx.so` 出共享库：`ET_DYN`、基址 0（VA 就是段内偏移，
