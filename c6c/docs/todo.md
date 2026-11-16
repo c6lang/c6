@@ -4968,3 +4968,12 @@ xml 那两条断言（`item 有 id`、`id 的长度`）都是它。
   会把头部注释块打乱）；
 - 验收：`ctest --test-dir build -L c6c -LE perf`（92 个）+ 
   `cmake --build build-tcc --target tests2-check`（意外失败 0）。
+
+### 第 249 轮：std-demo 的段错误已开始二分
+
+`examples/wordcount.c6` 编出来直接 `rc=139`，**一行输出都没有**——崩在第一个
+`printf` 之前。先排除了泛型容器本身：`@Vect@int v = new Vect@int; push/count/at`
+在独立小程序里正常（`len=2 sum=42`）。所以嫌疑在 `main` 开头那几样：
+`Buf@(96) out`（定长缓冲结构体）、`foreach (int k = range(0, 3))` 的展开，
+或者 `int counts[3]` 这种小数组。下一轮在副本里从 `main` 第一行开始插
+`printf`，一行一行往下挪就能定位。
