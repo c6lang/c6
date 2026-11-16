@@ -11,6 +11,13 @@ C6C=${C6C:-./build/c6c}
 LLC=${LLC:-llc}
 CC=${CC:-gcc}
 CORPUS=${CORPUS:-tests/c}
+# 没装 LLVM 的机器（打 AUR 包时的干净 chroot 就是）上这条用例跑不了：如实跳过，
+# 不要拿"C6C_LLC-NOTFOUND"当失败把整轮验收拖红（cmake 那边也按没找到 llc 处理，
+# 见 cmake/C6C.cmake）。
+if ! command -v "$LLC" >/dev/null 2>&1; then
+    echo "c6c: llvmtest 跳过：没找到 llc（LLVM IR 后端差分要它）"
+    exit 0
+fi
 # 上限（秒）：TMO 管"编一遍"（c6c / llc / 宿主 cc），RUN_TMO 管"跑一下"。
 # 一条用例卡死不该把整轮验收挂住；`timeout -k` 保证不理 SIGTERM 的也收得掉。
 TMO=${TMO:-120}

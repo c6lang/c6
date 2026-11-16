@@ -238,10 +238,19 @@ c6c_target(c99test ENV C6C=${C6C_BIN} CC=${CMAKE_C_COMPILER}
   COMMAND ./tests/c99-diff.sh
   COMMENT "c6c: c99test（native vs C99 后端差分）")
 
-c6c_target(llvmtest ENV C6C=${C6C_BIN} LLC=${C6C_LLC} CC=${CMAKE_C_COMPILER}
-  CORPUS=${C6C_DIR}/tests/c
-  COMMAND ./tests/llvm-diff.sh
-  COMMENT "c6c: llvmtest（native vs LLVM IR 后端差分，LLC=${C6C_LLC}）")
+# llvmtest 要拿 llc 把 IR 编回去做差分。没装 LLVM 的机器（打 AUR 包时的干净
+# chroot 就是）不该因此让 check-all 直接红：找不到 llc 就不注册这条用例，聚合
+# 目标里也把它摘掉，配置阶段留一行 status 说明跳过了什么。
+if(C6C_LLC)
+  set(C6C_LLVM_TARGETS llvmtest)
+  c6c_target(llvmtest ENV C6C=${C6C_BIN} LLC=${C6C_LLC} CC=${CMAKE_C_COMPILER}
+    CORPUS=${C6C_DIR}/tests/c
+    COMMAND ./tests/llvm-diff.sh
+    COMMENT "c6c: llvmtest（native vs LLVM IR 后端差分，LLC=${C6C_LLC}）")
+else()
+  set(C6C_LLVM_TARGETS "")
+  message(STATUS "c6c: 没找到 llc，llvmtest 不注册（LLVM IR 后端差分跳过）")
+endif()
 
 c6c_target(c99suite ENV C6C=${C6C_BIN} ROOT=${C6C_ROOT}
   COMMAND ./tests/c99-suite.sh -j ${C6C_JOBS}
@@ -328,14 +337,14 @@ c6c_target(g2c-check DEPENDS build-tcc ENV ROOT=${C6C_ROOT}
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
-          embedcheck pkgcheck tests2-check tests1-check ctutest c99suite llvmtest
+          embedcheck pkgcheck tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
-          c99suite llvmtest ctutest test-c6c build-tcc tests1-check tests2-check
+          c99suite ctutest ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")
 
 add_custom_target(check-all-perf
