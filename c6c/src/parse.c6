@@ -11973,10 +11973,21 @@ static u32 gen_unary(void)
         }
     }
     /* `new T`：分配一块零初始化的 T（`@T` 的表示就是 `T *`，对象头与引用
-     * 计数还没做，所以现在是"只分配不回收"，见 docs/manual/gc.md）。 */
-    if (PA_IS_IDENT("new") && !(pa_peek(1)->kind == TK_PUNCT
+     * 计数还没做，所以现在是"只分配不回收"，见 docs/manual/gc.md）。
+     *
+     * 只在 c6 TU 里认：纯 C 的 `.c` / 外部头里 `new` 是**普通标识符**。
+     * 内核 include/linux/list.h 的参数就叫 `new`（`__list_add(struct
+     * list_head *new, ...)` 里有 `new->next = next`），少了这道门 c6c 会把
+     * `new` 当关键字去解析类型，报出"结构体没有成员 'next'"这种完全跑偏的
+     * 诊断，还会一路污染 list.h 后面所有内容的类型。
+     *
+     * 排除表里必须有 `->` 和 `[`：它们是"这是个变量、后面跟成员访问/下标"
+     * 的铁证。少了 `->`，`new->next = next;` 会被当成 `new` 表达式去解析
+     * 类型——正是内核报的那条错的来源。 */
+    if (in_c6_tu() && PA_IS_IDENT("new") && !(pa_peek(1)->kind == TK_PUNCT
         && (TOK_EQ(pa_peek(1), "=") || tok_eq(pa_peek(1), "(")
-            || TOK_EQ(pa_peek(1), ";") || TOK_EQ(pa_peek(1), ".")))) {
+            || TOK_EQ(pa_peek(1), ";") || TOK_EQ(pa_peek(1), ".")
+            || TOK_EQ(pa_peek(1), "->") || TOK_EQ(pa_peek(1), "[")))) {
         u32 ty = 0;
         u32 esz = 0;
         u32 d = 0;
