@@ -32,7 +32,9 @@ std-doc
 std-ds
 std-enc
 std-exec
+std-fsx
 std-graph2
+std-h2
 std-hash
 std-hash2
 std-img
@@ -53,3 +55,4 @@ std-ser
 std-subs
 std-time
 std-transcode
+std-wire
