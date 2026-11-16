@@ -3739,15 +3739,121 @@ void __assert_fail(const char *expr, const char *file, unsigned int line, const 
 int pthread_condattr_init(void *a) { (void)a; return 0; }
 int pthread_condattr_destroy(void *a) { (void)a; return 0; }
 int pthread_condattr_setpshared(void *a, int v) { (void)a; (void)v; return 0; }
-int pthread_cond_init(void *c, const void *a) { (void)c; (void)a; return 0; }
-int pthread_cond_destroy(void *c) { (void)c; return 0; }
-int pthread_cond_wait(void *c, void *m) { (void)c; (void)m; return 0; }
-int pthread_cond_signal(void *c) { (void)c; return 0; }
-int pthread_cond_broadcast(void *c) { (void)c; return 0; }
-int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
-int pthread_mutex_destroy(void *m) { (void)m; return 0; }
-int pthread_mutex_lock(void *m) { (void)m; return 0; }
-int pthread_mutex_unlock(void *m) { (void)m; return 0; }
+/* ---- 互斥锁/条件变量：futex + 自带的 TSL 跳板 ----
+ *
+ * 以前这一整块是空操作（`lock` 直接返回 0），于是"互斥锁保护的计数"这类用例
+ * 全错（std-thread 的 sync/thread/chan 七条断言）。这里用内核 futex 实现：
+ *
+ *   互斥锁：头 4 字节当状态字，0 = 空闲、1 = 已占用、2 = 已占用且有等待者。
+ *   加锁先 `__c6_tsl`（xchg，硬件原子），拿到就是 0→1；没拿到把状态置 2 再
+ *   FUTEX_WAIT(2)，被唤醒后重新抢。
+ *   解锁把状态写回 0，然后无条件 FUTEX_WAKE 一个——**不能**只在"看到 2"时才
+ *   唤醒：置 2 和解锁之间有窗口，漏了唤醒就会永久挂住。
+ *
+ *   条件变量：头 4 字节当序号。wait 先取序号、放锁、FUTEX_WAIT(序号)，
+ *   醒来重新加锁；signal/broadcast 序号 +1 再唤醒。谓词检查由调用方按
+ *   pthread 的规矩自己套在 while 里。
+ *
+ * 锁对象只用到头 4 字节，pthread_mutex_t 的 40 字节够用，不需要越界写。 */
+#define C6C_FUTEX_WAIT 0
+#define C6C_FUTEX_WAKE 1
+
+static long c6c_futex(int *addr, int op, int val)
+{
+    return c6c_sys6(202 /* futex */, (long)addr, (long)op, (long)val, 0, 0, 0);
+}
+
+int pthread_mutex_init(void *m, const void *a)
+{
+    (void)a;
+    if (m)
+        *(int *)m = 0;
+    return 0;
+}
+
+int pthread_mutex_destroy(void *m)
+{
+    (void)m;
+    return 0;
+}
+
+int pthread_mutex_lock(void *m)
+{
+    int *w = (int *)m;
+
+    if (!w)
+        return 22;                      /* EINVAL */
+    if (__c6_tsl(w))                    /* 1 = 拿到（跳板返回"之前是 0 吗"） */
+        return 0;
+    for (;;) {
+        if (*w != 2)
+            *w = 2;
+        (void)c6c_futex(w, C6C_FUTEX_WAIT, 2);
+        if (__c6_tsl(w))
+            return 0;
+    }
+}
+
+int pthread_mutex_unlock(void *m)
+{
+    int *w = (int *)m;
+
+    if (!w)
+        return 22;
+    *w = 0;
+    (void)c6c_futex(w, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
+int pthread_cond_init(void *c, const void *a)
+{
+    (void)a;
+    if (c)
+        *(int *)c = 0;
+    return 0;
+}
+
+int pthread_cond_destroy(void *c)
+{
+    (void)c;
+    return 0;
+}
+
+int pthread_cond_wait(void *c, void *m)
+{
+    int *seq = (int *)c;
+    int s = 0;
+
+    if (!seq)
+        return 22;
+    s = *seq;
+    (void)pthread_mutex_unlock(m);
+    (void)c6c_futex(seq, C6C_FUTEX_WAIT, s);
+    (void)pthread_mutex_lock(m);
+    return 0;
+}
+
+int pthread_cond_signal(void *c)
+{
+    int *seq = (int *)c;
+
+    if (!seq)
+        return 22;
+    (*seq)++;
+    (void)c6c_futex(seq, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
+int pthread_cond_broadcast(void *c)
+{
+    int *seq = (int *)c;
+
+    if (!seq)
+        return 22;
+    (*seq)++;
+    (void)c6c_futex(seq, C6C_FUTEX_WAKE, 0x7fffffff);
+    return 0;
+}
 int pthread_attr_init(void *a) { (void)a; return 0; }
 int pthread_attr_destroy(void *a) { (void)a; return 0; }
 
@@ -4013,8 +4119,11 @@ int pthread_detach(unsigned long th)
 
 int pthread_mutex_trylock(void *m)
 {
-    (void)m;
-    return 0;
+    int *w = (int *)m;
+
+    if (!w)
+        return 22;
+    return __c6_tsl(w) ? 0 : 16;    /* EBUSY */
 }
 
 int pthread_mutex_timedlock(void *m, const void *abstime)
@@ -4676,10 +4785,20 @@ int sigpending(void *set)
     return 0;
 }
 
+/* 读写锁：头 12 字节 = { 读者数, 写者持有, 序号 }。
+ * 三个字段都由一把全局自旋锁保护（争用只在进出锁那一瞬间，够用），
+ * 阻塞/唤醒走 futex 的"序号变了就醒"：读者等"写者释放"，写者等"读者清零
+ * 且没有别的写者"。释放时序号 +1 再广播，等待方醒来重试。 */
+static int C6C_RW_LOCK;
+
 int pthread_rwlock_init(void *l, const void *a)
 {
-    (void)l;
     (void)a;
+    if (l) {
+        ((int *)l)[0] = 0;              /* readers */
+        ((int *)l)[1] = 0;              /* writer */
+        ((int *)l)[2] = 0;              /* seq */
+    }
     return 0;
 }
 
@@ -4691,32 +4810,99 @@ int pthread_rwlock_destroy(void *l)
 
 int pthread_rwlock_rdlock(void *l)
 {
-    (void)l;
-    return 0;
+    int *w = (int *)l;
+
+    if (!w)
+        return 22;
+    for (;;) {
+        int s = 0;
+
+        while (!__c6_tsl(&C6C_RW_LOCK))
+            ;
+        if (!w[1]) {
+            w[0]++;
+            __c6_unlock_(&C6C_RW_LOCK);
+            return 0;
+        }
+        s = w[2];
+        __c6_unlock_(&C6C_RW_LOCK);
+        (void)c6c_futex(&w[2], C6C_FUTEX_WAIT, s);
+    }
 }
 
 int pthread_rwlock_wrlock(void *l)
 {
-    (void)l;
-    return 0;
+    int *w = (int *)l;
+
+    if (!w)
+        return 22;
+    for (;;) {
+        int s = 0;
+
+        while (!__c6_tsl(&C6C_RW_LOCK))
+            ;
+        if (!w[1] && w[0] == 0) {
+            w[1] = 1;
+            __c6_unlock_(&C6C_RW_LOCK);
+            return 0;
+        }
+        s = w[2];
+        __c6_unlock_(&C6C_RW_LOCK);
+        (void)c6c_futex(&w[2], C6C_FUTEX_WAIT, s);
+    }
 }
 
 int pthread_rwlock_unlock(void *l)
 {
-    (void)l;
+    int *w = (int *)l;
+
+    if (!w)
+        return 22;
+    while (!__c6_tsl(&C6C_RW_LOCK))
+        ;
+    if (w[1]) {
+        w[1] = 0;
+    } else if (w[0] > 0) {
+        w[0]--;
+    }
+    w[2]++;
+    __c6_unlock_(&C6C_RW_LOCK);
+    (void)c6c_futex(&w[2], C6C_FUTEX_WAKE, 0x7fffffff);
     return 0;
 }
 
 int pthread_rwlock_tryrdlock(void *l)
 {
-    (void)l;
-    return 0;
+    int *w = (int *)l;
+    int ok = 16;                        /* EBUSY */
+
+    if (!w)
+        return 22;
+    while (!__c6_tsl(&C6C_RW_LOCK))
+        ;
+    if (!w[1]) {
+        w[0]++;
+        ok = 0;
+    }
+    __c6_unlock_(&C6C_RW_LOCK);
+    return ok;
 }
 
 int pthread_rwlock_trywrlock(void *l)
 {
-    (void)l;
-    return 0;
+    int *w = (int *)l;
+    int ok = 16;
+
+    if (!w)
+        return 22;
+    while (!__c6_tsl(&C6C_RW_LOCK))
+        ;
+    if (!w[1] && w[0] == 0) {
+        w[1] = 1;
+        ok = 0;
+    }
+    __c6_unlock_(&C6C_RW_LOCK);
+    return ok;
 }
 
 /* 屏障 / 自旋锁：rt.c6 的线程实现没有屏障语义，这里如实退化（init/destroy
@@ -5014,15 +5200,82 @@ int sigprocmask(int how, const void *set, void *old) { (void)how; (void)set; (vo
 int sigaction(int s, const void *act, void *old) { (void)s; (void)act; (void)old; return 0; }
 
 /* 信号量：单线程，空操作 */
-int sem_init(void *s, int pshared, unsigned int v) { (void)s; (void)pshared; (void)v; return 0; }
-int sem_wait(void *s) { (void)s; return 0; }
-int sem_post(void *s) { (void)s; return 0; }
-int sem_destroy(void *s) { (void)s; return 0; }
+/* 信号量：头 4 字节是计数，改计数时用一把全局自旋锁护一下（临界区就几条
+ * 指令），等不到就在计数为 0 上 FUTEX_WAIT，V 之后 FUTEX_WAKE 一个。 */
+static int C6C_SEM_LOCK;
+
+int sem_init(void *s, int pshared, unsigned int v)
+{
+    (void)pshared;
+    if (s)
+        *(int *)s = (int)v;
+    return 0;
+}
+
+int sem_wait(void *s)
+{
+    int *p = (int *)s;
+
+    if (!p)
+        return -1;
+    for (;;) {
+        while (!__c6_tsl(&C6C_SEM_LOCK))
+            ;
+        if (*p > 0) {
+            (*p)--;
+            __c6_unlock_(&C6C_SEM_LOCK);
+            return 0;
+        }
+        __c6_unlock_(&C6C_SEM_LOCK);
+        (void)c6c_futex(p, C6C_FUTEX_WAIT, 0);
+    }
+}
+
+int sem_post(void *s)
+{
+    int *p = (int *)s;
+
+    if (!p)
+        return -1;
+    while (!__c6_tsl(&C6C_SEM_LOCK))
+        ;
+    (*p)++;
+    __c6_unlock_(&C6C_SEM_LOCK);
+    (void)c6c_futex(p, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
+int sem_destroy(void *s)
+{
+    (void)s;
+    return 0;
+}
 /* 信号量这几个也是空操作（rt.c6 的 sem_* 没有计数），trywait/timedwait 一律
  * "拿到了"，getvalue 给 0——调用方按返回值分支的逻辑在单线程用例里成立。 */
-int sem_trywait(void *s) { (void)s; return 0; }
+int sem_trywait(void *s)
+{
+    int *p = (int *)s;
+    int ok = -1;
+
+    if (!p)
+        return -1;
+    while (!__c6_tsl(&C6C_SEM_LOCK))
+        ;
+    if (*p > 0) {
+        (*p)--;
+        ok = 0;
+    }
+    __c6_unlock_(&C6C_SEM_LOCK);
+    return ok;
+}
 int sem_timedwait(void *s, const void *abstime) { (void)s; (void)abstime; return 0; }
-int sem_getvalue(void *s, int *v) { (void)s; if (v) *v = 0; return 0; }
+int sem_getvalue(void *s, int *v)
+{
+    if (!s || !v)
+        return -1;
+    *v = *(int *)s;
+    return 0;
+}
 
 /* longjmp：没有可恢复的栈上下文（要保存 rsp/rip），明确退出而不是静默错走 */
 int _setjmp(void *buf) { (void)buf; return 0; }
