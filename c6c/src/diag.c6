@@ -11,20 +11,54 @@ typedef struct Diag {
 
 static Diag DG;
 
+/* 嵌入 API（tcc_set_error_func）用的钩子：设了就改走回调，不再直接打 stderr。
+ * 回调收到的是一条完整的诊断行（含 path:line:col 前缀），内容与 stderr 那份
+ * 逐字相同——宿主程序可以把它收进自己的日志，也可以第一次出错就返回。 */
+static void (*DIAG_CB)(void *opaque, const char *msg);
+static void *DIAG_CB_OPAQUE;
+
+static void diag_set_cb(void *opaque, void (*cb)(void *, const char *))
+{
+    DIAG_CB_OPAQUE = opaque;
+    DIAG_CB = cb;
+}
+
+/* 一行已经拼好的诊断交出去：设了回调走回调（宿主自己收），否则打 stderr。
+ * 解析器（parse.c6 的 pa_error / pa_warn_tcc）也走这里，所以回调拦到的是
+ * 前端那套 path:line[:col]: error|warning: …。计数留在各自的调用方
+ * （diag_vreport 数 DG，pa_error 数 PA_ERRS），两边口径不混。 */
+static void diag_emit(const char *line)
+{
+    if (DIAG_CB)
+        DIAG_CB(DIAG_CB_OPAQUE, line);
+    else
+        fprintf(stderr, "%s\n", line);
+}
+
 static void diag_vreport(int is_err, SrcFile *f, u32 off, const char *fmt, va_list ap)
 {
+    char msg[1024] = {0};
+    int n = 0;
+
     if (f) {
         u32 line = src_line_of(f, off);
         /* 列号必须按**物理**行走：`#line` 之后报出来的行号已经重映射过，
          * 拿它去查行首表会取错（甚至越界）。 */
         u32 col = off - f->lines[src_phys_line_of(f, off) - 1] + 1;
-        fprintf(stderr, "%s:%u:%u: %s: ", src_path_of(f), line, col,
-                is_err ? "error" : "warning");
+        n = snprintf(msg, sizeof(msg), "%s:%u:%u: %s: ", src_path_of(f), line, col,
+                     is_err ? "error" : "warning");
     } else {
-        fprintf(stderr, "c6c: %s: ", is_err ? "error" : "warning");
+        n = snprintf(msg, sizeof(msg), "c6c: %s: ", is_err ? "error" : "warning");
     }
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    /* snprintf 截断时返回的是"本来要写多少"：夹到缓冲区里再拼正文，
+     * 免得 msg + n 越过末尾。 */
+    if (n < 0)
+        n = 0;
+    if (n > (int)sizeof(msg) - 2)
+        n = (int)sizeof(msg) - 2;
+    vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, ap);
+    msg[sizeof(msg) - 1] = 0;
+    diag_emit(msg);
     if (is_err)
         DG.errors++;
     else
