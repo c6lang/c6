@@ -1970,6 +1970,91 @@ static void c6c_pad(char *out, long cap, long *n, long width, char pc)
     }
 }
 
+/* 四舍五入到整数，但**正好 .5 时取偶**——glibc 的默认舍入口径（printf("%.0f", 2.5)
+ * 印 "2"，printf("%.1f", 2.25) 印 "2.2"）。用 (long)(t + 0.5) 会一路进位到 3 / 2.3，
+ * 和 glibc 对不上。 */
+static double c6c_round_even(double t)
+{
+    unsigned long fl = (unsigned long)t;      /* 调用方保证 t < 2^64 */
+    double frac = t - (double)fl;
+
+    if (frac > 0.5)
+        return (double)fl + 1.0;
+    if (frac < 0.5)
+        return (double)fl;
+    if (fl != (fl / 2ul) * 2ul)               /* 正好 .5：取偶 */
+        return (double)fl + 1.0;
+    return (double)fl;
+}
+
+/* 整数部分的精确展开（1e19 以上 u64 装不下）。double 的整数部分就是
+ * `尾数 << 指数`，最多一千来位，用 10^9 进制的小 bignum 反复乘 2 就能算全——
+ * `printf("%f", 1e300)` 在 glibc 下就是把这 300 位一位不差地印出来。 */
+#define C6C_BIG_LIMB 40
+static long c6c_fmt_big(char *buf, double dv)
+{
+    unsigned long bits = *(unsigned long *)&dv;
+    long be = (long)((bits >> 52) & 0x7ffl);
+    unsigned long m = bits & 0xffffffffffffful;
+    long e = 0;
+    unsigned int limb[C6C_BIG_LIMB] = {0};
+    long nl = 1;
+    long i = 0;
+    long n = 0;
+    char tmp[16] = {0};
+    unsigned long v = 0;
+
+    if (be == 0)
+        return 0;                          /* 次正规数：整数部分就是 0 */
+    m = m | 0x10000000000000ul;            /* 补上隐含的 1 */
+    e = be - 1075;                         /* value = m * 2^e */
+    if (e < 0) {                           /* 整数部分 = m >> -e */
+        long sh = -e;
+
+        if (sh >= 53)
+            return 0;
+        m = m >> sh;
+        e = 0;
+    }
+    v = m % 1000000000ul;
+    limb[0] = (unsigned int)v;
+    m = m / 1000000000ul;
+    while (m) {
+        limb[nl] = (unsigned int)(m % 1000000000ul);
+        nl++;
+        m = m / 1000000000ul;
+    }
+    while (e > 0) {
+        unsigned long carry = 0;
+
+        for (i = 0; i < nl; i++) {
+            unsigned long t = (unsigned long)limb[i] * 2ul + carry;
+
+            limb[i] = (unsigned int)(t % 1000000000ul);
+            carry = t / 1000000000ul;
+        }
+        if (carry && nl < C6C_BIG_LIMB) {
+            limb[nl] = (unsigned int)carry;
+            nl++;
+        }
+        e--;
+    }
+    for (i = nl - 1; i >= 0; i--) {
+        long fl = 0;
+        long k = 0;
+
+        if (i == nl - 1) {
+            fl = c6c_utoa(tmp, (unsigned long)limb[i], 10, 0, 1);
+        } else {
+            fl = c6c_utoa(tmp, (unsigned long)limb[i], 10, 0, 9);
+        }
+        for (k = 0; k < fl; k++)
+            buf[n + k] = tmp[k];
+        n = n + fl;
+    }
+    return n;
+}
+
 /* 浮点 → 文本：%f/%e/%g（conv 只收小写）。返回值是 body 的长度，*sign 是符号字符
  * （0 表示不需要符号）。dv 的位模式从 va_arg 按 8 字节整型取出——本地约定里
  * double 就是走整型寄存器传的，所以变参函数里也能拿到。 */
@@ -1993,7 +2078,8 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         body[2] = 'n';
         return 3;
     }
-    if (dv < 0) {
+    /* -0.0：`dv < 0` 对它为假，但符号位是 1（glibc 印的是 -0.000000） */
+    if (dv < 0 || (dv == 0.0 && ((*(unsigned long *)&dv) >> 63) != 0)) {
         *sign = '-';
         dv = -dv;
     }
@@ -2032,6 +2118,21 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
     }
     for (k = 0; k < p; k++)
         sc = sc * 10;
+    if (conv == 'f' && dv >= 18446744073709551616.0) {
+        /* 2^64 以上：u64 装不下整数部分，改走精确展开。这个量级的 double 步长
+         * 已经大于 1，小数部分恒为 0，按精度补零即可。 */
+        len = c6c_fmt_big(body, dv);
+        if (p > 0) {
+            body[len] = '.';
+            len++;
+            for (k = 0; k < p; k++)
+                body[len + k] = '0';
+            len = len + p;
+        } else if (alt) {
+            body[len] = '.';
+            len++;
+        }
+    } else {
     /* 整数部分和小数部分分开算：整体乘 10^p 会超 53 位精度，
      * 1234567890123.0 会印成 ...000064（踩过） */
     if (dv < 18446744073709551616.0) {        /* 2^64：u64 装得下的都要取整数部分 */
@@ -2043,7 +2144,7 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         double t = (dv - (double)ip) * (double)sc;
 
         if (t < 18446744073709551615.0)
-            uval = (unsigned long)(t + 0.5);
+            uval = (unsigned long)c6c_round_even(t);
         else
             uval = 0;
     }
@@ -2070,11 +2171,20 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         body[len] = '.';
         len++;
     }
-    if (is_g && !alt) {                           /* %g 去掉尾零 */
-        while (len > 1 && body[len - 1] == '0')
-            len--;
-        if (len > 1 && body[len - 1] == '.')
-            len--;
+    }
+    if (is_g && !alt) {                           /* %g 去掉**小数部分**的尾零 */
+        long dot = -1;
+
+        /* 只在小数点存在时才剥——否则 100000 会被剥成 "1"（踩过） */
+        for (k = 0; k < len; k++)
+            if (body[k] == '.')
+                dot = k;
+        if (dot >= 0) {
+            while (len > dot + 1 && body[len - 1] == '0')
+                len--;
+            if (len == dot + 1)
+                len--;                            /* 去掉孤零零的小数点 */
+        }
     }
     if (conv == 'e') {
         long e2 = exp10 < 0 ? -exp10 : exp10;
@@ -2227,6 +2337,10 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
 
             *(unsigned long *)&dv = raw;
             bodylen = c6c_fmt_double(body, dv, lc, prec < 0 ? 6 : prec, alt, &sign);
+            if (!sign && plus)
+                sign = '+';               /* %+f：glibc 也这么印 */
+            else if (!sign && space)
+                sign = ' ';
             if (conv >= 'A' && conv <= 'Z') {
                 /* %E / %G：小写生成，最后整段转大写 */
                 for (k = 0; k < bodylen; k++)
@@ -2281,14 +2395,17 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
             }
             if (prec < 0)
                 prec = 1;
-            bodylen = c6c_utoa(body, v, base, upper, prec);
+            if (prec == 0 && v == 0)
+                bodylen = 0;              /* %.0d 的 0 什么都不印（glibc 口径） */
+            else
+                bodylen = c6c_utoa(body, v, base, upper, prec);
             if (neg)
                 sign = '-';
             else if (plus)
                 sign = '+';
             else if (space)
                 sign = ' ';
-            if (alt && base == 16) {
+            if (alt && base == 16 && v != 0) {   /* %#x 的 0 也不加 0x */
                 prefix[0] = '0';
                 prefix[1] = upper ? 'X' : 'x';
                 plen = 2;

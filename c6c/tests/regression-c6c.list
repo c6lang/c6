@@ -27,12 +27,14 @@ std-cont
 std-creds
 std-crypto
 std-data
+std-db
 std-disk
 std-doc
 std-ds
 std-enc
 std-exec
 std-fsx
+std-gfx
 std-graph2
 std-h2
 std-hash
@@ -47,8 +49,10 @@ std-mgmt
 std-node
 std-ops
 std-ordered
+std-pack
 std-pkg
 std-proto
+std-proto2
 std-proto3
 std-proto4
 std-search
@@ -58,3 +62,4 @@ std-subs
 std-time
 std-transcode
 std-wire
+std-words
