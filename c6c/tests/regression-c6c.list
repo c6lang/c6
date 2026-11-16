@@ -21,6 +21,7 @@ std-async5
 std-audio
 std-audio2
 std-bin
+std-bin2
 std-bwt
 std-calc
 std-cfg2
@@ -51,6 +52,7 @@ std-h2
 std-hash
 std-hash2
 std-img
+std-kit
 std-legacy
 std-linalg
 std-linux

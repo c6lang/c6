@@ -4688,3 +4688,14 @@ Str l[3] = {
   物化用的 `IR_CONST` **立即数只有 32 位**，`0xFFFFFFFF80000000` 又被截回去。
 - 修法：定义处 `(i64)(i32)(…)`；物化处改调 `gen_int_lit()`，它超过 32 位会
   自动走 `CONSTK`（64 位常量池）。
+
+## 第 229 轮：浮点 ==/!= 的 NaN 语义（**已修**）
+
+`ucomisd` 的有序比较（`<`/`<=`/`>`/`>=`）在无序时给 0，正好是 IEEE 要的，
+所以只有 `EQ`/`NE` 需要额外处理：`EQ = setnp & sete`、`NE = setp | setne`。
+
+判 NaN 只能靠 `dv != dv`（仓库里 printf 的 `c6c_fmt_double`、half 模块的
+`double_to_half` 都这么写），这条一反，NaN 就被当成普通数印成垃圾。
+
+顺带记一下没管的：`aout.c6` / `asmout.c6` 这两个"汇编文本"后端的 `IR_CMP`
+还是整数 `cmp`，浮点比较整个不对（它们只用于 `-S` 冒烟）。
