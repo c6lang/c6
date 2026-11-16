@@ -1,0 +1,53 @@
+// 端到端用例：proto3 的常用面。
+syntax = "proto3";
+
+package demo;
+
+enum PhoneType {
+  PHONE_MOBILE = 0;
+  PHONE_HOME = 1;
+  PHONE_WORK = 2;
+}
+
+message Address {
+  string city = 1;
+  string street = 2;
+}
+
+message Person {
+  string name = 1;
+  int32 id = 2;
+  string email = 3;
+
+  enum Kind {
+    KIND_UNKNOWN = 0;
+    KIND_HUMAN = 1;
+  }
+  Kind kind = 4;
+
+  message Phone {
+    string number = 1;
+    PhoneType type = 2;
+  }
+  repeated Phone phones = 5;
+
+  repeated int32 scores = 6;
+  repeated sint64 deltas = 7;
+  optional bool active = 8;
+  Address addr = 9;
+  map<string, int32> tags = 10;
+  oneof contact {
+    string handle = 11;
+    int64 icq = 12;
+  }
+  fixed32 crc = 13;
+  fixed64 stamp = 14;
+  float ratio = 15;
+  double weight = 16;
+  bytes blob = 17;
+  bool ok = 18;
+}
+
+message AddressBook {
+  repeated Person people = 1;
+}
