@@ -5,6 +5,24 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 未发布
+
+### 打包：默认包里带上自举编译器 `c6c`
+
+- `cmake/C6Install.cmake` 把 c6c 的数据文件从 `C6_ENABLE_TCC=OFF` 分支里挪出来，
+  默认配置（tcc 在）也把自举编译器装成 `bin/c6c`，与 tcc 版 `c6` 并存；没有 tcc
+  时它仍是 `bin/c6`，另外多一个同内容的 `bin/c6c`，两种配置的落点因此一致。
+  以前 DEB / RPM / TGZ 三种包里根本没有 c6c，只有 `-DC6_ENABLE_TCC=OFF` 才装得出来。
+- 新开关 `C6_INSTALL_C6C`（默认 `ON`，只在 tcc 在时起作用）：关掉就只装 tcc 版 `c6`。
+- 二进制必须跟它自己的数据成套：c6c 按 `argv[0]` 找 `<bin>/../lib/c6/include`
+  （自带头文件）与 `<bin>/../lib/c6/rt.c6`（自带运行时），所以 `lib/c6/` 跟着
+  `bin/c6c` 一起装——只装二进制的话它连 hello 都编不出来，只会报「找不到自带
+  运行时 lib/rt.c6」。
+- `cmake/c6-check-install.cmake.in` 除了核对落点，还用暂存树里的 `bin/c6c` 真编一个
+  程序并运行（退出码 91，同时用到自带头文件与 rt.c6）；`c6c/tests/pkgcheck.sh` 的
+  安装清单加上 `bin/c6c` 并单独验一遍它的自找路径；CI 的打包步骤对 DEB / RPM / TGZ
+  逐个断言 `usr/bin/c6c` 与 `usr/lib/c6/rt.c6` 在包里。
+
 ## 0.6.2 — 2026-11-16
 
 ### CI：发版说明直接取自版本提交的正文
