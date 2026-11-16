@@ -12323,6 +12323,16 @@ static u32 gen_unary(void)
             nv = irfn_vreg(&FN);
             irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), nv, old_v, one,
                       0, 0);
+            /* `++e` 的值是 e 的值（类型就是 e 的类型），所以窄于 8 字节的整数要
+             * 按宽度截断一次：否则 `u8 b = 255; ++b != 0` 会拿 256 去比（写回
+             * 时 store_lval 已经截过，这里漏的是**表达式值**）。AES-CTR 的
+             * counter 递增就靠 `++ctr[i] != 0` 判进位（std-cipher 红的就是它）。 */
+            if (ty_is_int(ty) && ty_size(ty) > 0 && ty_size(ty) < 8) {
+                u32 nt = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), nt, nv, 0, 0, 0);
+                nv = nt;
+            }
             if (bb)
                 store_lval_bits(addr, ty, bb, bb_off, nv);
             else
