@@ -467,7 +467,7 @@ cmake --build build --target regression-c6c         # 已全绿的那批（列�
 * selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
   仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
 
-当前基线（第 210 轮实测）：**45 / 92 全绿**，还差 47 个。缺口分四类，都在
+当前基线（第 211 轮实测）：**47 / 92 全绿**，还差 45 个。缺口分四类，都在
 `c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面（`getgrgid`、真信号投递、
 真 DNS）；`-lm` 还没有对应的动态依赖；模板成员函数与 `static`/`$2` 函数跨 TU
 的符号（`Iter_int_has`、`p_atom$2` 那种）；以及若干 `test` 块的**行为**差异
