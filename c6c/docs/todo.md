@@ -4759,3 +4759,25 @@ h2((P){ (int)2 }, ((Str){ S("a") }));   /* ✗ */
 `q = 1` 起数，`peek(0)` 的 `(` 没算进去，深度直接变负、永远等不到 0），改成从
 `peek(0)` 起数就好了。修完 std-client 又缺 `getnameinfo`，`rt.c6` 里补了个只做
 数字形式的版本。std-client 现在 36 项全过，回归 85 / 92。
+
+## 第 234 轮：模块限定的枚举成员解析到别处去了（**已定位，未修**）
+
+`std.data.csv.PARSE` 求出来是 `0x0E01B007`（234991623），不是 7，所以
+`examples/stdbox.c6` 里 `r.error == std.data.csv.PARSE` 永远不成立 —— 这是
+std-box 两个红用例的根因。最小复现：
+
+```c
+import std.data.csv;
+int main(void) { int e = 0; e = std.data.csv.PARSE; printf("%d\n", e); }
+/* 期望 7，实际 0x0E01B007 */
+```
+
+已排除的：
+- 不是"裸名被污染"：`poison_add()` 只记一张 POISON_NM 表供**报歧义**用，不改
+  `bs->val`，所以裸 `PARSE` 的值仍是 `ebase|7`；
+- 不是 ebase 没加：csv 的 `PARSE` = `mod_err_base(csv)|7`，这个加对了。
+
+下一步的切入点：`0x0E01B007` 的高位 `0x0E000000` 正是模块错误码号段基址，
+低位 `0x1B007` 不是 7 —— 看起来是"把**同名字段的其它枚举值**也用同一份基址
+OR 了一遍"。下一轮从 `parse.c6` 里最长前缀那圈（约 10450 行）跟着 `qd`/`qm`
+两个拼法打印一次，看最后 `sym_find` 命中的到底是哪个符号。
