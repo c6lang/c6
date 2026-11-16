@@ -1,0 +1,50 @@
+/* ctu 后端验收 TU A —— 全局量 / 跨 TU 调用 / 调纯 C 侧 / 分支·循环·数组。
+ *
+ * 这一份**故意只用普通 C**：这样验收脚本可以把它当 .c 直接交给 gcc 编一份
+ * 参照物，两边的运行输出必须逐字相同（见 run.sh）。c6 扩展留在后面几轮再加，
+ * 免得"后端还没成形就先被扩展语法的 lowering 拖住"。
+ */
+
+int a_total = 0;
+static int a_seed = 7;
+int a_buf[4];
+
+int b_add(int x, int y);
+unsigned b_fib(unsigned n);
+int c_scale(int x);
+
+int a_sum_to(int n)
+{
+    int s = 0;
+    int i = 1;
+
+    while (i <= n) {
+        if (i != 5)
+            s += i;
+        i++;
+    }
+    return s;
+}
+
+int a_fill(int base)
+{
+    int i;
+
+    for (i = 0; i < 4; i++)
+        a_buf[i] = base + i * 2;
+    return a_buf[3];
+}
+
+int a_run(int n)
+{
+    int s = a_sum_to(n);
+    int t = b_add(s, a_seed);
+
+    a_total = t + a_fill(n) + c_scale(n);
+    if (a_total > 100) {
+        a_total = a_total - 100;
+    } else {
+        a_total = a_total + 1;
+    }
+    return (int)b_fib((unsigned)n) + a_total;
+}
