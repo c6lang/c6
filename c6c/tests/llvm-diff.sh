@@ -42,6 +42,12 @@ for f in "$CORPUS"/*.c; do
     if [ -f "$CORPUS/native-only.txt" ] && grep -qx "$name" "$CORPUS/native-only.txt"; then
         continue
     fi
+    # 仅编译用例（`/* compile-only */`，通常还没有 main）跑不了"比标准输出+退出码"
+    # 这件事：它们在 run.sh 里只确认"编得过"。这里如实跳过。
+    if grep -q 'compile-only' "$f"; then
+        skip=$((skip + 1))
+        continue
+    fi
     if ! timeout -k 5 "$TMO" "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
         bad=$((bad + 1)); badlist="$badlist $name(native-cc)"; continue
     fi
