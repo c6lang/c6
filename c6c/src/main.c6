@@ -409,7 +409,6 @@ static const char *const BUILTIN_DEFS =
     "#define __builtin_memmove(a,b,c) memmove(a,b,c)\n"
     "#define __builtin_memset(a,b,c) memset(a,b,c)\n"
     "#define __builtin_memcmp(a,b,c) memcmp(a,b,c)\n"
-    "#define __builtin_strlen(a) strlen(a)\n"
     "#define __builtin_strcpy(a,b) strcpy(a,b)\n"
     "#define __builtin_strncpy(a,b,c) strncpy(a,b,c)\n"
     "#define __builtin_strcmp(a,b) strcmp(a,b)\n"
