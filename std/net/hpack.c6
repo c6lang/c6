@@ -1,0 +1,2189 @@
+/* std/net/hpack：HPACK 头部压缩（RFC 7541）——整数/字符串原语、Huffman 编解码、
+ * 静态表、动态表，以及头部块的解码游标与构造器。
+ *
+ *     import std.net.hpack;
+ *
+ *     HpackDecoder d = { 0 };
+ *     HpackTable t = { 0 };
+ *     HpackField f = { 0 };
+ *     char name[256] = { 0 };
+ *     char value[4096] = { 0 };
+ *
+ *     t.table_init(4096);
+ *     d.dec_init(block, block_len);
+ *     while (d.next_field(&t, &f, name, sizeof name, value, sizeof value) == 1) {
+ *         if (f.kind == HPACK_FIELD_SIZE)
+ *             continue;                       -- 动态表大小更新，没有字段
+ *         printf("%s: %s\n", name, value);
+ *     }
+ *
+ *     -- 编码侧：整数字段直接拼
+ *     int n = hpack_put_indexed(out, cap, 2);                  -- :method: GET
+ *
+ * 为什么单独一层：HTTP/2 的头部块全靠这套表示（索引/字面量/动态表），而
+ * HTTP/3 的 QPACK 只借它的 **Huffman 码表**（RFC 9204 §4.1.2 明确说用
+ * RFC 7541 附录 B 的表）。所以这里把两件共用的事做完整：Huffman 与静态表；
+ * 动态表也按 RFC 7541 §2.3/§4 做全，省得以后写 h2 再抄一遍。
+ *
+ * 解析口径：
+ *
+ * - 整数（§5.1）：N 位前缀，值 < 2^N-1 直接写；否则前缀全 1，后面每字节
+ *   7 位、最高位是「还有后续」；
+ * - 字符串（§5.2）：H 位 + 7 位前缀长度 + 负载；H=1 表示负载是 Huffman 码；
+ * - 五种表示：索引（1xxxxxxx）、带增量索引的字面量（01xxxxxx）、不索引的
+ *   字面量（0000xxxx）、从不索引（0001xxxx）、动态表大小更新（001xxxxx）；
+ * - 大小更新只能出现在头部块的**开头**（字段之前），否则算格式错；
+ * - Huffman 解码不接受 EOS 符号，尾部填充必须全是 1 且不超过 7 位；编码
+ *   输出与 RFC 7541 的示例逐字节一致（尾部同样补 1）；
+ * - 动态表按「name + value + 32」计费，超过上限就从最旧的开始逐出；容量
+ *   上限改成 0/变小也立刻逐出；单条就超过上限时整表清空、该条不进表
+ *   （RFC 7541 §4.4 的做法）。
+ *
+ * 约定：
+ *
+ * - 解出来的名字/值都**复制**进调用方给的缓冲（带 NUL），所以动态表随后
+ *   逐出条目也不会让指针悬空；缓冲不够返回 -1；
+ * - 动态表的绝对索引从 62 开始（1..61 是静态表）；表里最新一条是 62；
+ * - `hpack_int_encode` 的 `first` 是首字节的高位模板，低 prefix_bits 位必须
+ *   是 0；`hpack_int_decode` 只读低 prefix_bits 位；
+ * - `huff_encode`/`huff_decode` 的长度参数是**字节数**，不是位数；
+ * - 所有失败都返回 -1（解码游标还会把 `err` 置成 `PARSE`/`RANGE`/`HUFF`）。
+ */
+#include <string.h>
+
+module std.net.hpack;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3, HUFF = 4, TABLE = 5 };
+
+#define HPACK_STATIC_COUNT 61
+#define HPACK_DYN_BASE     62
+#define HPACK_ARENA        8192
+#define HPACK_MAX_ENTRIES  96
+
+/* 头部字段表示的类别 */
+#define HPACK_FIELD_INDEXED   1
+#define HPACK_FIELD_INCREMENTAL 2
+#define HPACK_FIELD_NO_INDEX  3
+#define HPACK_FIELD_NEVER     4
+#define HPACK_FIELD_SIZE      5
+
+/* 编码侧的三种字面量模式 */
+#define HPACK_LIT_INCREMENTAL 1
+#define HPACK_LIT_NO_INDEX    0
+#define HPACK_LIT_NEVER       2
+
+/* RFC 7541 附录 B（Huffman 码）与附录 A（静态表）的数据。
+ * 由 RFC 正文生成，不要手改。 */
+#define HPACK_SYM 257
+static const u32 hpack_code[HPACK_SYM] = {
+    0x1ff8,
+    0x7fffd8,
+    0xfffffe2,
+    0xfffffe3,
+    0xfffffe4,
+    0xfffffe5,
+    0xfffffe6,
+    0xfffffe7,
+    0xfffffe8,
+    0xffffea,
+    0x3ffffffc,
+    0xfffffe9,
+    0xfffffea,
+    0x3ffffffd,
+    0xfffffeb,
+    0xfffffec,
+    0xfffffed,
+    0xfffffee,
+    0xfffffef,
+    0xffffff0,
+    0xffffff1,
+    0xffffff2,
+    0x3ffffffe,
+    0xffffff3,
+    0xffffff4,
+    0xffffff5,
+    0xffffff6,
+    0xffffff7,
+    0xffffff8,
+    0xffffff9,
+    0xffffffa,
+    0xffffffb,
+    0x14,
+    0x3f8,
+    0x3f9,
+    0xffa,
+    0x1ff9,
+    0x15,
+    0xf8,
+    0x7fa,
+    0x3fa,
+    0x3fb,
+    0xf9,
+    0x7fb,
+    0xfa,
+    0x16,
+    0x17,
+    0x18,
+    0x0,
+    0x1,
+    0x2,
+    0x19,
+    0x1a,
+    0x1b,
+    0x1c,
+    0x1d,
+    0x1e,
+    0x1f,
+    0x5c,
+    0xfb,
+    0x7ffc,
+    0x20,
+    0xffb,
+    0x3fc,
+    0x1ffa,
+    0x21,
+    0x5d,
+    0x5e,
+    0x5f,
+    0x60,
+    0x61,
+    0x62,
+    0x63,
+    0x64,
+    0x65,
+    0x66,
+    0x67,
+    0x68,
+    0x69,
+    0x6a,
+    0x6b,
+    0x6c,
+    0x6d,
+    0x6e,
+    0x6f,
+    0x70,
+    0x71,
+    0x72,
+    0xfc,
+    0x73,
+    0xfd,
+    0x1ffb,
+    0x7fff0,
+    0x1ffc,
+    0x3ffc,
+    0x22,
+    0x7ffd,
+    0x3,
+    0x23,
+    0x4,
+    0x24,
+    0x5,
+    0x25,
+    0x26,
+    0x27,
+    0x6,
+    0x74,
+    0x75,
+    0x28,
+    0x29,
+    0x2a,
+    0x7,
+    0x2b,
+    0x76,
+    0x2c,
+    0x8,
+    0x9,
+    0x2d,
+    0x77,
+    0x78,
+    0x79,
+    0x7a,
+    0x7b,
+    0x7ffe,
+    0x7fc,
+    0x3ffd,
+    0x1ffd,
+    0xffffffc,
+    0xfffe6,
+    0x3fffd2,
+    0xfffe7,
+    0xfffe8,
+    0x3fffd3,
+    0x3fffd4,
+    0x3fffd5,
+    0x7fffd9,
+    0x3fffd6,
+    0x7fffda,
+    0x7fffdb,
+    0x7fffdc,
+    0x7fffdd,
+    0x7fffde,
+    0xffffeb,
+    0x7fffdf,
+    0xffffec,
+    0xffffed,
+    0x3fffd7,
+    0x7fffe0,
+    0xffffee,
+    0x7fffe1,
+    0x7fffe2,
+    0x7fffe3,
+    0x7fffe4,
+    0x1fffdc,
+    0x3fffd8,
+    0x7fffe5,
+    0x3fffd9,
+    0x7fffe6,
+    0x7fffe7,
+    0xffffef,
+    0x3fffda,
+    0x1fffdd,
+    0xfffe9,
+    0x3fffdb,
+    0x3fffdc,
+    0x7fffe8,
+    0x7fffe9,
+    0x1fffde,
+    0x7fffea,
+    0x3fffdd,
+    0x3fffde,
+    0xfffff0,
+    0x1fffdf,
+    0x3fffdf,
+    0x7fffeb,
+    0x7fffec,
+    0x1fffe0,
+    0x1fffe1,
+    0x3fffe0,
+    0x1fffe2,
+    0x7fffed,
+    0x3fffe1,
+    0x7fffee,
+    0x7fffef,
+    0xfffea,
+    0x3fffe2,
+    0x3fffe3,
+    0x3fffe4,
+    0x7ffff0,
+    0x3fffe5,
+    0x3fffe6,
+    0x7ffff1,
+    0x3ffffe0,
+    0x3ffffe1,
+    0xfffeb,
+    0x7fff1,
+    0x3fffe7,
+    0x7ffff2,
+    0x3fffe8,
+    0x1ffffec,
+    0x3ffffe2,
+    0x3ffffe3,
+    0x3ffffe4,
+    0x7ffffde,
+    0x7ffffdf,
+    0x3ffffe5,
+    0xfffff1,
+    0x1ffffed,
+    0x7fff2,
+    0x1fffe3,
+    0x3ffffe6,
+    0x7ffffe0,
+    0x7ffffe1,
+    0x3ffffe7,
+    0x7ffffe2,
+    0xfffff2,
+    0x1fffe4,
+    0x1fffe5,
+    0x3ffffe8,
+    0x3ffffe9,
+    0xffffffd,
+    0x7ffffe3,
+    0x7ffffe4,
+    0x7ffffe5,
+    0xfffec,
+    0xfffff3,
+    0xfffed,
+    0x1fffe6,
+    0x3fffe9,
+    0x1fffe7,
+    0x1fffe8,
+    0x7ffff3,
+    0x3fffea,
+    0x3fffeb,
+    0x1ffffee,
+    0x1ffffef,
+    0xfffff4,
+    0xfffff5,
+    0x3ffffea,
+    0x7ffff4,
+    0x3ffffeb,
+    0x7ffffe6,
+    0x3ffffec,
+    0x3ffffed,
+    0x7ffffe7,
+    0x7ffffe8,
+    0x7ffffe9,
+    0x7ffffea,
+    0x7ffffeb,
+    0xffffffe,
+    0x7ffffec,
+    0x7ffffed,
+    0x7ffffee,
+    0x7ffffef,
+    0x7fffff0,
+    0x3ffffee,
+    0x3fffffff,
+};
+static const u8 hpack_bits[HPACK_SYM] = {
+    13,
+    23,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    24,
+    30,
+    28,
+    28,
+    30,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    30,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    6,
+    10,
+    10,
+    12,
+    13,
+    6,
+    8,
+    11,
+    10,
+    10,
+    8,
+    11,
+    8,
+    6,
+    6,
+    6,
+    5,
+    5,
+    5,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    7,
+    8,
+    15,
+    6,
+    12,
+    10,
+    13,
+    6,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    8,
+    7,
+    8,
+    13,
+    19,
+    13,
+    14,
+    6,
+    15,
+    5,
+    6,
+    5,
+    6,
+    5,
+    6,
+    6,
+    6,
+    5,
+    7,
+    7,
+    6,
+    6,
+    6,
+    5,
+    6,
+    7,
+    6,
+    5,
+    5,
+    6,
+    7,
+    7,
+    7,
+    7,
+    7,
+    15,
+    11,
+    14,
+    13,
+    28,
+    20,
+    22,
+    20,
+    20,
+    22,
+    22,
+    22,
+    23,
+    22,
+    23,
+    23,
+    23,
+    23,
+    23,
+    24,
+    23,
+    24,
+    24,
+    22,
+    23,
+    24,
+    23,
+    23,
+    23,
+    23,
+    21,
+    22,
+    23,
+    22,
+    23,
+    23,
+    24,
+    22,
+    21,
+    20,
+    22,
+    22,
+    23,
+    23,
+    21,
+    23,
+    22,
+    22,
+    24,
+    21,
+    22,
+    23,
+    23,
+    21,
+    21,
+    22,
+    21,
+    23,
+    22,
+    23,
+    23,
+    20,
+    22,
+    22,
+    22,
+    23,
+    22,
+    22,
+    23,
+    26,
+    26,
+    20,
+    19,
+    22,
+    23,
+    22,
+    25,
+    26,
+    26,
+    26,
+    27,
+    27,
+    26,
+    24,
+    25,
+    19,
+    21,
+    26,
+    27,
+    27,
+    26,
+    27,
+    24,
+    21,
+    21,
+    26,
+    26,
+    28,
+    27,
+    27,
+    27,
+    20,
+    24,
+    20,
+    21,
+    22,
+    21,
+    21,
+    23,
+    22,
+    22,
+    25,
+    25,
+    24,
+    24,
+    26,
+    23,
+    26,
+    27,
+    26,
+    26,
+    27,
+    27,
+    27,
+    27,
+    27,
+    28,
+    27,
+    27,
+    27,
+    27,
+    27,
+    26,
+    30,
+};
+/* 按 (码长, 码值) 排序的符号表；hpack_start[L] 是码长 L 的区间起点，
+ * 码长 L 的符号是 hpack_sym[hpack_start[L] .. hpack_start[L+1])。 */
+static const u16 hpack_sym[HPACK_SYM] = {
+    48,
+    49,
+    50,
+    97,
+    99,
+    101,
+    105,
+    111,
+    115,
+    116,
+    32,
+    37,
+    45,
+    46,
+    47,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    61,
+    65,
+    95,
+    98,
+    100,
+    102,
+    103,
+    104,
+    108,
+    109,
+    110,
+    112,
+    114,
+    117,
+    58,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    89,
+    106,
+    107,
+    113,
+    118,
+    119,
+    120,
+    121,
+    122,
+    38,
+    42,
+    44,
+    59,
+    88,
+    90,
+    33,
+    34,
+    40,
+    41,
+    63,
+    39,
+    43,
+    124,
+    35,
+    62,
+    0,
+    36,
+    64,
+    91,
+    93,
+    126,
+    94,
+    125,
+    60,
+    96,
+    123,
+    92,
+    195,
+    208,
+    128,
+    130,
+    131,
+    162,
+    184,
+    194,
+    224,
+    226,
+    153,
+    161,
+    167,
+    172,
+    176,
+    177,
+    179,
+    209,
+    216,
+    217,
+    227,
+    229,
+    230,
+    129,
+    132,
+    133,
+    134,
+    136,
+    146,
+    154,
+    156,
+    160,
+    163,
+    164,
+    169,
+    170,
+    173,
+    178,
+    181,
+    185,
+    186,
+    187,
+    189,
+    190,
+    196,
+    198,
+    228,
+    232,
+    233,
+    1,
+    135,
+    137,
+    138,
+    139,
+    140,
+    141,
+    143,
+    147,
+    149,
+    150,
+    151,
+    152,
+    155,
+    157,
+    158,
+    165,
+    166,
+    168,
+    174,
+    175,
+    180,
+    182,
+    183,
+    188,
+    191,
+    197,
+    231,
+    239,
+    9,
+    142,
+    144,
+    145,
+    148,
+    159,
+    171,
+    206,
+    215,
+    225,
+    236,
+    237,
+    199,
+    207,
+    234,
+    235,
+    192,
+    193,
+    200,
+    201,
+    202,
+    205,
+    210,
+    213,
+    218,
+    219,
+    238,
+    240,
+    242,
+    243,
+    255,
+    203,
+    204,
+    211,
+    212,
+    214,
+    221,
+    222,
+    223,
+    241,
+    244,
+    245,
+    246,
+    247,
+    248,
+    250,
+    251,
+    252,
+    253,
+    254,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    11,
+    12,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    127,
+    220,
+    249,
+    10,
+    13,
+    22,
+    256,
+};
+#define HPACK_MIN_BITS 5
+#define HPACK_MAX_BITS 30
+static const u16 hpack_start[HPACK_MAX_BITS + 2] = {
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    10,
+    36,
+    68,
+    74,
+    74,
+    79,
+    82,
+    84,
+    90,
+    92,
+    95,
+    95,
+    95,
+    95,
+    98,
+    106,
+    119,
+    145,
+    174,
+    186,
+    190,
+    205,
+    224,
+    253,
+    253,
+    257,
+};
+#define HPACK_STATIC_N 62
+/* 索引 1..61；索引 0 是"没有索引"的占位，名字/值都为空。 */
+static const char *const hpack_sname[HPACK_STATIC_N] = {
+    "",
+    ":authority",
+    ":method",
+    ":method",
+    ":path",
+    ":path",
+    ":scheme",
+    ":scheme",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "accept-ranges",
+    "accept",
+    "access-control-allow-origin",
+    "age",
+    "allow",
+    "authorization",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-range",
+    "content-type",
+    "cookie",
+    "date",
+    "etag",
+    "expect",
+    "expires",
+    "from",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "last-modified",
+    "link",
+    "location",
+    "max-forwards",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "range",
+    "referer",
+    "refresh",
+    "retry-after",
+    "server",
+    "set-cookie",
+    "strict-transport-security",
+    "transfer-encoding",
+    "user-agent",
+    "vary",
+    "via",
+    "www-authenticate",
+};
+static const char *const hpack_svalue[HPACK_STATIC_N] = {
+    "",
+    "",
+    "GET",
+    "POST",
+    "/",
+    "/index.html",
+    "http",
+    "https",
+    "200",
+    "204",
+    "206",
+    "304",
+    "400",
+    "404",
+    "500",
+    "",
+    "gzip, deflate",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+};
+
+/* ---- 整数（RFC 7541 §5.1） ---- */
+
+int hpack_int_encode(u8 *out, int cap, int prefix_bits, int first, u64 value)
+{
+    u64 limit = 0;
+    int pos = 0;
+    int high = 0;
+
+    if (!out || cap < 1 || prefix_bits < 1 || prefix_bits > 8)
+        return -1;
+    limit = ((u64)1 << prefix_bits) - 1;
+    high = first & (int)(0xffu << prefix_bits) & 0xff;
+    if (value < limit) {
+        out[0] = (u8)(high | (int)value);
+        return 1;
+    }
+    out[0] = (u8)(high | (int)limit);
+    value -= limit;
+    pos = 1;
+    while (value >= 128) {
+        if (pos >= cap)
+            return -1;
+        out[pos++] = (u8)((value & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    if (pos >= cap)
+        return -1;
+    out[pos++] = (u8)value;
+    return pos;
+}
+
+int hpack_int_decode(const u8 *in, int n, int prefix_bits, u64 *value)
+{
+    u64 limit = 0;
+    u64 v = 0;
+    int pos = 1;
+    int shift = 0;
+
+    if (!in || n < 1 || prefix_bits < 1 || prefix_bits > 8)
+        return -1;
+    limit = ((u64)1 << prefix_bits) - 1;
+    v = (u64)(in[0] & (int)limit);
+    if (v < limit) {
+        if (value)
+            *value = v;
+        return 1;
+    }
+    while (1) {
+        int b = 0;
+        u64 add = 0;
+
+        if (pos >= n)
+            return -1;
+        b = in[pos++];
+        add = (u64)(b & 0x7f);
+        if (shift >= 63 || (shift == 56 && add > 0x7full))
+            return -1;
+        add <<= shift;
+        if (v + add < v)
+            return -1;          /* 溢出 */
+        v += add;
+        shift += 7;
+        if ((b & 0x80) == 0)
+            break;
+    }
+    if (value)
+        *value = v;
+    return pos;
+}
+
+/* ---- Huffman（RFC 7541 §5.2 与附录 B） ---- */
+
+/* 在某个码长里二分查找码值；找到返回符号，没找到 -1。 */
+static int hpack_lookup(u64 code, int bits)
+{
+    int lo = hpack_start[bits];
+    int hi = hpack_start[bits + 1];
+
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        u32 c = hpack_code[hpack_sym[mid]];
+
+        if ((u64)c < code)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < hpack_start[bits + 1]
+        && (u64)hpack_code[hpack_sym[lo]] == code)
+        return (int)hpack_sym[lo];
+    return -1;
+}
+
+/* 编码后的字节数；输入为空指针且 n>0 给 -1。 */
+int huff_len(const void *p, int n)
+{
+    const u8 *s = (const u8 *)p;
+    u64 bits = 0;
+    int i = 0;
+
+    if (n < 0 || (n > 0 && !s))
+        return -1;
+    for (i = 0; i < n; i++)
+        bits += (u64)hpack_bits[s[i]];
+    if (bits > 0x7fffffffull)
+        return -1;
+    return (int)((bits + 7) / 8);
+}
+
+int huff_encode(const void *p, int n, u8 *out, int cap)
+{
+    const u8 *s = (const u8 *)p;
+    u64 acc = 0;
+    int nbits = 0;
+    int pos = 0;
+    int i = 0;
+
+    if ((n > 0 && !s) || !out || n < 0)
+        return -1;
+    for (i = 0; i < n; i++) {
+        int bits = (int)hpack_bits[s[i]];
+
+        acc = (acc << bits) | (u64)hpack_code[s[i]];
+        nbits += bits;
+        while (nbits >= 8) {
+            if (pos >= cap)
+                return -1;
+            out[pos++] = (u8)(acc >> (nbits - 8));
+            nbits -= 8;
+            acc &= ((u64)1 << nbits) - 1;
+        }
+    }
+    if (nbits > 0) {
+        int pad = 8 - nbits;
+
+        if (pos >= cap)
+            return -1;
+        out[pos++] = (u8)((acc << pad) | (((u64)1 << pad) - 1));
+    }
+    return pos;
+}
+
+/* 解码；返回写出的字节数。EOS、非法填充、输出放不下都给 -1。 */
+int huff_decode(const void *p, int n, u8 *out, int cap)
+{
+    const u8 *s = (const u8 *)p;
+    u64 code = 0;
+    int nbits = 0;
+    int pos = 0;
+    int i = 0;
+    int bit = 0;
+
+    if (!s || !out || n < 0 || cap < 0)
+        return -1;
+    for (i = 0; i < n; i++) {
+        for (bit = 7; bit >= 0; bit--) {
+            code = (code << 1) | (u64)((s[i] >> bit) & 1);
+            nbits++;
+            if (nbits >= HPACK_MIN_BITS) {
+                int sym = hpack_lookup(code, nbits);
+
+                if (sym >= 0) {
+                    if (sym == 256)
+                        return -1;      /* EOS 不许出现在头部块里 */
+                    if (pos >= cap)
+                        return -1;
+                    out[pos++] = (u8)sym;
+                    code = 0;
+                    nbits = 0;
+                } else if (nbits > HPACK_MAX_BITS) {
+                    return -1;
+                }
+            }
+        }
+    }
+    /* 尾部填充：最多 7 位，且必须全是 1 */
+    if (nbits > 7)
+        return -1;
+    if (nbits > 0) {
+        u64 pad = ((u64)1 << nbits) - 1;
+
+        if (code != pad)
+            return -1;
+    }
+    return pos;
+}
+
+/* ---- 字符串（RFC 7541 §5.2） ---- */
+
+/* 解析字符串字面量，给出 H 位与负载视图；返回吃掉的字节数。 */
+int hpack_str_view(const u8 *in, int n, int *huff, int *off, int *len)
+{
+    u64 lenv = 0;
+    int used = 0;
+
+    if (!in || n < 1)
+        return -1;
+    if (huff)
+        *huff = (in[0] & 0x80) != 0;
+    used = hpack_int_decode(in, n, 7, &lenv);
+    if (used < 0)
+        return -1;
+    if (lenv > (u64)(n - used))
+        return -1;
+    if (off)
+        *off = used;
+    if (len)
+        *len = (int)lenv;
+    return used + (int)lenv;
+}
+
+/* 把字符串字面量解到 out（自动处理 Huffman）；*used 给字面量总字节数。 */
+int hpack_str_decode(const u8 *in, int n, char *out, int cap, int *used)
+{
+    int huff = 0;
+    int off = 0;
+    int len = 0;
+    int u = 0;
+
+    if (!out || cap < 0)
+        return -1;
+    u = hpack_str_view(in, n, &huff, &off, &len);
+    if (u < 0)
+        return -1;
+    if (used)
+        *used = u;
+    if (huff) {
+        int got = huff_decode(in + off, len, (u8 *)out, cap);
+
+        if (got < 0)
+            return -1;
+        return got;
+    }
+    if (len > cap)
+        return -1;
+    if (len > 0)
+        memcpy(out, in + off, (size_t)len);
+    return len;
+}
+
+int hpack_str_encode(u8 *out, int cap, const void *s, int len, int huffman)
+{
+    int n = 0;
+    int hl = 0;
+
+    if (!out || len < 0 || (len > 0 && !s))
+        return -1;
+    if (huffman) {
+        hl = huff_len(s, len);
+        if (hl < 0)
+            return -1;
+        n = hpack_int_encode(out, cap, 7, 0x80, (u64)hl);
+        if (n < 0 || n + hl > cap)
+            return -1;
+        if (hl > 0 && huff_encode(s, len, out + n, cap - n) != hl)
+            return -1;
+        return n + hl;
+    }
+    n = hpack_int_encode(out, cap, 7, 0x00, (u64)len);
+    if (n < 0 || n + len > cap)
+        return -1;
+    if (len > 0)
+        memcpy(out + n, s, (size_t)len);
+    return n + len;
+}
+
+/* ---- 静态表 ---- */
+
+int hpack_static_count(void) { return HPACK_STATIC_COUNT; }
+
+const char *hpack_static_name(int idx)
+{
+    if (idx < 1 || idx > HPACK_STATIC_COUNT)
+        return 0;
+    return hpack_sname[idx];
+}
+
+const char *hpack_static_value(int idx)
+{
+    if (idx < 1 || idx > HPACK_STATIC_COUNT)
+        return 0;
+    return hpack_svalue[idx];
+}
+
+/* 在静态表里找完全匹配；没有给 0。 */
+int hpack_static_find(const void *name, int nlen, const void *value, int vlen)
+{
+    int i = 0;
+
+    for (i = 1; i <= HPACK_STATIC_COUNT; i++) {
+        if ((int)strlen(hpack_sname[i]) != nlen
+            || memcmp(hpack_sname[i], name, (size_t)nlen) != 0)
+            continue;
+        if (vlen < 0)
+            return i;
+        if ((int)strlen(hpack_svalue[i]) == vlen
+            && (vlen == 0 || memcmp(hpack_svalue[i], value, (size_t)vlen) == 0))
+            return i;
+    }
+    return 0;
+}
+
+/* ---- 动态表（RFC 7541 §2.3/§4） ---- */
+
+struct HpackEntry {
+    int noff;
+    int nlen;
+    int voff;
+    int vlen;
+    int size;                   /* nlen + vlen + 32 */
+};
+
+struct HpackTable {
+    int max_size;
+    int size;                   /* 所有条目的 size 之和 */
+    int count;
+    int used;                   /* arena 里已经用掉的字节 */
+    u8 arena[HPACK_ARENA];
+    HpackEntry e[HPACK_MAX_ENTRIES];    /* e[0] 最新，尾部最旧 */
+};
+
+void table_init(HpackTable *t, int max_size)
+{
+    if (!t)
+        return;
+    memset(t, 0, sizeof *t);
+    if (max_size < 0)
+        max_size = 0;
+    if (max_size > HPACK_ARENA)
+        max_size = HPACK_ARENA;
+    t->max_size = max_size;
+}
+
+int table_max(HpackTable *t) { return t ? t->max_size : -1; }
+int table_size(HpackTable *t) { return t ? t->size : -1; }
+int table_count(HpackTable *t) { return t ? t->count : -1; }
+
+void table_clear(HpackTable *t)
+{
+    if (!t)
+        return;
+    t->count = 0;
+    t->size = 0;
+    t->used = 0;
+}
+
+/* 逐出最旧的一条（e[count-1]）。arena 先不回收，等压实。 */
+static void table_evict(HpackTable *t)
+{
+    if (!t || t->count <= 0)
+        return;
+    t->count--;
+    t->size -= t->e[t->count].size;
+}
+
+/* 把还活着的条目挪到 arena 开头：淘汰总是从最旧的开始，所以活着的字节
+ * 是一段连续的后缀，一次 memmove 就够。 */
+static int table_compact(HpackTable *t)
+{
+    int live = 0;
+    int start = 0;
+    int i = 0;
+
+    if (!t || t->count <= 0) {
+        if (t)
+            t->used = 0;
+        return 0;
+    }
+    start = t->e[t->count - 1].noff;
+    live = t->used - start;
+    if (start > 0 && live > 0)
+        memmove(t->arena, t->arena + start, (size_t)live);
+    for (i = 0; i < t->count; i++) {
+        t->e[i].noff -= start;
+        t->e[i].voff -= start;
+    }
+    t->used = live;
+    return live;
+}
+
+/* 调整容量上限；改小立刻逐出。返回生效的上限。 */
+int table_resize(HpackTable *t, int max_size)
+{
+    if (!t || max_size < 0)
+        return -1;
+    if (max_size > HPACK_ARENA)
+        max_size = HPACK_ARENA;
+    t->max_size = max_size;
+    while (t->count > 0 && t->size > t->max_size)
+        t->table_evict();
+    if (t->count == 0)
+        t->used = 0;
+    return t->max_size;
+}
+
+/* 插入一条；返回新的绝对索引（62 起），被"单条就超限"清掉时返回 0。 */
+int table_add(HpackTable *t, const void *name, int nlen, const void *value,
+              int vlen)
+{
+    int need = 0;
+    int i = 0;
+
+    if (!t || nlen < 0 || vlen < 0 || (nlen > 0 && !name)
+        || (vlen > 0 && !value))
+        return -1;
+    need = nlen + vlen + 32;
+    if (need > t->max_size) {
+        t->table_clear();
+        return 0;
+    }
+    if (nlen + vlen + 2 > HPACK_ARENA)
+        return 0;
+    while (t->count > 0
+           && (t->size + need > t->max_size || t->count >= HPACK_MAX_ENTRIES))
+        t->table_evict();
+    if (t->count == 0)
+        t->used = 0;
+    if (t->used + nlen + vlen + 2 > HPACK_ARENA) {
+        t->table_compact();
+        if (t->used + nlen + vlen + 2 > HPACK_ARENA) {
+            t->table_clear();
+            return 0;
+        }
+    }
+    /* 腾出头部一格 */
+    for (i = t->count; i > 0; i--) {
+        t->e[i] = t->e[i - 1];
+    }
+    t->e[0].noff = t->used;
+    t->e[0].nlen = nlen;
+    t->e[0].voff = t->used + nlen + 1;
+    t->e[0].vlen = vlen;
+    t->e[0].size = need;
+    if (nlen > 0)
+        memcpy(t->arena + t->used, name, (size_t)nlen);
+    t->arena[t->used + nlen] = 0;
+    if (vlen > 0)
+        memcpy(t->arena + t->used + nlen + 1, value, (size_t)vlen);
+    t->arena[t->used + nlen + 1 + vlen] = 0;
+    t->used += nlen + vlen + 2;
+    t->count++;
+    t->size += need;
+    return HPACK_DYN_BASE;
+}
+
+/* 绝对索引取条目：1..61 静态表，62 起动态表。 */
+int table_get(HpackTable *t, u64 idx, const char **name, int *nlen,
+              const char **value, int *vlen)
+{
+    if (!name || !nlen || !value || !vlen)
+        return -1;
+    if (idx >= 1 && idx <= (u64)HPACK_STATIC_COUNT) {
+        *name = hpack_sname[idx];
+        *nlen = (int)strlen(hpack_sname[idx]);
+        *value = hpack_svalue[idx];
+        *vlen = (int)strlen(hpack_svalue[idx]);
+        return 1;
+    }
+    if (!t || idx < (u64)HPACK_DYN_BASE)
+        return 0;
+    {
+        u64 rel = idx - HPACK_DYN_BASE;
+
+        if (rel >= (u64)t->count)
+            return 0;
+        *name = (const char *)(t->arena + t->e[rel].noff);
+        *nlen = t->e[rel].nlen;
+        *value = (const char *)(t->arena + t->e[rel].voff);
+        *vlen = t->e[rel].vlen;
+    }
+    return 1;
+}
+
+/* 找完全匹配的动态表条目；没有给 0。 */
+int table_find(HpackTable *t, const void *name, int nlen, const void *value,
+               int vlen)
+{
+    int i = 0;
+
+    if (!t || nlen < 0 || vlen < 0)
+        return 0;
+    for (i = 0; i < t->count; i++) {
+        if (t->e[i].nlen != nlen || t->e[i].vlen != vlen)
+            continue;
+        if (nlen > 0 && memcmp(t->arena + t->e[i].noff, name, (size_t)nlen) != 0)
+            continue;
+        if (vlen > 0
+            && memcmp(t->arena + t->e[i].voff, value, (size_t)vlen) != 0)
+            continue;
+        return HPACK_DYN_BASE + i;
+    }
+    return 0;
+}
+
+int table_find_name(HpackTable *t, const void *name, int nlen)
+{
+    int i = 0;
+
+    if (!t || nlen < 0)
+        return 0;
+    for (i = 0; i < t->count; i++) {
+        if (t->e[i].nlen != nlen)
+            continue;
+        if (nlen > 0 && memcmp(t->arena + t->e[i].noff, name, (size_t)nlen) != 0)
+            continue;
+        return HPACK_DYN_BASE + i;
+    }
+    return 0;
+}
+
+/* ---- 头部块解码 ---- */
+
+struct HpackDecoder {
+    const u8 *buf;
+    int len;
+    int pos;
+    int saw_field;
+    int err;
+};
+
+struct HpackField {
+    int kind;                   /* HPACK_FIELD_* */
+    u64 index;                  /* 名字索引（0 = 字面名字） */
+    u64 value_index;            /* 索引表示里命中的绝对索引 */
+    int name_len;
+    int value_len;
+    int huff_name;
+    int huff_value;
+    int added_index;            /* 插进动态表后的绝对索引；0 = 没插 */
+    u64 size_update;
+    int static_name;
+};
+
+void dec_init(HpackDecoder *d, const void *buf, int len)
+{
+    if (!d)
+        return;
+    memset(d, 0, sizeof *d);
+    d->buf = (const u8 *)buf;
+    d->len = len;
+}
+
+int dec_done(HpackDecoder *d)
+{
+    return d && d->pos >= d->len;
+}
+
+/* 解出一个字段；name/value 是调用方的输出缓冲（会补 NUL）。
+ * 返回 1 有内容 / 0 到头 / -1 格式错。大小更新也算"有内容"（kind=5）。 */
+int next_field(HpackDecoder *d, HpackTable *t, HpackField *f, char *name,
+               int ncap, char *value, int vcap)
+{
+    const char *tn = 0;
+    const char *tv = 0;
+    int tlen = 0;
+    int tvlen = 0;
+    int used = 0;
+    int b = 0;
+
+    if (!d || !d->buf)
+        return -1;
+    if (d->pos >= d->len)
+        return 0;
+    if (!f || !name || !value || ncap < 1 || vcap < 1) {
+        d->err = INVAL;
+        return -1;
+    }
+    memset(f, 0, sizeof *f);
+    b = d->buf[d->pos];
+    /* 1xxxxxxx：索引头部字段 */
+    if (b & 0x80) {
+        u64 idx = 0;
+
+        used = hpack_int_decode(d->buf + d->pos, d->len - d->pos, 7, &idx);
+        if (used < 0 || idx == 0) {
+            d->err = PARSE;
+            return -1;
+        }
+        if (t->table_get(idx, &tn, &tlen, &tv, &tvlen) != 1) {
+            d->err = RANGE;
+            return -1;
+        }
+        if (tlen + 1 > ncap || tvlen + 1 > vcap) {
+            d->err = RANGE;
+            return -1;
+        }
+        memcpy(name, tn, (size_t)tlen);
+        name[tlen] = 0;
+        memcpy(value, tv, (size_t)tvlen);
+        value[tvlen] = 0;
+        f->kind = HPACK_FIELD_INDEXED;
+        f->index = idx;
+        f->value_index = idx;
+        f->name_len = tlen;
+        f->value_len = tvlen;
+        f->static_name = idx <= (u64)HPACK_STATIC_COUNT;
+        d->pos += used;
+        d->saw_field = 1;
+        return 1;
+    }
+    /* 001xxxxx：动态表大小更新（只能出现在字段之前） */
+    if ((b & 0xe0) == 0x20) {
+        u64 sz = 0;
+
+        if (d->saw_field) {
+            d->err = PARSE;
+            return -1;
+        }
+        used = hpack_int_decode(d->buf + d->pos, d->len - d->pos, 5, &sz);
+        if (used < 0) {
+            d->err = PARSE;
+            return -1;
+        }
+        if (t->table_resize((int)sz) < 0) {
+            d->err = RANGE;
+            return -1;
+        }
+        f->kind = HPACK_FIELD_SIZE;
+        f->size_update = sz;
+        d->pos += used;
+        return 1;
+    }
+    /* 字面量三种：01 / 0000 / 0001 */
+    {
+        int kind = 0;
+        int prefix = 0;
+        u64 idx = 0;
+
+        if ((b & 0xc0) == 0x40) {
+            kind = HPACK_FIELD_INCREMENTAL;
+            prefix = 6;
+        } else if ((b & 0xf0) == 0x00) {
+            kind = HPACK_FIELD_NO_INDEX;
+            prefix = 4;
+        } else if ((b & 0xf0) == 0x10) {
+            kind = HPACK_FIELD_NEVER;
+            prefix = 4;
+        } else {
+            d->err = PARSE;
+            return -1;
+        }
+        used = hpack_int_decode(d->buf + d->pos, d->len - d->pos, prefix, &idx);
+        if (used < 0) {
+            d->err = PARSE;
+            return -1;
+        }
+        d->pos += used;
+        if (idx == 0) {
+            int hl = 0;
+            int off = 0;
+            int len = 0;
+
+            used = hpack_str_view(d->buf + d->pos, d->len - d->pos, &hl, &off,
+                                  &len);
+            if (used < 0) {
+                d->err = PARSE;
+                return -1;
+            }
+            {
+                int got = hpack_str_decode(d->buf + d->pos, d->len - d->pos,
+                                           name, ncap - 1, &used);
+
+                if (got < 0 || got + 1 > ncap) {
+                    d->err = HUFF;
+                    return -1;
+                }
+                name[got] = 0;
+                f->name_len = got;
+                f->huff_name = hl;
+            }
+            d->pos += used;
+        } else {
+            if (t->table_get(idx, &tn, &tlen, &tv, &tvlen) != 1) {
+                d->err = RANGE;
+                return -1;
+            }
+            if (tlen + 1 > ncap) {
+                d->err = RANGE;
+                return -1;
+            }
+            memcpy(name, tn, (size_t)tlen);
+            name[tlen] = 0;
+            f->name_len = tlen;
+            f->static_name = idx <= (u64)HPACK_STATIC_COUNT;
+        }
+        {
+            int hl = 0;
+            int got = 0;
+
+            used = hpack_str_view(d->buf + d->pos, d->len - d->pos, &hl, 0, 0);
+            if (used < 0) {
+                d->err = PARSE;
+                return -1;
+            }
+            got = hpack_str_decode(d->buf + d->pos, d->len - d->pos, value,
+                                   vcap - 1, &used);
+            if (got < 0 || got + 1 > vcap) {
+                d->err = HUFF;
+                return -1;
+            }
+            value[got] = 0;
+            f->value_len = got;
+            f->huff_value = hl;
+            d->pos += used;
+        }
+        f->kind = kind;
+        f->index = idx;
+        d->saw_field = 1;
+        if (kind == HPACK_FIELD_INCREMENTAL) {
+            int added = t->table_add(name, f->name_len, value, f->value_len);
+
+            if (added < 0) {
+                d->err = TABLE;
+                return -1;
+            }
+            f->added_index = added;
+        }
+    }
+    return 1;
+}
+
+/* ---- 头部块构造 ---- */
+
+int hpack_put_indexed(u8 *out, int cap, u64 idx)
+{
+    if (idx == 0)
+        return -1;
+    return hpack_int_encode(out, cap, 7, 0x80, idx);
+}
+
+int hpack_put_size_update(u8 *out, int cap, u64 size)
+{
+    return hpack_int_encode(out, cap, 5, 0x20, size);
+}
+
+/* mode 取 HPACK_LIT_*；name_index 非 0 时用索引里的名字，name/nlen 被忽略。 */
+int hpack_put_literal(u8 *out, int cap, int mode, u64 name_index,
+                      const void *name, int nlen, const void *value, int vlen,
+                      int huffman)
+{
+    int first = 0;
+    int prefix = 0;
+    int pos = 0;
+    int n = 0;
+
+    if (!out || vlen < 0 || (vlen > 0 && !value))
+        return -1;
+    if (mode == HPACK_LIT_INCREMENTAL) {
+        first = 0x40;
+        prefix = 6;
+    } else if (mode == HPACK_LIT_NEVER) {
+        first = 0x10;
+        prefix = 4;
+    } else if (mode == HPACK_LIT_NO_INDEX) {
+        first = 0x00;
+        prefix = 4;
+    } else {
+        return -1;
+    }
+    if (name_index > 0) {
+        n = hpack_int_encode(out, cap, prefix, first, name_index);
+    } else {
+        if (nlen < 0 || (nlen > 0 && !name))
+            return -1;
+        n = hpack_int_encode(out, cap, prefix, first, 0);
+        if (n < 0)
+            return -1;
+        pos = n;
+        n = hpack_str_encode(out + pos, cap - pos, name, nlen, huffman);
+        if (n < 0)
+            return -1;
+        n += pos;
+    }
+    if (n < 0)
+        return -1;
+    pos = n;
+    n = hpack_str_encode(out + pos, cap - pos, value, vlen, huffman);
+    if (n < 0)
+        return -1;
+    return pos + n;
+}
+
+/* ---- 自测 ---- */
+
+static int hpack_hex(const u8 *d, int n, const char *want)
+{
+    char got[256] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n && i * 2 + 1 < (int)sizeof got; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    return strcmp(got, want) == 0;
+}
+
+test "HPACK：整数与字符串原语（RFC 7541 C.1）" {
+    u8 out[16] = { 0 };
+    u64 v = 0;
+    int n = 0;
+    int used = 0;
+    char buf[64] = { 0 };
+
+    /* C.1.1：10 用 5 位前缀 */
+    n = hpack_int_encode(out, (int)sizeof out, 5, 0x00, 10);
+    if (n != 1 || out[0] != 0x0a)
+        return err(1, "10 应编码成 0x0a");
+    /* C.1.2：1337 用 5 位前缀 → 1f 9a 0a */
+    n = hpack_int_encode(out, (int)sizeof out, 5, 0x00, 1337);
+    if (n != 3 || out[0] != 0x1f || out[1] != 0x9a || out[2] != 0x0a)
+        return err(2, "1337 应编码成 1f 9a 0a");
+    used = hpack_int_decode(out, n, 5, &v);
+    if (used != 3 || v != 1337)
+        return err(3, "1337 解码不一致");
+    /* C.1.3：42 用 8 位前缀 */
+    n = hpack_int_encode(out, (int)sizeof out, 8, 0x00, 42);
+    if (n != 1 || out[0] != 0x2a)
+        return err(4, "42 应编码成 0x2a");
+    /* 首字节高位保留 */
+    n = hpack_int_encode(out, (int)sizeof out, 6, 0x40, 5);
+    if (n != 1 || out[0] != 0x45)
+        return err(5, "带 0x40 标志的 6 位前缀编码不对");
+    /* 截断的续字节 */
+    out[0] = 0x1f;
+    out[1] = 0x80;
+    if (hpack_int_decode(out, 2, 5, &v) != -1)
+        return err(6, "续字节链断掉应失败");
+    /* 字符串：明文 */
+    n = hpack_str_encode(out, (int)sizeof out, "abc", 3, 0);
+    if (n != 4 || out[0] != 0x03 || memcmp(out + 1, "abc", 3) != 0)
+        return err(7, "明文串编码不对");
+    if (hpack_str_decode(out, n, buf, (int)sizeof buf, &used) != 3
+        || used != 4 || strcmp(buf, "abc") != 0)
+        return err(8, "明文串解码不对");
+    /* 字符串：Huffman（"value" → ee 3a 2d 2f） */
+    n = hpack_str_encode(out, (int)sizeof out, "value", 5, 1);
+    if (n != 5 || out[0] != 0x84)
+        return err(9, "Huffman 串应带 H 位与长度 4");
+    if (!hpack_hex(out + 1, 4, "ee3a2d2f"))
+        return err(10, "value 的 Huffman 编码不对");
+    if (hpack_str_decode(out, n, buf, (int)sizeof buf, &used) != 5
+        || strcmp(buf, "value") != 0)
+        return err(11, "Huffman 串解码不一致");
+    /* 长度超过剩余字节 */
+    out[0] = 0x05;
+    if (hpack_str_decode(out, 3, buf, (int)sizeof buf, &used) != -1)
+        return err(12, "字符串长度越界应失败");
+    /* 输出缓冲不够 */
+    if (hpack_str_decode(out, n, buf, 3, &used) != -1)
+        return err(13, "输出缓冲不够应失败");
+}
+
+test "HPACK：Huffman 编解码（RFC 7541 C.4.1）" {
+    static const u8 www[12] = {
+        0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff
+    };
+    u8 out[32] = { 0 };
+    char buf[32] = { 0 };
+    int n = 0;
+
+    if (huff_len("www.example.com", 15) != 12)
+        return err(1, "www.example.com 的 Huffman 长度应为 12");
+    n = huff_encode("www.example.com", 15, out, (int)sizeof out);
+    if (n != 12 || memcmp(out, www, 12) != 0)
+        return err(2, "Huffman 编码与 RFC 7541 C.4.1 不一致");
+    n = huff_decode(www, 12, (u8 *)buf, (int)sizeof buf);
+    if (n != 15 || strcmp(buf, "www.example.com") != 0)
+        return err(3, "Huffman 解码不一致");
+    /* 单字符 'a' 是 5 位 0x1f，尾部补 3 个 1 */
+    n = huff_encode("a", 1, out, (int)sizeof out);
+    if (n != 1 || out[0] != 0x1f)
+        return err(4, "'a' 应编码成 0x1f");
+    if (huff_decode(out, 1, (u8 *)buf, (int)sizeof buf) != 1 || buf[0] != 'a')
+        return err(5, "'a' 的解码不对");
+    /* 空串 */
+    if (huff_len("", 0) != 0 || huff_encode("", 0, out, (int)sizeof out) != 0)
+        return err(6, "空串应编码成 0 字节");
+    if (huff_decode(out, 0, (u8 *)buf, (int)sizeof buf) != 0)
+        return err(7, "空串解码应给 0");
+    /* 尾部填充超过 7 位：0xff 的 8 个 1 不能当填充 */
+    out[0] = 0xff;
+    if (huff_decode(out, 1, (u8 *)buf, (int)sizeof buf) != -1)
+        return err(8, "8 位填充应失败");
+    /* EOS（30 位全 1）必须拒绝 */
+    out[0] = 0xff;
+    out[1] = 0xff;
+    out[2] = 0xff;
+    out[3] = 0xff;
+    if (huff_decode(out, 4, (u8 *)buf, (int)sizeof buf) != -1)
+        return err(9, "EOS 符号应失败");
+    /* 填充位不是全 1：'a' 的 1f 改成 10（低 3 位不是 111） */
+    out[0] = 0x10;
+    if (huff_decode(out, 1, (u8 *)buf, (int)sizeof buf) != -1)
+        return err(10, "填充位不是全 1 应失败");
+    /* 输出放不下 */
+    if (huff_decode(www, 12, (u8 *)buf, 8) != -1)
+        return err(11, "输出缓冲不够应失败");
+}
+
+test "HPACK：静态表与动态表" {
+    HpackTable t = { 0 };
+    const char *nm = 0;
+    const char *val = 0;
+    int nlen = 0;
+    int vlen = 0;
+
+    if (hpack_static_count() != 61)
+        return err(1, "静态表应有 61 项");
+    if (strcmp(hpack_static_name(2), ":method") != 0
+        || strcmp(hpack_static_value(2), "GET") != 0)
+        return err(2, "静态表第 2 项应是 :method: GET");
+    if (strcmp(hpack_static_name(4), ":path") != 0
+        || strcmp(hpack_static_value(4), "/") != 0)
+        return err(3, "静态表第 4 项应是 :path: /");
+    if (strcmp(hpack_static_name(61), "www-authenticate") != 0
+        || strcmp(hpack_static_value(61), "") != 0)
+        return err(4, "静态表第 61 项应是 www-authenticate");
+    if (hpack_static_name(0) != 0 || hpack_static_name(62) != 0)
+        return err(5, "静态表越界应给空指针");
+    if (hpack_static_find(":method", 7, "GET", 3) != 2)
+        return err(6, "静态表查找 :method: GET 应得 2");
+    if (hpack_static_find(":method", 7, "PUT", 3) != 0)
+        return err(7, "静态表没有 :method: PUT");
+    if (hpack_static_find(":method", 7, 0, -1) != 2)
+        return err(8, "只按名字查应得第一条 :method");
+    /* 动态表：:authority: www.example.com 占用 10+15+32 = 57 */
+    t.table_init(4096);
+    if (t.table_count() != 0 || t.table_size() != 0)
+        return err(9, "初始动态表应为空");
+    if (t.table_add(":authority", 10, "www.example.com", 15) != 62)
+        return err(10, "第一条动态表索引应为 62");
+    if (t.table_count() != 1 || t.table_size() != 57)
+        return err(11, "动态表计数/大小不对");
+    if (t.table_get(62, &nm, &nlen, &val, &vlen) != 1
+        || nlen != 10 || strcmp(nm, ":authority") != 0 || vlen != 15
+        || strcmp(val, "www.example.com") != 0)
+        return err(12, "动态表取 62 不对");
+    if (t.table_find(":authority", 10, "www.example.com", 15) != 62)
+        return err(13, "动态表精确查找失败");
+    if (t.table_find_name(":authority", 10) != 62)
+        return err(14, "动态表按名字查找失败");
+    if (t.table_find(":authority", 10, "x", 1) != 0)
+        return err(15, "值不匹配应给 0");
+    /* 第二条插到最前面（62 变旧），旧的顺延到 63 */
+    if (t.table_add("cache-control", 13, "no-cache", 8) != 62)
+        return err(16, "新条目应占索引 62");
+    if (t.table_count() != 2 || t.table_size() != 110)
+        return err(17, "两条的大小应为 110");
+    if (t.table_get(63, &nm, &nlen, &val, &vlen) != 1
+        || strcmp(nm, ":authority") != 0)
+        return err(18, "旧条目应顺延到 63");
+    /* 单条就超限：整表清空、条目不进表 */
+    if (t.table_resize(100) < 0)
+        return err(19, "改上限失败");
+    /* 逐出最旧的一条（:authority，57 字节），留下新的 53 字节那条 */
+    if (t.table_count() != 1 || t.table_size() != 53)
+        return err(20, "上限改到 100 后应只留下最新的一条");
+    {
+        char big[200] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 200; i++)
+            big[i] = 'x';
+        if (t.table_add("big", 3, big, 200) != 0)
+            return err(21, "单条超过上限应清表并返回 0");
+        if (t.table_count() != 0)
+            return err(22, "单条超过上限后表应为空");
+    }
+    /* 上限 0：什么也放不下 */
+    t.table_resize(0);
+    if (t.table_add("a", 1, "b", 1) != 0 || t.table_count() != 0)
+        return err(23, "上限 0 时不应有条目");
+}
+
+test "HPACK：头部块解码（RFC 7541 C.4.1/C.4.2）" {
+    /* C.4.1 的请求（Huffman） */
+    static const u8 r1[17] = {
+        0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5,
+        0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff
+    };
+    /* C.4.2 的第二个请求（:authority 走动态索引 62） */
+    static const u8 r2[12] = {
+        0x82, 0x86, 0x84, 0xbe, 0x58, 0x86, 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf
+    };
+    HpackDecoder d = { 0 };
+    HpackTable t = { 0 };
+    HpackField f = { 0 };
+    char name[128] = { 0 };
+    char value[512] = { 0 };
+    int rc = 0;
+    int i = 0;
+
+    t.table_init(4096);
+    d.dec_init(r1, 17);
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1)
+        return err(1, "C.4.1 第一个字段解析失败");
+    if (f.kind != HPACK_FIELD_INDEXED || strcmp(name, ":method") != 0
+        || strcmp(value, "GET") != 0)
+        return err(2, "第一个字段应是 :method: GET");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || strcmp(name, ":scheme") != 0 || strcmp(value, "http") != 0)
+        return err(3, "第二个字段应是 :scheme: http");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || strcmp(name, ":path") != 0 || strcmp(value, "/") != 0)
+        return err(4, "第三个字段应是 :path: /");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1)
+        return err(5, "第四个字段解析失败");
+    if (f.kind != HPACK_FIELD_INCREMENTAL || f.index != 1
+        || !f.huff_value || f.value_len != 15
+        || strcmp(name, ":authority") != 0
+        || strcmp(value, "www.example.com") != 0)
+        return err(6, "第四个字段应是 Huffman 的 :authority");
+    if (f.added_index != 62 || t.table_count() != 1 || t.table_size() != 57)
+        return err(7, "C.4.1 之后动态表应有 1 条、57 字节");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 0)
+        return err(8, "C.4.1 应恰好 4 个字段");
+    /* C.4.2：沿用同一张动态表 */
+    d.dec_init(r2, 12);
+    for (i = 0; i < 3; i++) {
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != 1)
+            return err(9, "C.4.2 的前三个索引字段解析失败");
+    }
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1)
+        return err(10, "C.4.2 的第四个字段解析失败");
+    if (f.kind != HPACK_FIELD_INDEXED || f.value_index != 62
+        || strcmp(name, ":authority") != 0
+        || strcmp(value, "www.example.com") != 0)
+        return err(11, "第四个字段应命中动态索引 62");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1)
+        return err(12, "C.4.2 的第五个字段解析失败");
+    if (f.kind != HPACK_FIELD_INCREMENTAL || f.index != 24
+        || strcmp(name, "cache-control") != 0 || strcmp(value, "no-cache") != 0)
+        return err(13, "第五个字段应是 cache-control: no-cache");
+    if (f.added_index != 62 || t.table_count() != 2 || t.table_size() != 110)
+        return err(14, "C.4.2 之后动态表应有 2 条、110 字节");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 0)
+        return err(15, "C.4.2 应恰好 5 个字段");
+    /* 索引到不存在的动态条目 */
+    {
+        u8 bad[2] = { 0xbe, 0x00 };
+
+        d.dec_init(bad, 1);
+        t.table_clear();
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != -1
+            || d.err != RANGE)
+            return err(16, "空动态表上索引 62 应失败");
+    }
+    /* 动态表大小更新：只能出现在字段之前 */
+    {
+        u8 su[2] = { 0x20, 0x82 };
+
+        d.dec_init(su, 2);
+        t.table_init(4096);
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != 1
+            || f.kind != HPACK_FIELD_SIZE || f.size_update != 0)
+            return err(17, "0x20 应把上限改成 0");
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != 1
+            || strcmp(name, ":method") != 0)
+            return err(18, "大小更新之后的索引字段应正常");
+        d.dec_init(su, 2);
+        su[0] = 0x82;           /* 先来一个字段 */
+        su[1] = 0x20;
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != 1)
+            return err(19, "第一个字段应成功");
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != -1)
+            return err(20, "字段之后的大小更新应失败");
+    }
+    /* 名字/值缓冲不够 */
+    d.dec_init(r1, 17);
+    if (d.next_field(&t, &f, name, 4, value, (int)sizeof value) != -1)
+        return err(21, "名字缓冲不够应失败");
+}
+
+test "HPACK：头部块构造与往返" {
+    u8 out[128] = { 0 };
+    HpackTable t = { 0 };
+    HpackDecoder d = { 0 };
+    HpackField f = { 0 };
+    char name[64] = { 0 };
+    char value[128] = { 0 };
+    int n = 0;
+    int pos = 0;
+
+    t.table_init(4096);
+    n = hpack_put_indexed(out, (int)sizeof out, 2);
+    if (n != 1 || out[0] != 0x82)
+        return err(1, "索引 2 应编码成 0x82");
+    pos = n;
+    n = hpack_put_literal(out + pos, (int)sizeof out - pos,
+                          HPACK_LIT_INCREMENTAL, 0, "x-test", 6, "hello", 5,
+                          0);
+    if (n <= 0)
+        return err(2, "字面量编码失败");
+    pos += n;
+    n = hpack_put_literal(out + pos, (int)sizeof out - pos,
+                          HPACK_LIT_NO_INDEX, 0, "x-raw", 5, "v", 1, 1);
+    if (n <= 0)
+        return err(3, "Huffman 字面量编码失败");
+    pos += n;
+    n = hpack_put_size_update(out + pos, (int)sizeof out - pos, 0);
+    if (n != 1 || out[pos] != 0x20)
+        return err(4, "大小更新 0 应编码成 0x20");
+    /* 大小更新必须在前，所以这里重新拼一个块 */
+    pos = 0;
+    out[pos++] = 0x20;
+    n = hpack_put_literal(out + pos, (int)sizeof out - pos,
+                          HPACK_LIT_NEVER, 1, 0, 0, "keep", 4, 0);
+    if (n <= 0)
+        return err(5, "从不索引字面量编码失败");
+    pos += n;
+    d.dec_init(out, pos);
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || f.kind != HPACK_FIELD_SIZE || f.size_update != 0)
+        return err(6, "往返：大小更新不对");
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || f.kind != HPACK_FIELD_NEVER || strcmp(name, ":authority") != 0
+        || strcmp(value, "keep") != 0)
+        return err(7, "往返：从不索引字段不对");
+    /* 带增量索引的往返：字段名/值都进动态表 */
+    t.table_init(4096);
+    d.dec_init(out, 0);
+    pos = hpack_put_literal(out, (int)sizeof out, HPACK_LIT_INCREMENTAL, 0,
+                            "x-test", 6, "hello", 5, 0);
+    d.dec_init(out, pos);
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || f.added_index != 62 || strcmp(name, "x-test") != 0
+        || strcmp(value, "hello") != 0)
+        return err(9, "增量索引字段的往返不对");
+    /* 编码时用已存在的动态条目做名字索引 */
+    n = hpack_put_literal(out, (int)sizeof out, HPACK_LIT_NO_INDEX, 62, 0, 0,
+                          "v2", 2, 0);
+    d.dec_init(out, n);
+    if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                     (int)sizeof value) != 1
+        || strcmp(name, "x-test") != 0 || strcmp(value, "v2") != 0)
+        return err(10, "按动态索引取名字的往返不对");
+    /* 动态表清空后，再引用索引 62 应失败 */
+    t.table_clear();
+    {
+        u8 idx62[1] = { 0xbe };
+
+        d.dec_init(idx62, 1);
+        if (d.next_field(&t, &f, name, (int)sizeof name, value,
+                         (int)sizeof value) != -1
+            || d.err != RANGE)
+            return err(11, "动态表清空后索引 62 应失败");
+    }
+}

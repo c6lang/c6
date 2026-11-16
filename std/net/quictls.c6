@@ -1,0 +1,1322 @@
+/* std/net/quictls：TLS 1.3 握手的「消息层 + 密钥层」，QUIC（RFC 9001）用。
+ *
+ *     import std.net.quictls;
+ *
+ *     TlsHelloCfg cfg = { 0 };
+ *     cfg.sni = "example.com";
+ *     cfg.alpn = "h3";
+ *     cfg.key_share = x25519_pub;         -- 32 字节
+ *     cfg.key_share_len = 32;
+ *     cfg.cipher_count = 2;
+ *     cfg.ciphers[0] = TLS13_AES_128_GCM_SHA256;
+ *     cfg.ciphers[1] = TLS13_CHACHA20_POLY1305_SHA256;
+ *     int n = tls_client_hello_build(&cfg, out, sizeof out);
+ *
+ *     Tls13Secrets sec = { 0 };
+ *     tls13_hs_secrets(&sec, TLS13_AES_128_GCM_SHA256, ecdhe, 32, th, 32);
+ *     QuicTlsKey k = { 0 };
+ *     tls13_quic_key(&k, TLS13_AES_128_GCM_SHA256, sec.s_hs);
+ *
+ * 为什么没有 record 层：QUIC 把握手字节放在 CRYPTO 帧里，加密由 QUIC 自己用
+ * AEAD 做（RFC 9001 §5），TLS 的 record 层在这里没有位置。所以这一层只做三件
+ * 事——把握手消息切出来/拼起来、按 RFC 8446 §7.1 的密钥表算 secret、把 secret
+ * 折成 QUIC 的 key/iv/hp。
+ *
+ * 支持的密码套件只有 SHA-256 的两个：`TLS_AES_128_GCM_SHA256` 与
+ * `TLS_CHACHA20_POLY1305_SHA256`。`TLS_AES_256_GCM_SHA384` 要 SHA-384，而
+ * `std/encoding` 里只有 SHA-256/512（SHA-384 不是简单截断），所以明确拒掉。
+ *
+ * 密钥表（RFC 8446 §7.1）：
+ *
+ *     early     = HKDF-Extract(0, 0)
+ *     derived   = Derive-Secret(early,   "derived", "")
+ *     handshake = HKDF-Extract(derived, ECDHE)
+ *     c hs / s hs traffic = Derive-Secret(handshake, "c hs traffic"/"s hs traffic", TH(CH..SH))
+ *     derived2  = Derive-Secret(handshake, "derived", "")
+ *     master    = HKDF-Extract(derived2, 0)
+ *     c ap / s ap traffic = Derive-Secret(master, "c ap traffic"/"s ap traffic", TH(..server Finished))
+ *
+ * 注意应用流量密钥务必用**服务器 Finished 之后**的 transcript hash；用
+ * ClientHello..ServerHello 的 hash 去算会得到一套自洽但和服务器对不上的密钥
+ * （`std/net/tlskdf` 的 `Tls13.handshake` 就是这么算的，只适合自测，这里不
+ * 复用它的这一步）。
+ *
+ * 证书链：DER 交给 `std.data.x509` 解析，这里只做**结构校验**——有效期、
+ * 签发者/主题串成链、CN 与主机名匹配（支持 `*.` 单层通配）。**签名验证不在
+ * 这里做**：std 里没有 RSA/ECDSA 验签原语，硬写一套大数模幂既慢又容易出错。
+ * 需要真正验签的调用方传 `TlsVerifyFn` 回调，`TlsChain.verified` 只在回调对
+ * 每一环都点头之后才置 1。
+ */
+#include <string.h>
+
+module std.net.quictls;
+import std.core.types;
+import std.text.str;
+import std.encoding.sha256;
+import std.encoding.hkdf;
+import std.net.tlskdf;
+import std.encoding.aead;
+import std.data.x509;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3, VERSION = 4, CIPHER = 5,
+             KEYSHARE = 6, CERT = 7, FINISHED = 8, UNSUPPORTED = 9 };
+
+/* 握手消息类型（RFC 8446 §4） */
+#define TLS_HS_CLIENT_HELLO        1
+#define TLS_HS_SERVER_HELLO        2
+#define TLS_HS_NEW_SESSION_TICKET  4
+#define TLS_HS_END_OF_EARLY_DATA   5
+#define TLS_HS_ENCRYPTED_EXTENSIONS 8
+#define TLS_HS_CERTIFICATE         11
+#define TLS_HS_CERTIFICATE_REQUEST 13
+#define TLS_HS_CERTIFICATE_VERIFY  15
+#define TLS_HS_FINISHED            20
+#define TLS_HS_KEY_UPDATE          24
+
+/* 扩展类型 */
+#define TLS_EXT_SERVER_NAME        0x0000
+#define TLS_EXT_SUPPORTED_GROUPS   0x000a
+#define TLS_EXT_SIGNATURE_ALGOS    0x000d
+#define TLS_EXT_ALPN               0x0010
+#define TLS_EXT_SUPPORTED_VERSIONS 0x002b
+#define TLS_EXT_COOKIE             0x002c
+#define TLS_EXT_PSK_MODES          0x002d
+#define TLS_EXT_KEY_SHARE          0x0033
+#define TLS_EXT_QUIC_TP            0x0039
+#define TLS_EXT_EARLY_DATA         0x002a
+
+/* 组与签名算法 */
+#define TLS_GROUP_X25519           0x001d
+#define TLS_GROUP_SECP256R1        0x0017
+#define TLS_SIG_RSA_PSS_SHA256     0x0403
+#define TLS_SIG_RSA_PKCS1_SHA256   0x0401
+#define TLS_SIG_ECDSA_P256_SHA256  0x0503
+#define TLS_SIG_ED25519            0x0807
+
+/* 密码套件 */
+#define TLS13_AES_128_GCM_SHA256       0x1301
+#define TLS13_AES_256_GCM_SHA384       0x1302
+#define TLS13_CHACHA20_POLY1305_SHA256 0x1303
+#define TLS12_AES_128_GCM_SHA256       0x1301 - 0x0100
+
+#define TLS_RANDOM_LEN 32
+#define TLS_HASH_LEN   32
+#define TLS_MAX_CIPHERS 8
+#define TLS_MAX_CERTS  8
+
+/* HelloRetryRequest 的固定随机数（RFC 8446 §4.1.3） */
+static const u8 tls13_hrr_random[32] = {
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11,
+    0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e,
+    0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c
+};
+
+int tls13_is_hrr(const void *random32)
+{
+    if (!random32)
+        return 0;
+    return memcmp(random32, tls13_hrr_random, 32) == 0;
+}
+
+/* 套件 → QUIC 的 key 长度 / 哈希长度；不支持的给 0 */
+int tls13_suite_key_len(int suite)
+{
+    switch (suite) {
+    case TLS13_AES_128_GCM_SHA256: return 16;
+    case TLS13_CHACHA20_POLY1305_SHA256: return 32;
+    default: return 0;
+    }
+}
+
+int tls13_suite_hash_len(int suite)
+{
+    (void)suite;
+    switch (suite) {
+    case TLS13_AES_128_GCM_SHA256:
+    case TLS13_CHACHA20_POLY1305_SHA256: return 32;
+    default: return 0;
+    }
+}
+
+const char *tls13_suite_name(int suite)
+{
+    switch (suite) {
+    case TLS13_AES_128_GCM_SHA256: return "TLS_AES_128_GCM_SHA256";
+    case TLS13_AES_256_GCM_SHA384: return "TLS_AES_256_GCM_SHA384";
+    case TLS13_CHACHA20_POLY1305_SHA256: return "TLS_CHACHA20_POLY1305_SHA256";
+    default: return "unknown";
+    }
+}
+
+/* ---- 握手消息切分 ---- */
+
+struct TlsMsg {
+    int type;
+    int len;                    /* 消息体长度 */
+    int hdr;                    /* 4 */
+    int total;                  /* hdr + len */
+};
+
+struct TlsMsgs {
+    const u8 *buf;
+    int len;
+    int pos;
+};
+
+/* 1 完整 / 0 还不够 / -1 格式错（长度超过 2^24 之类） */
+int tls_msg_parse(const void *buf, int n, TlsMsg *m)
+{
+    const u8 *p = (const u8 *)buf;
+    int len = 0;
+
+    if (!p || !m || n < 0)
+        return -1;
+    memset(m, 0, sizeof *m);
+    if (n < 4)
+        return 0;
+    len = ((int)p[1] << 16) | ((int)p[2] << 8) | (int)p[3];
+    m->type = p[0];
+    m->len = len;
+    m->hdr = 4;
+    m->total = 4 + len;
+    if (n < m->total)
+        return 0;
+    return 1;
+}
+
+/* 写 4 字节消息头 + 消息体；返回总字节数。 */
+int tls_msg_put(void *out, int cap, int type, const void *body, int len)
+{
+    u8 *p = (u8 *)out;
+
+    if (!p || len < 0 || cap < 4 + len || (len > 0 && !body))
+        return -1;
+    if (len > 0xffffff)
+        return -1;
+    p[0] = (u8)type;
+    p[1] = (u8)((len >> 16) & 0xff);
+    p[2] = (u8)((len >> 8) & 0xff);
+    p[3] = (u8)(len & 0xff);
+    if (len > 0)
+        memcpy(p + 4, body, (size_t)len);
+    return 4 + len;
+}
+
+void init(TlsMsgs *r, const void *buf, int len)
+{
+    if (!r)
+        return;
+    r->buf = (const u8 *)buf;
+    r->len = len;
+    r->pos = 0;
+}
+
+/* 1 取到一条 / 0 没有了（或半条）/ -1 格式错 */
+int next(TlsMsgs *r, TlsMsg *m)
+{
+    int rc = 0;
+
+    if (!r || !m || r->pos >= r->len)
+        return 0;
+    rc = tls_msg_parse(r->buf + r->pos, r->len - r->pos, m);
+    if (rc != 1)
+        return 0;
+    r->pos += m->total;
+    return 1;
+}
+
+/* ---- ClientHello / ServerHello ---- */
+
+struct TlsHello {
+    int legacy_version;
+    u8 random[TLS_RANDOM_LEN];
+    u8 session_id[32];
+    int session_id_len;
+    int cipher_count;
+    int ciphers[TLS_MAX_CIPHERS];
+    int suite;                  /* ServerHello 选中的套件 */
+    int has_supported_versions;
+    int supported_version;
+    int has_keyshare;
+    int group;
+    u8 key_share[64];
+    int key_share_len;
+    char sni[256];
+    int has_sni;
+    char alpn[64];
+    int has_alpn;
+    int has_quic_tp;
+    int tp_off;                 /* 相对消息体的偏移 */
+    int tp_len;
+    int is_hrr;
+    int err;
+};
+
+struct TlsHelloCfg {
+    const u8 *random;           /* 32 字节；0 = 全零（测试用） */
+    const u8 *session_id;       /* 0 = 不发 */
+    int session_id_len;
+    const char *sni;            /* 0 = 不带 SNI */
+    const char *alpn;           /* 单个协议名，如 "h3"；0 = 不带 */
+    const u8 *key_share;        /* x25519 公钥 */
+    int key_share_len;
+    const u8 *quic_tp;          /* QUIC transport parameters（不透明） */
+    int quic_tp_len;
+    int ciphers[TLS_MAX_CIPHERS];
+    int cipher_count;
+};
+
+static int tls_put_u16(u8 *p, int v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; return 2; }
+static int tls_get_u16(const u8 *p) { return ((int)p[0] << 8) | (int)p[1]; }
+
+static int tls_put_ext(u8 *out, int cap, int type, const void *body,
+                        int blen)
+{
+    if (!out || blen < 0 || cap < 4 + blen || (blen > 0 && !body))
+        return -1;
+    tls_put_u16(out, type);
+    tls_put_u16(out + 2, blen);
+    if (blen > 0)
+        memcpy(out + 4, body, (size_t)blen);
+    return 4 + blen;
+}
+
+/* 构造 ClientHello（不含消息头），返回消息体长度。 */
+int tls_client_hello_body(const TlsHelloCfg *cfg, void *out, int cap)
+{
+    u8 *p = (u8 *)out;
+    u8 body[1024] = { 0 };
+    int n = 0;
+    int ext_off = 0;
+    int i = 0;
+
+    if (!p || !cfg || cap < 64)
+        return -1;
+    n += tls_put_u16(p + n, 0x0303);            /* legacy_version */
+    if (cfg->random) {
+        memcpy(p + n, cfg->random, TLS_RANDOM_LEN);
+    } else {
+        for (i = 0; i < TLS_RANDOM_LEN; i++)
+            p[n + i] = (u8)(i * 7 + 1);
+    }
+    n += TLS_RANDOM_LEN;
+    if (cfg->session_id_len < 0 || cfg->session_id_len > 32)
+        return -1;
+    p[n++] = (u8)cfg->session_id_len;
+    if (cfg->session_id_len > 0) {
+        if (!cfg->session_id)
+            return -1;
+        memcpy(p + n, cfg->session_id, (size_t)cfg->session_id_len);
+        n += cfg->session_id_len;
+    }
+    if (cfg->cipher_count <= 0 || cfg->cipher_count > TLS_MAX_CIPHERS)
+        return -1;
+    n += tls_put_u16(p + n, 2 * cfg->cipher_count);
+    for (i = 0; i < cfg->cipher_count; i++)
+        n += tls_put_u16(p + n, cfg->ciphers[i]);
+    p[n++] = 1;                                 /* compression_methods */
+    p[n++] = 0;
+    ext_off = n;
+    n += 2;                                     /* extensions 总长度占位 */
+
+#define PUT_EXT(type_, body_, blen_)                                        \
+    do {                                                                    \
+        int m = tls_put_ext(p + n, cap - n, (type_), (body_), (blen_));      \
+        if (m < 0)                                                          \
+            return -1;                                                      \
+        n += m;                                                             \
+    } while (0)
+
+    if (cfg->sni && cfg->sni[0]) {              /* server_name */
+        int nl = (int)strlen(cfg->sni);
+        int b = 0;
+
+        if (nl > 255 || nl + 5 > (int)sizeof body)
+            return -1;
+        b += tls_put_u16(body + b, 3 + nl);
+        body[b++] = 0;
+        b += tls_put_u16(body + b, nl);
+        memcpy(body + b, cfg->sni, (size_t)nl);
+        b += nl;
+        PUT_EXT(TLS_EXT_SERVER_NAME, body, b);
+    }
+    {                                           /* supported_groups */
+        int b = 0;
+
+        b += tls_put_u16(body + b, 2);
+        b += tls_put_u16(body + b, TLS_GROUP_X25519);
+        PUT_EXT(TLS_EXT_SUPPORTED_GROUPS, body, b);
+    }
+    {                                           /* signature_algorithms */
+        static const int sigs[] = {
+            TLS_SIG_RSA_PSS_SHA256, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_ED25519
+        };
+        int b = 0;
+
+        b += tls_put_u16(body + b, 2 * (int)(sizeof sigs / sizeof sigs[0]));
+        for (i = 0; i < (int)(sizeof sigs / sizeof sigs[0]); i++)
+            b += tls_put_u16(body + b, sigs[i]);
+        PUT_EXT(TLS_EXT_SIGNATURE_ALGOS, body, b);
+    }
+    {                                           /* supported_versions */
+        int b = 0;
+
+        body[b++] = 2;
+        b += tls_put_u16(body + b, 0x0304);
+        PUT_EXT(TLS_EXT_SUPPORTED_VERSIONS, body, b);
+    }
+    if (cfg->key_share && cfg->key_share_len > 0) {     /* key_share */
+        int b = 0;
+
+        b += tls_put_u16(body + b, 4 + cfg->key_share_len);
+        b += tls_put_u16(body + b, TLS_GROUP_X25519);
+        b += tls_put_u16(body + b, cfg->key_share_len);
+        memcpy(body + b, cfg->key_share, (size_t)cfg->key_share_len);
+        b += cfg->key_share_len;
+        PUT_EXT(TLS_EXT_KEY_SHARE, body, b);
+    }
+    if (cfg->alpn && cfg->alpn[0]) {            /* ALPN */
+        int al = (int)strlen(cfg->alpn);
+        int b = 0;
+
+        if (al > 255)
+            return -1;
+        b += tls_put_u16(body + b, 1 + al);
+        body[b++] = (u8)al;
+        memcpy(body + b, cfg->alpn, (size_t)al);
+        b += al;
+        PUT_EXT(TLS_EXT_ALPN, body, b);
+    }
+    {                                           /* psk_key_exchange_modes */
+        int b = 0;
+
+        body[b++] = 1;
+        body[b++] = 1;
+        PUT_EXT(TLS_EXT_PSK_MODES, body, b);
+    }
+    if (cfg->quic_tp && cfg->quic_tp_len > 0)   /* QUIC transport params */
+        PUT_EXT(TLS_EXT_QUIC_TP, cfg->quic_tp, cfg->quic_tp_len);
+#undef PUT_EXT
+
+    if (n - ext_off - 2 > 0xffff)
+        return -1;
+    tls_put_u16(p + ext_off, n - ext_off - 2);
+    return n;
+}
+
+/* 构造完整的 ClientHello 消息（含 4 字节头）。 */
+int tls_client_hello_build(const TlsHelloCfg *cfg, void *out, int cap)
+{
+    u8 body[2048] = { 0 };
+    int n = 0;
+
+    n = tls_client_hello_body(cfg, body, (int)sizeof body);
+    if (n < 0)
+        return -1;
+    return tls_msg_put(out, cap, TLS_HS_CLIENT_HELLO, body, n);
+}
+
+/* 解 ClientHello/ServerHello 的消息体。
+ *
+ * `from_server` 非零表示这是 ServerHello：两者的 key_share 结构不同——客户端
+ * 的扩展体前面多一个 client_shares 的 16 位长度，服务器只有一个条目。 */
+int tls_hello_parse(const void *buf, int n, TlsHello *h, int from_server)
+{
+    const u8 *p = (const u8 *)buf;
+    int pos = 0;
+    int ciphers_len = 0;
+    int i = 0;
+
+    if (!p || !h || n < 0)
+        return -1;
+    memset(h, 0, sizeof *h);
+    if (n < 2 + TLS_RANDOM_LEN + 1 + 2)
+        return -1;
+    h->legacy_version = tls_get_u16(p);
+    pos = 2;
+    memcpy(h->random, p + pos, TLS_RANDOM_LEN);
+    pos += TLS_RANDOM_LEN;
+    h->is_hrr = tls13_is_hrr(h->random);
+    /* session_id */
+    {
+        int sid = p[pos++];
+
+        if (sid > 32 || pos + sid > n)
+            return -1;
+        memcpy(h->session_id, p + pos, (size_t)sid);
+        h->session_id_len = sid;
+        pos += sid;
+    }
+    /* 服务器侧是单个 cipher_suite，客户端侧是 cipher_suites<2..> */
+    if (from_server) {
+        if (pos + 2 > n)
+            return -1;
+        h->ciphers[0] = tls_get_u16(p + pos);
+        h->cipher_count = 1;
+        h->suite = h->ciphers[0];
+        pos += 2;
+    } else {
+        ciphers_len = tls_get_u16(p + pos);
+        pos += 2;
+        if (ciphers_len == 0 || pos + ciphers_len > n)
+            return -1;
+        h->cipher_count = ciphers_len / 2;
+        if (h->cipher_count > TLS_MAX_CIPHERS)
+            h->cipher_count = TLS_MAX_CIPHERS;
+        for (i = 0; i < h->cipher_count; i++)
+            h->ciphers[i] = tls_get_u16(p + pos + i * 2);
+        h->suite = h->cipher_count > 0 ? h->ciphers[0] : 0;
+        pos += ciphers_len;
+    }
+    /* compression */
+    {
+        int clen = 0;
+
+        if (pos >= n)
+            return -1;
+        clen = p[pos++];
+        if (pos + clen > n)
+            return -1;
+        pos += clen;
+    }
+    /* extensions */
+    if (pos == n)
+        return 1;               /* 没有扩展也是合法的 */
+    {
+        int ext_total = tls_get_u16(p + pos);
+
+        pos += 2;
+        if (pos + ext_total > n)
+            return -1;
+        while (pos + 4 <= n && pos < 2 + TLS_RANDOM_LEN + 1 + 2 + 32
+               + ciphers_len + 1 + 2 + ext_total) {
+            int type = tls_get_u16(p + pos);
+            int len = tls_get_u16(p + pos + 2);
+            int body = pos + 4;
+
+            if (body + len > n)
+                return -1;
+            switch (type) {
+            case TLS_EXT_SERVER_NAME:
+                if (len >= 5) {
+                    int list_len = tls_get_u16(p + body);
+                    int nl = tls_get_u16(p + body + 3);
+
+                    if (list_len >= 3 && nl > 0 && nl < (int)sizeof h->sni
+                        && body + 5 + nl <= n) {
+                        memcpy(h->sni, p + body + 5, (size_t)nl);
+                        h->sni[nl] = 0;
+                        h->has_sni = 1;
+                    }
+                }
+                break;
+            case TLS_EXT_KEY_SHARE:
+                {
+                    int comp = from_server ? 0 : 2;   /* 客户端多一个列表长度 */
+                    int g = 0;
+                    int kl = 0;
+
+                    if (len >= 4 + comp) {
+                        g = tls_get_u16(p + body + comp);
+                        kl = tls_get_u16(p + body + comp + 2);
+                        if (kl > 0 && kl <= (int)sizeof h->key_share
+                            && body + comp + 4 + kl <= n) {
+                            h->group = g;
+                            memcpy(h->key_share, p + body + comp + 4,
+                                   (size_t)kl);
+                            h->key_share_len = kl;
+                            h->has_keyshare = 1;
+                        }
+                    }
+                }
+                break;
+            case TLS_EXT_SUPPORTED_VERSIONS:
+                if (from_server) {
+                    if (len == 2) {     /* ServerHello：选中的版本 */
+                        h->supported_version = tls_get_u16(p + body);
+                        h->has_supported_versions = 1;
+                    }
+                } else if (len >= 3) {  /* ClientHello：u8 长度 + 版本列表 */
+                    int list = p[body];
+
+                    if (list >= 2 && 1 + list <= len) {
+                        h->supported_version = tls_get_u16(p + body + 1);
+                        h->has_supported_versions = 1;
+                    }
+                }
+                break;
+            case TLS_EXT_ALPN:
+                if (len >= 3) {
+                    int alen = p[body + 2];
+
+                    if (alen > 0 && alen < (int)sizeof h->alpn
+                        && body + 3 + alen <= n) {
+                        memcpy(h->alpn, p + body + 3, (size_t)alen);
+                        h->alpn[alen] = 0;
+                        h->has_alpn = 1;
+                    }
+                }
+                break;
+            case TLS_EXT_QUIC_TP:
+                h->has_quic_tp = 1;
+                h->tp_off = body;
+                h->tp_len = len;
+                break;
+            default:
+                break;
+            }
+            pos = body + len;
+        }
+    }
+    return 1;
+}
+
+/* 从整条握手消息（含 4 字节头）直接解 Hello。 */
+int tls_hello_parse_msg(const void *buf, int n, TlsHello *h)
+{
+    TlsMsg m = { 0 };
+
+    if (tls_msg_parse(buf, n, &m) != 1)
+        return -1;
+    if (m.type != TLS_HS_CLIENT_HELLO && m.type != TLS_HS_SERVER_HELLO)
+        return -1;
+    return tls_hello_parse((const u8 *)buf + m.hdr, m.len, h,
+                          m.type == TLS_HS_SERVER_HELLO);
+}
+
+/* ---- 证书链 ---- */
+
+struct TlsCerts {
+    int count;
+    const u8 *der[TLS_MAX_CERTS];
+    int len[TLS_MAX_CERTS];
+};
+
+/* Certificate 消息体：context<1> + CertificateList<3> + 每项 <3>DER */
+int tls_certs_parse(const void *buf, int n, TlsCerts *c)
+{
+    const u8 *p = (const u8 *)buf;
+    int pos = 0;
+    int ctx = 0;
+    int list_len = 0;
+    int list_end = 0;
+
+    if (!p || !c || n < 4)
+        return -1;
+    memset(c, 0, sizeof *c);
+    ctx = p[pos++];
+    if (pos + ctx + 3 > n)
+        return -1;
+    pos += ctx;
+    list_len = ((int)p[pos] << 16) | ((int)p[pos + 1] << 8) | p[pos + 2];
+    pos += 3;
+    if (pos + list_len > n)
+        return -1;
+    list_end = pos + list_len;
+    while (pos + 3 <= list_end) {
+        int clen = ((int)p[pos] << 16) | ((int)p[pos + 1] << 8) | p[pos + 2];
+
+        pos += 3;
+        if (clen <= 0 || pos + clen > list_end)
+            return -1;
+        if (c->count < TLS_MAX_CERTS) {
+            c->der[c->count] = p + pos;
+            c->len[c->count] = clen;
+            c->count++;
+        }
+        pos += clen;
+    }
+    return c->count > 0 ? c->count : -1;
+}
+
+/* 证书里的签名算法 + 签名（CertificateVerify 消息体） */
+struct TlsCertVerify {
+    int scheme;
+    const u8 *sig;
+    int sig_len;
+};
+
+int tls_cert_verify_parse(const void *buf, int n, TlsCertVerify *v)
+{
+    const u8 *p = (const u8 *)buf;
+
+    if (!p || !v || n < 4)
+        return -1;
+    memset(v, 0, sizeof *v);
+    v->scheme = tls_get_u16(p);
+    v->sig_len = tls_get_u16(p + 2);
+    if (v->sig_len <= 0 || 4 + v->sig_len > n)
+        return -1;
+    v->sig = p + 4;
+    return 1;
+}
+
+/* 验签回调：返回 1 = 通过。`scheme` 是 TLS 签名算法号，`spki` 是签发者公钥。 */
+typedef int (*TlsVerifyFn)(const void *der, int len, const void *sig,
+                           int sig_len, int scheme, const void *spki,
+                           int spki_len, void *ctx);
+
+struct TlsChain {
+    int count;
+    X509Cert cert[TLS_MAX_CERTS];
+    int valid;                  /* 结构检查通过 */
+    int verified;               /* 验签回调全过 */
+    int err;
+};
+
+/* 主机名匹配：支持 `*.` 单层通配（RFC 6125 的常用子集）。 */
+int tls_host_match(const char *pattern, const char *host)
+{
+    int plen = 0;
+    int hlen = 0;
+
+    if (!pattern || !host)
+        return 0;
+    plen = (int)strlen(pattern);
+    hlen = (int)strlen(host);
+    if (plen == 0 || hlen == 0)
+        return 0;
+    if (plen == hlen && strcmp(pattern, host) == 0)
+        return 1;
+    if (plen > 2 && pattern[0] == '*' && pattern[1] == '.') {
+        const char *dot = 0;
+
+        /* 通配只吃一层：host 的第一个点之后必须正好等于 pattern+1 */
+        if (hlen <= plen - 1)
+            return 0;
+        dot = strchr(host, '.');
+        if (!dot)
+            return 0;
+        if ((int)strlen(dot + 1) != plen - 2)
+            return 0;
+        return strcmp(dot + 1, pattern + 2) == 0;
+    }
+    return 0;
+}
+
+/* 日期 → 秒（Howard Hinnant 的 days_from_civil，1970 起算）。 */
+static i64 tls_days_from_civil(int y, int m, int d)
+{
+    int era = 0;
+    int yoe = 0;
+    int doy = 0;
+    int doe = 0;
+
+    y -= m <= 2;
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (i64)era * 146097 + (i64)doe - 719468;
+}
+
+i64 tls_time_seconds(int year, int month, int day, int hour, int min,
+                     int sec)
+{
+    return tls_days_from_civil(year, month, day) * 86400
+           + (i64)hour * 3600 + (i64)min * 60 + (i64)sec;
+}
+
+/* 结构校验：链式签发、有效期、叶子 CN 匹配主机名。
+ *
+ * `now` 是 `tls_time_seconds(...)` 算出的秒。`fn` 可为 0；给了就对每一环调一次
+ * （叶子用第二张证书的公钥验、依次向上；最后一张自签证书用自身公钥验）。 */
+int tls_chain_check(TlsChain *out, const TlsCerts *certs, const char *host,
+                    i64 now, TlsVerifyFn fn, void *ctx)
+{
+    int i = 0;
+
+    if (!out || !certs || certs->count <= 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->count = certs->count;
+    for (i = 0; i < certs->count && i < TLS_MAX_CERTS; i++) {
+        out->cert[i] = x509_parse(certs->der[i], certs->len[i]);
+
+        if (!out->cert[i].valid) {
+            out->err = CERT;
+            return -1;
+        }
+        if (out->cert[i].not_before[0] == 0 || out->cert[i].not_after[0] == 0) {
+            out->err = CERT;
+            return -1;
+        }
+        if (now > 0) {
+            i64 nb = tls_time_seconds(out->cert[i].not_before[0],
+                                      out->cert[i].not_before[1],
+                                      out->cert[i].not_before[2],
+                                      out->cert[i].not_before[3],
+                                      out->cert[i].not_before[4],
+                                      out->cert[i].not_before[5]);
+            i64 na = tls_time_seconds(out->cert[i].not_after[0],
+                                      out->cert[i].not_after[1],
+                                      out->cert[i].not_after[2],
+                                      out->cert[i].not_after[3],
+                                      out->cert[i].not_after[4],
+                                      out->cert[i].not_after[5]);
+
+            if (now < nb || now > na) {
+                out->err = CERT;
+                return -1;
+            }
+        }
+        /* 上一张的签发者要等于这一张的主题 */
+        if (i > 0
+            && strcmp(out->cert[i - 1].issuer.common_name,
+                      out->cert[i].subject.common_name) != 0) {
+            out->err = CERT;
+            return -1;
+        }
+        /* 签名算法必须是我们认识的（验签另说） */
+        if (out->cert[i].sig_alg[0] == 0) {
+            out->err = CERT;
+            return -1;
+        }
+    }
+    if (host && host[0]) {
+        X509Name *leaf = &out->cert[0].subject;
+
+        if (!tls_host_match(leaf->common_name, host)) {
+            out->err = CERT;
+            return -1;
+        }
+    }
+    out->valid = 1;
+    if (!fn) {
+        out->err = UNSUPPORTED; /* 没有回调就等于没验签 */
+        return 1;
+    }
+    for (i = 0; i < certs->count; i++) {
+        const X509Cert *issuer = 0;
+        int rc = 0;
+
+        if (i + 1 < certs->count)
+            issuer = &out->cert[i + 1];
+        else
+            issuer = &out->cert[i];     /* 自签根 */
+        rc = fn(certs->der[i], certs->len[i], out->cert[i].sig,
+                out->cert[i].sig_len, out->cert[i].sig_alg[0] ? 0 : 0,
+                issuer->spki, issuer->spki_len, ctx);
+        if (rc != 1) {
+            out->err = CERT;
+            return -1;
+        }
+    }
+    out->verified = 1;
+    out->err = OK;
+    return 1;
+}
+
+/* ---- 密钥表 ---- */
+
+struct Tls13Secrets {
+    int cipher;
+    u8 early[32];
+    u8 handshake[32];
+    u8 master[32];
+    u8 c_hs[32];
+    u8 s_hs[32];
+    u8 c_ap[32];
+    u8 s_ap[32];
+    u8 exporter[32];
+    int have_hs;
+    int have_ap;
+};
+
+/* 握手阶段的 secret：early / handshake / c hs / s hs / master。
+ * `th` 是 ClientHello..ServerHello 的 transcript hash。 */
+int tls13_hs_secrets(Tls13Secrets *s, int cipher, const void *ecdhe,
+                     int ecdhe_len, const void *th, int th_len)
+{
+    u8 zero[32] = { 0 };
+    u8 empty_hash[32] = { 0 };
+    u8 derived[32] = { 0 };
+    u8 empty[1] = { 0 };
+
+    if (!s || !ecdhe || ecdhe_len <= 0 || !th || th_len != TLS_HASH_LEN)
+        return -1;
+    if (tls13_suite_hash_len(cipher) != 32)
+        return -1;
+    memset(s, 0, sizeof *s);
+    s->cipher = cipher;
+    if (hkdf_extract(0, 0, zero, (usize)sizeof zero, s->early) != 0)
+        return -1;
+    sha256(empty, 0, empty_hash);
+    if (derive_secret(s->early, (int)sizeof s->early, "derived", empty_hash,
+                      (int)sizeof empty_hash, derived) != 1)
+        return -1;
+    if (hkdf_extract(derived, (usize)sizeof derived, ecdhe,
+                     (usize)ecdhe_len, s->handshake) != 0)
+        return -1;
+    if (derive_secret(s->handshake, (int)sizeof s->handshake, "c hs traffic",
+                      th, th_len, s->c_hs) != 1)
+        return -1;
+    if (derive_secret(s->handshake, (int)sizeof s->handshake, "s hs traffic",
+                      th, th_len, s->s_hs) != 1)
+        return -1;
+    memset(derived, 0, sizeof derived);
+    if (derive_secret(s->handshake, (int)sizeof s->handshake, "derived",
+                      empty_hash, (int)sizeof empty_hash, derived) != 1)
+        return -1;
+    if (hkdf_extract(derived, (usize)sizeof derived, zero,
+                     (usize)sizeof zero, s->master) != 0)
+        return -1;
+    s->have_hs = 1;
+    return 1;
+}
+
+/* 应用阶段的 secret：c ap / s ap / exporter。
+ * `th` 必须是**服务器 Finished 之后**的 transcript hash。 */
+int tls13_app_secrets(Tls13Secrets *s, const void *th, int th_len)
+{
+    if (!s || !s->have_hs || !th || th_len != TLS_HASH_LEN)
+        return -1;
+    if (derive_secret(s->master, (int)sizeof s->master, "c ap traffic", th,
+                      th_len, s->c_ap) != 1)
+        return -1;
+    if (derive_secret(s->master, (int)sizeof s->master, "s ap traffic", th,
+                      th_len, s->s_ap) != 1)
+        return -1;
+    if (derive_secret(s->master, (int)sizeof s->master, "exp master", th,
+                      th_len, s->exporter) != 1)
+        return -1;
+    s->have_ap = 1;
+    return 1;
+}
+
+/* finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", 32) */
+int tls13_finished_key(const void *traffic_secret, void *out32)
+{
+    return expand_label("finished", traffic_secret, TLS_HASH_LEN, 0, 0, out32,
+                        TLS_HASH_LEN);
+}
+
+/* verify_data = HMAC(finished_key, transcript_hash) */
+int tls13_finished_verify(const void *traffic_secret, const void *th,
+                          int th_len, void *out32)
+{
+    u8 key[32] = { 0 };
+
+    if (!traffic_secret || !th || !out32 || th_len <= 0)
+        return -1;
+    if (tls13_finished_key(traffic_secret, key) != 1)
+        return -1;
+    hmac_sha256(key, sizeof key, th, (usize)th_len, (u8 *)out32);
+    return 1;
+}
+
+/* 一套 QUIC 方向的密钥（RFC 9001 §5.1 的三个标签）。 */
+struct QuicTlsKey {
+    int cipher;
+    int key_len;
+    u8 key[32];
+    u8 iv[12];
+    u8 hp[32];
+};
+
+int tls13_quic_key(QuicTlsKey *out, int cipher, const void *secret32)
+{
+    int klen = tls13_suite_key_len(cipher);
+
+    if (!out || !secret32 || klen == 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->cipher = cipher;
+    out->key_len = klen;
+    if (expand_label("quic key", secret32, TLS_HASH_LEN, 0, 0, out->key,
+                     klen) != 1)
+        return -1;
+    if (expand_label("quic iv", secret32, TLS_HASH_LEN, 0, 0, out->iv,
+                     TLS13_IV_LEN) != 1)
+        return -1;
+    if (expand_label("quic hp", secret32, TLS_HASH_LEN, 0, 0, out->hp,
+                     klen) != 1)
+        return -1;
+    return 1;
+}
+
+/* 由包号与 IV 组 nonce：iv xor 左补零的包号（RFC 9001 §5.3）。 */
+void tls13_quic_nonce(const void *iv12, u64 pn, void *out12)
+{
+    u8 *o = (u8 *)out12;
+    const u8 *iv = (const u8 *)iv12;
+    int i = 0;
+
+    if (!o || !iv)
+        return;
+    memcpy(o, iv, 12);
+    for (i = 0; i < 8; i++)
+        o[11 - i] ^= (u8)(pn >> (8 * i));
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 把十六进制串（忽略空白）解成字节；返回长度。 */
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+    int hi = -1;
+
+    for (; *s; s++) {
+        int v = 0;
+
+        if (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t')
+            continue;
+        v = hexval(*s);
+        if (v < 0)
+            return -1;
+        if (hi < 0) {
+            hi = v;
+            continue;
+        }
+        if (n >= cap)
+            return -1;
+        dst[n++] = (u8)((hi << 4) | v);
+        hi = -1;
+    }
+    return hi < 0 ? n : -1;
+}
+
+static int hex_eq(const u8 *d, int n, const char *want)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        int hi = hexval(want[i * 2]);
+        int lo = hexval(want[i * 2 + 1]);
+
+        if (hi < 0 || lo < 0 || d[i] != (u8)((hi << 4) | lo))
+            return 0;
+    }
+    return 1;
+}
+
+test "TLS 1.3：握手消息与 ClientHello 往返" {
+    u8 pub[32] = { 0 };
+    u8 msg[1024] = { 0 };
+    TlsHelloCfg cfg = { 0 };
+    TlsHello h = { 0 };
+    TlsMsg m = { 0 };
+    TlsMsgs r = { 0 };
+    int n = 0;
+    int i = 0;
+
+    for (i = 0; i < 32; i++)
+        pub[i] = (u8)(0x40 + i);
+    cfg.sni = "example.com";
+    cfg.alpn = "h3";
+    cfg.key_share = pub;
+    cfg.key_share_len = 32;
+    cfg.cipher_count = 2;
+    cfg.ciphers[0] = TLS13_AES_128_GCM_SHA256;
+    cfg.ciphers[1] = TLS13_CHACHA20_POLY1305_SHA256;
+    n = tls_client_hello_build(&cfg, msg, (int)sizeof msg);
+    if (n <= 4)
+        return err(1, "ClientHello 构造失败");
+    if (tls_msg_parse(msg, n, &m) != 1 || m.type != TLS_HS_CLIENT_HELLO
+        || m.total != n)
+        return err(2, "ClientHello 的消息头不对");
+    if (tls_hello_parse_msg(msg, n, &h) != 1)
+        return err(3, "ClientHello 解析失败");
+    if (!h.has_sni || strcmp(h.sni, "example.com") != 0)
+        return err(4, "SNI 往返不对");
+    if (!h.has_alpn || strcmp(h.alpn, "h3") != 0)
+        return err(5, "ALPN 往返不对");
+    if (!h.has_keyshare || h.group != TLS_GROUP_X25519
+        || h.key_share_len != 32 || memcmp(h.key_share, pub, 32) != 0)
+        return err(6, "key_share 往返不对");
+    if (!h.has_supported_versions || h.supported_version != 0x0304)
+        return err(7, "supported_versions 应为 TLS 1.3");
+    if (h.cipher_count != 2 || h.ciphers[0] != TLS13_AES_128_GCM_SHA256
+        || h.ciphers[1] != TLS13_CHACHA20_POLY1305_SHA256)
+        return err(8, "cipher_suites 往返不对");
+    /* 多条消息的切分：CH + Finished + 半条 SH */
+    {
+        u8 buf[1200] = { 0 };
+        int pos = 0;
+        u8 ver[32] = { 0 };
+        int got = 0;
+
+        memcpy(buf, msg, (size_t)n);
+        pos = n;
+        pos += tls_msg_put(buf + pos, (int)sizeof buf - pos, TLS_HS_FINISHED,
+                           ver, 32);
+        pos += tls_msg_put(buf + pos, (int)sizeof buf - pos,
+                           TLS_HS_SERVER_HELLO, ver, 32);
+        r.init(buf, pos - 10);  /* 最后一条故意切半 */
+        while (r.next(&m) == 1)
+            got++;
+        if (got != 2)
+            return err(9, "应只取出两条完整消息");
+    }
+    /* 不支持的套件与未知算法 */
+    if (tls13_suite_key_len(TLS13_AES_256_GCM_SHA384) != 0
+        || tls13_suite_hash_len(TLS13_AES_256_GCM_SHA384) != 0)
+        return err(10, "AES-256-GCM-SHA384 应判为不支持");
+    if (strcmp(tls13_suite_name(TLS13_AES_128_GCM_SHA256),
+               "TLS_AES_128_GCM_SHA256") != 0)
+        return err(11, "套件名字不对");
+    /* 没有 SNI/ALPN/key_share 的最小 CH 也能造出来 */
+    {
+        TlsHelloCfg c2 = { 0 };
+
+        c2.cipher_count = 1;
+        c2.ciphers[0] = TLS13_AES_128_GCM_SHA256;
+        n = tls_client_hello_build(&c2, msg, (int)sizeof msg);
+        if (n <= 4 || tls_hello_parse_msg(msg, n, &h) != 1
+            || h.has_sni || h.has_keyshare)
+            return err(12, "最小 ClientHello 往返不对");
+    }
+    /* QUIC transport parameters 要原样带出去 */
+    {
+        static const u8 tp[4] = { 0x01, 0x02, 0x03, 0x04 };
+        TlsHelloCfg c3 = { 0 };
+
+        c3.cipher_count = 1;
+        c3.ciphers[0] = TLS13_AES_128_GCM_SHA256;
+        c3.quic_tp = tp;
+        c3.quic_tp_len = 4;
+        n = tls_client_hello_build(&c3, msg, (int)sizeof msg);
+        if (n <= 4 || tls_hello_parse_msg(msg, n, &h) != 1 || !h.has_quic_tp
+            || h.tp_len != 4)
+            return err(13, "QUIC TP 扩展没带出去");
+    }
+}
+
+test "TLS 1.3：解析 RFC 8448 的真实握手消息" {
+    /* §3 的 ClientHello（196 字节）与 ServerHello（90 字节） */
+    static const char *ch_hex =
+        "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef62"
+        "83024dece7000006130113031302010000910000000b0009000006736572766572"
+        "ff01000100000a00140012001d0017001800190100010101020103010400230000"
+        "003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae"
+        "4d5413691e529aaf2c002b0003020304000d0020001e0403050306030203080408"
+        "05080604010501060102010402050206020202002d00020101001c00024001";
+    static const char *sh_hex =
+        "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac15577"
+        "2ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c6"
+        "72e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
+    u8 ch[256] = { 0 };
+    u8 sh[128] = { 0 };
+    TlsHello h = { 0 };
+    TlsMsg m = { 0 };
+    int chn = 0;
+    int shn = 0;
+
+    chn = unhex(ch_hex, ch, (int)sizeof ch);
+    shn = unhex(sh_hex, sh, (int)sizeof sh);
+    if (chn != 196 || shn != 90)
+        return err(1, "向量长度应是 196/90");
+    if (tls_msg_parse(ch, chn, &m) != 1 || m.type != TLS_HS_CLIENT_HELLO
+        || m.len != 192)
+        return err(2, "RFC 8448 的 ClientHello 消息头不对");
+    if (tls_hello_parse_msg(ch, chn, &h) != 1)
+        return err(3, "RFC 8448 的 ClientHello 解析失败");
+    if (!h.has_sni || strcmp(h.sni, "server") != 0)
+        return err(4, "SNI 应是 server");
+    if (h.cipher_count != 3 || h.ciphers[0] != 0x1301 || h.ciphers[1] != 0x1303
+        || h.ciphers[2] != 0x1302)
+        return err(5, "cipher_suites 应是 1301/1303/1302");
+    if (!h.has_keyshare || h.group != TLS_GROUP_X25519)
+        return err(6, "key_share 组应是 x25519");
+    if (!hex_eq(h.key_share, 32,
+                "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"))
+        return err(7, "key_share 公钥不对");
+    if (!h.has_supported_versions || h.supported_version != 0x0304)
+        return err(8, "supported_versions 应是 0304");
+    /* ServerHello */
+    if (tls_hello_parse_msg(sh, shn, &h) != 1)
+        return err(9, "RFC 8448 的 ServerHello 解析失败");
+    if (h.suite != 0x1301)
+        return err(10, "ServerHello 选的套件应是 1301");
+    if (!h.has_keyshare || h.group != TLS_GROUP_X25519
+        || h.key_share_len != 32)
+        return err(11, "ServerHello 的 key_share 不对");
+    if (!hex_eq(h.key_share, 32,
+                "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"))
+        return err(12, "ServerHello 的公钥不对");
+    if (h.is_hrr)
+        return err(13, "这不是 HelloRetryRequest");
+}
+
+test "TLS 1.3：密钥表（RFC 8448 §3 向量）" {
+    /* ECDHE 共享密钥、TH(ClientHello..ServerHello)、以及各阶段 secret */
+    u8 ecdhe[32] = { 0 };
+    u8 th[32] = { 0 };
+    Tls13Secrets s = { 0 };
+    u8 fin[32] = { 0 };
+
+    if (unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d",
+              ecdhe, 32) != 32)
+        return err(1, "共享密钥向量解析失败");
+    if (unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8",
+              th, 32) != 32)
+        return err(2, "transcript hash 向量解析失败");
+    if (tls13_hs_secrets(&s, TLS13_AES_128_GCM_SHA256, ecdhe, 32, th, 32) != 1)
+        return err(3, "握手密钥推导失败");
+    if (!hex_eq(s.early, 32,
+                "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"))
+        return err(4, "early secret 不对");
+    if (!hex_eq(s.handshake, 32,
+                "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"))
+        return err(5, "handshake secret 不对");
+    if (!hex_eq(s.c_hs, 32,
+                "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"))
+        return err(6, "client handshake traffic secret 不对");
+    if (!hex_eq(s.s_hs, 32,
+                "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"))
+        return err(7, "server handshake traffic secret 不对");
+    if (!hex_eq(s.master, 32,
+                "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"))
+        return err(8, "master secret 不对");
+    /* finished key = HKDF-Expand-Label(c_hs, "finished", "", 32) */
+    if (tls13_finished_key(s.c_hs, fin) != 1
+        || !hex_eq(fin, 32,
+                   "b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4"))
+        return err(9, "client finished key 不对");
+    /* 应用流量密钥要用服务器 Finished 之后的 hash，这里只验“拿到了值且不同” */
+    {
+        u8 th2[32] = { 0 };
+
+        memcpy(th2, th, 32);
+        th2[0] ^= 0xff;
+        if (tls13_app_secrets(&s, th2, 32) != 1)
+            return err(10, "应用密钥推导失败");
+        if (!s.have_ap || memcmp(s.c_ap, s.s_ap, 32) == 0)
+            return err(11, "客户端/服务器应用密钥应不同");
+    }
+    /* 参数检查 */
+    if (tls13_hs_secrets(&s, TLS13_AES_256_GCM_SHA384, ecdhe, 32, th, 32)
+        != -1)
+        return err(12, "SHA-384 套件应被拒");
+    if (tls13_hs_secrets(&s, TLS13_AES_128_GCM_SHA256, ecdhe, 32, th, 16)
+        != -1)
+        return err(13, "transcript hash 长度不是 32 应被拒");
+}
+
+test "TLS 1.3：QUIC 密钥派生（RFC 9001 A.5）与 nonce" {
+    u8 secret[32] = { 0 };
+    QuicTlsKey k = { 0 };
+    u8 nonce[12] = { 0 };
+
+    if (unhex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b",
+              secret, 32) != 32)
+        return err(1, "A.5 的 secret 解析失败");
+    if (tls13_quic_key(&k, TLS13_CHACHA20_POLY1305_SHA256, secret) != 1)
+        return err(2, "QUIC 密钥派生失败");
+    if (k.key_len != 32)
+        return err(3, "ChaCha20 的 key 应是 32 字节");
+    if (!hex_eq(k.key, 32,
+                "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8"))
+        return err(4, "A.5 的 key 不对");
+    if (!hex_eq(k.iv, 12, "e0459b3474bdd0e44a41c144"))
+        return err(5, "A.5 的 iv 不对");
+    if (!hex_eq(k.hp, 32,
+                "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"))
+        return err(6, "A.5 的 hp 不对");
+    /* AES-128-GCM 的 key/hp 是 16 字节 */
+    {
+        QuicTlsKey a = { 0 };
+
+        if (tls13_quic_key(&a, TLS13_AES_128_GCM_SHA256, secret) != 1
+            || a.key_len != 16)
+            return err(7, "AES-128-GCM 的 key 应是 16 字节");
+        /* iv 与套件无关（长度恒为 12），同一 secret 下两者相同是正常的 */
+        if (memcmp(a.iv, k.iv, 12) != 0)
+            return err(8, "同一 secret 下不同套件的 iv 应相同");
+    }
+    /* nonce = iv xor pn（A.5：pn = 654360564 → e0459b3474bdd0e46d417eb0） */
+    tls13_quic_nonce(k.iv, 654360564ull, nonce);
+    if (!hex_eq(nonce, 12, "e0459b3474bdd0e46d417eb0"))
+        return err(9, "A.5 的 nonce 不对");
+    {
+        u8 n0[12] = { 0 };
+
+        tls13_quic_nonce(k.iv, 0, n0);
+        if (memcmp(n0, k.iv, 12) != 0)
+            return err(10, "包号 0 的 nonce 应等于 iv");
+        tls13_quic_nonce(k.iv, 1, n0);
+        if (n0[11] != (u8)(k.iv[11] ^ 1))
+            return err(11, "包号 1 只应改 iv 的最后一字节");
+    }
+    if (tls13_quic_key(&k, TLS13_AES_256_GCM_SHA384, secret) != -1)
+        return err(12, "SHA-384 套件应被拒");
+}
+
+test "TLS 1.3：证书链结构校验（RFC 8448 的 rsa 证书）" {
+    /* RFC 8448 §3 的 Certificate 消息体（1 张自签 rsa 证书） */
+    static const char *cert_hex =
+        "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a86"
+        "4886f70d01010b0500300e310c300a06035504031303727361301e170d31363037"
+        "33303031323335395a170d3236303733303031323335395a300e310c300a060355"
+        "0403130372736130819f300d06092a864886f70d010101050003818d0030818902"
+        "818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461"
+        "eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80e"
+        "e0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8c"
+        "a9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f02"
+        "03010001a31a301830090603551d1304023000300b0603551d0f0404030205a030"
+        "0d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267"
+        "170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6"
+        "c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a"
+        "99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402d"
+        "cc0cc8f8961229ac9187b42b4de10000";
+    u8 buf[1024] = { 0 };
+    TlsCerts certs = { 0 };
+    TlsChain chain = { 0 };
+    int n = 0;
+    i64 now = tls_time_seconds(2019, 6, 1, 0, 0, 0);
+
+    n = unhex(cert_hex, buf, (int)sizeof buf);
+    if (n != 445)
+        return err(1, "证书向量应是 445 字节");
+    /* 跳过 4 字节消息头，只把消息体交给解析器 */
+    if (tls_certs_parse(buf + 4, n - 4, &certs) != 1)
+        return err(2, "Certificate 消息体解析失败");
+    if (certs.count != 1 || certs.len[0] != 432)
+        return err(3, "应解出 1 张 432 字节的证书");
+    if (tls_chain_check(&chain, &certs, "rsa", now, 0, 0) != 1)
+        return err(4, "证书链结构检查应通过");
+    if (!chain.valid || chain.verified)
+        return err(5, "没有回调时 verified 必须是 0");
+    if (chain.err != UNSUPPORTED)
+        return err(6, "没有回调时 err 应是 UNSUPPORTED");
+    if (strcmp(chain.cert[0].subject.common_name, "rsa") != 0)
+        return err(7, "证书的 CN 应是 rsa");
+    if (strcmp(chain.cert[0].issuer.common_name, "rsa") != 0)
+        return err(8, "自签证书的签发者应是 rsa");
+    /* 主机名不匹配要拒 */
+    if (tls_chain_check(&chain, &certs, "example.com", now, 0, 0) != -1
+        || chain.err != CERT)
+        return err(9, "主机名不匹配应拒绝");
+    /* 有效期之外要拒（证书到 2026-07-30） */
+    if (tls_chain_check(&chain, &certs, "rsa",
+                        tls_time_seconds(2030, 1, 1, 0, 0, 0), 0, 0) != -1)
+        return err(10, "过期证书应拒绝");
+    if (tls_chain_check(&chain, &certs, "rsa",
+                        tls_time_seconds(2010, 1, 1, 0, 0, 0), 0, 0) != -1)
+        return err(11, "未生效证书应拒绝");
+    /* 通配符匹配 */
+    if (!tls_host_match("*.example.com", "www.example.com")
+        || tls_host_match("*.example.com", "example.com")
+        || tls_host_match("*.example.com", "a.b.example.com")
+        || !tls_host_match("example.com", "example.com")
+        || tls_host_match("example.com", "www.example.com"))
+        return err(12, "通配符匹配规则不对");
+    /* 时间换算 sanity：1970-01-01 是 0 */
+    if (tls_time_seconds(1970, 1, 1, 0, 0, 0) != 0)
+        return err(13, "1970-01-01 应是 0 秒");
+    if (tls_time_seconds(2000, 1, 1, 0, 0, 0) != 946684800)
+        return err(14, "2000-01-01 应是 946684800 秒");
+}

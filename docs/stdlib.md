@@ -539,6 +539,7 @@
 | `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`cmake --build build --target std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
 | `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`cmake --build build --target std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
 | `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`cmake --build build --target std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
+| `examples/stdquic.c6` | （无模块） | 第九十二批（QUIC 与 HTTP/3）的拼装示例（`ctest --test-dir build -R '^std-quic$'`）：变长整数与帧、流与流控、一条 1-RTT 连接、一次 HTTP/3 GET、按 CID 分流共五节（72 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4937,6 +4938,187 @@ cmake --build build --target std-mgmt
 五节：Prometheus 构造/解析；Gemini 请求行与响应状态；SNMP Response（sysDescr +
 sysUpTime）构造与解析；NNTP 命令行、多行正文与去点双写；最后串成「健康检查 →
 输出 Prometheus 暴露格式」（53 条检查）。
+
+### 第九十二批：QUIC 与 HTTP/3（`quic` / `aead` / `hpack` / `qpack` / `h3` / `quichp` / `quictls` / `quicrecovery` / `quicstream` / `quicconn` / `h3conn` / `h3c` / `h3d` / `quicd`）
+
+十四个模块、九层，从「一个字节怎么解释」一路铺到「一条 GET 怎么拿到响应」。这一批
+破了两个惯例：一是「每批 4 个模块」（QUIC 全栈拆成 4 个就没法互相验证），二是
+`docs/stdlib-coverage.md` 里「QUIC 不做」的结论——原因也写在那篇里：这十四个模块
+**零第三方依赖、全部纯 c6**，最大的 `quictls` 也只用到 `std/encoding` 的
+sha256 / hkdf / aead。
+
+**`std/net/quic.c6`**——报文层（RFC 9000 §16/§17/§19）：
+
+```c
+u8 buf[256] = { 0 };
+quic_varint_put(buf, sizeof buf, 15293);      // 2 字节变长整数
+quic_varint_get(buf, 2, &v);                  // 读回来
+quic_varint_size(64);                         // 按值给长度：2
+quic_pn_expand(largest, truncated, 2);        // 包号展开（§17.1）
+
+Packet p = { 0 };
+p.parse(buf, n, dcid_len);                    // 长/短包头
+p.is_long() / p.packet_bytes() / p.version_at(buf, 0);
+
+HeaderBuilder b = { 0 };
+b.init(out, cap);
+b.long_header(QUIC_PACKET_INITIAL, 1, dcid, 8, scid, 8);
+b.token(tok, tok_len); b.length(1200); b.pn(2, 7); b.finish();
+
+Frame f = { 0 };
+f.parse(buf, n);                              // 帧头 + 负载偏移（相对帧首）
+f.is_stream() / f.type / f.stream_id / f.offset / f.data_len / f.fin;
+frame_put_stream(out, cap, 4, 1, 100, 1, "abc", 3, 1);   // id,has_off,off,has_len,data,n,fin
+
+AckIt it = { 0 };
+it.open(&f, buf, n);                          // ACK 区间游标
+while (it.next(&lo, &hi)) ...
+```
+
+**`std/encoding/aead.c6`**——AEAD 组合层（AES-128/256-GCM 与 ChaCha20-Poly1305），
+把「nonce 派生 + 加密 + 出 tag」压成一次调用：
+
+```c
+AeadKey k = { 0 };
+k.init(AEAD_AES_128_GCM, key, 16);
+k.seal(out, &n, nonce, nonce_len, aad, aad_len, pt, pt_len);
+k.open(pt, &pn, nonce, nonce_len, aad, aad_len, ct, ct_len);   // tag 不符返回负
+```
+
+**`std/net/hpack.c6` / `std/net/qpack.c6`**——HPACK（RFC 7541）与 QPACK（RFC 9204）：
+静态表（QPACK 99 项）、动态表（容量 + 逐出 + 阻塞计数）、霍夫曼编解码、前缀整数，
+以及 QPACK 的「编码器流指令 / 解码器流指令」：
+
+```c
+HpackTable t = { 0 }; t.init(cap);
+hpack_encode_literal(&t, out, cap, name, nlen, value, vlen, huffman);
+hpack_decode(&t, block, n, &it);              // 逐字段游标式取值
+
+QpackTable q = { 0 }; q.init(0);
+h3_request_encode(&q, out, cap, "GET", "https", "host", "/p", 0);  // 末参 = 霍夫曼
+h3_request_decode(&q, block, n, &req);
+qpack_encoder_ins(&q, buf, n, &ins);          // 对端编码器流上的指令
+```
+
+**`std/net/h3.c6`**——HTTP/3 语法层（RFC 9114）：帧（DATA/HEADERS/SETTINGS/GOAWAY/
+PUSH_PROMISE…）、SETTINGS 三元组、请求/响应的伪头、单向流类型：
+
+```c
+h3_frame_parse(buf, n, &fr);                  // type / len / hdr_len
+h3_settings_encode(&st, out, cap);            // st.present 的位选三项
+h3_status_encode(out, cap, &table, 200, 0);   // :status: 200
+h3_stream_type(buf, n, &used);                // 0x00 控制 / 0x02 QPACK 编码器 / 0x03 解码器
+```
+
+**`std/net/quichp.c6`**——头保护（RFC 9001 §5.4）：AES-ECB 或 ChaCha20 取 16 字节
+采样、算 5 字节掩码、只掩首字节低 4 位与包号：
+
+```c
+HpKey k = { 0 };
+k.init(HP_AES, key, key_len);                 // HP_AES / HP_CHACHA
+k.protect_at(pkt, n, pn_off, pn_len, &ok);    // 采样点是 pn_off + 4
+k.apply(sample16, first_byte, is_long, pn_bytes, pn_len);
+```
+
+**`std/net/quictls.c6`**——TLS 1.3 握手消息层与 QUIC 密钥表（RFC 8446 / 9001）：
+ClientHello / ServerHello / EncryptedExtensions / Certificate / CertificateVerify /
+Finished 的解析与构造、HelloRetryRequest 识别、密钥调度（early / handshake / master
+→ `quic key` / `quic iv` / `quic hp`），证书链交给 `std/data/x509`：
+
+```c
+tls_hello_parse(buf, n, &hello, 0);           // 末参：是不是服务器方向
+tls13_quic_key(cipher, secret, TLS13_STAGE_HANDSHAKE, keys);   // 成功返回 1
+tls13_handshake_secret(cipher, shared, transcript, out);
+```
+
+**`std/net/quicrecovery.c6`**——丢包恢复与拥塞控制（RFC 9002）：RTT 采样（扣 ACK
+delay）、平滑 RTT 与抖动、PTO（含退避）、按包号与时间双条件的丢包检测、NewReno：
+
+```c
+Recovery r = { 0 };
+r.init(/* max_datagram */ 1200);
+r.on_sent(pn, now, is_ack_eliciting) / r.on_ack(pn, now, ack_delay);
+r.on_lost(pn, now);                           // 拥塞事件（同一恢复期内只触发一次）
+r.pto_timeout() / r.can_send(bytes) / r.on_ack_eliciting_sent(now);
+```
+
+**`std/net/quicstream.c6`**——流状态机（RFC 9000 §2/§4）：编号、乱序与重叠补齐、
+final_size 一致性、收发缓冲（滑动窗口）、流级与连接级流控：
+
+```c
+QStreams all = { 0 };
+all.init(server);                             // 服务端视角
+all.set_max_streams(0, 8); all.set_recv_max_data(64 * 1024);
+all.on_data(id, off, data, n, fin);           // 对端数据（乱序/重叠都幂等）
+all.find(id)->read(buf, cap);                 // 读出已到齐的部分
+all.open(0);                                  // 本端开一条双向流
+all.take_data(&all, s, out, cap);             // 出队待发字节
+```
+
+**`std/net/quicconn.c6`**——一条 1-RTT 连接：包号、头保护（收发两侧）、帧分发、
+ACK 区间管理、CRYPTO 缓冲、流表：
+
+```c
+QConn c = { 0 };
+c.init(server, scid, len); c.set_dcid(dcid, len);
+c.set_keys(TLS13_AES_128_GCM_SHA256, rx_secret, tx_secret);
+c.on_packet(pkt, n, now);                     // 解保护 + 分发帧
+c.write_stream(0, "hi", 2); c.read_stream(0, buf, cap);
+c.flush(out, cap, now);                       // 攒一个包：ACK + 待发流数据
+c.ack_pending_of() / c.packets_rx_of() / c.next_pn_of();
+```
+
+**`std/net/h3conn.c6`**——HTTP/3 会话：开控制流与两条 QPACK 流、发 SETTINGS、
+`pump()` 抽数据、按流解帧、QPACK 解码、请求/响应/正文：
+
+```c
+H3Peer p = { 0 };
+p.init(&qc);                                  // 三条单向流（0x00/0x02/0x03）+ SETTINGS
+p.start_request("GET", "https", "host", "/"); // 返回请求流号
+p.send_response(id, 200); p.send_data(id, "ok", 2); p.finish_stream(id);
+p.pump();                                     // 抽数据 → 解帧（返回处理的流数）
+p.request_of() / p.response_of() / p.body / p.body_len / p.err_of();
+```
+
+**`std/net/h3c.c6` / `std/net/h3d.c6`**——客户端驱动与服务端路由表：
+
+```c
+H3Client c = { 0 };
+c.init(scid, 8); c.peer(dcid, 8, "example.com");
+c.keys(TLS13_AES_128_GCM_SHA256, rx, tx);
+c.get("/index.html");                         // 返回流号
+c.flush(out, cap, now) / c.feed(pkt, n, now) / c.poll();
+c.status_of() / c.body_of() / c.have_response();
+
+H3Server s = { 0 };
+s.init(scid, 8); s.peer(dcid, 8); s.keys(...);
+s.route("/health", 200, "ok");                // 同路径再登记 = 改内容
+s.feed(pkt, n, now); s.poll();                // 有请求就回（没命中回 404）
+s.flush(out, cap, now); s.last_path_of() / s.handled_of();
+```
+
+**`std/net/quicd.c6`**——一个 UDP 端口上的分流：短包头按已登记 CID 的前缀匹配，
+长包头读自带的 DCID 长度；`flush_all` 轮流刷所有连接：
+
+```c
+QuicDaemon d = { 0 };
+d.init(16); d.add(&conn_a); d.add(&conn_b);
+d.deliver(pkt, n, now);                       // 交给所属连接（不认识则丢）
+d.flush_all(sink, ctx, now);                  // sink(ctx, pkt, n)
+d.count_of() / d.find(cid, len) / d.dropped_of();
+```
+
+### 集成示例：`examples/stdquic.c6`
+
+```sh
+ctest --test-dir build -R '^std-quic$' --output-on-failure
+```
+
+五节正好是从下往上五层：变长整数与帧；流的乱序补齐与流控；一对 `QConn` 之间的
+一次 1-RTT 往返（写流 → 读流 → 挂 ACK → 收 ACK → 回写 → 读响应）；`H3Client` +
+`H3Server` 在内存里跑两次 GET（命中 `/health` 与 404）；`QuicDaemon` 按 CID 把两个
+数据报分给两条连接。全部流量都在进程内存里，不绑端口、不联外网，离线可跑
+（72 条检查）。
 
 ### 第九十一批：网段、字节序、排序键、断词（`cidr` / `endian` / `collate` / `hyphen`）
 

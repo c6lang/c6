@@ -1,0 +1,1507 @@
+/* std/net/qpack：QPACK 头部压缩（RFC 9204）——静态表、动态表、编码器/解码器
+ * 流指令、字段块前缀与五种字段行表示。
+ *
+ *     import std.net.qpack;
+ *
+ *     QpackTable t = { 0 };
+ *     t.init(4096);                       -- 对端给的 SETTINGS_QPACK_MAX_TABLE_CAPACITY
+ *     t.set_capacity(220);                -- 编码器流里的 Set Capacity 指令
+ *     t.insert(":authority", 10, "www.example.com", 15);
+ *
+ *     QpackPrefix p = { 0 };
+ *     t.qpack_prefix_decode(block, block_len, &p);
+ *     QpackField f = { 0 };
+ *     char name[256] = { 0 };
+ *     char value[4096] = { 0 };
+ *     int used = 0;
+ *     int rc = t.qpack_field_decode(&p, block + 2, block_len - 2, &f,
+ *                                 name, sizeof name, value, sizeof value, &used);
+ *
+ * QPACK 和 HPACK 的差别只有两条，但两条都很关键：**绝对索引**（动态表条目
+ * 一旦插入，索引就不再变化；HPACK 的索引会随着插入/逐出漂移）与**乱序**
+ * （头部块可以引用「还没收到」的动态表条目，这时流被阻塞，等编码器流补齐
+ * 再解）。所以这里把「表」和「字段块」分开：表由编码器流的指令驱动，字段块
+ * 只带着自己的 Required Insert Count / Base 来引用它。
+ *
+ * 解析口径：
+ *
+ * - 字段块前缀：Required Insert Count 用 8 位前缀，编码值是
+ *   `(req mod (2*MaxEntries)) + 1`（0 表示 0）；Delta Base 用 7 位前缀加符号
+ *   位，`S=0 → base = req + delta`、`S=1 → base = req - delta - 1`；
+ * - 五种字段行：索引（1 T Index(6+)）、名字引用（01 N T Index(4+)）、字面
+ *   名字（001 N H NameLen(3+)）、后基索引（0001 Index(4+)）、后基名字引用
+ *   （0000 N Index(3+)）；后基索引的绝对索引是 `base + index`，动态相对索引
+ *   是 `base - index - 1`；
+ * - 引用到 `abs >= insert_count` 的条目时整块**阻塞**（返回 -2），不是格式错；
+ * - 字符串沿用 HPACK 的格式（H 位 + 长度 + 负载），Huffman 码表也复用
+ *   `std.net.hpack`（RFC 9204 §4.1.2 明确说用 RFC 7541 附录 B）；
+ * - 编码器流：Set Capacity（001xxxxx，不得超过 SETTINGS 上限）、Insert with
+ *   Name Reference（1 T Index(6+)）、Insert with Literal Name（01 H
+ *   NameLen(5+)）、Duplicate（000 Index(5+)）；
+ * - 解码器流：Section Acknowledgment（1xxxxxxx）、Stream Cancellation
+ *   （01xxxxxx）、Insert Count Increment（00xxxxxx，0 是格式错）。
+ *
+ * 约定：
+ *
+ * - 动态表的绝对索引从 0 起算，最新一条是 `insert_count - 1`；逐出只发生在
+ *   最旧的一端；
+ * - `init(max_capacity)` 只记 SETTINGS 上限，**当前容量是 0**——要等对端在
+ *   编码器流里发 Set Capacity 才能用动态表（RFC 9204 §3.2.3）；
+ * - 单条超过当前容量按错误处理（解码器遇到就是 QPACK_ENCODER_STREAM_ERROR）；
+ * - 字段块解码要求**整块字节齐了**：不够返回 -1（不做「再等等」，因为 h3 的
+ *   HEADERS 帧自带长度，凑齐才进来）；
+ * - 解出来的名字/值复制进调用方缓冲（带 NUL），字段条目本身留在表里；
+ * - 零分配：动态表的存储是结构体里的固定 8 KiB arena，超了就压实。
+ */
+#include <string.h>
+
+module std.net.qpack;
+import std.core.types;
+import std.net.hpack;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3, HUFF = 4, TABLE = 5,
+             BLOCKED = 6 };
+
+/* 编码器流指令 */
+#define QPACK_INSTR_CAPACITY       1
+#define QPACK_INSTR_INSERT_REF     2
+#define QPACK_INSTR_INSERT_LITERAL 3
+#define QPACK_INSTR_DUPLICATE      4
+/* 解码器流指令 */
+#define QPACK_INSTR_SECTION_ACK    5
+#define QPACK_INSTR_STREAM_CANCEL  6
+#define QPACK_INSTR_INSERT_COUNT   7
+
+#define QPACK_ARENA        8192
+#define QPACK_MAX_ENTRIES  128
+#define QPACK_NAME_TMP     512
+
+#define QPACK_STATIC_N 99
+static const char *const qpack_sname[QPACK_STATIC_N] = {
+    ":authority",
+    ":path",
+    "age",
+    "content-disposition",
+    "content-length",
+    "cookie",
+    "date",
+    "etag",
+    "if-modified-since",
+    "if-none-match",
+    "last-modified",
+    "link",
+    "location",
+    "referer",
+    "set-cookie",
+    ":method",
+    ":method",
+    ":method",
+    ":method",
+    ":method",
+    ":method",
+    ":method",
+    ":scheme",
+    ":scheme",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    "accept",
+    "accept",
+    "accept-encoding",
+    "accept-ranges",
+    "access-control-allow-headers",
+    "access-control-allow-headers",
+    "access-control-allow-origin",
+    "cache-control",
+    "cache-control",
+    "cache-control",
+    "cache-control",
+    "cache-control",
+    "cache-control",
+    "content-encoding",
+    "content-encoding",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "content-type",
+    "range",
+    "strict-transport-security",
+    "strict-transport-security",
+    "strict-transport-security",
+    "vary",
+    "vary",
+    "x-content-type-options",
+    "x-xss-protection",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    "accept-language",
+    "access-control-allow-credentials",
+    "access-control-allow-credentials",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "access-control-allow-methods",
+    "access-control-allow-methods",
+    "access-control-expose-headers",
+    "access-control-request-headers",
+    "access-control-request-method",
+    "access-control-request-method",
+    "alt-svc",
+    "authorization",
+    "content-security-policy",
+    "early-data",
+    "expect-ct",
+    "forwarded",
+    "if-range",
+    "origin",
+    "purpose",
+    "server",
+    "timing-allow-origin",
+    "upgrade-insecure-requests",
+    "user-agent",
+    "x-forwarded-for",
+    "x-frame-options",
+    "x-frame-options",
+};
+static const char *const qpack_svalue[QPACK_STATIC_N] = {
+    "",
+    "/",
+    "0",
+    "",
+    "0",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "CONNECT",
+    "DELETE",
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "http",
+    "https",
+    "103",
+    "200",
+    "304",
+    "404",
+    "503",
+    "*/*",
+    "application/dns-",
+    "gzip, deflate, br",
+    "bytes",
+    "cache-control",
+    "content-type",
+    "*",
+    "max-age=0",
+    "max-age=2592000",
+    "max-age=604800",
+    "no-cache",
+    "no-store",
+    "public, max-",
+    "br",
+    "gzip",
+    "application/dns-",
+    "application/",
+    "application/json",
+    "application/x-www-",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "text/css",
+    "text/html;",
+    "text/plain",
+    "text/",
+    "bytes=0-",
+    "max-age=31536000",
+    "max-age=31536000;",
+    "max-age=31536000;",
+    "accept-encoding",
+    "origin",
+    "nosniff",
+    "1; mode=block",
+    "100",
+    "204",
+    "206",
+    "302",
+    "400",
+    "403",
+    "421",
+    "425",
+    "500",
+    "",
+    "FALSE",
+    "TRUE",
+    "*",
+    "get",
+    "get, post, options",
+    "options",
+    "content-length",
+    "content-type",
+    "get",
+    "post",
+    "clear",
+    "",
+    "script-src 'none';",
+    "1",
+    "",
+    "",
+    "",
+    "",
+    "prefetch",
+    "",
+    "*",
+    "1",
+    "",
+    "",
+    "deny",
+    "sameorigin",
+};
+
+/* ---- 静态表 ---- */
+
+int qpack_static_count(void) { return QPACK_STATIC_N; }
+
+const char *qpack_static_name(int idx)
+{
+    if (idx < 0 || idx >= QPACK_STATIC_N)
+        return 0;
+    return qpack_sname[idx];
+}
+
+const char *qpack_static_value(int idx)
+{
+    if (idx < 0 || idx >= QPACK_STATIC_N)
+        return 0;
+    return qpack_svalue[idx];
+}
+
+/* 在静态表里找；value 给 0 时只比名字。没有返回 -1。 */
+int qpack_static_find(const void *name, int nlen, const void *value, int vlen)
+{
+    int i = 0;
+
+    for (i = 0; i < QPACK_STATIC_N; i++) {
+        if ((int)strlen(qpack_sname[i]) != nlen
+            || (nlen > 0 && memcmp(qpack_sname[i], name, (size_t)nlen) != 0))
+            continue;
+        if (!value && vlen < 0)
+            return i;
+        if ((int)strlen(qpack_svalue[i]) == vlen
+            && (vlen == 0
+                || memcmp(qpack_svalue[i], value, (size_t)vlen) == 0))
+            return i;
+    }
+    return -1;
+}
+
+/* ---- 动态表 ---- */
+
+struct QpackEntry {
+    int noff;
+    int nlen;
+    int voff;
+    int vlen;
+    int size;
+};
+
+struct QpackTable {
+    int max_capacity;           /* SETTINGS_QPACK_MAX_TABLE_CAPACITY */
+    int capacity;               /* 当前容量（Set Capacity 指令设的） */
+    int size;                   /* 所有条目 size 之和 */
+    int insert_count;           /* 累计插入条数（绝对索引的基数） */
+    int dropped;                /* 已逐出的条数 */
+    int count;
+    int used;
+    u8 arena[QPACK_ARENA];
+    QpackEntry e[QPACK_MAX_ENTRIES];    /* e[0] 最新 */
+};
+
+void init(QpackTable *t, int max_capacity)
+{
+    if (!t)
+        return;
+    memset(t, 0, sizeof *t);
+    if (max_capacity < 0)
+        max_capacity = 0;
+    if (max_capacity > QPACK_ARENA)
+        max_capacity = QPACK_ARENA;
+    t->max_capacity = max_capacity;
+    t->capacity = 0;            /* RFC 9204 §3.2.3：初始容量为 0 */
+}
+
+int max_capacity_of(QpackTable *t) { return t ? t->max_capacity : -1; }
+int capacity_of(QpackTable *t) { return t ? t->capacity : -1; }
+int size_of(QpackTable *t) { return t ? t->size : -1; }
+int entries(QpackTable *t) { return t ? t->count : -1; }
+int inserts(QpackTable *t) { return t ? t->insert_count : -1; }
+int dropped_count(QpackTable *t) { return t ? t->dropped : -1; }
+
+void clear(QpackTable *t)
+{
+    if (!t)
+        return;
+    t->count = 0;
+    t->size = 0;
+    t->used = 0;
+}
+
+static void table_evict(QpackTable *t)
+{
+    if (!t || t->count <= 0)
+        return;
+    t->count--;
+    t->size -= t->e[t->count].size;
+    t->dropped++;
+}
+
+static int table_compact(QpackTable *t)
+{
+    int live = 0;
+    int start = 0;
+    int i = 0;
+
+    if (!t || t->count <= 0) {
+        if (t)
+            t->used = 0;
+        return 0;
+    }
+    start = t->e[t->count - 1].noff;
+    live = t->used - start;
+    if (start > 0 && live > 0)
+        memmove(t->arena, t->arena + start, (size_t)live);
+    for (i = 0; i < t->count; i++) {
+        t->e[i].noff -= start;
+        t->e[i].voff -= start;
+    }
+    t->used = live;
+    return live;
+}
+
+/* 设当前容量（编码器的 Set Capacity 指令）；超过 SETTINGS 上限返回 -1。 */
+int set_capacity(QpackTable *t, int capacity)
+{
+    if (!t || capacity < 0 || capacity > t->max_capacity)
+        return -1;
+    t->capacity = capacity;
+    while (t->count > 0 && t->size > t->capacity)
+        t->table_evict();
+    if (t->count == 0)
+        t->used = 0;
+    return 0;
+}
+
+/* 插入一条；返回新的绝对索引。容量放不下返回 -1。 */
+int insert(QpackTable *t, const void *name, int nlen, const void *value,
+           int vlen)
+{
+    int need = 0;
+    int i = 0;
+
+    if (!t || nlen < 0 || vlen < 0 || (nlen > 0 && !name)
+        || (vlen > 0 && !value))
+        return -1;
+    need = nlen + vlen + 32;
+    if (need > t->capacity || nlen + vlen + 2 > QPACK_ARENA)
+        return -1;
+    while (t->count > 0
+           && (t->size + need > t->capacity || t->count >= QPACK_MAX_ENTRIES))
+        t->table_evict();
+    if (t->used + nlen + vlen + 2 > QPACK_ARENA) {
+        t->table_compact();
+        if (t->used + nlen + vlen + 2 > QPACK_ARENA)
+            return -1;
+    }
+    for (i = t->count; i > 0; i--)
+        t->e[i] = t->e[i - 1];
+    t->e[0].noff = t->used;
+    t->e[0].nlen = nlen;
+    t->e[0].voff = t->used + nlen + 1;
+    t->e[0].vlen = vlen;
+    t->e[0].size = need;
+    if (nlen > 0)
+        memcpy(t->arena + t->used, name, (size_t)nlen);
+    t->arena[t->used + nlen] = 0;
+    if (vlen > 0)
+        memcpy(t->arena + t->used + nlen + 1, value, (size_t)vlen);
+    t->arena[t->used + nlen + 1 + vlen] = 0;
+    t->used += nlen + vlen + 2;
+    t->count++;
+    t->size += need;
+    t->insert_count++;
+    return t->insert_count - 1;
+}
+
+/* 按绝对索引取条目；还没插入（>= insert_count）或已逐出返回 0。 */
+int get_abs(QpackTable *t, int abs, const char **name, int *nlen,
+            const char **value, int *vlen)
+{
+    int rel = 0;
+
+    if (!t || abs < 0 || abs >= t->insert_count)
+        return 0;
+    rel = t->insert_count - 1 - abs;
+    if (rel >= t->count)
+        return 0;               /* 已经被逐出（dropped） */
+    *name = (const char *)(t->arena + t->e[rel].noff);
+    *nlen = t->e[rel].nlen;
+    *value = (const char *)(t->arena + t->e[rel].voff);
+    *vlen = t->e[rel].vlen;
+    return 1;
+}
+
+/* 相对索引（相对 insert_count）→ 绝对索引；越界给 -1。 */
+int abs_of_relative(QpackTable *t, int rel)
+{
+    int abs = 0;
+
+    if (!t || rel < 0)
+        return -1;
+    abs = t->insert_count - 1 - rel;
+    if (abs < 0)
+        return -1;
+    return abs;
+}
+
+/* 复制一条已有条目（Duplicate 指令）；返回新绝对索引。 */
+int duplicate(QpackTable *t, int rel)
+{
+    const char *nm = 0;
+    const char *vl = 0;
+    int nlen = 0;
+    int vlen = 0;
+    int abs = 0;
+    char tmp[QPACK_NAME_TMP] = { 0 };
+
+    abs = t->abs_of_relative(rel);
+    if (abs < 0 || t->get_abs(abs, &nm, &nlen, &vl, &vlen) != 1)
+        return -1;
+    if (nlen >= QPACK_NAME_TMP)
+        return -1;
+    if (nlen > 0)
+        memcpy(tmp, nm, (size_t)nlen);
+    return t->insert(tmp, nlen, vl, vlen);
+}
+
+/* ---- 字段块前缀（RFC 9204 §4.5.1） ---- */
+
+struct QpackPrefix {
+    int required_insert_count;
+    int base;
+    int used;
+};
+
+/* 前缀解码：1 成功 / -1 格式错 / -2 整块被阻塞（等编码器流）。 */
+int qpack_prefix_decode(QpackTable *t, const u8 *in, int n, QpackPrefix *p)
+{
+    u64 enc = 0;
+    u64 delta = 0;
+    int used = 0;
+    int max_entries = 0;
+    int req = 0;
+    int base = 0;
+
+    if (!t || !in || !p)
+        return -1;
+    memset(p, 0, sizeof *p);
+    used = hpack_int_decode(in, n, 8, &enc);
+    if (used < 0)
+        return -1;
+    max_entries = t->max_capacity / 32;
+    if (enc == 0) {
+        req = 0;
+    } else {
+        u64 full = (u64)(2 * max_entries);
+        u64 max_value = 0;
+        u64 max_wrapped = 0;
+
+        if (full == 0 || enc > full)
+            return -1;
+        max_value = (u64)(t->insert_count + max_entries);
+        max_wrapped = (max_value / full) * full;
+        req = (int)(max_wrapped + enc - 1);
+        if ((u64)req > max_value) {
+            if ((u64)req <= full)
+                return -1;
+            req -= (int)full;
+        }
+        if (req == 0)
+            return -1;
+    }
+    {
+        int dpos = used;
+        int n2 = hpack_int_decode(in + used, n - used, 7, &delta);
+
+        if (n2 < 0)
+            return -1;
+        used += n2;
+        if (in[dpos] & 0x80) {
+            if (req < (int)delta + 1)
+                return -1;
+            base = req - (int)delta - 1;
+        } else {
+            base = req + (int)delta;
+        }
+    }
+    p->required_insert_count = req;
+    p->base = base;
+    p->used = used;
+    if (req > t->insert_count)
+        return -2;              /* 阻塞：等这些插入到齐 */
+    return 1;
+}
+
+/* 前缀编码；req/base 由调用方给（base 是字段块里的相对索引基准）。 */
+int qpack_prefix_encode(QpackTable *t, int req, int base, u8 *out, int cap)
+{
+    u64 enc = 0;
+    int n = 0;
+    int m = 0;
+    int max_entries = 0;
+
+    if (!t || !out || req < 0 || base < 0)
+        return -1;
+    max_entries = t->max_capacity / 32;
+    if (req > 0) {
+        int full = 2 * max_entries;
+
+        if (full == 0)
+            return -1;
+        enc = (u64)(req % full) + 1;
+    }
+    n = hpack_int_encode(out, cap, 8, 0, enc);
+    if (n < 0)
+        return -1;
+    if (base >= req) {
+        m = hpack_int_encode(out + n, cap - n, 7, 0x00, (u64)(base - req));
+    } else {
+        m = hpack_int_encode(out + n, cap - n, 7, 0x80,
+                             (u64)(req - base - 1));
+    }
+    if (m < 0)
+        return -1;
+    return n + m;
+}
+
+/* ---- 字段行（RFC 9204 §4.5） ---- */
+
+struct QpackField {
+    int kind;                   /* QPACK_FIELD_* */
+    int dynamic;                /* 名字/值是否来自动态表 */
+    int abs_index;              /* 动态条目的绝对索引（-1 = 静态或字面量） */
+    int static_index;           /* 静态表索引（-1 = 不是静态引用） */
+    int post_base;              /* 用了后基索引 */
+    int name_len;
+    int value_len;
+    int huff_name;
+    int huff_value;
+};
+
+#define QPACK_FIELD_INDEXED      1
+#define QPACK_FIELD_NAME_REF     2
+#define QPACK_FIELD_LITERAL_NAME 3
+
+/* 解一条字段行：1 成功 / -1 格式错 / -2 引用的动态条目还没到。 */
+int qpack_field_decode(QpackTable *t, const QpackPrefix *p, const u8 *in, int n,
+                       QpackField *f, char *name, int ncap, char *value,
+                       int vcap, int *consumed)
+{
+    int b = 0;
+    int used = 0;
+    int vused = 0;
+    int got = 0;
+
+    if (!t || !p || !in || !f || !name || !value || !consumed || n < 1)
+        return -1;
+    memset(f, 0, sizeof *f);
+    f->abs_index = -1;
+    f->static_index = -1;
+    b = in[0];
+    if (b & 0x80) {             /* 1 T Index(6+)：索引字段行（名字和值都来自表） */
+        u64 idx = 0;
+        int is_static = (b >> 6) & 1;
+
+        used = hpack_int_decode(in, n, 6, &idx);
+        if (used < 0)
+            return -1;
+        if (is_static) {
+            if (idx >= (u64)QPACK_STATIC_N)
+                return -1;
+            f->static_index = (int)idx;
+            f->name_len = (int)strlen(qpack_sname[idx]);
+            f->value_len = (int)strlen(qpack_svalue[idx]);
+            if (f->name_len + 1 > ncap || f->value_len + 1 > vcap)
+                return -1;
+            memcpy(name, qpack_sname[idx], (size_t)f->name_len);
+            name[f->name_len] = 0;
+            memcpy(value, qpack_svalue[idx], (size_t)f->value_len);
+            value[f->value_len] = 0;
+        } else {
+            int abs = p->base - (int)idx - 1;
+            const char *nm = 0;
+            const char *vl = 0;
+            int nlen = 0;
+            int vlen = 0;
+
+            if (abs < 0)
+                return -1;
+            if (abs >= t->insert_count)
+                return -2;
+            if (t->get_abs(abs, &nm, &nlen, &vl, &vlen) != 1)
+                return -1;
+            if (nlen + 1 > ncap || vlen + 1 > vcap)
+                return -1;
+            memcpy(name, nm, (size_t)nlen);
+            name[nlen] = 0;
+            memcpy(value, vl, (size_t)vlen);
+            value[vlen] = 0;
+            f->dynamic = 1;
+            f->abs_index = abs;
+            f->name_len = nlen;
+            f->value_len = vlen;
+        }
+        f->kind = QPACK_FIELD_INDEXED;
+        *consumed = used;
+        return 1;
+    }
+    if ((b & 0xf0) == 0x10) {   /* 0001 Index(4+)：后基索引 */
+        u64 idx = 0;
+        int abs = 0;
+        const char *nm = 0;
+        const char *vl = 0;
+        int nlen = 0;
+        int vlen = 0;
+
+        used = hpack_int_decode(in, n, 4, &idx);
+        if (used < 0)
+            return -1;
+        abs = p->base + (int)idx;
+        if (abs >= t->insert_count)
+            return -2;
+        if (t->get_abs(abs, &nm, &nlen, &vl, &vlen) != 1)
+            return -1;
+        if (nlen + 1 > ncap || vlen + 1 > vcap)
+            return -1;
+        memcpy(name, nm, (size_t)nlen);
+        name[nlen] = 0;
+        memcpy(value, vl, (size_t)vlen);
+        value[vlen] = 0;
+        f->kind = QPACK_FIELD_INDEXED;
+        f->dynamic = 1;
+        f->post_base = 1;
+        f->abs_index = abs;
+        f->name_len = nlen;
+        f->value_len = vlen;
+        *consumed = used;
+        return 1;
+    }
+    if ((b & 0xc0) == 0x40 || (b & 0xf0) == 0x00) {
+        /* 01 N T Index(4+) 或 0000 N Index(3+)：名字引用 + 字面量值 */
+        int is_post = (b & 0xf0) == 0x00;
+        int prefix = is_post ? 3 : 4;
+        int is_static = is_post ? 0 : ((b >> 4) & 1);
+        u64 idx = 0;
+
+        used = hpack_int_decode(in, n, prefix, &idx);
+        if (used < 0)
+            return -1;
+        if (is_static) {
+            if (idx >= (u64)QPACK_STATIC_N)
+                return -1;
+            f->static_index = (int)idx;
+            f->name_len = (int)strlen(qpack_sname[idx]);
+            if (f->name_len + 1 > ncap)
+                return -1;
+            memcpy(name, qpack_sname[idx], (size_t)f->name_len);
+            name[f->name_len] = 0;
+        } else {
+            int abs = is_post ? p->base + (int)idx
+                              : p->base - (int)idx - 1;
+            const char *nm = 0;
+            const char *vl = 0;
+            int nlen = 0;
+            int vlen = 0;
+
+            if (abs < 0)
+                return -1;
+            if (abs >= t->insert_count)
+                return -2;
+            if (t->get_abs(abs, &nm, &nlen, &vl, &vlen) != 1)
+                return -1;
+            if (nlen + 1 > ncap)
+                return -1;
+            memcpy(name, nm, (size_t)nlen);
+            name[nlen] = 0;
+            f->dynamic = 1;
+            f->post_base = is_post;
+            f->abs_index = abs;
+            f->name_len = nlen;
+        }
+        if (n - used < 1)
+            return -1;
+        {
+            int huff = 0;
+            int off = 0;
+            int len = 0;
+
+            vused = hpack_str_view(in + used, n - used, &huff, &off, &len);
+            if (vused < 0)
+                return -1;
+            got = hpack_str_decode(in + used, n - used, value, vcap - 1,
+                                   &vused);
+            if (got < 0 || got + 1 > vcap)
+                return -1;
+            value[got] = 0;
+            f->value_len = got;
+            f->huff_value = huff;
+        }
+        f->kind = QPACK_FIELD_NAME_REF;
+        *consumed = used + vused;
+        return 1;
+    }
+    if ((b & 0xe0) == 0x20) {   /* 001 N H NameLen(3+)：字面量名字 */
+        int huff = (b >> 3) & 1;
+        u64 nlen_raw = 0;
+
+        used = hpack_int_decode(in, n, 3, &nlen_raw);
+        if (used < 0)
+            return -1;
+        if (nlen_raw > (u64)(n - used))
+            return -1;
+        if (huff) {
+            got = huff_decode(in + used, (int)nlen_raw, (u8 *)name, ncap - 1);
+            if (got < 0)
+                return -1;
+            name[got] = 0;
+            f->name_len = got;
+            f->huff_name = 1;
+        } else {
+            if ((int)nlen_raw + 1 > ncap)
+                return -1;
+            memcpy(name, in + used, (size_t)nlen_raw);
+            name[nlen_raw] = 0;
+            f->name_len = (int)nlen_raw;
+        }
+        used += (int)nlen_raw;
+        if (n - used < 1)
+            return -1;
+        {
+            int vhuff = 0;
+            int off = 0;
+            int len = 0;
+
+            vused = hpack_str_view(in + used, n - used, &vhuff, &off, &len);
+            if (vused < 0)
+                return -1;
+            got = hpack_str_decode(in + used, n - used, value, vcap - 1,
+                                   &vused);
+            if (got < 0 || got + 1 > vcap)
+                return -1;
+            value[got] = 0;
+            f->value_len = got;
+            f->huff_value = vhuff;
+        }
+        f->kind = QPACK_FIELD_LITERAL_NAME;
+        *consumed = used + vused;
+        return 1;
+    }
+    return -1;
+}
+
+/* 编码一条字段行：优先静态表完全匹配，其次静态名字 + 字面量值，最后字面量
+ * 名字。只产生「静态表/字面量」形式（不引用动态表），所以编码器不需要为
+ * 引用跟踪发愁；要动态表请自己拼 0x80/0x10 那两种形式。 */
+int qpack_field_encode(u8 *out, int cap, QpackTable *t, const void *name,
+                       int nlen, const void *value, int vlen, int huffman)
+{
+    int si = 0;
+    int n = 0;
+    int m = 0;
+    int rawlen = 0;
+
+    (void)t;
+    if (!out || nlen < 0 || vlen < 0 || (nlen > 0 && !name)
+        || (vlen > 0 && !value))
+        return -1;
+    si = qpack_static_find(name, nlen, value, vlen);
+    if (si >= 0)
+        return hpack_int_encode(out, cap, 6, 0xc0, (u64)si);
+    si = qpack_static_find(name, nlen, 0, -1);
+    if (si >= 0) {
+        n = hpack_int_encode(out, cap, 4, 0x50, (u64)si);
+        if (n < 0)
+            return -1;
+        m = hpack_str_encode(out + n, cap - n, value, vlen, huffman);
+        if (m < 0)
+            return -1;
+        return n + m;
+    }
+    rawlen = huffman ? huff_len(name, nlen) : nlen;
+    if (rawlen < 0)
+        return -1;
+    n = hpack_int_encode(out, cap, 3, 0x20 | (huffman ? 0x08 : 0),
+                         (u64)rawlen);
+    if (n < 0)
+        return -1;
+    if (rawlen > 0) {
+        if (huffman) {
+            if (huff_encode(name, nlen, out + n, cap - n) != rawlen)
+                return -1;
+        } else {
+            if (n + rawlen > cap)
+                return -1;
+            memcpy(out + n, name, (size_t)rawlen);
+        }
+    }
+    n += rawlen;
+    m = hpack_str_encode(out + n, cap - n, value, vlen, huffman);
+    if (m < 0)
+        return -1;
+    return n + m;
+}
+
+/* ---- 编码器流指令（RFC 9204 §4.3） ---- */
+
+struct QpackInstr {
+    int kind;
+    int index;                  /* 索引 / 流号 / 增量 / 容量 */
+    int is_static;
+    int new_abs;                /* 插入/复制后的绝对索引；-1 = 没插入 */
+    int used;
+};
+
+/* 解一条编码器流指令并作用到表上；返回吃掉的字节数，格式错 -1。 */
+int qpack_encoder_ins(QpackTable *t, const u8 *in, int n, QpackInstr *out)
+{
+    int b = 0;
+
+    if (!t || !in || !out || n < 1)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->new_abs = -1;
+    b = in[0];
+    if (b & 0x80) {             /* 1 T Index(6+)：带名字引用的插入 */
+        int is_static = (b >> 6) & 1;
+        u64 idx = 0;
+        int used = hpack_int_decode(in, n, 6, &idx);
+        int vused = 0;
+        int got = 0;
+        char value[4096] = { 0 };
+        char nm[QPACK_NAME_TMP] = { 0 };
+        int abs = 0;
+
+        if (used < 0)
+            return -1;
+        if (is_static) {
+            if (idx >= (u64)QPACK_STATIC_N)
+                return -1;
+            {
+                int nl = (int)strlen(qpack_sname[idx]);
+
+                if (nl >= QPACK_NAME_TMP)
+                    return -1;
+                memcpy(nm, qpack_sname[idx], (size_t)nl);
+                out->index = (int)idx;
+            }
+        } else {
+            const char *pn = 0;
+            const char *pv = 0;
+            int nl = 0;
+            int vl = 0;
+
+            abs = t->abs_of_relative((int)idx);
+            if (abs < 0 || t->get_abs(abs, &pn, &nl, &pv, &vl) != 1)
+                return -1;
+            if (nl >= QPACK_NAME_TMP)
+                return -1;
+            memcpy(nm, pn, (size_t)nl);
+            out->index = abs;
+        }
+        got = hpack_str_decode(in + used, n - used, value,
+                               (int)sizeof value - 1, &vused);
+        if (got < 0)
+            return -1;
+        out->kind = QPACK_INSTR_INSERT_REF;
+        out->is_static = is_static;
+        out->new_abs = t->insert(nm, (int)strlen(nm), value, got);
+        if (out->new_abs < 0)
+            return -1;
+        out->used = used + vused;
+        return out->used;
+    }
+    if ((b & 0xc0) == 0x40) {   /* 01 H NameLen(5+)：字面量名字的插入 */
+        int huff = (b >> 5) & 1;
+        u64 nlen_raw = 0;
+        int used = hpack_int_decode(in, n, 5, &nlen_raw);
+        char nm[QPACK_NAME_TMP] = { 0 };
+        int nl = 0;
+        int vused = 0;
+        int got = 0;
+        char value[4096] = { 0 };
+
+        if (used < 0 || nlen_raw > (u64)(n - used))
+            return -1;
+        if (huff) {
+            nl = huff_decode(in + used, (int)nlen_raw, (u8 *)nm,
+                             QPACK_NAME_TMP - 1);
+            if (nl < 0)
+                return -1;
+        } else {
+            if (nlen_raw >= QPACK_NAME_TMP)
+                return -1;
+            memcpy(nm, in + used, (size_t)nlen_raw);
+            nl = (int)nlen_raw;
+        }
+        used += (int)nlen_raw;
+        got = hpack_str_decode(in + used, n - used, value,
+                               (int)sizeof value - 1, &vused);
+        if (got < 0)
+            return -1;
+        out->kind = QPACK_INSTR_INSERT_LITERAL;
+        out->new_abs = t->insert(nm, nl, value, got);
+        if (out->new_abs < 0)
+            return -1;
+        out->used = used + vused;
+        return out->used;
+    }
+    if ((b & 0xe0) == 0x20) {   /* 001 Capacity(5+)：设当前容量 */
+        u64 cap = 0;
+        int used = hpack_int_decode(in, n, 5, &cap);
+
+        if (used < 0 || cap > (u64)t->max_capacity)
+            return -1;
+        if (t->set_capacity((int)cap) < 0)
+            return -1;
+        out->kind = QPACK_INSTR_CAPACITY;
+        out->index = (int)cap;
+        out->used = used;
+        return used;
+    }
+    {                           /* 000 Index(5+)：复制已有条目 */
+        u64 rel = 0;
+        int used = hpack_int_decode(in, n, 5, &rel);
+
+        if (used < 0)
+            return -1;
+        out->kind = QPACK_INSTR_DUPLICATE;
+        out->index = (int)rel;
+        out->new_abs = t->duplicate((int)rel);
+        if (out->new_abs < 0)
+            return -1;
+        out->used = used;
+        return used;
+    }
+}
+
+/* ---- 解码器流指令（RFC 9204 §4.4） ---- */
+
+/* 解一条解码器流指令；返回吃掉的字节数，格式错 -1。 */
+int qpack_decoder_ins(const u8 *in, int n, QpackInstr *out)
+{
+    u64 v = 0;
+    int used = 0;
+
+    if (!in || !out || n < 1)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->new_abs = -1;
+    if (in[0] & 0x80) {
+        used = hpack_int_decode(in, n, 7, &v);
+        if (used < 0)
+            return -1;
+        out->kind = QPACK_INSTR_SECTION_ACK;
+        out->index = (int)v;
+        out->used = used;
+        return used;
+    }
+    if ((in[0] & 0xc0) == 0x40) {
+        used = hpack_int_decode(in, n, 6, &v);
+        if (used < 0)
+            return -1;
+        out->kind = QPACK_INSTR_STREAM_CANCEL;
+        out->index = (int)v;
+        out->used = used;
+        return used;
+    }
+    used = hpack_int_decode(in, n, 6, &v);
+    if (used < 0 || v == 0)
+        return -1;              /* 增量 0 是格式错 */
+    out->kind = QPACK_INSTR_INSERT_COUNT;
+    out->index = (int)v;
+    out->used = used;
+    return used;
+}
+
+/* ---- 指令构造 ---- */
+
+int qpack_enc_set_capacity_(u8 *out, int cap, u64 capacity)
+{
+    return hpack_int_encode(out, cap, 5, 0x20, capacity);
+}
+
+int qpack_enc_insert_ref(u8 *out, int cap, int is_static, u64 index,
+                         const void *value, int vlen, int huffman)
+{
+    int n = hpack_int_encode(out, cap, 6, is_static ? 0xc0 : 0x80, index);
+    int m = 0;
+
+    if (n < 0)
+        return -1;
+    m = hpack_str_encode(out + n, cap - n, value, vlen, huffman);
+    if (m < 0)
+        return -1;
+    return n + m;
+}
+
+int qpack_enc_insert_literal(u8 *out, int cap, const void *name, int nlen,
+                             const void *value, int vlen, int huffman)
+{
+    int rawlen = huffman ? huff_len(name, nlen) : nlen;
+    int n = 0;
+    int m = 0;
+
+    if (rawlen < 0)
+        return -1;
+    n = hpack_int_encode(out, cap, 5, 0x40 | (huffman ? 0x20 : 0),
+                         (u64)rawlen);
+    if (n < 0)
+        return -1;
+    if (rawlen > 0) {
+        if (huffman) {
+            if (huff_encode(name, nlen, out + n, cap - n) != rawlen)
+                return -1;
+        } else {
+            if (n + rawlen > cap)
+                return -1;
+            memcpy(out + n, name, (size_t)rawlen);
+        }
+    }
+    n += rawlen;
+    m = hpack_str_encode(out + n, cap - n, value, vlen, huffman);
+    if (m < 0)
+        return -1;
+    return n + m;
+}
+
+int qpack_enc_duplicate(u8 *out, int cap, u64 rel)
+{
+    return hpack_int_encode(out, cap, 5, 0x00, rel);
+}
+
+int qpack_dec_section_ack(u8 *out, int cap, u64 stream_id)
+{
+    return hpack_int_encode(out, cap, 7, 0x80, stream_id);
+}
+
+int qpack_dec_stream_cancel(u8 *out, int cap, u64 stream_id)
+{
+    return hpack_int_encode(out, cap, 6, 0x40, stream_id);
+}
+
+int qpack_dec_insert_count_inc(u8 *out, int cap, u64 inc)
+{
+    if (inc == 0)
+        return -1;
+    return hpack_int_encode(out, cap, 6, 0x00, inc);
+}
+
+/* ---- 自测 ---- */
+
+test "QPACK：静态表与动态表" {
+    QpackTable t = { 0 };
+    const char *nm = 0;
+    const char *vl = 0;
+    int nlen = 0;
+    int vlen = 0;
+
+    if (qpack_static_count() != 99)
+        return err(1, "静态表应有 99 项");
+    if (strcmp(qpack_static_name(0), ":authority") != 0
+        || strcmp(qpack_static_value(0), "") != 0)
+        return err(2, "静态表第 0 项应是 :authority");
+    if (strcmp(qpack_static_name(1), ":path") != 0
+        || strcmp(qpack_static_value(1), "/") != 0)
+        return err(3, "静态表第 1 项应是 :path: /");
+    if (strcmp(qpack_static_name(17), ":method") != 0
+        || strcmp(qpack_static_value(17), "GET") != 0)
+        return err(4, "静态表第 17 项应是 :method: GET");
+    if (strcmp(qpack_static_name(98), "x-frame-options") != 0)
+        return err(5, "静态表第 98 项应是 x-frame-options");
+    if (qpack_static_name(99) != 0 || qpack_static_name(-1) != 0)
+        return err(6, "静态表越界应给空指针");
+    if (qpack_static_find(":method", 7, "GET", 3) != 17)
+        return err(7, "静态表查找 :method: GET 应得 17");
+    if (qpack_static_find(":method", 7, 0, -1) != 15)
+        return err(8, "只按名字查应得第一条 :method（15）");
+    if (qpack_static_find(":method", 7, "PUT", 3) != 21)
+        return err(9, ":method: PUT 应是 21");
+    if (qpack_static_find("x-nope", 6, 0, -1) != -1)
+        return err(10, "不存在时查名字应得 -1");
+    /* 动态表：初始容量是 0 */
+    t.init(4096);
+    if (t.max_capacity_of() != 4096 || t.capacity_of() != 0)
+        return err(11, "初始容量应为 0、上限 4096");
+    if (t.insert(":authority", 10, "www.example.com", 15) != -1)
+        return err(12, "容量 0 时插入应失败");
+    if (t.set_capacity(4096) != 0 || t.capacity_of() != 4096)
+        return err(13, "设容量失败");
+    if (t.insert(":authority", 10, "www.example.com", 15) != 0)
+        return err(14, "第一条的绝对索引应为 0");
+    if (t.inserts() != 1 || t.size_of() != 57 || t.entries() != 1)
+        return err(15, "插入后计数/大小不对");
+    if (t.get_abs(0, &nm, &nlen, &vl, &vlen) != 1 || nlen != 10
+        || strcmp(nm, ":authority") != 0 || vlen != 15
+        || strcmp(vl, "www.example.com") != 0)
+        return err(16, "按绝对索引取 0 不对");
+    if (t.get_abs(1, &nm, &nlen, &vl, &vlen) != 0)
+        return err(17, "还没插入的绝对索引应给 0");
+    if (t.abs_of_relative(0) != 0)
+        return err(18, "相对索引 0 应是绝对索引 0");
+    if (t.insert(":path", 5, "/sample/path", 12) != 1)
+        return err(19, "第二条的绝对索引应为 1");
+    if (t.size_of() != 106)
+        return err(20, "两条的大小应为 106");
+    if (t.abs_of_relative(1) != 0)
+        return err(21, "相对索引 1 应是绝对索引 0");
+    if (t.duplicate(0) != 2)
+        return err(22, "复制最新一条应得绝对索引 2");
+    if (t.size_of() != 155)
+        return err(23, "复制之后的大小应为 155");
+    /* 容量改小：从最旧的开始逐出 */
+    if (t.set_capacity(100) != 0)
+        return err(24, "改容量失败");
+    if (t.entries() != 2 || t.size_of() != 98)
+        return err(25, "容量 100 只应逐出最旧的 57 字节那条");
+    if (t.dropped_count() != 1)
+        return err(26, "应逐出 1 条");
+    if (t.insert(":path", 5, "/x", 2) != 3)
+        return err(27, "逐出后插入的绝对索引应继续递增");
+}
+
+test "QPACK：RFC 9204 附录 B 的完整示例" {
+    /* B.2：Set Capacity=220，两条带名字引用的插入 */
+    static const u8 enc1[3] = { 0x3f, 0xbd, 0x01 };
+    static const u8 ins1[17] = {
+        0xc0, 0x0f, 'w', 'w', 'w', '.', 'e', 'x', 'a', 'm',
+        'p', 'l', 'e', '.', 'c', 'o', 'm'
+    };
+    static const u8 ins2[14] = {
+        0xc1, 0x0c, '/', 's', 'a', 'm', 'p', 'l',
+        'e', '/', 'p', 'a', 't', 'h'
+    };
+    static const u8 sec1[4] = { 0x03, 0x81, 0x10, 0x11 };
+    static const u8 b3[20] = {
+        0x4a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0c,
+        'c', 'u', 's', 't', 'o', 'm', '-', 'v'
+    };
+    static const u8 b4[3] = { 0x02, 0x80, 0xc1 };
+    QpackTable t = { 0 };
+    QpackInstr ins = { 0 };
+    QpackPrefix p = { 0 };
+    QpackField f = { 0 };
+    char name[256] = { 0 };
+    char value[512] = { 0 };
+    int used = 0;
+    int rc = 0;
+
+    t.init(4096);
+    rc = t.qpack_encoder_ins(enc1, 3, &ins);
+    if (rc != 3 || ins.kind != QPACK_INSTR_CAPACITY || ins.index != 220)
+        return err(1, "Set Capacity 220 解错");
+    if (t.capacity_of() != 220)
+        return err(2, "容量应为 220");
+    rc = t.qpack_encoder_ins(ins1, 17, &ins);
+    if (rc != 17 || ins.kind != QPACK_INSTR_INSERT_REF || ins.new_abs != 0)
+        return err(3, ":authority 插入解错");
+    rc = t.qpack_encoder_ins(ins2, 14, &ins);
+    if (rc != 14 || ins.new_abs != 1)
+        return err(4, ":path 插入解错");
+    if (t.size_of() != 106 || t.inserts() != 2)
+        return err(5, "两条插入后的大小/计数不对");
+    /* 字段块：req=2、base=0，两条后基索引 */
+    if (t.qpack_prefix_decode(sec1, 2, &p) != 1)
+        return err(6, "前缀解码失败");
+    if (p.required_insert_count != 2 || p.base != 0 || p.used != 2)
+        return err(7, "前缀应为 req=2、base=0");
+    rc = t.qpack_field_decode(&p, sec1 + 2, 1, &f, name, (int)sizeof name,
+                            value, (int)sizeof value, &used);
+    if (rc != 1 || f.abs_index != 0 || !f.post_base
+        || strcmp(name, ":authority") != 0
+        || strcmp(value, "www.example.com") != 0)
+        return err(8, "第一条后基索引字段不对");
+    rc = t.qpack_field_decode(&p, sec1 + 3, 1, &f, name, (int)sizeof name,
+                            value, (int)sizeof value, &used);
+    if (rc != 1 || f.abs_index != 1 || strcmp(name, ":path") != 0
+        || strcmp(value, "/sample/path") != 0)
+        return err(9, "第二条后基索引字段不对");
+    /* 解码器流：Section Acknowledgment(stream=4) */
+    {
+        static const u8 ack[1] = { 0x84 };
+
+        rc = qpack_decoder_ins(ack, 1, &ins);
+        if (rc != 1 || ins.kind != QPACK_INSTR_SECTION_ACK || ins.index != 4)
+            return err(10, "Section Acknowledgment 解错");
+    }
+    /* B.3：字面量名字的插入（custom-key: custom-value） */
+    {
+        static const u8 lit[24] = {
+            0x4a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0c,
+            'c', 'u', 's', 't', 'o', 'm', '-', 'v', 'a', 'l', 'u', 'e'
+        };
+
+        rc = t.qpack_encoder_ins(lit, 24, &ins);
+        if (rc != 24 || ins.kind != QPACK_INSTR_INSERT_LITERAL
+            || ins.new_abs != 2)
+            return err(11, "字面量名字插入解错");
+    }
+    if (t.size_of() != 160 || t.inserts() != 3)
+        return err(12, "三条插入后的大小应为 160");
+    /* B.4：Duplicate(相对 2) → 绝对 0 的副本 */
+    {
+        static const u8 dup[1] = { 0x02 };
+
+        rc = t.qpack_encoder_ins(dup, 1, &ins);
+        if (rc != 1 || ins.kind != QPACK_INSTR_DUPLICATE
+            || ins.new_abs != 3)
+            return err(13, "Duplicate 应产生绝对索引 3");
+    }
+    if (t.size_of() != 217 || t.inserts() != 4)
+        return err(14, "复制之后的大小应为 217");
+    /* 字段块 req=4、base=4，混合动态相对索引与静态索引 */
+    {
+        static const u8 sec2[7] = { 0x05, 0x00, 0x80, 0xc1, 0x81, 0x00, 0x00 };
+
+        if (t.qpack_prefix_decode(sec2, 2, &p) != 1)
+            return err(15, "第二个字段块前缀失败");
+        if (p.required_insert_count != 4 || p.base != 4)
+            return err(16, "前缀应为 req=4、base=4");
+        rc = t.qpack_field_decode(&p, sec2 + 2, 1, &f, name, (int)sizeof name,
+                                value, (int)sizeof value, &used);
+        if (rc != 1 || f.abs_index != 3 || strcmp(name, ":authority") != 0
+            || strcmp(value, "www.example.com") != 0)
+            return err(17, "绝对索引 3 的字段不对");
+        rc = t.qpack_field_decode(&p, sec2 + 3, 1, &f, name, (int)sizeof name,
+                                value, (int)sizeof value, &used);
+        if (rc != 1 || f.static_index != 1 || strcmp(name, ":path") != 0
+            || strcmp(value, "/") != 0)
+            return err(18, "静态索引 1 的字段不对");
+        rc = t.qpack_field_decode(&p, sec2 + 4, 1, &f, name, (int)sizeof name,
+                                value, (int)sizeof value, &used);
+        if (rc != 1 || f.abs_index != 2 || strcmp(name, "custom-key") != 0
+            || strcmp(value, "custom-value") != 0)
+            return err(19, "绝对索引 2 的字段不对");
+    }
+    /* 解码器流：Stream Cancellation(stream=8) 与 Insert Count Increment */
+    {
+        static const u8 cancel[1] = { 0x48 };
+        static const u8 inc[1] = { 0x01 };
+
+        rc = qpack_decoder_ins(cancel, 1, &ins);
+        if (rc != 1 || ins.kind != QPACK_INSTR_STREAM_CANCEL || ins.index != 8)
+            return err(20, "Stream Cancellation 解错");
+        rc = qpack_decoder_ins(inc, 1, &ins);
+        if (rc != 1 || ins.kind != QPACK_INSTR_INSERT_COUNT || ins.index != 1)
+            return err(21, "Insert Count Increment 解错");
+        rc = qpack_decoder_ins(inc, 1, &ins);
+        if (rc != 1 || ins.index != 1)
+            return err(22, "增量 1 是合法值");
+    }
+    /* B.5：动态名字引用的插入（相对 1 → 绝对 2），并逐出最旧一条 */
+    {
+        static const u8 b5[15] = {
+            0x81, 0x0d, 'c', 'u', 's', 't', 'o', 'm', '-', 'v', 'a', 'l',
+            'u', 'e', '2'
+        };
+
+        rc = t.qpack_encoder_ins(b5, 15, &ins);
+        if (rc != 15 || ins.new_abs != 4)
+            return err(23, "B.5 的动态名字引用插入不对");
+        if (t.size_of() != 215 || t.inserts() != 5)
+            return err(24, "B.5 之后的表大小应为 215（逐出最旧的）");
+        if (t.dropped_count() != 1)
+            return err(25, "应逐出 1 条");
+    }
+}
+
+test "QPACK：前缀、字段行编码与阻塞" {
+    QpackTable t = { 0 };
+    QpackPrefix p = { 0 };
+    QpackField f = { 0 };
+    char name[128] = { 0 };
+    char value[256] = { 0 };
+    u8 out[128] = { 0 };
+    int used = 0;
+    int n = 0;
+    int rc = 0;
+
+    t.init(4096);
+    t.set_capacity(220);
+    /* 静态完全匹配：:path: / → 0xc0 */
+    n = qpack_field_encode(out, (int)sizeof out, &t, ":path", 5, "/", 1, 0);
+    if (n != 1 || out[0] != 0xc1)
+        return err(1, "静态完全匹配应给 0xc1");
+    /* 静态名字 + 字面量值：:path: /index.html */
+    n = qpack_field_encode(out, (int)sizeof out, &t, ":path", 5, "/index.html",
+                           11, 0);
+    if (n != 13 || out[0] != 0x51 || out[1] != 0x0b)
+        return err(2, "静态名字引用应以 0x51 0x0b 开头");
+    /* 前缀 req=0/base=0 */
+    used = t.qpack_prefix_encode(0, 0, out, (int)sizeof out);
+    if (used != 2 || out[0] != 0x00 || out[1] != 0x00)
+        return err(3, "req=0/base=0 的前缀应是 00 00");
+    if (t.qpack_prefix_decode(out, used, &p) != 1
+        || p.required_insert_count != 0 || p.base != 0)
+        return err(4, "前缀往返回读不对");
+    /* 字面量名字 + 值 */
+    n = qpack_field_encode(out, (int)sizeof out, &t, "x-test", 6, "hello", 5,
+                           0);
+    if (n <= 0 || (out[0] & 0xe0) != 0x20)
+        return err(5, "字面量名字应以 001 开头");
+    {
+        u8 block[64] = { 0 };
+        int blen = 0;
+
+        blen = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+        memcpy(block + blen, out, (size_t)n);
+        blen += n;
+        if (t.qpack_prefix_decode(block, blen, &p) != 1)
+            return err(6, "字面量块的前缀解码失败");
+        rc = t.qpack_field_decode(&p, block + p.used, blen - p.used, &f,
+                                name, (int)sizeof name, value,
+                                (int)sizeof value, &used);
+        if (rc != 1 || strcmp(name, "x-test") != 0 || strcmp(value, "hello") != 0)
+            return err(7, "字面量名字的往返不对");
+        if (used != blen - p.used)
+            return err(8, "字段行应正好吃掉剩余字节");
+    }
+    /* Huffman 值 */
+    n = qpack_field_encode(out, (int)sizeof out, &t, "x-huff", 6, "value", 5,
+                           1);
+    if (n <= 0)
+        return err(9, "Huffman 字面量编码失败");
+    {
+        u8 block[64] = { 0 };
+        int blen = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+
+        memcpy(block + blen, out, (size_t)n);
+        blen += n;
+        if (t.qpack_prefix_decode(block, blen, &p) != 1)
+            return err(10, "Huffman 块前缀解码失败");
+        rc = t.qpack_field_decode(&p, block + p.used, blen - p.used, &f,
+                                name, (int)sizeof name, value,
+                                (int)sizeof value, &used);
+        if (rc != 1 || f.name_len != 6 || !f.huff_value
+            || strcmp(value, "value") != 0)
+            return err(11, "Huffman 值的往返不对");
+    }
+    /* 阻塞：req 大于已插入条数 → -2；引用未来条目 → -2 */
+    {
+        u8 block[8] = { 0x00, 0x00, 0x80 };
+
+        t.set_capacity(220);
+        t.insert("a", 1, "b", 1);
+        t.insert("c", 1, "d", 1);
+        if (t.qpack_prefix_encode(3, 3, block, (int)sizeof block) != 2)
+            return err(12, "req=3 的前缀编码失败");
+        if (t.qpack_prefix_decode(block, 2, &p) != -2)
+            return err(13, "req 大于已插入条数应阻塞");
+    }
+    /* 字段行引用还没到的绝对索引 */
+    {
+        u8 block[8] = { 0x00, 0x00, 0x80 };
+        int blen = 0;
+
+        blen = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+        block[blen++] = 0x80;   /* T=0 相对索引 0 → base-1 */
+        if (t.qpack_prefix_decode(block, blen, &p) != 1)
+            return err(14, "前缀解码失败");
+        /* base = 0，相对索引 0 → abs = -1，是格式错 */
+        rc = t.qpack_field_decode(&p, block + p.used, blen - p.used, &f,
+                                name, (int)sizeof name, value,
+                                (int)sizeof value, &used);
+        if (rc != -1)
+            return err(15, "相对索引下溢应失败");
+    }
+    /* 解码器指令的增量 0 是格式错 */
+    {
+        u8 zero[1] = { 0x00 };
+        QpackInstr ins = { 0 };
+
+        if (qpack_decoder_ins(zero, 1, &ins) != -1)
+            return err(16, "增量 0 应失败");
+    }
+    /* Set Capacity 超过上限是格式错 */
+    {
+        u8 bad[8] = { 0 };
+        QpackInstr ins = { 0 };
+
+        n = qpack_enc_set_capacity_(bad, (int)sizeof bad, 9999);
+        if (n < 0)
+            return err(17, "容量指令编码失败");
+        if (t.qpack_encoder_ins(bad, n, &ins) != -1)
+            return err(18, "容量超过 SETTINGS 上限应失败");
+    }
+    /* 指令往返：插入 + 复制 */
+    {
+        u8 buf[128] = { 0 };
+        QpackInstr ins = { 0 };
+        int pos = 0;
+
+        t.init(4096);
+        t.set_capacity(1024);
+        pos = qpack_enc_insert_ref(buf, (int)sizeof buf, 1, 1, "abc", 3, 0);
+        if (pos <= 0 || t.qpack_encoder_ins(buf, pos, &ins) != pos
+            || ins.kind != QPACK_INSTR_INSERT_REF || ins.new_abs != 0)
+            return err(19, "带名字引用的插入往返不对");
+        pos = qpack_enc_duplicate(buf, (int)sizeof buf, 0);
+        if (pos != 1 || t.qpack_encoder_ins(buf, pos, &ins) != 1
+            || ins.kind != QPACK_INSTR_DUPLICATE || ins.new_abs != 1)
+            return err(20, "复制指令往返不对");
+        pos = qpack_enc_insert_literal(buf, (int)sizeof buf, "x-a", 3, "v", 1,
+                                       0);
+        if (pos <= 0 || t.qpack_encoder_ins(buf, pos, &ins) != pos
+            || ins.new_abs != 2)
+            return err(21, "字面量名字插入往返不对");
+    }
+    /* 解码器指令往返 */
+    {
+        u8 buf[16] = { 0 };
+        QpackInstr ins = { 0 };
+        int pos = 0;
+
+        pos = qpack_dec_section_ack(buf, (int)sizeof buf, 300);
+        if (pos <= 0 || qpack_decoder_ins(buf, pos, &ins) != pos
+            || ins.kind != QPACK_INSTR_SECTION_ACK || ins.index != 300)
+            return err(22, "Section Acknowledgment 往返不对");
+        pos = qpack_dec_stream_cancel(buf, (int)sizeof buf, 5);
+        if (pos <= 0 || qpack_decoder_ins(buf, pos, &ins) != pos
+            || ins.index != 5)
+            return err(23, "Stream Cancellation 往返不对");
+        pos = qpack_dec_insert_count_inc(buf, (int)sizeof buf, 7);
+        if (pos <= 0 || qpack_decoder_ins(buf, pos, &ins) != pos
+            || ins.kind != QPACK_INSTR_INSERT_COUNT || ins.index != 7)
+            return err(24, "Insert Count Increment 往返不对");
+    }
+}
