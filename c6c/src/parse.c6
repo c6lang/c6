@@ -1528,8 +1528,9 @@ static int agg_find_member(u32 ty, const char *name, u32 len)
         if (e->ty == ty) {
             for (i = 0; i < e->n; i++)
                 if (e->lens[i] == len && e->names[i] &&
-                    memcmp(e->names[i], name, len) == 0)
+                    memcmp(e->names[i], name, len) == 0) {
                     return (int)i;
+                }
             /* 同一个 type id 可能有多条名字表（布局相同、名字不同），继续找 */
         }
         j = e->next_same;
@@ -9401,6 +9402,7 @@ static u32 gen_postfix_ops(u32 v)
                 v = addr;
                 continue;
             }
+
             a2 = addr;
             if (off) {
                 a2 = irfn_vreg(&FN);
@@ -10473,10 +10475,20 @@ static u32 gen_postfix(void)
                         assign_ctx = 1;
                     if (PEND_LVAL && assign_ctx)
                         return rv;
-                    if (PEND_LVAL)
-                        rv = load_lval(rv, mty4);
-                    PEND_LVAL = 0;
-                    GEN_TY = mty4;
+                    if (PEND_LVAL) {
+                        /* 后缀链可能已经把类型走远了：裸 `d` 再接 `->head`
+                         * 之后该是 int，不是 `Deque@int *`。按链上留下的类型
+                         * 取值/回填，否则 `d->head + i` 会被当成指针加法算步长
+                         * （24 = sizeof(Deque@int)），下标永远是 0；元素宽度也
+                         * 跟着从 4 变 8（std-tour 的 deque 迭代永远吐第一个元素
+                         * 就是这么来的）。 */
+                        u32 cty5 = PEND_TY;
+
+                        rv = load_lval(rv, cty5);
+                        PEND_LVAL = 0;
+                        GEN_TY = cty5;
+                        return rv;
+                    }
                     return rv;
                 }
             }
