@@ -8,7 +8,16 @@
  *     不进任何字符串表。
  */
 
-#define MAX_PARAMS 16
+/* 一个函数式宏最多收多少个**具名**参数（变参那个槽不算）。
+ *
+ * 原来写 16，而内核 include/linux/args.h 的 `__COUNT_ARGS(_0 … _15, _n, X...)`
+ * 是 **17** 个具名参数：第 17 个被 pp.c6 的 `if (m->nparams < MAX_PARAMS)`
+ * 静默丢掉，于是 `_n` 那个槽根本不存在。后果不是"报个参数太多"，而是要命
+ * 的连锁：`COUNT_ARGS(X...)` 展开成 `_n` 而不是 3，`CONCATENATE(GEN_BINARY_
+ * RMWcc_, _n)` 拼出 `GEN_BINARY_RMWcc__n`，arch/x86/include/asm/bitops.h 的
+ * 每个原子操作就都成了"未声明的标识符"。这类依靠几十个占位参数的计张宏在
+ * 内核里到处都是，留足余量。 */
+#define MAX_PARAMS 32
 #define MACRO_BUCKETS 4096
 
 typedef struct Hide {
@@ -405,12 +414,14 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
         if (b->kind == TK_PUNCT && b->len == 2 && memcmp(tok_data(b), "##", 2) == 0) {
             Tok rhs = {0};
             int got = 0;
+            int was_variadic = 0;
             i++;
             if (i >= m->nbody)
                 break;
             if (tok_is_param(m, &m->body[i], &pi)) {
                 u32 an = (pi < nargs) ? argn[pi] : 0;
                 Tok *ap = (pi < nargs) ? args[pi] : NULL;
+                was_variadic = m->variadic && pi == m->nparams;
                 if (an > 0) {
                     rhs = ap[0];
                     got = 1;
@@ -418,6 +429,40 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
             } else {
                 rhs = m->body[i];
                 got = 1;
+            }
+            if (was_variadic) {
+                /* `X ## __VA_ARGS__`：**不拼接**。GNU 的这个写法只有一个
+                 * 用处——变参为空时让 `##` 连同左边那个逗号一起消失（gcc
+                 * 文档的 "comma-swallow"）。有实参时它等价于普通的
+                 * `X __VA_ARGS__`，逐 token 展开。
+                 *
+                 * 这里必须和普通 `##` 分开：普通路径会把相邻两个 token 的
+                 * 文本粘起来，`,` 和 `42` 一粘就变成 `,42` 一个坏 token
+                 * （实测：修好零变参之后，`LOG("%d\n", 42)` 当场报
+                 * "这里要 ')'（当前是 ',42'）"）。 */
+                u32 an = (pi < nargs) ? argn[pi] : 0;
+                Tok *ap = (pi < nargs) ? args[pi] : NULL;
+                u32 k = 0;
+
+                if (an == 0) {
+                    /* 空变参：吃掉紧挨在 `##` 左边的逗号。只对变参形参
+                     * 生效——普通形参为空本就是语法错误，不该悄悄吞逗号。 */
+                    if (n > 0 && r[n - 1].kind == TK_PUNCT && r[n - 1].len == 1
+                        && tok_data(&r[n - 1])[0] == ',')
+                        n--;
+                    continue;
+                }
+                if (n + an + 2 > cap) {
+                    u32 ncap = cap * 2 + an + 8;
+                    Tok *nr = exp_alloc(ncap);
+
+                    memcpy(nr, r, (size_t)n * sizeof(Tok));
+                    r = nr;
+                    cap = ncap;
+                }
+                for (k = 0; k < an; k++)
+                    r[n++] = ap[k];
+                continue;
             }
             if (got) {
                 if (n > 0)
