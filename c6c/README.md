@@ -146,8 +146,9 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 * `extern int counter;` 在 `-c` 下**只是引用**（C99 6.9.2p2），不分配存储；
 * `-c` 不出 `_start`、不带运行时、不查 `main`，一次只编一个源文件。
 
-还没有的：c6c 自己的链接器（现在得借系统 `cc` 的）、`.bss`（零初始化数据也
-落在 `.data` 里）、weak / 可见性 / 段 GC、`-fPIC` 与 `-shared`。
+还没有的：`.bss`（零初始化数据也落在 `.data` 里）、weak / 可见性 / 段 GC。
+（`-fPIC` 收下即可——native 后端出来的代码本来就位置无关；`-shared` 见下面
+「共享库」那节。）
 回归：`cmake --build build --target objcheck`（单/多 TU 真编、真链、真跑 + readelf 结构核对）。
 
 ## 链接：`c6c -o prog a.o b.o`
@@ -182,7 +183,8 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
   恰好一个 `.o` 带 TLS 时，链接器会把它的 `__c6_tls_img/len/delta` 抄给
   其它 `.o`（构造函数在运行时那侧，它得知道有 TLS 块要建）；两个以上就
   如实报错。
-* 不做：`.a` 静态库、`-shared`/`-fPIC`、段 GC、符号版本、调试信息重定位。
+* 不做：`.a` 静态库、段 GC、符号版本、调试信息重定位（`-shared` 出共享库
+  在下一节）。
 
 回归：`cmake --build build --target ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
 重定位 / 构造函数顺序 / 跨 `.o` TLS / 缺符号报错 / `readelf` 结构核对）。
@@ -223,8 +225,8 @@ libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查�
   的缓冲区之类）拷进来仍是 0；纯函数的 libc 调用（`printf`/`getpid`/
   `malloc`/`strlen`……）不受影响。要用环境变量就自己读 `/proc/self/environ`
   或 `argv`（`rt.c6` 里就是这么干的）。
-* 不做 `-shared` / `-fPIC` 产物、符号版本（`.gnu.version`）、
-  `.rela.dyn` 里的 `R_X86_64_RELATIVE`（本程序是固定基址的 ET_EXEC）。
+* 不做符号版本（`.gnu.version`）；`.rela.dyn` 里的 `R_X86_64_RELATIVE` 留给
+  共享库（本程序是固定基址的 ET_EXEC，用不上）。
 * 默认仍是静态链接：动态是**显式**选项（`-Wl,--dynamic`），拼错的链接器
   选项会直接报错，不会被当成告警开关静默忽略。
 
@@ -232,6 +234,51 @@ libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查�
 自报导入个数、数据符号点名警告、产物真跑且 libc 返回值对、`readelf` 逐项核对
 ET_EXEC / 两个 `PT_LOAD` / `PT_INTERP` / `PT_DYNAMIC` / `DT_NEEDED` /
 `BIND_NOW` / JUMP_SLOT 条数、`ldd` 认得 libc、默认静态仍会对未定义符号报错）。
+
+## 共享库：`c6c -shared a.o -o liba.so`
+
+```sh
+./c6c/build/c6c -c lib.c6 -o lib.o
+./c6c/build/c6c -shared lib.o -o liba.so
+./c6c/build/c6c -shared -o libb.so b.o c.o     # 多个 .o 合成一个 .so
+```
+
+产物是 `ET_DYN`：
+
+* **基址 0**：`st_value` 和段地址都是段内偏移，加载基址由 ld.so 选
+  （所以同一个 `.so` 可以在不同进程里落到不同地址）；
+* **没有 `PT_INTERP`、没有入口**（`e_entry = 0`）：它不自己起进程，是被
+  `dlopen` 起来或者被别的产物链进去的；`_start` 那套合成代码也不生成；
+* `.dynsym` 里除了导入的函数，还**导出**这个库里定义的全局/弱符号
+  （函数 `T`、数据 `D`），`dlopen` + `dlsym` 就是查这张表；
+* 代码本来位置无关（全局地址走 `lea rip+rel32` + 重定位），所以数据里剩下的
+  绝对地址（字符串指针、初始化器、`.init_array` 里的函数指针）全进 `.rela.dyn`
+  当 `R_X86_64_RELATIVE`，ld.so 加载时统一加基址；
+* `DT_SONAME` 就是输出文件名（别的产物按这个名字记 `DT_NEEDED`），
+  `DT_INIT_ARRAY`/`DT_FINI_ARRAY` 让 `__attribute__((constructor))` 在
+  `dlopen` 那一刻就跑；
+* 末尾补一张**节头表**（`.text` / `.dynsym` / `.dynstr` / `.hash` /
+  `.rela.dyn` / `.dynamic` / `.shstrtab`……）：ld.so 不看它，但 GNU ld 把
+  `.so` 当**输入**时只认节头（没有就 `file in wrong format`），
+  `readelf --dyn-syms` / `nm -D` 也一样。
+
+口径与限制：
+
+* 输入**必须**是 `.o`（先 `-c` 再 `-shared`）：`-shared lib.c6` 会直接报错，
+  不猜；
+* 外部**数据**符号（`extern int optind;` 那种）如实拒绝——共享库里的外部数据
+  要走 GOT 间接寻址，这一版还没做（COPY 重定位只适合固定基址的可执行文件）；
+  外部**函数**没问题，走 PLT；
+* `-fPIC` / `-fpic` 收下不报错（native 后端本来就位置无关），不加 `-shared`
+  时同一个 `.o` 仍然出 `ET_EXEC`——共享库是**显式**选项；
+* 不做符号版本、`.a` 静态库、`-Wl,-soname=` 之类的别名控制。
+
+回归：`cmake --build build --target sharedcheck`（19 条：`ET_DYN` / 入口 0 /
+无 `PT_INTERP` / 程序头 4 个 / `DT_SONAME` / `DT_INIT_ARRAY` / `RELATIVE` /
+节头表齐全 / 导出符号 `T`+`D` / `dlopen`+`dlsym` 真调通且数据读写一致 /
+字符串指针经 `RELATIVE` 后指向正确 / 构造器在 `dlopen` 时跑 / `cc -L … -l`
+直接链也能跑 / 源文件与外部数据符号两条边界如实报错 / `-fPIC` 收下且默认
+仍是 `ET_EXEC`）。
 
 ## 汇编文本：`-S`
 
@@ -341,18 +388,31 @@ API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
 `c6_output_file`。库形态没有 `argv[0]` 可推，所以 `lib/rt.c6` 和自带
 `include/` 的绝对路径在编译期就塞进去（`C6_DEFAULT_RT` / `C6_DEFAULT_INC`）。
 
-**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 那套名字
-（`tcc_new` / `tcc_compile_string` / `tcc_relocate` / `tcc_run` /
-`tcc_get_symbol` / `tcc_output_file` / `tcc_set_options`），实现一一接到
-`c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库换掉就能编过、跑出
-一样的结果——这是"顶替 tcc 产品位"里最实的一步。
+**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 公开嵌入头里的一整套
+名字，实现一一接到 `c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库
+换掉就能编过；能做的照旧跑，做不到的当场返回失败并说明原因（不留"设上了但
+没生效"的坑）。这是"顶替 tcc 产品位"里最实的一步。
 
-口径与限制：一个 `C6State` 只能编一次（第二次如实拒绝，不做静默错结果）；
-`tcc_set_error_func` 收了回调但诊断仍走 stderr；`tcc_add_file` 只收
+* 真实现：`tcc_new` / `tcc_delete` / `tcc_set_options` /
+  `tcc_add_include_path` / `tcc_add_sysinclude_path`（等价 `-I`，c6c 不区分
+  系统头）/ `tcc_define_symbol` / `tcc_undefine_symbol` /
+  `tcc_compile_string` / `tcc_add_file` / `tcc_relocate`（一参数与老的
+  `(s, TCC_RELOCATE_AUTO)` 两种写法都收）/ `tcc_get_symbol` / `tcc_run` /
+  `tcc_output_file` / `tcc_list_symbols`（列镜像里的符号与 VA）/
+  `tcc_set_error_func`（诊断整行交给回调，不再打 stderr）/ `tcc_set_lib_path`
+  （认 `<dir>/lib/rt.c6` 与 `<dir>/rt.c6`）。
+* 收了但不动：`tcc_set_realloc`（arena 不可换）、`tcc_set_backtrace_func`
+  （没有 `-b` 的运行期）。
+* 如实拒绝（返回 -1 + 原因）：`tcc_add_library_path` / `tcc_add_library`
+  （链接器没有 `-L`/`-l`）、`tcc_add_symbol`（宿主地址注入要 JIT 重定位）。
+
+口径与限制：**一个进程只能编一次**（前端/后端/符号表都是文件级全局量，重置
+那套还没做，换 state 也不行，见 `c6c/docs/todo.md`）；`tcc_add_file` 只收
 `.c6`/`.c` 源文件，不收 `.o`/`.a`；`tcc_set_options` 只认 `-I`/`-D`/`-U`。
 
-回归：`cmake --build build --target embedcheck`（6 条：动态库 / 静态库 / 落盘后独立跑 /
-编译失败被报告 / 二次编译被拒绝 / `tcc_*` 兼容层）。
+回归：`cmake --build build --target embedcheck`（10 条：动态库 / 静态库 /
+落盘后独立跑 / 编译失败被报告 / 二次编译被拒绝 / `tcc_*` 一条龙 / 错误回调 /
+系统头目录 + 列符号 / 如实拒绝的三件 / `tcc_set_lib_path`）。
 
 ## 安装与包契约：没有 tcc 也能装出全套
 

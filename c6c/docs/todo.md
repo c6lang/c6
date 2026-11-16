@@ -3992,7 +3992,128 @@ $ make -C c6c selfhost # fixpoint 逐字节相同（3816960 字节 / 5758 符号
 调用约定"，与 x86-64 后端（连编码和 ELF 都自己写）相比这一步是租来的，文档里
 写清楚。
 
-## 第 207 轮：per-TU C 后端（`--emit-ctu`）——rtos-c6 的 S3 交叉构建接上 c6c
+## 第 207 轮：`tcc_*` 兼容面补齐
+
+`include/tcc-compat.h` 以前只声明 13 个函数，tcc 公开嵌入头里剩下的九个连声明
+都没有——拿 tcc 写的宿主程序一碰这些名字就编不过。这一轮按「能做的做、做不到
+的如实拒绝」补齐，接口对齐的好处是调用方代码一行都不用改。
+
+**真实现**（语义对得上 tcc）：
+
+```
+tcc_set_error_func      diag.c6 新增 diag_emit(line)：设了回调，诊断整行交给宿主，
+                        不再打 stderr；传 NULL 恢复默认
+tcc_list_symbols        遍历 X64.sym（defined 的那些），回调拿名字 + VA
+tcc_set_lib_path        按 c6c 的布局认 <dir>/lib/rt.c6 与 <dir>/rt.c6，找到就
+                        pa_set_runtime()；找不到把原因写进 c6_strerror
+tcc_add_sysinclude_path 等价 -I：c6c 不标"系统头"，<...> 与 "..." 走同一条搜索序
+tcc_relocate            改成变参：tcc_relocate(s) 与老的 (s, TCC_RELOCATE_AUTO) 都收
+```
+
+**收了不动**：`tcc_set_realloc`（arena 不可换）、`tcc_set_backtrace_func`（没有
+`-b` 的运行期，回调永远不会被调用）。
+
+**如实拒绝**（返回 -1 + `c6_strerror` 给原因）：`tcc_add_library_path` /
+`tcc_add_library`（链接器没有 `-L`/`-l`，只链输入文件与 libc）、
+`tcc_add_symbol`（宿主地址注入要 JIT 重定位，c6c 走内存镜像 + mmap）。
+
+踩的两个坑：
+
+1. **回调一条都收不到**：`diag_vreport` 改成先拼缓冲再输出时只搬了 `diag_*`，
+   而解析器的 `pa_error` 自己 `fprintf(stderr)` —— 编译失败的诊断全从那儿走，
+   回调里 `nerr=0`。改成 `diag_emit(line)` 后，`pa_error` / `pa_warn_tcc` /
+   「错误太多，停止」/「N 个错误，不写输出」都经过它；计数仍留在各自的调用方
+   （`DG` 与 `PA_ERRS` 口径不混），没设回调时输出字节与以前一致。
+2. **`tcc_set_lib_path` 只生效一瞬间**：第一版把栈上的 `char buf[1024]` 交给
+   `pa_set_runtime()`，而它只存指针不拷贝——函数返回后悬空，编译时报「找不到
+   自带运行时 lib/rt.c6」。改成 `static` 缓冲（`c6_set_runtime_path` 的注释里
+   写明这个生存期要求）。
+
+顺带把「一个进程只能编一次」变成守得住的规则：以前同一个 state 编第二次会被
+拒，但**换一个新 state 再编**会在 `x64_sym` 里段错误（前端/后端/符号表都是
+文件级全局量，重置那套没做）。现在同样如实拒绝，并提示「多次编译请每个编译
+fork 一个子进程」——用例也是这么写的。
+
+**实测**：
+
+```
+make -C c6c embedcheck          # 10/10（原来 6 条，新增 4 条覆盖兼容面）
+  ok 兼容面：tcc_set_error_func：回调收到 221 条诊断（首条『…/stddef.h:5: warning…』），stderr 干净
+  ok 兼容面：tcc_add_sysinclude_path + 一参数 relocate + list_symbols(381 个) + run=13
+  ok 兼容面：tcc_add_library_path/add_library/add_symbol 返回 -1 并说明原因；set_realloc/set_backtrace_func 收下不炸
+  ok 兼容面：tcc_set_lib_path 指向 <dir>/lib/rt.c6 真的生效（run=21）
+make -C c6c lint                # 通过
+make -C c6c pkgcheck            # 8/8
+cmake --build build --target check-install   # 通过（两种 flavour 都装、都编得动）
+```
+
+还没做：多次编译的全局状态重置（现在是拒绝 + fork 兜底）、`tcc_add_file` 收
+`.o`/`.a`、库搜索路径（`-L`/`-l`）——这三件都在 §「还差的」里，排在一起是因为
+它们都要动链接器/全局状态，不是补几个函数的事。
+
+## 第 208 轮：`-shared` / `-fPIC` 共享库
+
+硬缺口①（链接器）的尾巴里最后一件能做动的：c6c 现在能出 `.so`。
+
+**做了什么**：
+
+* `c6c -shared a.o b.o -o libx.so` → `ET_DYN`。基址 0（VA 就是段内偏移，
+  加载基址由 ld.so 选）、没有入口、没有 `PT_INTERP`、程序头 4 个（两个 LOAD
+  + DYNAMIC + GNU_STACK）。输入必须是 `.o`，`-shared lib.c6` 直接报错。
+* `-fPIC` / `-fpic` 收下不报错：native 后端出来的代码本来就位置无关（全局
+  地址走 `lea rip+rel32` + 重定位），所以"PIC 代码生成"不用另写一套。
+* `ld.c6`：`LD_BASE_VA` 从宏改成**变量**（静态 0x400000 / 共享 0），新开关
+  `LD_SHARED`；`ld_link` 在共享模式下跳过「找 main」「合成 `_start`」
+  「把 ctor/dtor 补进 `_start` 的 call」这三步。
+* 数据里的绝对地址（字符串指针、初始化器、`.init_array` 里的函数指针）变成
+  `.rela.dyn` 的 `R_X86_64_RELATIVE`：`ld_apply` 遇到 `R_X86_64_64` 时记
+  （站点 VA、addend），`ld_dyn_plan` 先数条数定尺寸，写盘时逐条落。
+* 导出符号进 `.dynsym`：定义的全局/弱符号（函数 `STT_FUNC`、数据
+  `STT_OBJECT`），名字进 `.dynstr`，SysV `.hash` 的 nchain 跟着长；
+  `DT_SONAME` = 输出文件名；`DT_INIT_ARRAY`/`DT_FINI_ARRAY` 让
+  `__attribute__((constructor))` 在 `dlopen` 那一刻就跑。
+* 产物末尾补一张 16 项的**节头表**（`.text` / `.rodata` / `.dynstr` /
+  `.dynsym` / `.hash` / `.rela.plt` / `.plt` / `.rela.dyn` / `.got.plt` /
+  `.data` / `.init_array` / `.fini_array` / `.bss` / `.dynamic` /
+  `.shstrtab`）：ld.so 不看它，但 GNU ld 把 `.so` 当**输入**时只认节头。
+* 导出符号的 `st_shndx` 按"函数在 .text、数据在 .data、bss 里在 .bss"填：
+  ld.so 只用它判 ABS，但 `nm -D` 会照它打 `T`/`D`/`B`。
+* 外部**数据**符号如实拒绝（共享库里的外部数据要走 GOT 间接寻址；COPY
+  重定位只适合固定基址的可执行文件），外部函数照旧走 PLT。
+
+**踩的三个坑**：
+
+1. **SysV `.hash` 一直是错的**：以前 nchain 少写一个字、chain 每位写成 `j+2`
+   （应为 `j+1`），静态可执行文件没人查这张表所以一直没露馅——`dlopen`
+   一上来 `dlsym` 就返回 NULL。改成标准"一个桶串全链"后通过。
+2. **节头表不是可选装饰**：第一版没有节头，`dlopen` 能用，但
+   `cc -o use use.c -L. -lshare` 直接 `file in wrong format`——GNU ld 只从节头
+   读 `.dynsym`。补上之后 `readelf --dyn-syms` / `nm -D` 也一起可用了。
+3. **数条数要跟重定位阶段用同一套字段偏移**：`ld_count_abs_relocs` 第一版把
+   `sh_size` 读成 `sh_flags` 的低半截（`base+20` 而不是 `base+32`），数出来
+   0 条，链接时当场报「RELATIVE 重定位比预计的多」。另外 `shared` 是 c6 的
+   关键字（`@shared`），`main.c6` 的选项字段只能叫 `so_out`。
+
+**实测**：
+
+```
+cmake --build build --target sharedcheck   # 19/19（新增）
+  ok e_type 是 ET_DYN / 入口 0 / 没有 PT_INTERP / 程序头 4 个
+  ok DT_SONAME 是 libshare.so / DT_INIT_ARRAY 在 / 字符串指针走 RELATIVE
+  ok 节头表齐全 / 函数导出成 T / 数据导出成 D
+  ok dlopen + dlsym：add=42 counter=7 bump=101（构造器 booted=42）
+  ok cc 直接链 .so（-L … -lshare）跑通：direct add=3 booted=42
+  ok 边界：-shared 给源文件报错、共享库里的外部数据符号如实拒绝、
+     -fPIC 收下、不加 -shared 仍是 ET_EXEC
+cmake --build build --target ldcheck dyncheck objcheck embedcheck pkgcheck lint
+  # 13/13 · 18/18 · 11/11 · 10/10 · 8/8 · 通过
+cmake --build build --target check-install   # 通过
+```
+
+**还差的**：共享库里的外部数据符号（GOT 间接寻址）、符号版本
+（`.gnu.version`）、`.a` 静态库、`--gc-sections`、`-Wl,-soname=` 别名。
+
+## 第 209 轮：per-TU C 后端（`--emit-ctu`）——rtos-c6 的 S3 交叉构建接上 c6c
 
 rtos-c6 的 Makefile 写死了 `C6CC := $(C6_ROOT)/tcc/c6`，它要的是 cc 那种口径：
 **一个 TU 出一个 .c**，再交给目标平台的 cc 出机器码。
