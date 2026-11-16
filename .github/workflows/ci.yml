@@ -380,6 +380,16 @@ jobs:
           _tag=${GITHUB_REF_NAME}
           _notes="$RUNNER_TEMP/notes.md"
 
+          # actions/checkout 会把 `refs/tags/<tag>` 重新指向**提交**（日志里是
+          # `git fetch ... +<commit-sha>:refs/tags/v0.6.2`），本地 tag 于是从附注
+          # tag 变成轻量 tag：`%(contents)` 读到的其实是提交消息，标题和"注解兜底"
+          # 都会拿错东西（v0.6.2 的 Release 标题就这么变成了那条修 CI 的提交标题）。
+          # 所以先把 tag 对象显式取回来；取不回来就退到只认提交（下面有兜底）。
+          if [ "$(git cat-file -t "$_tag" 2>/dev/null || true)" != "tag" ]; then
+            git fetch --force --no-tags origin "+refs/tags/$_tag:refs/tags/$_tag" \
+              >/dev/null 2>&1 || true
+          fi
+
           # 版本提交：主题正好是 `c6 <版本>`，取最新的一条。
           # 按主题整串比，不用 --grep：后者是子串/正则匹配，`c6 0.6.1` 会连
           # `c6 0.6.10` 一起捞进来。
