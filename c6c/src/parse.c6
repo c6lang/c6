@@ -6081,6 +6081,18 @@ static u32 parse_typespec(void)
         if (PA_ACCEPT_IDENT("unsigned")) { uns = 1; saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("signed")) { nsigned = 1; saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("long")) { nlong++; saw_int = 1; continue; }
+        /* `__int128` / `unsigned __int128`（GCC 扩展）。见 type.c6 里
+         * TY_I128 的注释：内核 include/uapi/linux/types.h 无条件 typedef 了
+         * `unsigned __int128 __u128`，而这行必须解析得过。
+         *
+         * 只做类型层：宽 16 字节、按整数类型对待（sizeof/对齐/取地址/当成员
+         * 都对），128 位的算术与转换没有实现——内核头链里它只出现在声明
+         * 位置（`union __u128_halves`、`__u128 irte`、GENMASK_U128）。 */
+        if (PA_ACCEPT_IDENT("__int128") || PA_ACCEPT_IDENT("__int128_t")) {
+            base = uns ? ty_u128() : ty_i128();
+            saw_int = 1;
+            continue;
+        }
         if (PA_ACCEPT_IDENT("short")) { nshort++; saw_int = 1; continue; }
         if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__")
             || PA_IS_IDENT("__typeof")) {
@@ -7324,6 +7336,10 @@ static u8 ir_ty_of(u32 t)
     case TY_LLONG: return IRT_I64;
     case TY_ULONG: return IRT_U64;
     case TY_ULLONG: return IRT_U64;
+    /* `__int128` 没有对应的 IR 宽度：IR 寄存器一律 64 位。目前只保证
+     * "声明得出、sizeof 对、拿地拿得到"，真正的 128 位运算没有实现。 */
+    case TY_I128: return IRT_I64;
+    case TY_U128: return IRT_U64;
     case TY_FLOAT: return IRT_F32;
     case TY_DOUBLE: return IRT_F64;
     case TY_LDOUBLE: return IRT_F64;

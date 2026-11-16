@@ -446,6 +446,12 @@ static const char *const BUILTIN_DEFS =
     "#define __SIZEOF_LONG__ 8\n"
     "#define __SIZEOF_LONG_LONG__ 8\n"
     "#define __SIZEOF_POINTER__ 8\n"
+    /* `__int128` 已在类型层成立（16 字节，见 type.c6 的 TY_I128），所以这个
+     * 标准宏可以如实给。内核 include/linux/types.h 用它把
+     * `typedef __u128 u128;` 圈在 #ifdef 里，而 arch/x86/include/asm/
+     * cmpxchg_64.h 的 `union __u128_halves { u128 full; … };` 无条件用 u128——
+     * 不给这个宏，整条 include/linux/types.h 之后的头链在那一行全断。 */
+    "#define __SIZEOF_INT128__ 16\n"
     "#define __SIZE_TYPE__ unsigned long\n"
     "#define __PTRDIFF_TYPE__ long\n"
     "#define __WCHAR_TYPE__ int\n"
