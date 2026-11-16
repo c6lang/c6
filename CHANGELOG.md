@@ -7,6 +7,26 @@
 
 ## 未发布
 
+### 嵌入 API：`tcc_*` 兼容面补齐
+
+- `c6c/include/tcc-compat.h` 以前只声明 13 个 `tcc_*`，现在与 tcc 公开嵌入头对齐
+  （23 个 + 回调 typedef）：`tcc_set_error_func`（诊断整行交给回调）、
+  `tcc_add_sysinclude_path`（等价 `-I`）、`tcc_list_symbols`（镜像里的符号与 VA）、
+  `tcc_set_lib_path`（认 `<dir>/lib/rt.c6` 与 `<dir>/rt.c6`）都是真实现；
+  `tcc_set_realloc` / `tcc_set_backtrace_func` 收下不动（arena 不可换、没有 `-b` 的
+  运行期）；`tcc_add_library_path` / `tcc_add_library` / `tcc_add_symbol` 返回 -1 并把
+  原因写进 `c6_strerror`（链接器没有 `-L`/`-l`、宿主地址注入要 JIT 重定位）。
+  `tcc_relocate` 改成变参，一参数的新写法与老的两参数写法都收。
+- `c6c/src/diag.c6` 新增 `diag_emit`：`diag_error`/`diag_warn` 与解析器的 `pa_error`、
+  `pa_warn_tcc`（含「错误太多，停止」和「N 个错误，不写输出」那两行）全部改走它，
+  所以设了回调之后编译诊断不再漏到 stderr；没设回调时输出字节与以前一致。
+- 新增进程级守卫：同一个 `C6State` 编第二次一直是被拒的，但换一个新 state 再编会在
+  `x64_sym` 里段错误（前端/后端/符号表都是文件级全局量）。现在同样如实拒绝，并提示
+  「多次编译请每个编译 fork 一个子进程」。
+- `c6c/tests/embed-check.sh` 的兼容面用例按 stage 分进程跑（`tcc_set_error_func` /
+  系统头目录 + 列符号 / 如实拒绝的三件 / `tcc_set_lib_path` 真的换掉运行时），
+  6 条 → 10 条，全绿。
+
 ### 打包：默认包里带上自举编译器 `c6c`
 
 - `cmake/C6Install.cmake` 把 c6c 的数据文件从 `C6_ENABLE_TCC=OFF` 分支里挪出来，

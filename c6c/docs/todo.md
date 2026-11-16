@@ -3991,3 +3991,62 @@ $ make -C c6c selfhost # fixpoint 逐字节相同（3816960 字节 / 5758 符号
 机器码编码与 ELF 写出仍借系统工具（clang/ld.lld）——c6c 这一侧是"指令选择 +
 调用约定"，与 x86-64 后端（连编码和 ELF 都自己写）相比这一步是租来的，文档里
 写清楚。
+
+## 第 207 轮：`tcc_*` 兼容面补齐
+
+`include/tcc-compat.h` 以前只声明 13 个函数，tcc 公开嵌入头里剩下的九个连声明
+都没有——拿 tcc 写的宿主程序一碰这些名字就编不过。这一轮按「能做的做、做不到
+的如实拒绝」补齐，接口对齐的好处是调用方代码一行都不用改。
+
+**真实现**（语义对得上 tcc）：
+
+```
+tcc_set_error_func      diag.c6 新增 diag_emit(line)：设了回调，诊断整行交给宿主，
+                        不再打 stderr；传 NULL 恢复默认
+tcc_list_symbols        遍历 X64.sym（defined 的那些），回调拿名字 + VA
+tcc_set_lib_path        按 c6c 的布局认 <dir>/lib/rt.c6 与 <dir>/rt.c6，找到就
+                        pa_set_runtime()；找不到把原因写进 c6_strerror
+tcc_add_sysinclude_path 等价 -I：c6c 不标"系统头"，<...> 与 "..." 走同一条搜索序
+tcc_relocate            改成变参：tcc_relocate(s) 与老的 (s, TCC_RELOCATE_AUTO) 都收
+```
+
+**收了不动**：`tcc_set_realloc`（arena 不可换）、`tcc_set_backtrace_func`（没有
+`-b` 的运行期，回调永远不会被调用）。
+
+**如实拒绝**（返回 -1 + `c6_strerror` 给原因）：`tcc_add_library_path` /
+`tcc_add_library`（链接器没有 `-L`/`-l`，只链输入文件与 libc）、
+`tcc_add_symbol`（宿主地址注入要 JIT 重定位，c6c 走内存镜像 + mmap）。
+
+踩的两个坑：
+
+1. **回调一条都收不到**：`diag_vreport` 改成先拼缓冲再输出时只搬了 `diag_*`，
+   而解析器的 `pa_error` 自己 `fprintf(stderr)` —— 编译失败的诊断全从那儿走，
+   回调里 `nerr=0`。改成 `diag_emit(line)` 后，`pa_error` / `pa_warn_tcc` /
+   「错误太多，停止」/「N 个错误，不写输出」都经过它；计数仍留在各自的调用方
+   （`DG` 与 `PA_ERRS` 口径不混），没设回调时输出字节与以前一致。
+2. **`tcc_set_lib_path` 只生效一瞬间**：第一版把栈上的 `char buf[1024]` 交给
+   `pa_set_runtime()`，而它只存指针不拷贝——函数返回后悬空，编译时报「找不到
+   自带运行时 lib/rt.c6」。改成 `static` 缓冲（`c6_set_runtime_path` 的注释里
+   写明这个生存期要求）。
+
+顺带把「一个进程只能编一次」变成守得住的规则：以前同一个 state 编第二次会被
+拒，但**换一个新 state 再编**会在 `x64_sym` 里段错误（前端/后端/符号表都是
+文件级全局量，重置那套没做）。现在同样如实拒绝，并提示「多次编译请每个编译
+fork 一个子进程」——用例也是这么写的。
+
+**实测**：
+
+```
+make -C c6c embedcheck          # 10/10（原来 6 条，新增 4 条覆盖兼容面）
+  ok 兼容面：tcc_set_error_func：回调收到 221 条诊断（首条『…/stddef.h:5: warning…』），stderr 干净
+  ok 兼容面：tcc_add_sysinclude_path + 一参数 relocate + list_symbols(381 个) + run=13
+  ok 兼容面：tcc_add_library_path/add_library/add_symbol 返回 -1 并说明原因；set_realloc/set_backtrace_func 收下不炸
+  ok 兼容面：tcc_set_lib_path 指向 <dir>/lib/rt.c6 真的生效（run=21）
+make -C c6c lint                # 通过
+make -C c6c pkgcheck            # 8/8
+cmake --build build --target check-install   # 通过（两种 flavour 都装、都编得动）
+```
+
+还没做：多次编译的全局状态重置（现在是拒绝 + fork 兜底）、`tcc_add_file` 收
+`.o`/`.a`、库搜索路径（`-L`/`-l`）——这三件都在 §「还差的」里，排在一起是因为
+它们都要动链接器/全局状态，不是补几个函数的事。
