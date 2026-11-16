@@ -13110,6 +13110,7 @@ static const struct C6ErrStdSlot {
     { "std.net.quicd",         C6_ERR_SLOT_STD + 388 },
     { "std.net.h3c",           C6_ERR_SLOT_STD + 389 },
     { "std.net.h3d",           C6_ERR_SLOT_STD + 390 },
+    { "std.data.protobuf",     C6_ERR_SLOT_STD + 391 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

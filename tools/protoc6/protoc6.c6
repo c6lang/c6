@@ -1,0 +1,1547 @@
+/* protoc6：把 .proto 编成 C6 代码（结构体 + init/size/encode/decode）。
+ *
+ *     ./protoc6 --out build/pb --rep-cap 8 tests/protobuf/addressbook.proto
+ *
+ * 生成 `build/pb/demo/addressbook.c6`（模块名 `demo.addressbook`），里面每个
+ * message 变成：
+ *
+ *     struct demo_Person { ... };                    // 字段按声明顺序
+ *     void demo_Person_init(struct demo_Person *m);   // 清空 + proto2 默认值
+ *     int  demo_Person_size(const struct demo_Person *m);          // 线长
+ *     int  demo_Person_encode(const struct demo_Person *m, void *dst, int cap);
+ *     int  demo_Person_decode(const void *src, int n, struct demo_Person *m);
+ *
+ * 代码生成的目标是**嵌入式可用**：零分配、调用方给缓冲、repeated 字段用固定
+ * 容量数组（`--rep-cap`，默认 8），字符串/bytes 是输入上的视图。生成代码只
+ * 依赖 `std.data.protobuf`（线格式）与 `std.text.str`（Str）。
+ *
+ * 语义跟 protoc 对齐：
+ *
+ * - proto3 隐式存在的标量：等于默认值（0 / 空串 / false）就不写；
+ *   `optional` 字段生成 `<f>_has`，写了就带（哪怕值是 0）；
+ * - 消息字段一律有 presence（`<f>_has`），空消息也写长度 0；
+ * - proto2：`required` 必须出现（解码后检查位图），`optional` 用 `_has`，
+ *   字段默认值进 `_init`；
+ * - `repeated` 数值字段 proto3 默认打包，proto2 默认逐个（`[packed=true]` 可改），
+ *   解码侧两种写法都接受；
+ * - `map<K,V>` 展开成 repeated 的合成入口消息（键 1、值 2），与 protoc 的线上
+ *   形状一致；
+ * - `oneof` 用 `int <name>_case` 记字段号（0 = 未设），只写当前成员；
+ * - 未知字段、以及已知字段号但线型对不上的字段，都用 `r.skip()` 跳过（与 protoc
+ *   一致：老版本读到新字段、或字段类型被改过时不会整体失败）；字段乱序、重复
+ *   出现都按「后者覆盖」；
+ * - 解码是**全有或全无**：先解到临时结构体，全部成功才拷给 `*m`。
+ *
+ * 明确不支持（生成阶段报错，不静默降级）：
+ *
+ * - 递归的消息类型（C6 结构体按值嵌入，会无限大）：A 直接或间接包含 A 时报错；
+ * - `group`、`extensions` / `extend` 的 C6 侧、`editions` 语法；
+ * - JSON / TextFormat 映射、Any 的打包解包、服务（service/rpc）生成。
+ *
+ * 生成的文件不写 `#include`/`module` 之外的东西；C6 没有头文件，所以使用方
+ * 把生成的 .c6 文件列进编译命令行、在源码里 `import <module>;` 即可。
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <sys/stat.h>
+
+import std.core.types;
+import std.text.str;
+import protoc6.protofile;
+
+/* ---- 输出缓冲 ---- */
+
+static char obuf[1 << 21];
+static int on = 0;
+static int obad = 0;
+
+static void em(const char *s)
+{
+    int n = (int)strlen(s);
+
+    if (obad || on + n > (int)sizeof obuf) {
+        obad = 1;
+        return;
+    }
+    memcpy(obuf + on, s, (usize)n);
+    on += n;
+}
+
+static void ems(Str s)
+{
+    if (obad || !s.s.data)
+        return;
+    if (on + s.s.len > (int)sizeof obuf) {
+        obad = 1;
+        return;
+    }
+    memcpy(obuf + on, s.s.data, (usize)s.s.len);
+    on += s.s.len;
+}
+
+static void emf(const char *fmt, ...)
+{
+    char tmp[1024] = { 0 };
+    va_list ap = { 0 };
+    int n = 0;
+
+    if (obad)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= (int)sizeof tmp) {
+        obad = 1;
+        return;
+    }
+    em(tmp);
+}
+
+/* 解析结果与生成状态（先声明：下面的名字准备、后续所有 emit 都用它）。 */
+static ProtoFile *pf = 0;
+static int gen_error = 0;
+
+static void fail(const char *msg);
+static void fail2(const char *msg, Str name);
+
+/* ---- C 关键字与字段名 ---- */
+
+static int kw(const char *s)
+{
+    static const char *const kws[] = {
+        "auto", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "float", "for", "goto", "if",
+        "inline", "int", "long", "register", "restrict", "return", "short",
+        "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "void", "volatile", "while", "_Bool", "error", "try",
+        "catch", "async", "await", "module", "import", "test", "defer",
+    };
+    int i = 0;
+
+    for (i = 0; i < (int)(sizeof kws / sizeof kws[0]); i++)
+        if (strcmp(kws[i], s) == 0)
+            return 1;
+    return 0;
+}
+
+/* 字段名：撞 C 关键字就加一个 `_` 后缀（并在文件头说明）。 */
+static char fname_e[PF_MAX_FIELD][96];
+static char oname_e[PF_MAX_ONEOF][96];
+
+static void copy_ident(char *dst, int cap, Str name, int suffix)
+{
+    int n = name.s.len;
+
+    if (n > cap - 2)
+        n = cap - 2;
+    memset(dst, 0, (usize)cap);
+    if (n > 0)
+        memcpy(dst, name.s.data, (usize)n);
+    if (suffix)
+        dst[n++] = '_';
+    dst[n] = 0;
+}
+
+static int same_name(const char *a, Str b)
+{
+    int n = (int)strlen(a);
+
+    return b.s.len == n && (n == 0 || memcmp(a, b.s.data, (usize)n) == 0);
+}
+
+/* 生成前先把所有名字落成唯一、不与生成后缀冲突的 C 标识符。 */
+static int prepare_names(void)
+{
+    int i = 0;
+    int j = 0;
+
+    for (i = 0; i < pf->nfields; i++) {
+        PfField *f = &pf->fields[i];
+        char tmp[96] = { 0 };
+
+        copy_ident(tmp, (int)sizeof tmp, f->name, 0);
+        copy_ident(fname_e[i], (int)sizeof fname_e[i], f->name, kw(tmp));
+    }
+    for (i = 0; i < pf->noneofs; i++) {
+        char tmp[96] = { 0 };
+
+        copy_ident(tmp, (int)sizeof tmp, pf->oneofs[i].name, 0);
+        copy_ident(oname_e[i], (int)sizeof oname_e[i], pf->oneofs[i].name,
+                   kw(tmp));
+    }
+    for (i = 0; i < pf->nfields; i++) {
+        PfField *f = &pf->fields[i];
+        PfMsg *m = &pf->msgs[f->owner];
+
+        for (j = m->first_field; j >= 0; j = pf->fields[j].next) {
+            PfField *g = &pf->fields[j];
+            char tail[128] = { 0 };
+
+            if (j == i)
+                continue;
+            if (strcmp(fname_e[i], fname_e[j]) == 0) {
+                fail2("字段名撞车（关键字后缀之后重复）", f->name);
+                return 0;
+            }
+            snprintf(tail, sizeof tail, "%s_n", fname_e[j]);
+            if (strcmp(fname_e[i], tail) == 0
+                || (snprintf(tail, sizeof tail, "%s_has", fname_e[j]) > 0
+                    && strcmp(fname_e[i], tail) == 0)) {
+                fail2("字段名与生成的 _n/_has 后缀冲突", f->name);
+                return 0;
+            }
+        }
+        for (j = 0; j < pf->noneofs; j++) {
+            char tail[128] = { 0 };
+
+            if (pf->oneofs[j].msg != f->owner)
+                continue;
+            snprintf(tail, sizeof tail, "%s_case", oname_e[j]);
+            if (strcmp(fname_e[i], tail) == 0) {
+                fail2("字段名与生成的 oneof _case 冲突", f->name);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* 引用一个字段：m->name（indexed 时 m->name[i]）。 */
+static void em_ref(int fi, int indexed)
+{
+    if (indexed)
+        emf("m->%s[i]", fname_e[fi]);
+    else
+        emf("m->%s", fname_e[fi]);
+}
+
+/* ---- 类型映射 ---- */
+
+static int is_varint(int kind)
+{
+    return kind == PK_INT32 || kind == PK_INT64 || kind == PK_UINT32
+           || kind == PK_UINT64 || kind == PK_SINT32 || kind == PK_SINT64
+           || kind == PK_BOOL || kind == PK_ENUM;
+}
+
+static int is_fixed32(int kind)
+{
+    return kind == PK_FIXED32 || kind == PK_SFIXED32 || kind == PK_FLOAT;
+}
+
+static int is_fixed64(int kind)
+{
+    return kind == PK_FIXED64 || kind == PK_SFIXED64 || kind == PK_DOUBLE;
+}
+
+static int is_bytes(int kind) { return kind == PK_STRING || kind == PK_BYTES; }
+
+static int is_numeric(int kind)
+{
+    return is_varint(kind) || is_fixed32(kind) || is_fixed64(kind);
+}
+
+static const char *ctype(int kind)
+{
+    switch (kind) {
+    case PK_DOUBLE:
+        return "f64";
+    case PK_FLOAT:
+        return "f32";
+    case PK_INT64:
+    case PK_SINT64:
+    case PK_SFIXED64:
+        return "i64";
+    case PK_UINT64:
+    case PK_FIXED64:
+        return "u64";
+    case PK_INT32:
+    case PK_SINT32:
+    case PK_SFIXED32:
+        return "i32";
+    case PK_UINT32:
+    case PK_FIXED32:
+        return "u32";
+    case PK_BOOL:
+    case PK_ENUM:
+        return "int";
+    case PK_STRING:
+    case PK_BYTES:
+        return "Str";
+    default:
+        return "int";
+    }
+}
+
+static const char *pkwire(int kind)
+{
+    if (is_varint(kind))
+        return "PB_VARINT";
+    if (is_fixed32(kind))
+        return "PB_FIXED32";
+    if (is_fixed64(kind))
+        return "PB_FIXED64";
+    return "PB_BYTES";
+}
+
+/* ---- 命令行 ---- */
+
+static const char *out_dir = 0;
+static int rep_cap = 8;
+static const char *source_name = "";
+
+static void usage(void)
+{
+    fprintf(stderr,
+            "usage: protoc6 --out DIR [--rep-cap N] file.proto...\n"
+            "  --out DIR       生成文件的根目录（必需）\n"
+            "  --rep-cap N     repeated/map 字段的容量（默认 8）\n"
+            "  --version       打印版本\n"
+            "  -h, --help      这个帮助\n");
+}
+
+/* ---- 生成：结构体 / 枚举 ---- */
+
+static void fail(const char *msg)
+{
+    if (gen_error)
+        return;
+    gen_error = 1;
+    fprintf(stderr, "protoc6: %s\n", msg);
+}
+
+static void fail2(const char *msg, Str name)
+{
+    if (gen_error)
+        return;
+    gen_error = 1;
+    fprintf(stderr, "protoc6: %s: %.*s\n", msg, name.s.len, name.s.data);
+}
+
+static int field_is_message(PfField *f)
+{
+    return f->kind == PK_MESSAGE;
+}
+
+static PfMsg *msg_of(PfField *f)
+{
+    if (f->kind != PK_MESSAGE || f->msg < 0 || f->msg >= pf->nmsgs)
+        return 0;
+    return &pf->msgs[f->msg];
+}
+
+/* 字段按号排序（protoc 的线上顺序不要求，但稳定输出便于比对字节）。 */
+static int field_order(PfMsg *m, int *order)
+{
+    int n = 0;
+    int i = 0;
+
+    for (i = m->first_field; i >= 0; i = pf->fields[i].next) {
+        int j = n;
+
+        while (j > 0 && pf->fields[order[j - 1]].number > pf->fields[i].number) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+        n++;
+    }
+    return n;
+}
+
+/* 生成的名字里 repeated 容量的上界（也是解码时的硬上限）。 */
+static int cap_of(void) { return rep_cap; }
+
+/* ---- 枚举 ---- */
+
+static void emit_enums(void)
+{
+    int i = 0;
+
+    for (i = 0; i < pf->nenums; i++) {
+        PfEnum *e = &pf->enums[i];
+        int j = 0;
+
+        emf("enum %.*s {\n", e->cname.s.len, e->cname.s.data);
+        for (j = 0; j < e->nvals; j++) {
+            PfEnumVal *v = &pf->vals[e->first_val + j];
+
+            emf("    %.*s = %d,\n", v->cname.s.len, v->cname.s.data, v->value);
+        }
+        em("};\n\n");
+    }
+}
+
+/* ---- 结构体 ---- */
+
+static void emit_field_member(int fi)
+{
+    PfField *f = &pf->fields[fi];
+    PfMsg *child = msg_of(f);
+
+    emf("    /* #%d %s */\n", f->number,
+        is_bytes(f->kind) ? "bytes" : ctype(f->kind));
+    if (f->repeated) {
+        if (child)
+            emf("    struct %.*s ", child->cname.s.len, child->cname.s.data);
+        else
+            emf("    %s ", ctype(f->kind));
+        em(fname_e[fi]);
+        emf("[%d];\n", cap_of());
+        emf("    int %s_n;\n", fname_e[fi]);
+        return;
+    }
+    if (f->oneof >= 0) {
+        if (child)
+            emf("    struct %.*s %s;\n", child->cname.s.len, child->cname.s.data,
+                fname_e[fi]);
+        else
+            emf("    %s %s;\n", ctype(f->kind), fname_e[fi]);
+        return;
+    }
+    if (child) {
+        emf("    int %s_has;\n", fname_e[fi]);
+        emf("    struct %.*s %s;\n", child->cname.s.len, child->cname.s.data,
+            fname_e[fi]);
+        return;
+    }
+    if (f->optional || f->required) {
+        if (f->optional)
+            emf("    int %s_has;\n", fname_e[fi]);
+        emf("    %s %s;\n", ctype(f->kind), fname_e[fi]);
+        return;
+    }
+    emf("    %s %s;\n", ctype(f->kind), fname_e[fi]);
+}
+
+static void emit_struct(PfMsg *m)
+{
+    int i = 0;
+    int has_field = 0;
+
+    emf("/* %.*s */\n", m->full.s.len, m->full.s.data);
+    emf("struct %.*s {\n", m->cname.s.len, m->cname.s.data);
+    for (i = 0; i < pf->noneofs; i++) {
+        PfOneof *o = &pf->oneofs[i];
+
+        if (o->msg != (int)(m - pf->msgs))
+            continue;
+        emf("    int %s_case;   /* 0 = 未设；否则是 oneof 成员的字段号 */\n",
+            oname_e[i]);
+    }
+    for (i = m->first_field; i >= 0; i = pf->fields[i].next) {
+        emit_field_member(i);
+        has_field = 1;
+    }
+    if (!has_field)
+        em("    int _unused;\n");
+    em("};\n\n");
+}
+
+/* 生成顺序：被引用的结构体先出现（按值嵌入要求完整类型）。 */
+static int tstate[PF_MAX_MSG];
+static int torder[PF_MAX_MSG];
+static int tn = 0;
+
+static int topo_visit(int mi)
+{
+    PfMsg *m = 0;
+    int i = 0;
+
+    if (mi < 0 || mi >= pf->nmsgs)
+        return 1;
+    if (tstate[mi] == 2)
+        return 1;
+    if (tstate[mi] == 1) {
+        fail2("递归的消息类型（C6 结构体按值嵌入会无限大；请改成 bytes 或拆一层）",
+              pf->msgs[mi].full);
+        return 0;
+    }
+    tstate[mi] = 1;
+    m = &pf->msgs[mi];
+    for (i = m->first_field; i >= 0; i = pf->fields[i].next) {
+        PfField *f = &pf->fields[i];
+
+        if (f->kind == PK_MESSAGE && !topo_visit(f->msg))
+            return 0;
+    }
+    tstate[mi] = 2;
+    torder[tn++] = mi;
+    return 1;
+}
+
+static int topo_sort(void)
+{
+    int i = 0;
+
+    memset(tstate, 0, sizeof tstate);
+    tn = 0;
+    for (i = 0; i < pf->nmsgs; i++)
+        if (!topo_visit(i))
+            return 0;
+    return 1;
+}
+
+/* ---- 函数原型 ---- */
+
+static void emit_protos(void)
+{
+    int i = 0;
+
+    for (i = 0; i < pf->nmsgs; i++) {
+        Str c = pf->msgs[i].cname;
+
+        emf("void %.*s_init(struct %.*s *m);\n", c.s.len, c.s.data, c.s.len,
+            c.s.data);
+        emf("int %.*s_size(const struct %.*s *m);\n", c.s.len, c.s.data, c.s.len,
+            c.s.data);
+        emf("int %.*s_encode(const struct %.*s *m, void *dst, int cap);\n",
+            c.s.len, c.s.data, c.s.len, c.s.data);
+        emf("int %.*s_decode(const void *src, int n, struct %.*s *m);\n\n",
+            c.s.len, c.s.data, c.s.len, c.s.data);
+    }
+}
+
+/* ---- 尺寸 ---- */
+
+/* proto3 的 repeated 数值默认打包；proto2 默认逐个（[packed=true] 可改）。 */
+static int packed_on(PfField *f)
+{
+    if (!is_numeric(f->kind))
+        return 0;
+    if (f->packed >= 0)
+        return f->packed;
+    return pf->syntax == 3;
+}
+
+static void em_size_of(int kind, const char *ref)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_INT64:
+    case PK_ENUM:
+        emf("pb_varint_size((u64)(i64)%s)", ref);
+        break;
+    case PK_UINT32:
+    case PK_UINT64:
+        emf("pb_varint_size((u64)%s)", ref);
+        break;
+    case PK_SINT32:
+    case PK_SINT64:
+        emf("pb_varint_size(pb_zigzag((i64)%s))", ref);
+        break;
+    case PK_BOOL:
+        em("1");
+        break;
+    case PK_FIXED32:
+    case PK_SFIXED32:
+    case PK_FLOAT:
+        em("4");
+        break;
+    case PK_FIXED64:
+    case PK_SFIXED64:
+    case PK_DOUBLE:
+        em("8");
+        break;
+    case PK_STRING:
+    case PK_BYTES:
+        emf("pb_varint_size((u64)%s.s.len) + %s.s.len", ref, ref);
+        break;
+    default:
+        em("0");
+        break;
+    }
+}
+
+/* presence：不需要条件直接写语句，需要时包一层 if。 */
+static void em_guard_begin(int fi)
+{
+    PfField *f = &pf->fields[fi];
+
+    if (f->required) {
+        em("    {\n");
+        return;
+    }
+    em("    if (");
+    if (f->oneof >= 0)
+        emf("m->%s_case == %d", oname_e[f->oneof], f->number);
+    else if (f->kind == PK_MESSAGE || f->optional)
+        emf("m->%s_has", fname_e[fi]);
+    else if (is_bytes(f->kind))
+        emf("m->%s.s.len > 0", fname_e[fi]);
+    else
+        emf("m->%s != 0", fname_e[fi]);
+    em(") {\n");
+}
+
+static void emit_size_field(int fi)
+{
+    PfField *f = &pf->fields[fi];
+    char ref[128] = { 0 };
+
+    if (f->repeated) {
+        if (is_numeric(f->kind)) {
+            if (packed_on(f)) {
+                snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+                emf("    if (m->%s_n > 0) {\n", fname_e[fi]);
+                em("        int pay = 0;\n\n");
+                emf("        for (i = 0; i < m->%s_n; i++)\n", fname_e[fi]);
+                em("            pay += ");
+                em_size_of(f->kind, ref);
+                emf(";\n        n += pb_tag_size(%d) + pb_varint_size((u64)pay) + pay;\n",
+                    f->number);
+                em("    }\n");
+            } else {
+                snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+                emf("    for (i = 0; i < m->%s_n; i++)\n", fname_e[fi]);
+                emf("        n += pb_tag_size(%d) + ", f->number);
+                em_size_of(f->kind, ref);
+                em(";\n");
+            }
+            return;
+        }
+        if (is_bytes(f->kind)) {
+            snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+            emf("    for (i = 0; i < m->%s_n; i++)\n", fname_e[fi]);
+            emf("        n += pb_tag_size(%d) + ", f->number);
+            em_size_of(f->kind, ref);
+            em(";\n");
+            return;
+        }
+        {
+            PfMsg *child = msg_of(f);
+
+            if (!child) {
+                fail("repeated 字段的消息类型没有解析出来");
+                return;
+            }
+            emf("    for (i = 0; i < m->%s_n; i++) {\n", fname_e[fi]);
+            emf("        sub = %.*s_size(&m->%s[i]);\n", child->cname.s.len,
+                child->cname.s.data, fname_e[fi]);
+            em("        if (sub < 0)\n            return -1;\n");
+            emf("        n += pb_tag_size(%d) + pb_varint_size((u64)sub) + sub;\n",
+                f->number);
+            em("    }\n");
+        }
+        return;
+    }
+    if (f->kind == PK_MESSAGE) {
+        PfMsg *child = msg_of(f);
+
+        if (!child) {
+            fail("消息字段的类型没有解析出来");
+            return;
+        }
+        em_guard_begin(fi);
+        emf("        sub = %.*s_size(&m->%s);\n", child->cname.s.len,
+            child->cname.s.data, fname_e[fi]);
+        em("        if (sub < 0)\n            return -1;\n");
+        emf("        n += pb_tag_size(%d) + pb_varint_size((u64)sub) + sub;\n",
+            f->number);
+        em("    }\n");
+        return;
+    }
+    em_guard_begin(fi);
+    snprintf(ref, sizeof ref, "m->%s", fname_e[fi]);
+    emf("        n += pb_tag_size(%d) + ", f->number);
+    em_size_of(f->kind, ref);
+    em(";\n    }\n");
+}
+
+static void emit_size(void)
+{
+    int mi = 0;
+    int i = 0;
+
+    for (mi = 0; mi < pf->nmsgs; mi++) {
+        PfMsg *m = &pf->msgs[mi];
+        int order[PF_MAX_FIELD] = { 0 };
+        int n = field_order(m, order);
+
+        emf("int %.*s_size(const struct %.*s *m)\n{\n", m->cname.s.len,
+            m->cname.s.data, m->cname.s.len, m->cname.s.data);
+        em("    int n = 0;\n    int i = 0;\n    int sub = 0;\n\n");
+        em("    if (!m)\n        return -1;\n");
+        for (i = 0; i < n; i++)
+            emit_size_field(order[i]);
+        em("    return n;\n}\n\n");
+    }
+}
+
+/* ---- 编码 ---- */
+
+static void em_write_value(int kind, const char *ref)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_INT64:
+    case PK_ENUM:
+        emf("w.write_int((i64)%s);", ref);
+        break;
+    case PK_UINT32:
+    case PK_UINT64:
+        emf("w.write_uint((u64)%s);", ref);
+        break;
+    case PK_SINT32:
+    case PK_SINT64:
+        emf("w.write_sint((i64)%s);", ref);
+        break;
+    case PK_BOOL:
+        emf("w.write_bool(%s);", ref);
+        break;
+    case PK_FIXED32:
+    case PK_SFIXED32:
+        emf("w.write_fixed32((u32)%s);", ref);
+        break;
+    case PK_FLOAT:
+        emf("w.write_float(%s);", ref);
+        break;
+    case PK_FIXED64:
+    case PK_SFIXED64:
+        emf("w.write_fixed64((u64)%s);", ref);
+        break;
+    case PK_DOUBLE:
+        emf("w.write_double(%s);", ref);
+        break;
+    case PK_STRING:
+    case PK_BYTES:
+        emf("w.write_str(%s);", ref);
+        break;
+    default:
+        break;
+    }
+}
+
+static void em_write_singular(int fi, const char *ref)
+{
+    PfField *f = &pf->fields[fi];
+
+    if (is_bytes(f->kind)) {
+        emf("w.write_key(%d, PB_BYTES);\n", f->number);
+        emf("        w.write_uint((u64)%s.s.len);\n", ref);
+        emf("        ");
+        em_write_value(f->kind, ref);
+        em("\n");
+        return;
+    }
+    emf("w.write_key(%d, %s);\n", f->number, pkwire(f->kind));
+    emf("            ");
+    em_write_value(f->kind, ref);
+    em("\n");
+}
+
+static void emit_encode_field(int fi)
+{
+    PfField *f = &pf->fields[fi];
+    char ref[128] = { 0 };
+
+    if (f->repeated) {
+        if (is_numeric(f->kind)) {
+            if (packed_on(f)) {
+                snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+                emf("    if (m->%s_n > 0) {\n", fname_e[fi]);
+                em("        int pay = 0;\n\n");
+                emf("        for (i = 0; i < m->%s_n; i++)\n", fname_e[fi]);
+                em("            pay += ");
+                em_size_of(f->kind, ref);
+                emf(";\n        w.write_key(%d, PB_BYTES);\n", f->number);
+                em("        w.write_uint((u64)pay);\n");
+                emf("        for (i = 0; i < m->%s_n; i++) {\n", fname_e[fi]);
+                em("            ");
+                em_write_value(f->kind, ref);
+                em("\n        }\n    }\n");
+            } else {
+                snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+                emf("    for (i = 0; i < m->%s_n; i++) {\n", fname_e[fi]);
+                em("        ");
+                em_write_singular(fi, ref);
+                em("    }\n");
+            }
+            return;
+        }
+        if (is_bytes(f->kind)) {
+            snprintf(ref, sizeof ref, "m->%s[i]", fname_e[fi]);
+            emf("    for (i = 0; i < m->%s_n; i++) {\n", fname_e[fi]);
+            em("        ");
+            em_write_singular(fi, ref);
+            em("    }\n");
+            return;
+        }
+        {
+            PfMsg *child = msg_of(f);
+
+            if (!child) {
+                fail("repeated 字段的消息类型没有解析出来");
+                return;
+            }
+            emf("    for (i = 0; i < m->%s_n; i++) {\n", fname_e[fi]);
+            emf("        sub = %.*s_size(&m->%s[i]);\n", child->cname.s.len,
+                child->cname.s.data, fname_e[fi]);
+            em("        if (sub < 0)\n            return -1;\n");
+            emf("        w.write_key(%d, PB_BYTES);\n", f->number);
+            em("        w.write_uint((u64)sub);\n");
+            em("        if (w.ok()) {\n            if (w.put(sub, &p) != 1)\n                return -1;\n");
+            emf("            if (%.*s_encode(&m->%s[i], p, sub) != sub)\n",
+                child->cname.s.len, child->cname.s.data, fname_e[fi]);
+            em("                return -1;\n        }\n    }\n");
+        }
+        return;
+    }
+    if (f->kind == PK_MESSAGE) {
+        PfMsg *child = msg_of(f);
+
+        if (!child) {
+            fail("消息字段的类型没有解析出来");
+            return;
+        }
+        em_guard_begin(fi);
+        emf("        sub = %.*s_size(&m->%s);\n", child->cname.s.len,
+            child->cname.s.data, fname_e[fi]);
+        em("        if (sub < 0)\n            return -1;\n");
+        emf("        w.write_key(%d, PB_BYTES);\n", f->number);
+        em("        w.write_uint((u64)sub);\n");
+        em("        if (w.ok()) {\n            if (w.put(sub, &p) != 1)\n                return -1;\n");
+        emf("            if (%.*s_encode(&m->%s, p, sub) != sub)\n",
+            child->cname.s.len, child->cname.s.data, fname_e[fi]);
+        em("                return -1;\n        }\n    }\n");
+        return;
+    }
+    em_guard_begin(fi);
+    snprintf(ref, sizeof ref, "m->%s", fname_e[fi]);
+    em("        ");
+    em_write_singular(fi, ref);
+    em("    }\n");
+}
+
+static void emit_encode(void)
+{
+    int mi = 0;
+    int i = 0;
+
+    for (mi = 0; mi < pf->nmsgs; mi++) {
+        PfMsg *m = &pf->msgs[mi];
+        int order[PF_MAX_FIELD] = { 0 };
+        int n = field_order(m, order);
+
+        emf("int %.*s_encode(const struct %.*s *m, void *dst, int cap)\n{\n",
+            m->cname.s.len, m->cname.s.data, m->cname.s.len, m->cname.s.data);
+        em("    PbWriter w = pb_writer(dst, cap);\n");
+        em("    int sub = 0;\n    int i = 0;\n    char *p = 0;\n\n");
+        em("    if (!m)\n        return -1;\n");
+        for (i = 0; i < n; i++)
+            emit_encode_field(order[i]);
+        em("    if (!w.ok())\n        return -1;\n    return w.len();\n}\n\n");
+    }
+}
+
+/* ---- 解码 ---- */
+
+static const char *mem_type(int kind)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_INT64:
+    case PK_ENUM:
+    case PK_SINT32:
+    case PK_SINT64:
+        return "i64";
+    case PK_UINT32:
+    case PK_UINT64:
+    case PK_FIXED64:
+    case PK_SFIXED64:
+        return "u64";
+    case PK_BOOL:
+        return "int";
+    case PK_FIXED32:
+    case PK_SFIXED32:
+        return "u32";
+    case PK_FLOAT:
+        return "f32";
+    case PK_DOUBLE:
+        return "f64";
+    case PK_STRING:
+    case PK_BYTES:
+        return "Str";
+    default:
+        return "int";
+    }
+}
+
+static const char *as_fn(int kind)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_INT64:
+    case PK_ENUM:
+        return "as_int";
+    case PK_UINT32:
+    case PK_UINT64:
+        return "as_uint";
+    case PK_SINT32:
+    case PK_SINT64:
+        return "as_sint";
+    case PK_BOOL:
+        return "as_bool";
+    case PK_FIXED32:
+    case PK_SFIXED32:
+        return "as_fixed32";
+    case PK_FLOAT:
+        return "as_float";
+    case PK_FIXED64:
+    case PK_SFIXED64:
+        return "as_fixed64";
+    case PK_DOUBLE:
+        return "as_double";
+    case PK_STRING:
+    case PK_BYTES:
+        return "as_str";
+    default:
+        return "as_int";
+    }
+}
+
+static const char *pi_fn(int kind)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_INT64:
+    case PK_ENUM:
+        return "next_int";
+    case PK_UINT32:
+    case PK_UINT64:
+        return "next_uint";
+    case PK_SINT32:
+    case PK_SINT64:
+        return "next_sint";
+    case PK_BOOL:
+        return "next_bool";
+    case PK_FIXED32:
+    case PK_SFIXED32:
+        return "next_fixed32";
+    case PK_FLOAT:
+        return "next_float";
+    case PK_FIXED64:
+    case PK_SFIXED64:
+        return "next_fixed64";
+    case PK_DOUBLE:
+        return "next_double";
+    default:
+        return "next_int";
+    }
+}
+
+/* 把中间变量 v 落成结构体字段的右值。 */
+static void em_cast_value(int kind, const char *var)
+{
+    switch (kind) {
+    case PK_INT32:
+    case PK_SINT32:
+    case PK_SFIXED32:
+        emf("(i32)%s", var);
+        break;
+    case PK_INT64:
+    case PK_SINT64:
+    case PK_SFIXED64:
+        emf("(i64)%s", var);
+        break;
+    case PK_ENUM:
+        emf("(int)%s", var);
+        break;
+    case PK_UINT32:
+        emf("(u32)%s", var);
+        break;
+    case PK_UINT64:
+        emf("(u64)%s", var);
+        break;
+    default:
+        em(var);
+        break;
+    }
+}
+
+/* 一个标量的取值块：{ <type> v = 0; if (f.as_x(&v) != 1) return -1; ... } */
+static void em_scalar_from_field(int kind)
+{
+    if (kind == PK_STRING || kind == PK_BYTES)
+        em("                Str v = { 0 };\n\n");
+    else
+        emf("                %s v = 0;\n\n", mem_type(kind));
+    emf("                if (f.%s(&v) != 1)\n", as_fn(kind));
+    em("                    return -1;\n");
+}
+
+static void em_append_bytes(int fi)
+{
+    em("            {\n                Str v = { 0 };\n\n");
+    em("                if (f.as_str(&v) != 1)\n                    return -1;\n");
+    emf("                if (tmp.%s_n >= %d)\n                    return -1;\n",
+        fname_e[fi], cap_of());
+    emf("                tmp.%s[tmp.%s_n++] = v;\n", fname_e[fi], fname_e[fi]);
+    em("            }\n");
+}
+
+static void emit_decode_field(int fi, int *req_bit)
+{
+    PfField *f = &pf->fields[fi];
+    char ref[160] = { 0 };
+
+    emf("        case %d: {\n", f->number);
+    if (f->repeated) {
+        if (is_numeric(f->kind)) {
+            emf("            if (f.wire == %s) {\n", pkwire(f->kind));
+            em_scalar_from_field(f->kind);
+            emf("                if (tmp.%s_n >= %d)\n                    return -1;\n",
+                fname_e[fi], cap_of());
+            emf("                tmp.%s[tmp.%s_n++] = ", fname_e[fi],
+                fname_e[fi]);
+            em_cast_value(f->kind, "v");
+            em(";\n");
+            em("            } else if (f.wire == PB_BYTES) {\n");
+            em("                PbIter it = { 0 };\n\n");
+            em("                if (f.packed(&it) != 1)\n                    return -1;\n");
+            em("                for (;;) {\n");
+            emf("                    %s v = 0;\n", mem_type(f->kind));
+            emf("                    int er = it.%s(&v);\n\n", pi_fn(f->kind));
+            em("                    if (er == 0)\n                        break;\n");
+            em("                    if (er < 0)\n                        return -1;\n");
+            emf("                    if (tmp.%s_n >= %d)\n                        return -1;\n",
+                fname_e[fi], cap_of());
+            emf("                    tmp.%s[tmp.%s_n++] = ", fname_e[fi],
+                fname_e[fi]);
+            em_cast_value(f->kind, "v");
+            em(";\n                }\n");
+            em("            } else {\n");
+            em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+            em("            }\n");
+            em("            break;\n        }\n");
+            return;
+        }
+        if (is_bytes(f->kind)) {
+            em("            if (f.wire != PB_BYTES) {\n");
+            em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+            em("                break;\n            }\n");
+            em_append_bytes(fi);
+            em("            break;\n        }\n");
+            return;
+        }
+        {
+            PfMsg *child = msg_of(f);
+
+            if (!child) {
+                fail("repeated 消息字段的类型没有解析出来");
+                return;
+            }
+            em("            if (f.wire != PB_BYTES) {\n");
+            em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+            em("                break;\n            }\n");
+            emf("            if (tmp.%s_n >= %d)\n                return -1;\n",
+                fname_e[fi], cap_of());
+            emf("            if (%.*s_decode(f.s.s.data, f.s.s.len, &tmp.%s[tmp.%s_n]) != 1)\n",
+                child->cname.s.len, child->cname.s.data, fname_e[fi],
+                fname_e[fi]);
+            em("                return -1;\n");
+            emf("            tmp.%s_n++;\n", fname_e[fi]);
+            em("            break;\n        }\n");
+        }
+        return;
+    }
+    if (f->kind == PK_MESSAGE) {
+        PfMsg *child = msg_of(f);
+
+        if (!child) {
+            fail("消息字段的类型没有解析出来");
+            return;
+        }
+        em("            if (f.wire != PB_BYTES) {\n");
+        em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+        em("                break;\n            }\n");
+        emf("            if (%.*s_decode(f.s.s.data, f.s.s.len, &tmp.%s) != 1)\n",
+            child->cname.s.len, child->cname.s.data, fname_e[fi]);
+        em("                return -1;\n");
+        if (f->oneof >= 0)
+            emf("            tmp.%s_case = %d;\n", oname_e[f->oneof], f->number);
+        else
+            emf("            tmp.%s_has = 1;\n", fname_e[fi]);
+        em("            break;\n        }\n");
+        return;
+    }
+    if (is_bytes(f->kind)) {
+        em("            if (f.wire != PB_BYTES) {\n");
+        em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+        em("                break;\n            }\n");
+        em_scalar_from_field(f->kind);
+        emf("            tmp.%s = v;\n", fname_e[fi]);
+        if (f->optional && f->oneof < 0)
+            emf("            tmp.%s_has = 1;\n", fname_e[fi]);
+        if (f->oneof >= 0)
+            emf("            tmp.%s_case = %d;\n", oname_e[f->oneof], f->number);
+        em("            break;\n        }\n");
+        return;
+    }
+    emf("            if (f.wire != %s) {\n", pkwire(f->kind));
+    em("                if (r.skip(&f) != 1)\n                    return -1;\n");
+    em("                break;\n            }\n");
+    em_scalar_from_field(f->kind);
+    snprintf(ref, sizeof ref, "tmp.%s", fname_e[fi]);
+    emf("            %s = ", ref);
+    em_cast_value(f->kind, "v");
+    em(";\n");
+    if (f->optional && f->oneof < 0)
+        emf("            tmp.%s_has = 1;\n", fname_e[fi]);
+    if (f->required) {
+        emf("            seen |= 1ull << %d;\n", *req_bit);
+        (*req_bit)++;
+    }
+    if (f->oneof >= 0)
+        emf("            tmp.%s_case = %d;\n", oname_e[f->oneof], f->number);
+    em("            break;\n        }\n");
+}
+
+/* ---- init 与默认值 ---- */
+
+static int str_is(Str s, const char *lit)
+{
+    int n = (int)strlen(lit);
+
+    return s.s.len == n
+           && (n == 0 || memcmp(s.s.data, lit, (usize)n) == 0);
+}
+
+static void em_cstr(Str s)
+{
+    int i = 0;
+
+    em("\"");
+    for (i = 0; i < s.s.len; i++) {
+        int c = (u8)s.s.data[i];
+
+        if (c == '"' || c == '\\') {
+            emf("\\%c", c);
+        } else if (c == '\n') {
+            em("\\n");
+        } else if (c == '\t') {
+            em("\\t");
+        } else if (c == '\r') {
+            em("\\r");
+        } else if (c >= 32 && c < 127) {
+            char one[2] = { (char)c, 0 };
+
+            em(one);
+        } else {
+            emf("\\x%02x", c);
+        }
+    }
+    em("\"");
+}
+
+static int emit_default(int fi)
+{
+    PfField *f = &pf->fields[fi];
+    Str d = f->def_text;
+
+    if (!f->has_default)
+        return 1;
+    if (f->repeated) {
+        fail2("repeated 字段不能有默认值", f->name);
+        return 0;
+    }
+    emf("    m->%s = ", fname_e[fi]);
+    if (f->kind == PK_STRING || f->kind == PK_BYTES) {
+        em("(Str){ (char[:]){ (char *)");
+        em_cstr(d);
+        emf(", %d } }", d.s.len);
+    } else if (f->kind == PK_BOOL) {
+        em(str_is(d, "true") ? "1" : "0");
+    } else if (f->kind == PK_ENUM) {
+        PfEnum *e = 0;
+        int j = 0;
+        int found = 0;
+
+        if (f->msg < 0 || f->msg >= pf->nenums) {
+            fail2("枚举字段的默认值没有枚举类型", f->name);
+            return 0;
+        }
+        e = &pf->enums[f->msg];
+        for (j = 0; j < e->nvals; j++) {
+            PfEnumVal *v = &pf->vals[e->first_val + j];
+
+            if (v->name.s.len == d.s.len
+                && memcmp(v->name.s.data, d.s.data, (usize)d.s.len) == 0) {
+                ems(v->cname);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fail2("默认值不是这个枚举的成员", f->name);
+            return 0;
+        }
+    } else if ((f->kind == PK_FLOAT || f->kind == PK_DOUBLE)
+               && (str_is(d, "inf") || str_is(d, "nan"))) {
+        fail2("default 的 inf/nan 还没有落成 C6 字面量", f->name);
+        return 0;
+    } else {
+        if (f->def_neg)
+            em("-");
+        ems(d);
+    }
+    em(";\n");
+    return 1;
+}
+
+static void emit_init(void)
+{
+    int mi = 0;
+    int i = 0;
+
+    for (mi = 0; mi < pf->nmsgs; mi++) {
+        PfMsg *m = &pf->msgs[mi];
+
+        emf("void %.*s_init(struct %.*s *m)\n{\n", m->cname.s.len,
+            m->cname.s.data, m->cname.s.len, m->cname.s.data);
+        em("    if (!m)\n        return;\n    memset(m, 0, sizeof *m);\n");
+        for (i = m->first_field; i >= 0; i = pf->fields[i].next)
+            if (!emit_default(i))
+                return;
+        em("}\n\n");
+    }
+}
+
+static void emit_decode(void)
+{
+    int mi = 0;
+    int i = 0;
+
+    for (mi = 0; mi < pf->nmsgs; mi++) {
+        PfMsg *m = &pf->msgs[mi];
+        int order[PF_MAX_FIELD] = { 0 };
+        int n = field_order(m, order);
+        int nreq = 0;
+        int bit = 0;
+
+        for (i = 0; i < n; i++)
+            if (pf->fields[order[i]].required)
+                nreq++;
+        emf("int %.*s_decode(const void *src, int n, struct %.*s *out)\n{\n",
+            m->cname.s.len, m->cname.s.data, m->cname.s.len, m->cname.s.data);
+        emf("    struct %.*s tmp = { 0 };\n", m->cname.s.len, m->cname.s.data);
+        em("    PbReader r = pb_reader(src, n);\n");
+        em("    PbField f = { 0 };\n    int rr = 0;\n");
+        if (nreq > 0)
+            em("    u64 seen = 0;\n");
+        em("\n    if (!out)\n        return -1;\n");
+        emf("    %.*s_init(&tmp);\n", m->cname.s.len, m->cname.s.data);
+        em("    for (;;) {\n");
+        em("        rr = r.next(&f);\n");
+        em("        if (rr == 0)\n            break;\n");
+        em("        if (rr != 1)\n            return -1;\n");
+        em("        switch (f.field) {\n");
+        for (i = 0; i < n; i++)
+            emit_decode_field(order[i], &bit);
+        em("        default:\n");
+        em("            if (r.skip(&f) != 1)\n                return -1;\n");
+        em("            break;\n        }\n    }\n");
+        if (nreq > 0) {
+            u64 mask = 0;
+
+            mask = nreq >= 64 ? 0xffffffffffffffffull : ((1ull << nreq) - 1);
+            emf("    if ((seen & 0x%llxull) != 0x%llxull)\n        return -1;\n",
+                (unsigned long long)mask, (unsigned long long)mask);
+        }
+        em("    *out = tmp;\n    return 1;\n}\n\n");
+    }
+}
+
+/* ---- 路径与文件 ---- */
+
+static char mod_dotted[512];
+static char dir_rel[512];
+static char out_path[1024];
+
+static int ident_char(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9') || c == '_';
+}
+
+static void sanitize_ident(char *dst, int cap, const char *src)
+{
+    int n = 0;
+
+    for (; src[n] && n < cap - 1; n++)
+        dst[n] = ident_char((u8)src[n]) ? src[n] : '_';
+    dst[n] = 0;
+}
+
+static int mkdir_p(const char *path)
+{
+    char tmp[1024] = { 0 };
+    int i = 0;
+    int n = (int)strlen(path);
+
+    if (n >= (int)sizeof tmp)
+        return 0;
+    memcpy(tmp, path, (usize)n);
+    for (i = 1; i <= n; i++) {
+        if (tmp[i] == '/' || tmp[i] == 0) {
+            char save = tmp[i];
+
+            tmp[i] = 0;
+            if (tmp[0] && mkdir(tmp, 0777) != 0) {
+                struct stat st = { 0 };
+
+                if (stat(tmp, &st) != 0 || !(st.st_mode & S_IFDIR)) {
+                    fprintf(stderr, "protoc6: 建不了目录 %s\n", tmp);
+                    return 0;
+                }
+            }
+            tmp[i] = save;
+        }
+    }
+    return 1;
+}
+
+static int read_file(const char *path, char **out, int *n)
+{
+    FILE *fp = 0;
+    long size = 0;
+    size_t got = 0;
+    char *buf = 0;
+
+    if (!path || !out || !n)
+        return 0;
+    fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "protoc6: 打不开 %s\n", path);
+        return 0;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || (size = ftell(fp)) < 0
+        || fseek(fp, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "protoc6: 读不了 %s\n", path);
+        fclose(fp);
+        return 0;
+    }
+    buf = (char *)malloc((size_t)size + 1);
+    if (!buf) {
+        fprintf(stderr, "protoc6: 内存不够\n");
+        fclose(fp);
+        return 0;
+    }
+    got = fread(buf, 1, (size_t)size, fp);
+    fclose(fp);
+    buf[got] = 0;
+    *out = buf;
+    *n = (int)got;
+    return 1;
+}
+
+/* 源路径 -> 文件主名（去掉目录与 .proto 后缀，非法字符换成 _）。 */
+static void file_stem(const char *path, char *dst, int cap)
+{
+    const char *base = path;
+    const char *dot = 0;
+    int i = 0;
+    int n = 0;
+
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/')
+            base = path + i + 1;
+    for (i = 0; base[i]; i++)
+        if (base[i] == '.')
+            dot = base + i;
+    n = dot ? (int)(dot - base) : (int)strlen(base);
+    if (n <= 0) {
+        dst[0] = 0;
+        return;
+    }
+    if (n > cap - 1)
+        n = cap - 1;
+    memcpy(dst, base, (usize)n);
+    dst[n] = 0;
+}
+
+static int line_of(const char *src, int n, int at)
+{
+    int i = 0;
+    int line = 1;
+
+    for (i = 0; i < at && i < n; i++)
+        if (src[i] == '\n')
+            line++;
+    return line;
+}
+
+static int gen_file(const char *path)
+{
+    static ProtoFile store;
+    ProtoFile *p = &store;
+    char *src = 0;
+    int n = 0;
+    char stem[256] = { 0 };
+    int i = 0;
+
+    if (!read_file(path, &src, &n))
+        return 0;
+    if (pf_open(p, src, n) != 0 || parse(p) != 0) {
+        Str w = why(p);
+
+        fprintf(stderr, "protoc6: %s:%d: %s\n", path,
+                line_of(src, n, error_at(p)), w.s.len ? w.s.data : "解析失败");
+        free(src);
+        return 0;
+    }
+    pf = p;
+    source_name = path;
+    if (!prepare_names() || !topo_sort()) {
+        free(src);
+        return 0;
+    }
+
+    /* 模块名：<package>.<stem>；没有 package 时用 pb.<stem>。 */
+    file_stem(path, stem, (int)sizeof stem);
+    {
+        char safe[256] = { 0 };
+
+        sanitize_ident(safe, (int)sizeof safe, stem);
+        if (safe[0] == 0)
+            strcpy(safe, "pb");
+        if (p->package.s.len > 0) {
+            snprintf(mod_dotted, sizeof mod_dotted, "%.*s.%s",
+                     p->package.s.len, p->package.s.data, safe);
+        } else {
+            snprintf(mod_dotted, sizeof mod_dotted, "pb.%s", safe);
+        }
+        /* 目录：模块名的点换成斜杠（模块名就是路径） */
+        snprintf(dir_rel, sizeof dir_rel, "%s", mod_dotted);
+        for (i = 0; dir_rel[i]; i++)
+            if (dir_rel[i] == '.')
+                dir_rel[i] = '/';
+        snprintf(out_path, sizeof out_path, "%s/%s.c6", out_dir, dir_rel);
+    }
+    if (!mkdir_p(out_dir)) {
+        free(src);
+        return 0;
+    }
+    {
+        char dir[1024] = { 0 };
+
+        snprintf(dir, sizeof dir, "%s/%s", out_dir, dir_rel);
+        /* 去掉最后一段文件名 */
+        for (i = (int)strlen(dir) - 1; i > 0 && dir[i] != '/'; i--)
+            dir[i] = 0;
+        if (!mkdir_p(dir)) {
+            free(src);
+            return 0;
+        }
+    }
+
+    on = 0;
+    obad = 0;
+    gen_error = 0;
+    emf("/* 由 tools/protoc6 从 %s 生成，不要手改。\n", source_name);
+    emf(" * repeated/map 容量：%d；零分配：字符串是输入上的视图。\n", rep_cap);
+    emf(" * 源语法：proto%d；%d 个消息、%d 个枚举。\n */\n\n", p->syntax, p->nmsgs,
+        p->nenums);
+    em("#include <string.h>\n\n");
+    emf("module %s;\n\n", mod_dotted);
+    em("import std.core.types;\n");
+    em("import std.text.str;\n");
+    em("import std.data.protobuf;\n\n");
+    emit_enums();
+    for (i = 0; i < tn; i++)
+        emit_struct(&pf->msgs[torder[i]]);
+    emit_protos();
+    emit_init();
+    emit_size();
+    emit_encode();
+    emit_decode();
+    if (obad || gen_error) {
+        fprintf(stderr, "protoc6: %s: 生成失败（输出缓冲不够或语义错误）\n", path);
+        free(src);
+        return 0;
+    }
+    {
+        FILE *fp = fopen(out_path, "wb");
+
+        if (!fp) {
+            fprintf(stderr, "protoc6: 写不了 %s\n", out_path);
+            free(src);
+            return 0;
+        }
+        if (fwrite(obuf, 1, (size_t)on, fp) != (size_t)on) {
+            fprintf(stderr, "protoc6: 写 %s 时出错\n", out_path);
+            fclose(fp);
+            free(src);
+            return 0;
+        }
+        fclose(fp);
+    }
+    printf("protoc6: %s -> %s（%d 个消息、%d 个枚举）\n", path, out_path,
+           p->nmsgs, p->nenums);
+    free(src);
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    int i = 0;
+    int nfiles = 0;
+    int bad = 0;
+
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            usage();
+            return 0;
+        }
+        if (strcmp(a, "--version") == 0) {
+            printf("protoc6 1.0（c6 %s）\n", "0.6.2");
+            return 0;
+        }
+        if (strcmp(a, "--out") == 0 || strcmp(a, "-o") == 0) {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            out_dir = argv[++i];
+            continue;
+        }
+        if (strncmp(a, "--out=", 6) == 0) {
+            out_dir = a + 6;
+            continue;
+        }
+        if (strcmp(a, "--rep-cap") == 0) {
+            if (i + 1 >= argc || atoi(argv[++i]) <= 0
+                || atoi(argv[i]) > 1024) {
+                fprintf(stderr, "protoc6: --rep-cap 要是 1..1024\n");
+                return 2;
+            }
+            rep_cap = atoi(argv[i]);
+            continue;
+        }
+        if (strncmp(a, "--rep-cap=", 10) == 0) {
+            rep_cap = atoi(a + 10);
+            if (rep_cap <= 0 || rep_cap > 1024) {
+                fprintf(stderr, "protoc6: --rep-cap 要是 1..1024\n");
+                return 2;
+            }
+            continue;
+        }
+        if (a[0] == '-' && a[1] != 0) {
+            fprintf(stderr, "protoc6: 不认识的选项 %s\n", a);
+            usage();
+            return 2;
+        }
+        if (!gen_file(a))
+            bad = 1;
+        nfiles++;
+    }
+    if (!out_dir || nfiles == 0) {
+        usage();
+        return 2;
+    }
+    return bad ? 1 : 0;
+}

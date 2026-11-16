@@ -1,0 +1,22 @@
+// protoc6 用例：proto2 的 required / optional 默认值 / packed 开关。
+syntax = "proto2";
+
+package demo;
+
+enum Mode {
+  MODE_A = 0;
+  MODE_B = 1;
+}
+
+message Old {
+  required int32 id = 1;
+  optional string name = 2 [default = "anon"];
+  optional int32 count = 3 [default = 42];
+  optional bool flag = 4 [default = true];
+  optional double ratio = 5 [default = 1.5];
+  optional Mode mode = 6 [default = MODE_B];
+  optional sint32 delta = 7 [default = -3];
+  repeated int32 nums = 8;
+  repeated int32 packed_nums = 9 [packed = true];
+  repeated sint32 zz = 10 [packed = false];
+}

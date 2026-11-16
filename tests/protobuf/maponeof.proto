@@ -1,0 +1,19 @@
+// protoc6 用例：map（含消息值）、oneof、嵌套消息数组。
+syntax = "proto3";
+
+package demo;
+
+message Item {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message Order {
+  map<string, Item> lines = 1;
+  map<int32, string> labels = 2;
+  oneof pay {
+    string card = 3;
+    int64 iban = 4;
+  }
+  repeated Item items = 5;
+}
