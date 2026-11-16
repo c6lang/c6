@@ -26,6 +26,7 @@ std-calc
 std-cfg2
 std-check
 std-clean
+std-color
 std-cont
 std-creds
 std-crypto
@@ -41,6 +42,7 @@ std-font
 std-form
 std-fsx
 std-geo
+std-geo2
 std-gfx
 std-graph2
 std-h2
@@ -75,6 +77,7 @@ std-search
 std-sec
 std-ser
 std-serve
+std-stats
 std-subs
 std-text
 std-textan

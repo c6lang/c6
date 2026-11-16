@@ -9318,8 +9318,18 @@ static u32 gen_postfix_ops(u32 v)
                     if (pa_accept_ch('(')) {
                         if (!pa_accept_ch(')')) {
                             for (;;) {
+                                u32 av3 = gen_assign();
+                                u32 aty3 = cur_op_ty();
+                                u32 pty3 = ty_func_param(ms->type, narg);
+
+                                /* 实参按形参类型转换：`m.push(10)` 里 10 是 int、
+                                 * 形参是 double，不转就进通用寄存器，被调方从
+                                 * xmm0 读到的是 0（同一个调用写 `m.push(10.0)`
+                                 * 却完全正确，所以很难看出来）。 */
+                                if (pty3 && !ty_is_agg(pty3) && aty3 != pty3)
+                                    av3 = gen_convert(av3, aty3, pty3);
                                 if (narg < 16)
-                                    avs[narg++] = value_of(gen_assign());
+                                    avs[narg++] = value_of(av3);
                                 if (!pa_accept_ch(','))
                                     break;
                             }
