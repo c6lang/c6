@@ -87,6 +87,7 @@ std-time
 std-tour
 std-transcode
 std-ub
+std-util
 std-web
 std-wire
 std-words
