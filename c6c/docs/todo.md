@@ -4163,3 +4163,60 @@ cmake --build build --target lint embedcheck pkgcheck sharedcheck ldcheck dynche
 下一轮的顺序：先补 libc 面（`opendir`/`readdir`/`getrusage`/`tcsetattr` 各一条
 syscall，能把 std-fsx/std-ub/std-sys/std-term 一起点亮），再看跨 TU 符号那 9 个
 （那是多 TU 语义，得先定规则），最后才碰行为差异。
+
+## 第 210 轮：运行时第二批 + `errno` 真的会设（回归 42 → 45）
+
+上一轮把开关和基线做出来了，这一轮往缺口里填东西。结论只有一句话：
+**卡住那些用例的从来不是"缺函数"，而是"缺 `errno`"**。
+
+**做了什么**：
+
+* `c6c/src/main.c6`：预定义宏里加 `_GNU_SOURCE 1`——和 tcc 一个口径。glibc 把
+  `pthread_setname_np`、`cfmakeraw`、`strsignal` 一大片藏在 `__USE_GNU` 后面，
+  不开就「未声明的标识符」。这一条不改变行为，只是让系统头把该给的东西给全。
+* `c6c/lib/rt.c6` 第二批（全是薄壳，能弱定义的一律 `weak`）：
+  * 目录：`opendir` / `readdir` / `closedir` / `rewinddir`（自己 decode
+    `getdents64`，`DIR *` 其实是「fd + 4 KiB 缓冲 + 游标」）；
+  * 进程/终端：`getrusage`、`tcsetattr`/`tcflush`/`tcdrain`；
+  * 线程身份：`pthread_self`（`gettid`）、`pthread_equal`、`pthread_detach`、
+    `pthread_once`、`pthread_key_create`/`setspecific`/`getspecific`、
+    `pthread_mutex_trylock`/`timedlock`、`pthread_cond_timedwait`、
+    `pthread_rwlock_*`、`pthread_attr_setstacksize`/`setdetachstate`、
+    `pthread_setname_np`（自己的线程走 `prctl`，别人的线程写
+    `/proc/self/task/<tid>/comm`）/`pthread_getname_np`、`sched_yield`；
+  * 文件/链接：`symlink`、`link`、`readlink`、`fcntl`、`msync`；
+  * 口令库：`getpwuid` / `getpwnam`（解析 `/etc/passwd`，字段指进静态缓冲）；
+  * 信号**集合**：`sigemptyset`/`sigfillset`/`sigaddset`/`sigdelset`/`sigismember`
+    改成真位操作（glibc 的 `sigset_t` 就是 1024 位位图）；`sigpending` 返回 0。
+    `sigaction`/`sigprocmask` **仍是空操作**——没有信号投递，这一条没变。
+  * 名字解析：`getaddrinfo` / `freeaddrinfo` / `gai_strerror` / `inet_addr` /
+    `inet_ntoa` / `inet_pton` / `inet_ntop`。**只认**数字点分 IPv4、`localhost`
+    和数字/常见名字的端口（http/https/ssh/domain）；真域名返回 `EAI_NONAME`，
+    不假装解析成功。结构体按 glibc 的 ABI 摆，调用方用的是系统 `<netdb.h>`。
+  * stdio 的 `ferror`/`feof`/`clearerr`/`fileno`：前三个只能是"没错误、没到
+    EOF"（rt.c6 的 `FILE` 就是 fd，没有标志位），`fileno` 是准的。
+* **`errno` 现在真的会设**：rt.c6 一直只返回 `-errno`、不设 errno，于是
+  `errno == EINPROGRESS` / `EAGAIN` / `EINTR` 这类分支永远走失败那条路——
+  `std/net/tcp.c6` 的非阻塞 connect 就是这么被卡掉的（`poll` 明明可写，却因为
+  `errno` 还是 0 被判成"连接失败"）。做法是在六个 `c6c_sys*` 薄壳里统一
+  `if (r < 0 && r > -4096) errno = -r;`，返回值口径不变。`errno` 的**定义**按
+  `#ifdef errno` 分岔：系统 `<errno.h>`（glibc/musl）把它做成宏
+  `(*__errno_location())`，那就用系统那份；c6c 自己的 `<errno.h>` 是
+  `extern int errno;`，那就给一个 `weak` 定义（多 TU 链接不会撞"重复定义"）。
+
+**实测**（`./c6c/tests/regression-c6c.sh --all`，即全部 92 个 std-* 用例）：
+
+```
+42 → 45 / 92     新增全绿：std-fsx（33 条自检）/ std-h2（49 条）/ std-wire（19 条）
+                 没有一条从绿变红
+差一点的：std-serve 28 条只差 1 条（assets: Content-Type）、std-pack 差 1 条
+         （hexdump 大写列）、std-cipher 差 1 条（AES CTR 向量）、std-db 差 1 条
+```
+
+`std-term` 现在是「tty 那半段全过，跑到信号那半段被 SIGUSR1 打死」——因为
+`sigaction` 还是空操作。要做真信号（`rt_sigaction` + `SA_RESTORER` 跳板）才能过，
+不是这一轮的量级。
+
+**还差的 47 个**，分类没变（libc 面 / `-lm` / 跨 TU 符号 / 行为差异），但每一类
+都薄了一层。下一轮的顺序：`getgrgid`+`getgrouplist` 补完口令那半边、`-lm` 走
+动态依赖（`DT_NEEDED` 加一条 libm）、再看跨 TU 的模板成员函数与 `$2` 符号。

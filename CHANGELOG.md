@@ -7,6 +7,31 @@
 
 ## 未发布
 
+### 运行时第二批 + `errno`：回归 42 → 45 / 92
+
+- `c6c/src/main.c6` 预定义 `_GNU_SOURCE 1`（和 tcc 一个口径）：glibc 把
+  `pthread_setname_np`、`cfmakeraw`、`strsignal` 这些藏在 `__USE_GNU` 后面，
+  不开就「未声明的标识符」。
+- `c6c/lib/rt.c6` 补第二批（能弱定义的一律 `weak`）：`opendir`/`readdir`/
+  `closedir`/`rewinddir`（自己 decode `getdents64`）、`getrusage`、
+  `tcsetattr`/`tcflush`/`tcdrain`、`pthread_self`（`gettid`）/`equal`/`detach`/
+  `once`/`key_create`/`setspecific`/`getspecific`/`mutex_trylock`/`timedlock`/
+  `cond_timedwait`/`rwlock_*`/`attr_setstacksize`/`setdetachstate`/
+  `setname_np`（自己走 `prctl`，别的线程写 `/proc/self/task/<tid>/comm`）/
+  `getname_np`、`sched_yield`、`symlink`/`link`/`readlink`/`fcntl`/`msync`、
+  `getpwuid`/`getpwnam`、真的 `sigset_t` 位操作（`sigemptyset`/`sigfillset`/
+  `sigaddset`/`sigdelset`/`sigismember`）、`sigpending`、
+  `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`inet_addr`/`inet_ntoa`/
+  `inet_pton`/`inet_ntop`（只认数字地址与 `localhost`，真域名如实返回
+  `EAI_NONAME`）、`ferror`/`feof`/`clearerr`/`fileno`。
+- **`errno` 真的会设了**：六个 `c6c_sys*` 薄壳统一在返回负数时
+  `errno = -r`（返回值口径不变）。在这之前按 `errno == EINPROGRESS`/`EAGAIN`/
+  `EINTR` 分支的代码永远走失败那条路——`std/net/tcp.c6` 的非阻塞 connect 就是
+  这么被卡死的。`errno` 的定义按 `#ifdef errno` 分岔：系统 `<errno.h>` 是宏
+  （`(*__errno_location())`）时用系统那份，c6c 自己的 `<errno.h>` 下给一个
+  `weak` 定义。
+- 回归：42 → 45 / 92，新增 `std-fsx` / `std-h2` / `std-wire` 全绿，没有回退。
+
 ### 回归换编译器跑：`C6_CC` + c6c 侧 42 个用例
 
 - `tests/regression.sh` 的被测编译器从写死的 `$C6_TCC_DIR/c6` 改成 `$C6_CC`
