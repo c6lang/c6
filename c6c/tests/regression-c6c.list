@@ -19,6 +19,7 @@ std-async3
 std-async4
 std-async5
 std-audio
+std-audio2
 std-bin
 std-bwt
 std-calc
@@ -35,6 +36,7 @@ std-docs
 std-ds
 std-enc
 std-exec
+std-font
 std-fsx
 std-gfx
 std-graph2
@@ -42,10 +44,12 @@ std-h2
 std-hash
 std-hash2
 std-img
+std-legacy
 std-linalg
 std-linux
 std-markup
 std-match
+std-math2
 std-math3
 std-mesh
 std-mgmt
@@ -55,6 +59,7 @@ std-node
 std-ops
 std-ordered
 std-pack
+std-packet
 std-pkg
 std-proto
 std-proto2

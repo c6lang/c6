@@ -4592,3 +4592,25 @@ fetch(SS("GET"), (Str){ (char[:]){ url, (int)5 } }, SS(""), ...);
 另外这个用例还缺第二个东西：`未定义的符号 'getnameinfo'`（`std/net/resolver.c6`
 用它做反查）。即使解析修好，也得先补上 `getnameinfo` 才能在 c6c 上链出来。
 两个都补掉才算这一个用例全绿。
+
+## 第 219 轮：浮点/整数比较（std-geo 全绿，59 → 64）
+
+顺着 std-geo 那 16 条失败摸下去的。`geo_distance` 里 haversine 的 `h` 算出来
+是对的（0.006999873），可 `if (h > 1) h = 1;` 之后 `h` 变成 1，距离直接从
+1067 km 跳到 20015 km（半圈）。
+
+`gen_cmp3` 的浮点分支把整数那一侧只做了 `gen_cast_to`（按位截断），没转成
+浮点——注释里写着这是给"通用 `task` 句柄的 `t->val` 按位和浮点字面量比"留的
+偏门。于是 `h > 1` 拿 `h` 的位模式当整数和 1 比，恒为真。加法那边是对的
+（`h + 1` = 1.005），只有比较走这条偏门。
+
+改成两边都 `gen_convert` 到公共浮点宽度。`tests/async.c6` 里那处
+`t->val != i * 2 + 0.5` 改成显式 union 还原 double（旧写法就是靠这条偏门）。
+
+```
+59 → 64 / 92   新增：std-audio2 / std-font / std-legacy / std-math2 / std-packet
+               test-c6c 66/1/0（async 改完之后）
+```
+
+剩下 28 个：libc 面（信号投递 / 真 DNS / 非阻塞边角）、若干模块的数值细节、
+以及 `std-client` 的解析坑（见第 218 轮）。
