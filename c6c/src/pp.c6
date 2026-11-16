@@ -6,7 +6,17 @@
  */
 
 #define MAX_INCDIRS 32
-#define MAX_NEST 64
+/* 源文件栈的最大深度（`#include` 嵌套）。
+ *
+ * 原值 64，对内核远远不够：**即使 include guard 立即挡住内容，压栈这一层
+ * 也已经算深度**，而内核头链层层互引（printk.h → ratelimit_types.h →
+ * spinlock_types.h → qrwlock_types.h → byteorder.h → swab.h → …，
+ * 一路回到 linux/types.h 再展开），实测 lib/vsprintf.c 会到 70 多层。
+ * gcc 的上限是 200（-fmax-include-depth），这里对齐。
+ *
+ * 注意这不是"放宽检查"：栈本身是 PP_STACK_CAP(1024) 那么大，64 从来不是
+ * 容量限制，只是一个拍脑袋的递归保护。 */
+#define MAX_NEST 200
 
 typedef struct Src {
     struct Src *up;
@@ -277,10 +287,19 @@ static int raw_next(Tok *out)
             int k = lex_next(&s->lex, out);
 
             if (k == TK_EOF) {
+                /* **先读再把这一层还回池子**。pp_drop_src() 只是把池指针回退
+                 * （PP_DEPTH = s->idx），下一次 pp_new_src() 就会复用**同一块
+                 * 内存**并覆写 s->up——写成 `pp_drop_src(s); PP_TOP = s->up;`
+                 * 时读到的是已经被重写过的 up，整条源文件栈会被串成错乱的链
+                 * （实测：内核 lib/vsprintf.c 的 include 链在
+                 *  uapi/linux/swab.h(60) → asm/swab.h(64) 之间凭空跳 4 层，
+                 *  最后撞"#include 嵌套太深（64 层）"）。 */
+                Src *up = s->up;
+
                 INCLUDE_DEPTH = s->depth;
                 exp_reset(s->emark);
                 pp_drop_src(s);
-                PP_TOP = s->up;
+                PP_TOP = up;
                 cur_file_sync();
                 continue;
             }
