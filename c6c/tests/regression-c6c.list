@@ -26,6 +26,7 @@ std-bwt
 std-calc
 std-cfg2
 std-check
+std-cipher
 std-clean
 std-cli
 std-client
