@@ -1,0 +1,696 @@
+/* std/net/http2：HTTP/2 帧层（RFC 9113）——帧头与帧负载、连接层常量、管道收发。
+ *
+ *     import std.net.http2;
+ *
+ *     H2Pipe p = { 0 };
+ *     char buf[256] = { 0 };
+ *     H2Frame f = { 0 };
+ *     h2_pipe_attach(&p, rfd, wfd);
+ *     h2_pipe_send(&p, H2_SETTINGS, 0, 0, settings, n);
+ *     if (h2_pipe_recv(&p, &f) == 1) { ... h2_pipe_payload(&p, buf, (int)sizeof buf); }
+ *
+ * 这一层只做「字节 <-> 帧」和「帧 <-> fd」，不碰 HPACK（那是
+ * `std.encoding.hpack`），也不管请求/响应语义（那是 `std.net.http2c` /
+ * `std.net.http2d`）。把两个方向拆开的好处是：帧层可以脱网用字节数组测，
+ * 客户端/服务端只用关心自己的状态机。
+ *
+ * 约定：
+ *
+ * - 帧头是 9 字节：24 位长度 + 8 位类型 + 8 位标志 + 31 位流号（最高位保留）；
+ * - `h2_frame_head` 返回 1（完整帧头）/ 0（字节还不够）/ -1（长度为零字节区外
+ *   或流号最高位为 1）；未知帧类型**不**算错（RFC 9113 §4.1 要求忽略）；
+ * - `h2_pipe_recv` 只读帧头，负载由调用方用 `h2_pipe_payload` 读（读进自己的
+ *   缓冲）或 `h2_pipe_discard` 丢掉；两个都要把 `f->len` 字节处理干净，否则
+ *   后面的帧会错位；
+ * - fd 的阻塞/超时归调用方（`std.net.tcp` 的 `set_timeout` 就是干这个的）；
+ *   `h2_pipe_*` 只处理 EINTR 重试；
+ * - `h2_payload_off` 统一剥 PADDED / PRIORITY 两个前缀（DATA 只有 padding，
+ *   HEADERS 两个都可能有），返回有效载荷长度，起点写进 `*off`；
+ * - 所有写函数都是「先算再写」：容量不够返回 -1，一个字节都不动。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+
+module std.net.http2;
+import std.core.types;
+import std.text.str;
+
+/* 字面量 -> 视图（宏不随 import 传递，每个模块自己定义一次） */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+#define H2_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+#define H2_PREFACE_LEN 24
+#define H2_HEAD_LEN 9
+#define H2_DEFAULT_WINDOW 65535
+#define H2_DEFAULT_FRAME 16384
+#define H2_MAX_FRAME_LIMIT 16777215
+#define H2_MAX_STREAM 0x7fffffffu
+#define H2_MAX_WINDOW 0x7fffffffu
+
+enum H2Type {
+    H2_DATA = 0,
+    H2_HEADERS = 1,
+    H2_PRIORITY = 2,
+    H2_RST_STREAM = 3,
+    H2_SETTINGS = 4,
+    H2_PUSH_PROMISE = 5,
+    H2_PING = 6,
+    H2_GOAWAY = 7,
+    H2_WINDOW_UPDATE = 8,
+    H2_CONTINUATION = 9,
+};
+
+enum H2Flag {
+    H2_END_STREAM = 0x1,
+    H2_ACK = 0x1,
+    H2_END_HEADERS = 0x4,
+    H2_PADDED = 0x8,
+    H2_PRIORITY_FLAG = 0x20,
+};
+
+enum H2Error {
+    H2_NO_ERROR = 0,
+    H2_PROTOCOL = 1,
+    H2_INTERNAL = 2,
+    H2_FLOW_CONTROL = 3,
+    H2_SETTINGS_TIMEOUT = 4,
+    H2_STREAM_CLOSED = 5,
+    H2_FRAME_SIZE = 6,
+    H2_REFUSED_STREAM = 7,
+    H2_CANCEL = 8,
+    H2_COMPRESSION = 9,
+    H2_CONNECT = 10,
+    H2_ENHANCE_CALM = 11,
+    H2_INADEQUATE_SEC = 12,
+    H2_HTTP_1_1_REQUIRED = 13,
+};
+
+enum H2SettingId {
+    H2_SET_HEADER_TABLE = 1,
+    H2_SET_ENABLE_PUSH = 2,
+    H2_SET_MAX_CONCURRENT = 3,
+    H2_SET_INITIAL_WINDOW = 4,
+    H2_SET_MAX_FRAME = 5,
+    H2_SET_MAX_HEADER_LIST = 6,
+};
+
+struct H2Frame {
+    int len;            /* 载荷长度 */
+    int type;
+    int flags;
+    u32 stream;
+};
+
+struct H2Setting {
+    int id;
+    u32 value;
+};
+
+struct H2Pipe {
+    int rfd;
+    int wfd;
+};
+
+static u32 h2_u32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static int h2_u24(const u8 *p)
+{
+    return ((int)p[0] << 16) | ((int)p[1] << 8) | (int)p[2];
+}
+
+static void h2_put_u24(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 16) & 0xff);
+    p[1] = (u8)((v >> 8) & 0xff);
+    p[2] = (u8)(v & 0xff);
+}
+
+static void h2_put_u32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xffu);
+    p[1] = (u8)((v >> 16) & 0xffu);
+    p[2] = (u8)((v >> 8) & 0xffu);
+    p[3] = (u8)(v & 0xffu);
+}
+
+/* preface：1 完全匹配 / 0 前缀一致但还不够 / -1 不是 h2c */
+int h2_preface_check(const char *p, int n)
+{
+    int i = 0;
+
+    if (!p || n < 0)
+        return -1;
+    if (n > H2_PREFACE_LEN)
+        n = H2_PREFACE_LEN;
+    for (i = 0; i < n; i++)
+        if (p[i] != H2_PREFACE[i])
+            return -1;
+    return n >= H2_PREFACE_LEN ? 1 : 0;
+}
+
+/* 帧头：1 完整 / 0 字节还不够 / -1 坏帧头 */
+int h2_frame_head(const void *p, int n, H2Frame *out)
+{
+    const u8 *b = (const u8 *)p;
+
+    if (!p || !out || n < 0)
+        return -1;
+    if (n < H2_HEAD_LEN)
+        return 0;
+    out->len = h2_u24(b);
+    out->type = (int)b[3];
+    out->flags = (int)b[4];
+    out->stream = h2_u32(b + 5) & H2_MAX_STREAM;
+    return 1;
+}
+
+/* 写 9 字节帧头（负载由调用方接着写）；返回 9 或 -1 */
+int h2_head_write(char *dst, int cap, int type, int flags, u32 stream, int len)
+{
+    u8 *b = (u8 *)dst;
+
+    if (!dst || cap < H2_HEAD_LEN || type < 0 || type > 255 || len < 0
+        || len > H2_MAX_FRAME_LIMIT || (stream & ~H2_MAX_STREAM) != 0)
+        return -1;
+    h2_put_u24(b, len);
+    b[3] = (u8)type;
+    b[4] = (u8)(flags & 0xff);
+    h2_put_u32(b + 5, stream & H2_MAX_STREAM);
+    return H2_HEAD_LEN;
+}
+
+/* 帧头 + 负载一起写进缓冲（测试与离线拼包用）；返回总字节数或 -1 */
+int h2_frame_write(char *dst, int cap, int type, int flags, u32 stream,
+                   const void *payload, int len)
+{
+    int h = 0;
+
+    if (!dst || len < 0 || (len > 0 && !payload))
+        return -1;
+    if (cap < H2_HEAD_LEN + len)
+        return -1;
+    h = h2_head_write(dst, cap, type, flags, stream, len);
+    if (h < 0)
+        return -1;
+    if (len > 0)
+        memcpy(dst + h, payload, (size_t)len);
+    return h + len;
+}
+
+/* 剥 PADDED / PRIORITY 前缀：返回有效长度，起点写进 *off */
+int h2_payload_off(const void *p, int len, int flags, int has_priority, int *off)
+{
+    const u8 *b = (const u8 *)p;
+    int start = 0;
+    int pad = 0;
+
+    if (!p || !off || len < 0)
+        return -1;
+    if (flags & H2_PADDED) {
+        if (len < 1)
+            return -1;
+        pad = (int)b[0];
+        start = 1;
+    }
+    if (has_priority) {
+        if (start + 5 > len)
+            return -1;
+        start += 5;
+    }
+    if (start + pad > len)
+        return -1;
+    *off = start;
+    return len - start - pad;
+}
+
+/* SETTINGS 负载：6 字节一项（16 位 id + 32 位值） */
+int h2_settings_write(char *dst, int cap, H2Setting *s, int n)
+{
+    u8 *b = (u8 *)dst;
+    int i = 0;
+
+    if (!dst || n < 0 || cap < n * 6 || (n > 0 && !s))
+        return -1;
+    for (i = 0; i < n; i++) {
+        b[i * 6] = (u8)((s[i].id >> 8) & 0xff);
+        b[i * 6 + 1] = (u8)(s[i].id & 0xff);
+        h2_put_u32(b + i * 6 + 2, s[i].value);
+    }
+    return n * 6;
+}
+
+/* 解 SETTINGS：1 成功 / -1 长度不是 6 的倍数或数组不够 */
+int h2_settings_parse(const void *p, int n, H2Setting *out, int max, int *count)
+{
+    const u8 *b = (const u8 *)p;
+    int i = 0;
+    int k = 0;
+
+    if (!p || !out || n < 0 || max < 0)
+        return -1;
+    if (n % 6 != 0 || n / 6 > max)
+        return -1;
+    for (i = 0; i < n; i += 6) {
+        out[k].id = ((int)b[i] << 8) | (int)b[i + 1];
+        out[k].value = h2_u32(b + i + 2);
+        k++;
+    }
+    if (count)
+        *count = k;
+    return 1;
+}
+
+/* 找一项设置；没有返回 0 */
+int h2_setting_find(H2Setting *s, int n, int id, u32 *out)
+{
+    int i = 0;
+
+    if (!s || n < 0)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (s[i].id == id) {
+            if (out)
+                *out = s[i].value;
+            return 1;
+        }
+    return 0;
+}
+
+int h2_window_write(char *dst, int cap, u32 stream, u32 inc)
+{
+    if (!dst || cap < 4 || inc == 0 || inc > H2_MAX_WINDOW
+        || (stream & ~H2_MAX_STREAM) != 0)
+        return -1;
+    h2_put_u32((u8 *)dst, inc);
+    return 4;
+}
+
+/* 读 WINDOW_UPDATE 的 4 字节增量；0 是协议错 */
+int h2_window_parse(const void *p, int n, u32 *inc)
+{
+    u32 v = 0;
+
+    if (!p || !inc || n != 4)
+        return -1;
+    v = h2_u32((const u8 *)p) & H2_MAX_STREAM;
+    if (v == 0)
+        return -1;
+    *inc = v;
+    return 1;
+}
+
+int h2_rst_write(char *dst, int cap, u32 stream, int code)
+{
+    if (!dst || cap < 4 || stream == 0 || (stream & ~H2_MAX_STREAM) != 0
+        || code < 0 || code > 0xffffffff)
+        return -1;
+    h2_put_u32((u8 *)dst, (u32)code);
+    return 4;
+}
+
+int h2_rst_parse(const void *p, int n, int *code)
+{
+    if (!p || !code || n != 4)
+        return -1;
+    *code = (int)h2_u32((const u8 *)p);
+    return 1;
+}
+
+int h2_ping_write(char *dst, int cap, u64 data)
+{
+    if (!dst || cap < 8)
+        return -1;
+    h2_put_u32((u8 *)dst, (u32)(data >> 32));
+    h2_put_u32((u8 *)dst + 4, (u32)data);
+    return 8;
+}
+
+int h2_ping_parse(const void *p, int n, u64 *data)
+{
+    if (!p || !data || n != 8)
+        return -1;
+    *data = ((u64)h2_u32((const u8 *)p) << 32) | (u64)h2_u32((const u8 *)p + 4);
+    return 1;
+}
+
+/* GOAWAY：4 字节 last-stream + 4 字节错误码 + debug 数据 */
+int h2_goaway_write(char *dst, int cap, u32 last, int code, Str debug)
+{
+    int dn = 0;
+
+    if (!dst || last > H2_MAX_STREAM || code < 0 || debug.s.len < 0)
+        return -1;
+    dn = debug.s.len;
+    if (dn > 0 && !debug.s.data)
+        return -1;
+    if (cap < 8 + dn)
+        return -1;
+    h2_put_u32((u8 *)dst, last);
+    h2_put_u32((u8 *)dst + 4, (u32)code);
+    if (dn > 0)
+        memcpy(dst + 8, debug.s.data, (size_t)dn);
+    return 8 + dn;
+}
+
+int h2_goaway_parse(const void *p, int n, u32 *last, int *code, Str *debug)
+{
+    const u8 *b = (const u8 *)p;
+
+    if (!p || n < 8)
+        return -1;
+    if (last)
+        *last = h2_u32(b) & H2_MAX_STREAM;
+    if (code)
+        *code = (int)h2_u32(b + 4);
+    if (debug)
+        *debug = (Str){ (char[:]){ (char *)b + 8, n - 8 } };
+    return 1;
+}
+
+/* ---- 管道：fd 上的帧收发 ---- */
+
+int h2_pipe_attach(H2Pipe *self, int rfd, int wfd)
+{
+    if (!self || rfd < 0 || wfd < 0)
+        return -1;
+    self->rfd = rfd;
+    self->wfd = wfd;
+    return 1;
+}
+
+int h2_ok(H2Pipe *self) { return self && self->rfd >= 0 && self->wfd >= 0; }
+
+static int h2_read_full(int fd, void *p, int n)
+{
+    char *b = (char *)p;
+    int got = 0;
+
+    while (got < n) {
+        ssize_t k = read(fd, b + got, (size_t)(n - got));
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (k == 0)
+            break;
+        got += (int)k;
+    }
+    return got;
+}
+
+static int h2_write_full(int fd, const void *p, int n)
+{
+    const char *b = (const char *)p;
+    int sent = 0;
+
+    while (sent < n) {
+        ssize_t k = write(fd, b + sent, (size_t)(n - sent));
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (k == 0)
+            return -1;
+        sent += (int)k;
+    }
+    return sent;
+}
+
+/* 发一帧（帧头 + 负载）；返回总字节数或 -1 */
+int h2_pipe_send(H2Pipe *self, int type, int flags, u32 stream,
+                 const void *payload, int len)
+{
+    char head[H2_HEAD_LEN] = { 0 };
+    int h = 0;
+
+    if (!h2_ok(self) || len < 0 || (len > 0 && !payload))
+        return -1;
+    h = h2_head_write(head, (int)sizeof head, type, flags, stream, len);
+    if (h < 0)
+        return -1;
+    if (h2_write_full(self->wfd, head, h) != h)
+        return -1;
+    if (len > 0 && h2_write_full(self->wfd, payload, len) != len)
+        return -1;
+    return h + len;
+}
+
+/* 往写端写一段原始字节（preface 这种不属于任何帧的字节用） */
+int h2_pipe_write(H2Pipe *self, const void *p, int n)
+{
+    if (!h2_ok(self) || n < 0 || (n > 0 && !p))
+        return -1;
+    if (n == 0)
+        return 1;
+    return h2_write_full(self->wfd, p, n) == n ? 1 : -1;
+}
+
+/* 读一帧的帧头：1 拿到 / 0 对端关闭 / -1 错 */
+int h2_pipe_recv(H2Pipe *self, H2Frame *f)
+{
+    u8 head[H2_HEAD_LEN] = { 0 };
+    int n = 0;
+    int rc = 0;
+
+    if (!h2_ok(self) || !f)
+        return -1;
+    n = h2_read_full(self->rfd, head, H2_HEAD_LEN);
+    if (n == 0)
+        return 0;
+    if (n != H2_HEAD_LEN)
+        return -1;
+    rc = h2_frame_head(head, H2_HEAD_LEN, f);
+    if (rc != 1)
+        return -1;
+    return 1;
+}
+
+/* 读恰好 `n` 字节负载（n 一般就是 f->len）；1 成功 / 0 对端关闭 / -1 错 */
+int h2_pipe_payload(H2Pipe *self, void *dst, int n)
+{
+    if (!h2_ok(self) || n < 0 || (n > 0 && !dst))
+        return -1;
+    if (n == 0)
+        return 1;
+    return h2_read_full(self->rfd, dst, n) == n ? 1 : (self ? 0 : -1);
+}
+
+/* 丢掉 n 字节负载（未知帧用） */
+int h2_pipe_discard(H2Pipe *self, int n)
+{
+    char tmp[256] = { 0 };
+    int left = n;
+
+    if (!h2_ok(self) || n < 0)
+        return -1;
+    while (left > 0) {
+        int take = left < (int)sizeof tmp ? left : (int)sizeof tmp;
+
+        if (h2_read_full(self->rfd, tmp, take) != take)
+            return -1;
+        left -= take;
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define T(lit) (SS(lit))
+
+static int h2_has_str(Str s, const char *z)
+{
+    int n = z ? (int)strlen(z) : 0;
+
+    if (s.s.len != n)
+        return 0;
+    return n == 0 || memcmp(s.s.data, z, (size_t)n) == 0;
+}
+
+test "帧头、帧体与 preface" {
+    char buf[64] = { 0 };
+    H2Frame f = { 0 };
+    H2Setting st[2] = { 0 };
+    u32 inc = 0;
+    u64 data = 0;
+    Str dbg = { 0 };
+    u32 last = 0;
+    int code = 0;
+    int n = 0;
+
+    /* preface：前缀一致但不够 -> 0，全等 -> 1，别的东西 -> -1 */
+    if (h2_preface_check("PRI * HT", 8) != 0)
+        return err(1, "preface 前缀应该 0");
+    if (h2_preface_check(H2_PREFACE, H2_PREFACE_LEN) != 1)
+        return err(2, "preface 全等应该 1");
+    if (h2_preface_check("GET / HTTP/1.1\r\n", 16) != -1)
+        return err(3, "HTTP/1 请求不该被当成 h2 preface");
+    /* 帧头：9 字节之前返回 0 */
+    st[0].id = H2_SET_MAX_FRAME;
+    st[0].value = 32768;
+    st[1].id = H2_SET_INITIAL_WINDOW;
+    st[1].value = 1048576;
+    n = h2_settings_write(buf, (int)sizeof buf, st, 2);
+    if (n != 12)
+        return err(4, "SETTINGS 负载应该是 12 字节");
+    if (h2_frame_head(buf, 8, &f) != 0)
+        return err(5, "8 字节还不够一个帧头");
+    /* 帧头 + 负载 */
+    {
+        char frame[64] = { 0 };
+        int total = h2_frame_write(frame, (int)sizeof frame, H2_SETTINGS, 0, 0,
+                                   buf, n);
+
+        if (total != 21)
+            return err(6, "帧总长应该是 21");
+        if (h2_frame_head(frame, total, &f) != 1)
+            return err(7, "帧头解不出来");
+        if (f.len != 12 || f.type != H2_SETTINGS || f.flags != 0 || f.stream != 0)
+            return err(8, "帧头字段不对");
+        if (h2_settings_parse(frame + H2_HEAD_LEN, f.len, st, 2, &n) != 1
+            || n != 2)
+            return err(9, "SETTINGS 解不出来");
+        if (!h2_setting_find(st, n, H2_SET_MAX_FRAME, &inc) || inc != 32768)
+            return err(10, "MAX_FRAME 设置不对");
+        if (h2_setting_find(st, n, H2_SET_ENABLE_PUSH, &inc))
+            return err(11, "没发的设置不该找到");
+        if (h2_settings_parse(buf, 11, st, 2, &n) != -1)
+            return err(12, "SETTINGS 长度不是 6 的倍数应该 -1");
+    }
+    /* WINDOW_UPDATE / RST_STREAM / PING */
+    if (h2_window_write(buf, (int)sizeof buf, 5, 65535) != 4)
+        return err(13, "WINDOW_UPDATE 写不出来");
+    if (h2_window_parse(buf, 4, &inc) != 1 || inc != 65535)
+        return err(14, "WINDOW_UPDATE 解不出来");
+    if (h2_window_write(buf, (int)sizeof buf, 0, 0) != -1)
+        return err(15, "增量 0 应该拒绝");
+    if (h2_rst_write(buf, (int)sizeof buf, 3, H2_CANCEL) != 4)
+        return err(16, "RST_STREAM 写不出来");
+    if (h2_rst_parse(buf, 4, &code) != 1 || code != H2_CANCEL)
+        return err(17, "RST_STREAM 解不出来");
+    if (h2_ping_write(buf, (int)sizeof buf, 0x12345678ull) != 8)
+        return err(18, "PING 写不出来");
+    if (h2_ping_parse(buf, 8, &data) != 1 || data != 0x12345678ull)
+        return err(19, "PING 解不出来");
+    /* GOAWAY：带 debug 数据 */
+    if (h2_goaway_write(buf, (int)sizeof buf, 7, H2_PROTOCOL, T("bad")) != 11)
+        return err(20, "GOAWAY 应该是 11 字节");
+    if (h2_goaway_parse(buf, 11, &last, &code, &dbg) != 1)
+        return err(21, "GOAWAY 解不出来");
+    if (last != 7 || code != H2_PROTOCOL || !h2_has_str(dbg, "bad"))
+        return err(22, "GOAWAY 字段不对");
+    /* 流号最高位不算数（保留位） */
+    {
+        u8 raw[9] = { 0, 0, 0, 1, 0, 0x80, 0, 0, 1 };
+
+        if (h2_frame_head(raw, 9, &f) != 1 || f.stream != 1)
+            return err(23, "流号保留位应该被屏蔽");
+    }
+    /* 容量不够：一个字节都不动 */
+    {
+        char keep[4] = { 'a', 'b', 'c', 0 };
+
+        if (h2_head_write(keep, 8, H2_DATA, 0, 1, 0) != -1)
+            return err(24, "帧头容量不够应该 -1");
+        if (keep[0] != 'a' || keep[3] != 0)
+            return err(25, "失败时不该写缓冲");
+    }
+}
+
+test "填充与优先级前缀" {
+    /* DATA + PADDED：1 字节 pad 长度 + "abc" + 3 字节填充 */
+    u8 data[8] = { 3, 'a', 'b', 'c', 0, 0, 0, 9 };
+    int off = 0;
+    int n = 0;
+
+    n = h2_payload_off(data, 7, H2_PADDED, 0, &off);
+    if (n != 3 || off != 1)
+        return err(26, "DATA 填充剥离不对");
+    /* 填充长度超过载荷 */
+    if (h2_payload_off(data, 3, H2_PADDED, 0, &off) != -1)
+        return err(27, "填充越界应该 -1");
+    /* HEADERS + PADDED + PRIORITY：pad 长度 + 5 字节优先级 + 块 + 填充 */
+    {
+        u8 hb[16] = { 2, 0, 0, 0, 0, 0, 0x82, 0x86, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        n = h2_payload_off(hb, 10, H2_PADDED, 1, &off);
+        if (n != 2 || off != 6)
+            return err(28, "HEADERS 前缀剥离不对");
+    }
+    /* 普通 DATA：原样返回 */
+    if (h2_payload_off("xy", 2, 0, 0, &off) != 2 || off != 0)
+        return err(29, "无前缀时不该移动起点");
+    /* 太短 */
+    if (h2_payload_off("x", 1, 0, 1, &off) != -1)
+        return err(30, "PRIORITY 前缀不足 5 字节应该 -1");
+}
+
+test "管道：帧的收发" {
+    /* 用 socketpair 自环：一端发，另一端收（不依赖 tcp/uds 模块） */
+    int fds[2] = { -1, -1 };
+    H2Pipe a = { 0 };
+    H2Pipe b = { 0 };
+    H2Frame f = { 0 };
+    char payload[64] = { 0 };
+    H2Setting st[1] = { 0 };
+    Str dbg = { 0 };
+    u32 last = 0;
+    int code = 0;
+    int n = 0;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+        return err(31, "socketpair 建不起来");
+    /* socketpair：写 fds[0] 的数据在对端 fds[1] 可读，所以每端读写同一个 fd */
+    h2_pipe_attach(&a, fds[0], fds[0]);
+    h2_pipe_attach(&b, fds[1], fds[1]);
+    st[0].id = H2_SET_MAX_FRAME;
+    st[0].value = 16384;
+    n = h2_settings_write(payload, (int)sizeof payload, st, 1);
+    if (h2_pipe_send(&a, H2_SETTINGS, 0, 0, payload, n) != 9 + 6)
+        return err(32, "SETTINGS 发不出去");
+    if (h2_pipe_send(&a, H2_HEADERS, H2_END_HEADERS | H2_END_STREAM, 1,
+                    "\x82\x86", 2) != 11)
+        return err(33, "HEADERS 发不出去");
+    if (h2_pipe_recv(&b, &f) != 1 || f.type != H2_SETTINGS || f.len != 6)
+        return err(34, "第一个帧收不对");
+    if (h2_pipe_payload(&b, payload, f.len) != 1)
+        return err(35, "SETTINGS 负载读不出来");
+    if (h2_settings_parse(payload, f.len, st, 1, &n) != 1 || st[0].value != 16384)
+        return err(36, "SETTINGS 负载不对");
+    if (h2_pipe_recv(&b, &f) != 1 || f.type != H2_HEADERS || f.stream != 1
+        || f.flags != (H2_END_HEADERS | H2_END_STREAM) || f.len != 2)
+        return err(37, "第二个帧收不对");
+    if (h2_pipe_payload(&b, payload, f.len) != 1
+        || (u8)payload[0] != 0x82 || (u8)payload[1] != 0x86)
+        return err(38, "HEADERS 负载不对");
+    /* 丢弃一个未知帧 */
+    if (h2_pipe_send(&a, 0x42, 0, 0, "0123456789", 10) != 19)
+        return err(39, "未知帧发不出去");
+    if (h2_pipe_recv(&b, &f) != 1 || f.type != 0x42 || f.len != 10)
+        return err(40, "未知帧头不对");
+    if (h2_pipe_discard(&b, f.len) != 1)
+        return err(41, "未知帧丢不掉");
+    /* 对端关闭：recv 返回 0 */
+    if (h2_pipe_send(&a, H2_GOAWAY, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00",
+                     8) != 17)
+        return err(42, "GOAWAY 发不出去");
+    if (h2_pipe_recv(&b, &f) != 1 || f.type != H2_GOAWAY)
+        return err(43, "GOAWAY 头不对");
+    if (h2_pipe_payload(&b, payload, f.len) != 1
+        || h2_goaway_parse(payload, f.len, &last, &code, &dbg) != 1
+        || last != 0 || code != H2_NO_ERROR)
+        return err(44, "GOAWAY 负载不对");
+    close(fds[0]);
+    if (h2_pipe_recv(&b, &f) != 0)
+        return err(45, "对端关闭应该返回 0");
+    close(fds[1]);
+}
