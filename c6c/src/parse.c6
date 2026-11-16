@@ -1366,6 +1366,32 @@ static void alias_register(const char *from, const char *to)
     NALIAS++;
 }
 
+/* 方法式函数的**短名 → 真名**别名。
+ *
+ * 声明那会儿结构体可能还只有个名字（`struct Bucket;`），发射名只能按源码
+ * 短名走，调用点也按它发过重定位；等到定义处结构体补齐了，发射名换成
+ * `<结构体>_<方法>`，旧的那条就悬着了（`static int poke(Bucket *b);` 先声明
+ * 后定义时，链接期报 `poke$2` 未定义）。
+ *
+ * 记账而不是当场接：`x64_alias_idx` 干的是**复制偏移**，定义处这会儿代码
+ * 还没生成，接过去的是 0 —— 引用会跳到地址 0（c6c 编 tcc 时 whole 程序
+ * 一启动就段错误，就是这条线踩的）。等所有 TU 解析完、代码都发出来，
+ * `alias_apply()` 里再接，那会儿偏移才是定下来的。
+ */
+#define METH_ALIAS_MAX 1024
+static u32 METH_ALIAS_FROM[METH_ALIAS_MAX];
+static u32 METH_ALIAS_TO[METH_ALIAS_MAX];
+static u32 NMETH_ALIAS;
+
+static void meth_alias_register(u32 from, u32 to)
+{
+    if (from == to || NMETH_ALIAS >= METH_ALIAS_MAX)
+        return;
+    METH_ALIAS_FROM[NMETH_ALIAS] = from;
+    METH_ALIAS_TO[NMETH_ALIAS] = to;
+    NMETH_ALIAS++;
+}
+
 static u32 gen_expr(void);
 static u32 gen_assign(void);
 static u32 value_of(u32 v);
@@ -4194,7 +4220,18 @@ static u32 tmpl_inst(Tmpl *t, const u32 *args)
         memcpy(inst_nm_sv, TMPL_INST_NM, sizeof(inst_nm_sv));
         memcpy(TMPL_INST_NM, nm, sizeof(TMPL_INST_NM));
         TMPL_INST_NM[sizeof(TMPL_INST_NM) - 1] = 0;
-        ty = parse_struct_body(cid, tag, t->is_union);
+        /* 外层可能正走在"只登记签名"的那一遍里（模板 A 的方法签名里用到
+         * 模板 B 的实例）：B 的体必须在这里一次展开完。外层的第二遍不会
+         * 再重放 B —— `tmpl_inst` 的缓存直接短路返回，于是 B 的方法只剩
+         * 声明、没有定义，链接期报 `<实例名>_<方法>` 未定义（std 的
+         * `Vect@T.iter()` 返回 `Iter@T`，`Iter_int_has` 就是这么丢的）。 */
+        {
+            int sig_sv = PA_SIG_ONLY;
+
+            PA_SIG_ONLY = 0;
+            ty = parse_struct_body(cid, tag, t->is_union);
+            PA_SIG_ONLY = sig_sv;
+        }
         memcpy(TMPL_INST_NM, inst_nm_sv, sizeof(inst_nm_sv));
         PA_TMPL_BODY = tmpl_body_sv;
         tmpl_restore_state(&tmpl_sv);
@@ -20540,10 +20577,31 @@ static void gen_decl_from_spec(u32 base)
                         /* static 的函数名带 TU 后缀（见 tu_static_name）：
                          * 方法真名也得带，否则两个 TU 各自的同名 static 方法
                          * 会撞到同一个符号上。 */
-                        if (s->is_static)
-                            s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
-                        else
-                            s->val = (i64)x64_sym(&X64, emit_name(mn));
+                        {
+                            /* 前向声明那条已经按**短名**建过一条 ELF 符号，
+                             * 而且这之前的调用点（`poke(b)` 写在定义之前）已经
+                             * 按它发过重定位。这里要换成真名，就得把旧的那条
+                             * 也接到同一份代码上，否则那些引用永远悬着——
+                             * 链接期报的 `poke$2` 未定义就是这么来的。
+                             * 接的动作留到 `alias_apply()`（偏移定下来之后）。 */
+                            u32 old_val = (u32)s->val;
+                            const char *sn = s->is_static
+                                ? tu_static_name(s->name) : s->name;
+
+                            if (s->is_static)
+                                s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
+                            else
+                                s->val = (i64)x64_sym(&X64, emit_name(mn));
+                            /* 只有"旧的那条确实是按短名建出来的"才记账：
+                             * 没建过符号时 s->val 也可能是 0，别把 0 号符号
+                             * （可能是别的函数）接过去。 */
+                            /* 声明那条的发射名是 `tu_static_name(nm)`，**不带**
+                             * 模块前缀（`s->val = x64_sym(&X64, enf)` 里那个
+                             * enf），所以这里按同一个口径比。 */
+                            if (old_val != (u32)s->val && X64.sym[old_val].name
+                                && strcmp(X64.sym[old_val].name, sn) == 0)
+                                meth_alias_register(old_val, (u32)s->val);
+                        }
                         if (s->len == 4 && memcmp(s->name, "drop", 4) == 0
                             && ty_func_nparams(ty) == 1) {
                             if (ty_func_ret(ty) != ty_void())
@@ -20838,6 +20896,15 @@ static void alias_apply(void)
             continue;
         }
         x64_alias_idx(&X64, from, to);
+    }
+    /* 方法式函数的前向声明：短名那条接到真名上。只声明没定义的不算错
+     * （真名本来就没定义，短名也没人引用），静悄悄跳过。 */
+    for (i = 0; i < NMETH_ALIAS; i++) {
+        u32 from = METH_ALIAS_FROM[i];
+        u32 to = METH_ALIAS_TO[i];
+
+        if (X64.sym[to].defined && !X64.sym[from].defined)
+            x64_alias_idx(&X64, from, to);
     }
 }
 

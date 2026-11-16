@@ -15,6 +15,7 @@ std-algo
 std-arch
 std-async
 std-async2
+std-async3
 std-async4
 std-async5
 std-audio
@@ -30,6 +31,7 @@ std-data
 std-db
 std-disk
 std-doc
+std-docs
 std-ds
 std-enc
 std-exec
@@ -45,7 +47,9 @@ std-linux
 std-markup
 std-match
 std-math3
+std-mesh
 std-mgmt
+std-mw
 std-node
 std-ops
 std-ordered
@@ -61,5 +65,6 @@ std-ser
 std-subs
 std-time
 std-transcode
+std-ub
 std-wire
 std-words
