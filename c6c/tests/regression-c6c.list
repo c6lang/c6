@@ -65,6 +65,7 @@ std-sec
 std-ser
 std-subs
 std-time
+std-tour
 std-transcode
 std-ub
 std-wire
