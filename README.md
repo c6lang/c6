@@ -85,6 +85,11 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 依赖：`cmake`（≥ 3.20，文档与 CI 使用 `ctest --test-dir`）、`make`、C 编译器（gcc/clang）、`binutils`。缺少工具链时构建会
 直接报错，请先按系统包管理器手动安装；不需要联网拉取源码。
 
+完整测试/跑分还依赖 `python3`（`find_package(Python3 COMPONENTS Interpreter REQUIRED)`）：`c6c/bench/bench.py`
+用它做性能基线、生成合成语料并断言 `bench/thresholds.json`；`ctest` 的 `perf` 标签（`bench` / `bench-c6c`）
+与 `check-all-c6c` 会调用它。只构建产品、不跑测试时不需要 Python；Arch/DPKG 打包请在 `check()` 阶段
+确保 `python3` 在 `PATH` 中（CMake 配置时即会查找解释器）。
+
 ```sh
 # 1. 配置（只有第一次需要；tcc/ 源码就在仓库里）
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr

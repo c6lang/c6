@@ -45,6 +45,13 @@ stderr、收尾统计在 stdout 最后一行、失败数当退出码、零块静
 （等价于 `ctest --test-dir build -L regression -LE aux -j N`），拆开看是下面
 「完整回归」里那些目标。
 
+**工具依赖**：运行完整测试与跑分需要 `python3`（CMake 通过
+`find_package(Python3 COMPONENTS Interpreter REQUIRED)` 查找）。`c6c/bench/bench.py`
+负责性能基线、合成语料生成与 `bench/thresholds.json` 断言，`perf` 标签下的
+`bench` / `bench-c6c` 以及 `check-all-c6c` 都会用到；脚本由 CMake 显式传给
+Python 解释器，不依赖文件的可执行位。只跑 `test` 块 / `errcheck` 等纯 CTest 用例
+不需要 Python；打包 CI 的 `check()` 阶段须保证 `python3` 可用，否则配置阶段就会报错。
+
 每个用例由 CTest 注入独立的 `C6_CASE_OUT`（`build/tests/<用例>/`），编译产物、
 自举文件与临时文件都落在自己的目录里，因此整个回归矩阵可以 `ctest -j N`
 全并发，不再需要按输出路径分组串行。仍保留 `RESOURCE_LOCK` 的只有三组：
