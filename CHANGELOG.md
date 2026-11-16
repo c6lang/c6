@@ -7,6 +7,38 @@
 
 ## 未发布
 
+### 共享库：`c6c -shared`（ET_DYN）
+
+- `c6c -shared a.o b.o -o libx.so` 出共享库：`ET_DYN`、基址 0（VA 就是段内偏移，
+  加载基址由 ld.so 选）、没有入口与 `PT_INTERP`、程序头 4 个。输入必须是 `.o`
+  （`-shared lib.c6` 直接报错）；`-fPIC` / `-fpic` 收下不报错——native 后端出来的
+  代码本来就位置无关（全局地址走 `lea rip+rel32` + 重定位），不需要另一套 PIC
+  代码生成。
+- `c6c/src/ld.c6`：`LD_BASE_VA` 从宏改成变量（静态 `0x400000` / 共享 `0`），新增
+  `LD_SHARED` 开关；共享模式下跳过「找 `main`」「合成 `_start`」「把 ctor/dtor
+  补进 `_start` 的 call」三步。数据里的绝对地址（字符串指针、初始化器、
+  `.init_array` 的函数指针）变成 `.rela.dyn` 的 `R_X86_64_RELATIVE`（`ld_apply`
+  记账 → `ld_dyn_plan` 定尺寸 → 落盘时逐条写）。定义的全局/弱符号进 `.dynsym`
+  （函数 `STT_FUNC`、数据 `STT_OBJECT`，`st_shndx` 按 `.text`/`.data`/`.bss` 填），
+  名字进 `.dynstr`，`DT_SONAME` = 输出文件名，`DT_INIT_ARRAY`/`DT_FINI_ARRAY`
+  让 `__attribute__((constructor))` 在 `dlopen` 那一刻就跑。
+- 产物末尾补一张 16 项**节头表**（`.text` / `.rodata` / `.dynstr` / `.dynsym` /
+  `.hash` / `.rela.plt` / `.plt` / `.rela.dyn` / `.got.plt` / `.data` /
+  `.init_array` / `.fini_array` / `.bss` / `.dynamic` / `.shstrtab`）：ld.so 不看
+  它，但 GNU ld 把 `.so` 当**输入**时只认节头（没有就 `file in wrong format`），
+  `readelf --dyn-syms` / `nm -D` 也靠它。
+- 修好一处一直错着的 SysV `.hash`：`nchain` 少写一个字、`chain` 每位写成 `j+2`
+  （应为 `j+1`）。静态可执行文件没人查这张表所以从没露馅，`dlopen` 一上来
+  `dlsym` 就返回 NULL。
+- 边界如实拒绝：共享库里的外部**数据**符号（`extern int optind;`）要走 GOT
+  间接寻址，这一版还没做，直接报错而不是悄悄写 0；外部函数照旧走 PLT。
+- 新增回归 `c6c/tests/shared-check.sh`（19 条，`cmake --build build --target
+  sharedcheck`）：`ET_DYN` / 入口 0 / 无 `PT_INTERP` / 程序头 4 个 / `DT_SONAME` /
+  `DT_INIT_ARRAY` / `RELATIVE` / 节头表齐全 / 导出符号 `T`+`D` /
+  `dlopen`+`dlsym` 真调通且数据读写一致 / 构造器在 `dlopen` 时跑 /
+  `cc -L … -l` 直接链也能跑 / 源文件与外部数据符号两条边界 / `-fPIC` 收下且
+  默认仍是 `ET_EXEC`。
+
 ### 嵌入 API：`tcc_*` 兼容面补齐
 
 - `c6c/include/tcc-compat.h` 以前只声明 13 个 `tcc_*`，现在与 tcc 公开嵌入头对齐
