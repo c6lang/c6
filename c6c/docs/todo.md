@@ -4868,3 +4868,19 @@ thread: 4 个 worker 跑完 4 个任务，1..400 的和=80200
 `cond_wait` 里"读序号→放锁→FUTEX_WAIT(序号)"这一段，和 `chan` 的
 "push 之后 signal / pop 之后 signal" 在什么交错下丢唤醒还没看出来。下一版要么
 把序号读放在锁外、要么在 wait 里加一层"放锁前再确认一次谓词变了没"的重试。
+
+### 第 242 轮：把 cond_wait 改成"序号没变就继续等"**更糟**（10/20 挂）
+
+又试了标准写法：
+
+```c
+s = *seq; unlock(m);
+while (*seq == s) futex_wait(seq, s);
+lock(m);
+```
+
+连跑 20 次挂了 10 次（原来 5 次）。所以"单次 FUTEX_WAIT 提前返回"不是原因，
+问题更可能在**谓词与信号之间的一致性**（chan 的 `not_empty/not_full` 用同一个
+Mutex 保护队列，但 signal 发生在 unlock 之后的那一侧）。下一版要先把
+`Chan` 的 push/pop 与 signal 的顺序打出来（或换成"signal 在锁内"）再看。
+改动依旧没进主干（`git checkout` 回去了），回归 86 / 92、CI 绿。
