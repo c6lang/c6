@@ -11434,6 +11434,64 @@ static u32 gen_postfix(void)
         GEN_TY = ty_ulong();
         return gen_postfix_ops(d0);
     }
+    if (TOK_EQ(t, "__builtin_memcpy") || TOK_EQ(t, "__builtin_memmove")
+        || TOK_EQ(t, "__builtin_memset")) {
+        /* `__builtin_memcpy/memmove/memset`：**内建**，不需要先有声明。
+         *
+         * c6c 以前在预定义宏表里写 `#define __builtin_memcpy(a,b,c) memcpy(a,b,c)`，
+         * 把它文本替换成一次普通调用——于是 TU 里没先声明过 memcpy 的地方就报
+         * "未声明的标识符 'memcpy'"。内核 include/vdso/unaligned.h:37 的
+         * get_unaligned() 正是这种情形：它在 GNU 语句表达式里直接用
+         * __builtin_memcpy（lib/xxhash.c、lib/hexdump.c、lib/test_rhashtable.c
+         * 各刷 3 条）。
+         *
+         * 实现就是"隐式声明 + 普通调用"：按名字去符号表找，找不到就现造一个
+         * extern 函数符号（real 编译器对内建正是这么做的），然后发 IR_CALL。
+         * 目标符号按名字解析（见 addr_sym_of），所以别的 TU 里定义也能连上。
+         */
+        int is_set = TOK_EQ(t, "__builtin_memset");
+        const char *nm = is_set ? "memset"
+                         : TOK_EQ(t, "__builtin_memmove") ? "memmove" : "memcpy";
+        u32 nlen = (u32)strlen(nm);
+        u32 a[3] = {0};
+        u32 na = 0;
+        u32 i = 0;
+        Sym *fs = sym_find(nm, nlen);
+
+        pa_advance();
+        pa_expect_ch('(');
+        for (;;) {
+            a[na] = value_of(gen_assign());
+            na++;
+            if (!pa_accept_ch(',') || na >= 3) {
+                while (pa_accept_ch(','))
+                    (void)value_of(gen_assign());   /* 多余的实参照吃 */
+                break;
+            }
+        }
+        pa_expect_ch(')');
+        if (!fs || !fs->is_func) {
+            u32 params[3] = {0};
+
+            params[0] = ty_ptr(ty_void());
+            params[1] = is_set ? ty_int() : ty_ptr(ty_void());
+            params[2] = ty_ulong();
+            fs = sym_add(nm, nlen,
+                         ty_func(ty_ptr(ty_void()), params, 3, 0), SC_GLOBAL);
+            if (fs)
+                fs->is_func = 1;
+        }
+        for (i = 0; i < na; i++)
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, a[i], 0, 0, i);
+        {
+            u32 d = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_CALL, IRT_PTR, d, 0, 0, 0,
+                      fs ? addr_sym_of(fs) : x64_sym(&X64, nm));
+            GEN_TY = ty_ptr(ty_void());
+            return gen_postfix_ops(d);
+        }
+    }
     if (TOK_EQ(t, "__builtin_strlen")) {
         /* `__builtin_strlen(s)`。
          *
