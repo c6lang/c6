@@ -4382,3 +4382,43 @@ std-demo / std-kit / std-tour   未定义符号 → Segmentation fault
                  没有一条从绿变红
 新增 check：tmplcheck（4 条）
 ```
+
+## 第 214 轮：下标赋值的托管判定（std-tour 段错误）
+
+上一轮把 `std-demo`/`std-kit`/`std-tour` 从"链接不上"推到"跑起来段错误"，
+这一轮查的就是这个段错误。
+
+现象：`examples/stdtour.c6` 打印完标题就崩，崩在 `lock xadd %rax,(%rdi)`，
+`rdi = 0x3c = 60`。把 `tour_strbuf` 单独拎出来还崩，最后缩到
+
+```c
+@StrBuf b = new StrBuf;
+b->write((char[:]){ (char *)"abcdef", 6 }) catch e { return 1; };
+b->truncate(3);          /* <-- 崩 */
+return 0;
+```
+
+反汇编 `StrBuf_truncate` 看到它写结尾 NUL 时多了一条：
+
+```
+movsbq 0x0(%rax),%rdx     ; 旧值 = data[n]（一个字节）
+mov    %dl,0x0(%rax)      ; 存 0
+mov    %rdx,%rdi
+call   __c6_gc_release    ; 把旧字节当指针 release
+```
+
+100 就是 `'d'`——"abcdef" 的第 4 个字符。运行时的 release 先算
+`ptr - 40`（引用计数头）再 `lock xadd`，于是拿 60 当地址。
+
+根因在 `gen_postfix_ops` 的下标分支：`pmgd`（基址那层给的托管标记）**非 0 就**
+传给元素，`@char` 这种"托管指针指向普通标量"也跟着传。改成"基址是数组/切片
+**且元素是指针**"才传。
+
+判据第一版按"成员 kind 2（引用数组）"写，CI 立刻在 `tests/foreach_iter` 上抓到：
+局部 `@MNode a[2]` 的 `a[i] = v` 没有成员 kind（不是成员访问），元素却是托管
+引用——于是那条赋值不再 retain/release。局部引用数组也得算，所以最终判据是
+"元素类型是数组/切片的元素、并且是指针"。
+- 收效：std-tour 段错误 → `73 check(s), 1 failure(s)`，只剩
+  `deque: 迭代顺序与求和`（`Deque@int.iter()`，实例身份那条线，下一轮）；
+  std-kit 的崩溃点往后挪到 num 段之后；std-demo 仍在别的段错误上。
+- 基线不变（57 / 92）：三个用例都还没全绿。

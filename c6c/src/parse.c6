@@ -8825,9 +8825,13 @@ static u32 gen_postfix_ops(u32 v)
                 PEND_VSYM = vsy;
                 PEND_VDIM = vdim + 1;
             }
-            /* `h->arr[0]`：托管数组字段的元素也是托管引用（成员那一层已经把
-             * PEND_MGD 标上了，下标这层不能把它抹掉）。 */
-            if (pmgd)
+            /* `h->arr[0]` / `@T a[2]` 的 `a[i]`：**元素本身是引用**才是托管
+             * 赋值（基址是数组或切片、元素是指针）。`@char data` 这种"托管
+             * 指针指向普通标量"不算——`data[i] = 0` 若按托管赋值走，会先把
+             * 旧字符当指针 release 掉：strbuf.truncate 写结尾 NUL 时旧值是
+             * 'd' = 100，运行时按 `ptr - 头长` 取引用计数头，一写就段错误
+             * （std-tour / std-demo / std-kit 全挂在这一条上）。 */
+            if (pmgd && ty_is_ptr(elem) && (ty_is_array(bty) || ty_is_slice(bty)))
                 PEND_MGD = 1;
             v = off;
             continue;
