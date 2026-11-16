@@ -4948,3 +4948,23 @@ xml 那两条断言（`item 有 id`、`id 的长度`）都是它。
 下一轮的做法：在 `/tmp/conf_dbg2.c6`（第 246 轮那份，内联版本坏、局部版本好的
 副本）里，把 `attr` 的形参 `Str name` 的 `len/data` 直接打出来——现在只是从
 "返回 0"推断它坏了，还没有直接证据。
+
+## 第 248 轮：剩下的五个红用例 + 各自的下一步（交接用）
+
+回归 86 / 92（`std-thread` 偶尔会挂，见第 245 轮那条更正：回滚后的主干本身就有
+1/10 的挂死率，不是同步原语引入的）。五个稳定红的是：
+
+| 用例 | 现象 | 已知 | 下一步 |
+| --- | --- | --- | --- |
+| `std-box` | csv 未闭合引号不报 PARSE；json 解析失败 | 常量本身对（两边都是 `0x0E01B007`，见第 235 轮） | 直接在 `stdbox` 的 `box_csv()` 里打 `r.error` 与 `csv_parse` 的失败点 |
+| `std-conf` | xml `item 有 id` / `id 的长度` | 内联 `e.attr(conf_str(S("id")), &v)` 返回 0，先赋局部变量再传返回 1（第 246 轮） | 在 `attr` 里打形参 `name.s.len/data`（第 247 轮想做的事，独立小例复现不出来） |
+| `std-demo` | 段错误（rc=139） | 二进制 2176531 字节 / 4337 符号 | 先 `gdb` 或 `C6C_DBG_*` 二分定位函数 |
+| `std-term` | `User defined signal 1`（rc=138） | rt.c6 里 `sigaction` 是空操作、没有信号投递（文件头注释就写着） | 实装 `rt_sigaction` + 汇编 restorer，是独立的一大块 |
+| `std-https` | 两路都是 200 / body_len / body 各归各的 | 3 条断言，和 co/fiber 调度有关 | 先看 `std/net/https.c6` 的两路并发是怎么起的 |
+
+公共基础设施（已经稳定、可直接用）：
+- 基线脚本 `/tmp/wt-baseline.sh` + 用例表 `/tmp/rc5-cases.txt`（92 条）；
+- 回归用例清单 `c6c/tests/regression-c6c.list`（追加即可，**别排序整份文件**，
+  会把头部注释块打乱）；
+- 验收：`ctest --test-dir build -L c6c -LE perf`（92 个）+ 
+  `cmake --build build-tcc --target tests2-check`（意外失败 0）。
