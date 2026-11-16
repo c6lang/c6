@@ -240,11 +240,29 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake make gcc binutils texinfo perl dpkg-dev rpm
 
+      - name: Check version identity
+        run: |
+          # 版本号只有一个来源（根 VERSION），但代码里还有一处镜像：c6c/src/c6c.c6
+          # 的 C6C_VERSION（`c6c --version` 打的就是它）。两处漂了会发出
+          # 「包名 0.6.1、编译器自称 0.6.0」的包，这里直接挡住。
+          _ver=$(tr -d '\n' < VERSION)
+          _macro=$(sed -n 's/^#define C6C_VERSION "\(.*\)"$/\1/p' c6c/src/c6c.c6)
+          if [ "$_ver" != "$_macro" ]; then
+            echo "::error::VERSION（${_ver}）与 c6c/src/c6c.c6 的 C6C_VERSION（${_macro}）不一致"
+            exit 1
+          fi
+          # 发布说明直接取自 CHANGELOG 的「## <版本> — <日期>」段落（release job
+          # 拿它填 Release body，见下面 release job），所以先确认它在。
+          if ! grep -q "^## ${_ver} — " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 里没有「## ${_ver} — 」段落"
+            exit 1
+          fi
+
       - name: Check tag matches VERSION
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          # 包名里的版本来自根 VERSION，tag 只是触发器：两者不一致就会发出
-          # 「v0.2.0 的 Release 里躺着 0.1.0 的包」，这里直接挡住。
+          # tag 只是触发器：两者不一致就会发出「v0.2.0 的 Release 里躺着 0.1.0
+          # 的包」，这里直接挡住。
           _ver="v$(tr -d '\n' < VERSION)"
           if [ "$_ver" != "${GITHUB_REF_NAME}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} 与 VERSION 文件（${_ver}）不一致"
@@ -328,8 +346,54 @@ jobs:
           ls -lh
           sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
 
+      # Release 的说明不靠手抄、也不靠 GitHub 的自动 commit 列表：正文取自
+      # CHANGELOG 里该版本的段落（tag 注解作为兜底），标题取自 tag 注解的首行。
+      # 于是「发版说明」和仓库里的变更史是同一份文字，改 CHANGELOG 就够了。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tag 注解要历史，浅克隆里读不到
+
+      - name: Release notes from CHANGELOG
+        id: notes
+        run: |
+          set -eu
+          _ver=$(tr -d '\n' < VERSION)
+          _tag=${GITHUB_REF_NAME}
+          _notes="$RUNNER_TEMP/notes.md"
+
+          # 「## 0.6.1 — 2026-11-16」到下一个「## 」之前，就是这一版的说明。
+          awk -v ver="$_ver" '
+            index($0, "## " ver " — ") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > "$_notes"
+          if ! grep -q '[^[:space:]]' "$_notes"; then
+            # 兜底：CHANGELOG 里没有就用 tag 注解（写 tag 的人通常写了摘要）。
+            git tag -l --format='%(contents)' "$_tag" > "$_notes"
+          fi
+          if ! grep -q '[^[:space:]]' "$_notes"; then
+            echo "::error::CHANGELOG 里没有 $_ver 的段落，tag 注解也是空的"
+            exit 1
+          fi
+
+          # 产物清单和校验方式跟在说明后面，省得下载的人再问。
+          {
+            printf '\n### 产物\n\n'
+            for f in dist/*; do
+              [ -f "$f" ] && printf -- '- `%s`\n' "$(basename "$f")"
+            done
+            printf '\n校验：下载 `SHA256SUMS` 后在本目录执行 `sha256sum -c SHA256SUMS`。\n'
+          } >> "$_notes"
+
+          _title=$(git tag -l --format='%(contents:subject)' "$_tag")
+          [ -n "$_title" ] || _title="c6 $_ver"
+          printf 'title=%s\n' "$_title" >> "$GITHUB_OUTPUT"
+          echo "--- Release body ---"
+          cat "$_notes"
+
       - uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.notes.outputs.title }}
+          body_path: ${{ runner.temp }}/notes.md
           files: dist/*
-          generate_release_notes: true
           fail_on_unmatched_files: true
