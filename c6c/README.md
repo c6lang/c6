@@ -341,18 +341,31 @@ API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
 `c6_output_file`。库形态没有 `argv[0]` 可推，所以 `lib/rt.c6` 和自带
 `include/` 的绝对路径在编译期就塞进去（`C6_DEFAULT_RT` / `C6_DEFAULT_INC`）。
 
-**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 那套名字
-（`tcc_new` / `tcc_compile_string` / `tcc_relocate` / `tcc_run` /
-`tcc_get_symbol` / `tcc_output_file` / `tcc_set_options`），实现一一接到
-`c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库换掉就能编过、跑出
-一样的结果——这是"顶替 tcc 产品位"里最实的一步。
+**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 公开嵌入头里的一整套
+名字，实现一一接到 `c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库
+换掉就能编过；能做的照旧跑，做不到的当场返回失败并说明原因（不留"设上了但
+没生效"的坑）。这是"顶替 tcc 产品位"里最实的一步。
 
-口径与限制：一个 `C6State` 只能编一次（第二次如实拒绝，不做静默错结果）；
-`tcc_set_error_func` 收了回调但诊断仍走 stderr；`tcc_add_file` 只收
+* 真实现：`tcc_new` / `tcc_delete` / `tcc_set_options` /
+  `tcc_add_include_path` / `tcc_add_sysinclude_path`（等价 `-I`，c6c 不区分
+  系统头）/ `tcc_define_symbol` / `tcc_undefine_symbol` /
+  `tcc_compile_string` / `tcc_add_file` / `tcc_relocate`（一参数与老的
+  `(s, TCC_RELOCATE_AUTO)` 两种写法都收）/ `tcc_get_symbol` / `tcc_run` /
+  `tcc_output_file` / `tcc_list_symbols`（列镜像里的符号与 VA）/
+  `tcc_set_error_func`（诊断整行交给回调，不再打 stderr）/ `tcc_set_lib_path`
+  （认 `<dir>/lib/rt.c6` 与 `<dir>/rt.c6`）。
+* 收了但不动：`tcc_set_realloc`（arena 不可换）、`tcc_set_backtrace_func`
+  （没有 `-b` 的运行期）。
+* 如实拒绝（返回 -1 + 原因）：`tcc_add_library_path` / `tcc_add_library`
+  （链接器没有 `-L`/`-l`）、`tcc_add_symbol`（宿主地址注入要 JIT 重定位）。
+
+口径与限制：**一个进程只能编一次**（前端/后端/符号表都是文件级全局量，重置
+那套还没做，换 state 也不行，见 `c6c/docs/todo.md`）；`tcc_add_file` 只收
 `.c6`/`.c` 源文件，不收 `.o`/`.a`；`tcc_set_options` 只认 `-I`/`-D`/`-U`。
 
-回归：`cmake --build build --target embedcheck`（6 条：动态库 / 静态库 / 落盘后独立跑 /
-编译失败被报告 / 二次编译被拒绝 / `tcc_*` 兼容层）。
+回归：`cmake --build build --target embedcheck`（10 条：动态库 / 静态库 /
+落盘后独立跑 / 编译失败被报告 / 二次编译被拒绝 / `tcc_*` 一条龙 / 错误回调 /
+系统头目录 + 列符号 / 如实拒绝的三件 / `tcc_set_lib_path`）。
 
 ## 安装与包契约：没有 tcc 也能装出全套
 
