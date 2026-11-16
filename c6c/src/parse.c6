@@ -1222,6 +1222,7 @@ static void tykw_init(void)
     }
 }
 
+static int tykw_is_qual(Tok *t);
 static int is_typename_tok(Tok *t)
 {
     int i = 0;
@@ -6158,6 +6159,14 @@ static u32 parse_typespec(void)
             continue;
         }
         if (PA_ACCEPT_IDENT("_Atomic")) { continue; }    /* 限定符位置 */
+        /* `__seg_gs` / `__seg_fs`：x86 的**地址空间限定符**（gcc 内置关键字，
+         * 不是宏——内核只在 sparse（__CHECKER__）下才把它们定义成
+         * __attribute__((address_space(...)))）。内核
+         * arch/x86/include/asm/percpu_types.h 用它拼出
+         * `typeof(var) __seg_gs *`，于是 percpu 读写整套宏（per_cpu()、
+         * this_cpu_ptr()、raw_cpu_read()…）全靠它。c6c 没有分段模型，
+         * 当限定符吃掉即可——语义上等价于"普通指针"。 */
+        if (PA_ACCEPT_IDENT("__seg_gs") || PA_ACCEPT_IDENT("__seg_fs")) { continue; }
         if (PA_ACCEPT_IDENT("int")) { saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("char")) { base = uns ? ty_uchar() : (nsigned ? ty_schar() : ty_char()); continue; }
         if (PA_ACCEPT_IDENT("float")) { base = ty_float(); continue; }
@@ -14281,7 +14290,8 @@ static int tykw_is_qual(Tok *t)
 {
     return t->kind == TK_IDENT
         && (TOK_EQ(t, "const") || TOK_EQ(t, "volatile") || TOK_EQ(t, "restrict")
-            || TOK_EQ(t, "__const") || TOK_EQ(t, "__volatile__") || TOK_EQ(t, "__restrict"));
+            || TOK_EQ(t, "__const") || TOK_EQ(t, "__volatile__") || TOK_EQ(t, "__restrict")
+            || TOK_EQ(t, "__seg_gs") || TOK_EQ(t, "__seg_fs"));
 }
 
 /* 当前位置是不是一个类型名（关键字 / typedef / **模板实例** `Vect@int`） */
