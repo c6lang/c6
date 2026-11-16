@@ -431,37 +431,60 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
                 got = 1;
             }
             if (was_variadic) {
-                /* `X ## __VA_ARGS__`：**不拼接**。GNU 的这个写法只有一个
-                 * 用处——变参为空时让 `##` 连同左边那个逗号一起消失（gcc
-                 * 文档的 "comma-swallow"）。有实参时它等价于普通的
-                 * `X __VA_ARGS__`，逐 token 展开。
+                /* `__VA_ARGS__` 参与 `##` 有两种截然不同的语义，必须分开看
+                 * **左边那个 token 是不是逗号**：
                  *
-                 * 这里必须和普通 `##` 分开：普通路径会把相邻两个 token 的
-                 * 文本粘起来，`,` 和 `42` 一粘就变成 `,42` 一个坏 token
-                 * （实测：修好零变参之后，`LOG("%d\n", 42)` 当场报
-                 * "这里要 ')'（当前是 ',42'）"）。 */
+                 * 1. `, ## __VA_ARGS__`（comma-swallow，GNU 扩展）：变参为空时
+                 *    连同左边那个逗号一起消失，非空时等价于 `, __VA_ARGS__`。
+                 *    **绝不能做文本粘贴**——`,` 和 `42` 一粘就变成 `,42` 一个
+                 *    坏 token（实测：`LOG("%d\n", 42)` 报"这里要 ')'（当前是
+                 *    ',42'）"）。内核 include/linux/printk.h 的 no_printk()
+                 *    就是这个形态。
+                 *
+                 * 2. `a ## __VA_ARGS__ ## b`（普通粘贴）：变参为空时两侧直接
+                 *    拼起来。内核 include/linux/compiler-context-analysis.h
+                 *    的 `__try_acquires##__VA_ARGS__##_ctx_lock` 正是这个——
+                 *    当成情形 1 处理会把 `__try_acquires` 单独留下，报
+                 *    "未声明的标识符 '__try_acquires'"。
+                 *
+                 * 以前一律按情形 1 走，于是 (2) 全废。 */
+                int left_comma = (n > 0 && r[n - 1].kind == TK_PUNCT
+                                  && r[n - 1].len == 1
+                                  && tok_data(&r[n - 1])[0] == ',');
                 u32 an = (pi < nargs) ? argn[pi] : 0;
                 Tok *ap = (pi < nargs) ? args[pi] : NULL;
                 u32 k = 0;
 
-                if (an == 0) {
-                    /* 空变参：吃掉紧挨在 `##` 左边的逗号。只对变参形参
-                     * 生效——普通形参为空本就是语法错误，不该悄悄吞逗号。 */
-                    if (n > 0 && r[n - 1].kind == TK_PUNCT && r[n - 1].len == 1
-                        && tok_data(&r[n - 1])[0] == ',')
+                if (left_comma) {
+                    if (an == 0) {
+                        /* 空变参：吃掉那个逗号 */
                         n--;
+                        continue;
+                    }
+                    if (n + an + 2 > cap) {
+                        u32 ncap = cap * 2 + an + 8;
+                        Tok *nr = exp_alloc(ncap);
+
+                        memcpy(nr, r, (size_t)n * sizeof(Tok));
+                        r = nr;
+                        cap = ncap;
+                    }
+                    for (k = 0; k < an; k++)
+                        r[n++] = ap[k];
                     continue;
                 }
-                if (n + an + 2 > cap) {
-                    u32 ncap = cap * 2 + an + 8;
-                    Tok *nr = exp_alloc(ncap);
-
-                    memcpy(nr, r, (size_t)n * sizeof(Tok));
-                    r = nr;
-                    cap = ncap;
+                /* 情形 2：逐个 token 贴到左边。空变参就是什么都不贴。 */
+                for (k = 0; k < an; k++) {
+                    if (n > 0)
+                        r[n - 1] = paste_tok(r[n - 1], ap[k],
+                                             file_by_id(ap[k].file));
+                    else
+                        r[n++] = ap[k];
+                    /* paste_tok 之后 n 没变，只有第一个 token 需要推进入 r */
+                    if (n == 0)
+                        n = 1;
                 }
-                for (k = 0; k < an; k++)
-                    r[n++] = ap[k];
+                got = 0;
                 continue;
             }
             if (got) {
