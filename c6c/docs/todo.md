@@ -4920,3 +4920,20 @@ silgnal 插进来）。所以第 242 轮"谓词与信号不一致"的猜测也�
 下一轮的第一件事应该是：把 stdthread 的 chan 段单独拎出来（或给 sync 写独立
 压力用例），确认挂死的到底是 `pthread_join`、线程跳板还是 chan；在弄清之前
 不要再动同步原语的实现。
+
+### 第 246 轮：std-conf 的 xml attr —— 内联调用实参被弄坏（复现已缩小）
+
+`examples/stdconf.c6` 的 `e.attr(conf_str(S("id")), &v)` 返回 0，而把同一个值
+**先赋给一个局部变量**再传就返回 1。在示例副本里加的打印：
+
+```
+DBG attr=0 vlen=0 name=[ id="a"]      # 内联：e.attr(conf_str(S("id")), &v)
+DBG attr=1 vlen=1 name=[ id="a"]      # 先建局部：Str nmid = conf_str(S("id")); e.attr(nmid, &v)
+```
+
+也就是说：**"返回结构体的调用"作为方法调用的实参、它自己的实参又是复合字面量**时，
+传进去的那个 Str 是坏的（`attr` 里按名字比长度/memcmp 对不上，所以返回 0）。
+xml 那两条断言（`item 有 id`、`id 的长度`）都是它。
+
+下一轮的最小复现：`struct S {…}; S f(char[:]); void g(S, int*); g(f((char[:]){"x",1}), &p);`
+——注意这和 std-box 的 `std.data.csv.PARSE` 不是同一个问题（那个是限定名解析）。
