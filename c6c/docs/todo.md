@@ -4479,3 +4479,44 @@ while (it.has()) printf("%d ", it.next());     /* 期望 1 2 3 */
 
 当前基线仍 **57 / 92**：std-tour 73 条断言只差这一条，std-kit / std-demo 还各有
 别的段错误。
+
+## 第 216 轮：方法体的裸名字被实例化点的局部量遮住（回归 57 → 58）
+
+第 215 轮把 deque 迭代器的问题定位成"两个类型 id"，这一轮发现**还有一半**
+是作用域问题，而且更好修。
+
+模板实例的体在实例化点展开，那一刻作用域链上挂着**调用方函数的局部量**。
+方法体里裸写的成员名走的是 `sym_find`，于是：
+
+```c
+struct DIter@T { Deque@T *d; int i; ... }      /* has() { return i < d->n; } */
+void tour_deque(void) { @Deque@int d = ...; int i = 0; ... }
+foreach (int x = d->iter())                    /* 实例在这里展开 */
+```
+
+`i` 撞上 `tour_deque` 的循环变量 `i`、`d` 撞上它的队列指针。现象就是
+`i++` 改的是外层循环变量，`has()` 永远真、`next()` 永远返回第一个元素
+（std-tour 的 `sum` 恒为 6）。`It@T` 里写 `b->n` 时更明显：外层那个 `b` 是
+值，取成员读到的是临时量里的 0。
+
+修法：`pa_func_def` 里 `scope_enter()` 之后记下 `METHOD_SCOPE_BASE`；裸名字
+解析时如果查到的符号（`SC_LOCAL`/`SC_PARAM`）**不在** `SCOPE` 到
+`METHOD_SCOPE_BASE` 这条链上，就当没查到，转而按接收者的成员走。方法自己的
+形参/局部量仍在链上，遮蔽字段的语义不变。
+
+- `std-net` 从段错误变全绿；`std-tour` 的迭代器正常推进了
+- 57 → 58 / 92，无回退
+
+**还剩一半**：同一个 `DIter@int.next()` 的 IR 里，`d->head`/`d->cap` 被当成
+8 字节指针读、`(d->head + i)` 的 stride 是 `i * 24`（24 = sizeof(Deque@int)）：
+
+```
+R(12) = ld8(d + 12)          ; cap 读成 8 字节
+R(19) = i * 24               ; 指针算术的 stride 用了 Deque@int 的尺寸
+R(25) = ld8(d + 8)           ; head 同理
+R(26) = (cap + i*24) % head  ; 连操作数顺序都翻了
+```
+
+说明 `Deque@T` 的**成员类型**在实例里被替换错了（`int head` 变成了
+`Deque@int *`）。下一轮从 `parse_struct_body` 重放实例体时的成员类型登记
+切进去：比对同一个实例在两个 TU 里的 `ty_member()`，找出谁把成员类型换掉了。

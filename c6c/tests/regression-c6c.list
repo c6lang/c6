@@ -50,6 +50,7 @@ std-math3
 std-mesh
 std-mgmt
 std-mw
+std-net
 std-node
 std-ops
 std-ordered

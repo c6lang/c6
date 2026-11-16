@@ -926,6 +926,9 @@ static u32 BLOCK_VAL;
 static u32 BLOCK_TY;
 static int BLOCK_HAS;
 static u32 METHOD_SELF_TY;  /* 结构体内方法：接收者类型（0 = 普通函数） */
+/* 方法体入口那一层作用域。模板实例的体是在实例化点展开的，那里能看见
+ * 调用方函数的局部量——裸字段名会被同名局部量遮住（见 sym_in_method_scope）。 */
+static Scope *METHOD_SCOPE_BASE;
 static u32 CUR_RET_TY;      /* 当前函数的返回类型（return 要按它转换） */
 /* 聚合按值返回的"结果槽"（**只给 C99 输出后端**用）：C 的语义是调用者提供
  * 位置、被调方写进去；C99 后端以前返回的是被调方帧里那个临时对象的地址，
@@ -1591,6 +1594,42 @@ static int agg_find_promoted(u32 ty, const char *nm, u32 len, u32 *mty, u32 *mof
         }
     }
     return 0;
+}
+
+/* `s` 是不是方法**自己的**作用域里声明的？
+ *
+ * 模板实例的体在实例化点（往往是别的函数的声明中间）展开，那时调用方的
+ * 局部量、形参都在作用域链上。方法体里的裸名字本该指向接收者的成员，可
+ * `sym_find` 会先撞上调用方的同名局部量：
+ *
+ *     struct DIter@T { Deque@T *d; int i; }   方法体里裸写 d / i
+ *     void tour_deque(void) { @Deque@int d = ...; int i = 0; }
+ *     foreach (int x = d->iter())             实例在这里展开
+ *
+ * 于是 `i++` 改的是 tour_deque 的循环变量、`has()` 读的是调用方的 `i`：
+ * std-tour 的 deque 迭代永远是第一个元素（sum 恒等于 6）。
+ *
+ * 判断方法：从当前作用域往上走到方法入口那一层，看这个符号到底登记在哪个
+ * 作用域的链表里。链表里有 = 方法自己的（形参/局部量/`self`），没有 = 外层
+ * 函数的，调用方该让位给接收者的成员。 */
+static int sym_in_method_scope(Sym *s)
+{
+    Scope *sc = SCOPE;
+
+    if (!s)
+        return 1;
+    if (!METHOD_SCOPE_BASE)
+        return 1;
+    for (;;) {
+        Sym *p = sc ? sc->head : NULL;
+
+        for (; p; p = p->scope_next)
+            if (p == s)
+                return 1;
+        if (sc == METHOD_SCOPE_BASE || !sc || !sc->up)
+            return 0;
+        sc = sc->up;
+    }
 }
 
 /* 字符族判断：插值只接受"能当文本看"的切片/指针。`@char` 这种托管文本
@@ -10365,7 +10404,11 @@ static u32 gen_postfix(void)
          * （`std/core/fixed.c6` 的 `int cmp(Fix *self, Fix b)` 就让
          * std/container/pqueue.c6 的 `cmp` 成员在方法体里失效了）。
          * 形参/局部变量在更内层的作用域里，sym_find 会先找到，不受影响。 */
-        if (METHOD_SELF_TY && (!s || s->kind == SC_GLOBAL)) {
+        /* 裸名字：全局、没查到，或者查到的是**外层函数**的局部量/形参
+         * （实例化点上看得见它们，方法体里不该看见）——都按接收者的成员走。 */
+        if (METHOD_SELF_TY && (!s || s->kind == SC_GLOBAL
+                               || ((s->kind == SC_LOCAL || s->kind == SC_PARAM)
+                                   && !sym_in_method_scope(s)))) {
             u32 mty4 = 0;
             u32 moff4 = 0;
 
@@ -18997,6 +19040,8 @@ static void pa_func_def(Sym *fn, Declarator *d)
     NSW = 0;
     NGLBL = 0;
     scope_enter();
+    /* 方法体（`METHOD_SELF_TY` 非 0）靠这个判断"裸名字是不是自己的" */
+    METHOD_SCOPE_BASE = SCOPE;
     /* 闭包体：捕获变量登记成"在环境对象里"的形参（slot 带标记位） */
     for (i = 0; i < FLCAP_N && i < FL_CAP_MAX; i++) {
         Sym *cp = sym_add(FLCAP_NAME[i], FLCAP_LEN[i], FLCAP_TY[i], SC_PARAM);
