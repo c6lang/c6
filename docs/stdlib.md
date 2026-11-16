@@ -172,6 +172,7 @@
 | `std/encoding/otp.c6` | `std.encoding.otp` | 一次性口令（RFC 4226 / 6238，零分配）：`hotp(secret, slen, counter, digits)`、`totp(secret, slen, unix_time, step, digits)`、`otp_format`（定宽补零）、`otp_verify_totp`（前后各 `window` 步、常量时间比较）；HMAC-SHA-1 动态截断，位数 4..9，密钥是原始字节（Base32 先走 `std.encoding.base32`） |
 | `std/encoding/lzw.c6` | `std.encoding.lzw` | GIF 变体的 LZW（零分配）：`lzw_gif_decode(src, n, out, cap, min_code)`（LSB 先、clear/eoi、码宽 2..12 位、码值越界/截断/放不下返回 -1）与 `lzw_gif_encode`（贪心最长匹配 + 线性扫字典，字典满时发 clear）；不处理 TIFF/Unix compress 的 MSB 变体 |
 | `std/encoding/snappy.c6` | `std.encoding.snappy` | Snappy 块格式（零分配）：`snappy_decode` 认全部四种元素（字面量、三种复制，含重叠复制），严格校验长度前缀/越界/截断；`snappy_encode` 用调用方给的 16 KB 哈希表做贪心匹配（传 0 则退化成整块字面量，仍是合法流）——一次匹配最长 64 字节，够快不追求最好；`snappy_max_encoded` 给 `32 + n + n/6` 上界；不做 framed 分帧与 CRC-32C |
+| `std/encoding/hpack.c6` | `std.encoding.hpack` | HPACK 头压缩（RFC 7541，零分配）：`hpack_init`（动态表区 + arena 都由调用方给）工厂 + `Hpack` 的 `err`/`why`/`size`/`count`/`max`/`set_max`，整数 `hpack_int_put`/`hpack_int_get`（1..8 位前缀），字符串 `hpack_str_put` 与 Huffman `hpack_huff_len`/`hpack_huff_encode`/`hpack_huff_decode`（MSB-first、末尾补 1、拒绝 EOS），表 `hpack_static`/`hpack_index`/`hpack_field_size`，整块 `hpack_put_block`/`hpack_decode_block`；编码策略 `HPACK_AUTO`/`HPACK_NO_INDEX`/`HPACK_NEVER`，编码端**不**往动态表里插（解码端按对端的增量索引插），`authorization`/`cookie`/`set-cookie`/`proxy-authorization` 强制 never-indexed，头名自动转小写 |
 
 **`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM/GIF/TIFF/ICO 图像解码、Snappy 压缩）
 
@@ -444,6 +445,9 @@
 | `std/net/sse.c6` | `std.net.sse` | Server-Sent Events 流解析（零分配）：`sse_open`/`next` 按空行派发事件，`event`/`data`/`id`/`retry` 四个字段，多行 `data` 用 `\n` 拼进调用方缓冲；注释行忽略、BOM 跳过、`\n`/`\r\n`/`\r` 都认；EOF 前没空行收尾的半截事件按规范丢弃 |
 | `std/net/socks5.c6` | `std.net.socks5` | SOCKS5（RFC 1928/1929）报文编解码（零分配，不含套接字）：`socks5_greeting`/`socks5_userpass`/`socks5_request` 造报文（`Socks5Addr` 支持 IPv4/IPv6/域名），`socks5_parse_method`/`socks5_parse_userpass`/`socks5_parse_reply`/`socks5_parse_addr` 解析，半包返回 0、坏包 -1；不做域名解析与 UDP 封装 |
 | `std/net/mqtt.c6` | `std.net.mqtt` | MQTT 3.1.1 报文编解码（零分配，不含套接字）：`mqtt_parse_header` 给整包长度与视图（半包 0、坏包 -1），`mqtt_build_connect`/`mqtt_build_publish`/`mqtt_build_subscribe`/`mqtt_build_id`/`mqtt_build_empty` 造报文，`mqtt_parse_publish`/`mqtt_parse_connack`/`mqtt_parse_suback`/`mqtt_parse_id` 解析，`mqtt_topic_matches` 做 `+`/`#` 通配；`mqtt_varint`/`mqtt_varint_len` 处理剩余长度变长整数 |
+| `std/net/http2.c6` | `std.net.http2` | HTTP/2 帧层（RFC 9113，零分配）：`h2_frame_write`/`h2_frame_head`（半包 0 / 完整 1 / 坏帧 -1）、`h2_head_write`、`h2_payload_off`（跳过 PADDED / PRIORITY 前缀）、`h2_preface_check`（24 字节 preface，短的给 0）、SETTINGS 的 `h2_settings_write`/`h2_settings_parse`/`h2_setting_find`、`h2_window_write`/`h2_window_parse`、`h2_rst_write`/`h2_rst_parse`、`h2_ping_write`/`h2_ping_parse`（8 字节负载）、`h2_goaway_write`/`h2_goaway_parse`；`H2Pipe` 把 `attach`/`send`/`recv`/`payload`/`discard`/`write` 收成一套同步读写；枚举 `H2Type`/`H2Flag`/`H2Error`/`H2SettingId`，`H2Frame`/`H2Setting`；不做优先级树与推送 |
+| `std/net/http2c.c6` | `std.net.http2c` | h2c（明文 HTTP/2）客户端（在 `std.net.http2` + `std.encoding.hpack` + `std.net.tcp` 之上，零分配）：`h2c_connect`/`h2c_attach` 工厂 + `H2Client` 的 `ok`/`err`/`why`/`requests`/`next_stream`，`h2c_request`（任意方法 + 额外头 + body）与 `h2c_get`，`H2Response` 的 `status`/`body`/`hdrs` + `h2c_header`；连上先发 preface + SETTINGS 并等对端 SETTINGS 落地，SETTINGS/PING 自动应答、DATA 自动还 WINDOW_UPDATE、GOAWAY/RST_STREAM 让本次请求失败；一条连接串行发请求、流号 1/3/5…，CONTINUATION 与填充都拼装，请求体必须放得进首窗 |
+| `std/net/http2d.c6` | `std.net.http2d` | h2c（明文 HTTP/2）服务端骨架（零分配）：`h2d_listen`/`h2d_accept` 工厂 + `Server` 的 `ok`/`port`/`set_timeout`/`close_socket`、`Conn` 的 `next_request`（1 拿到 / 0 对端收工 / -1 错）/`respond`/`respond_text`/`requests`/`err`/`why`/`close_conn`，`Request` 的 `method`/`scheme`/`authority`/`path`/`body`/`fields`/`stream`；连接第一件事必须是 preface（HTTP/1 报文判协议错），一条连接一次一个流（并发的流回 `RST_STREAM(REFUSED_STREAM)`），响应体必须放得进当前窗口；不做 h2 over TLS 的 ALPN 协商与推送 |
 **集成示例**（`main` 只能写在模块外的文件里）
 
 | 文件 | 模块 | 内容 |
@@ -539,6 +543,7 @@
 | `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`cmake --build build --target std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
 | `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`cmake --build build --target std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
 | `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`cmake --build build --target std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
+| `examples/stdh2.c6` | （无模块） | 第九十二批（HTTP/2）的拼装示例（`cmake --build build --target std-h2`）：HPACK / 帧层各一节，`fork` 起 h2c 服务端让 h2c 客户端在同一条连接上打三条流，最后验 HTTP/1 报文被 preface 拒绝（49 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -823,6 +828,7 @@ std/encoding/lzw.c6         2 test(s), 0 failure(s)
 std/encoding/snappy.c6      2 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
+std/encoding/hpack.c6     26 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
 std/net/http.c6            5 test(s), 0 failure(s)
 std/net/inet.c6            8 test(s), 0 failure(s)
@@ -840,6 +846,9 @@ std/net/session.c6       45 test(s), 0 failure(s)
 std/net/sse.c6           24 test(s), 0 failure(s)
 std/net/socks5.c6        35 test(s), 0 failure(s)
 std/net/mqtt.c6          25 test(s), 0 failure(s)
+std/net/http2.c6          3 test(s), 0 failure(s)
+std/net/http2c.c6        36 test(s), 0 failure(s)
+std/net/http2d.c6        35 test(s), 0 failure(s)
 std/os/env.c6              39 test(s), 0 failure(s)
 std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
@@ -953,6 +962,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/net/sse.c6` 24 | sse 2 + str 22 |
 | `std/net/socks5.c6` 35 | socks5 2 + inet 8 + str 22 + err 3（地址构造走 inet_parse） |
 | `std/net/mqtt.c6` 25 | mqtt 3 + str 22 |
+| `std/encoding/hpack.c6` 26 | hpack 4 + str 22（只借 `Str` 类型；静态表与 Huffman 表都在模块里） |
+| `std/net/http2.c6` 3 | 自成一体（帧层只用 `Str` 类型，读写走 libc） |
+| `std/net/http2c.c6` 36 | http2c 4 + http2 3 + hpack 4 + tcp 3 + str 22（连接用 tcp、头压缩用 hpack、帧用 http2） |
+| `std/net/http2d.c6` 35 | http2d 3 + http2 3 + hpack 4 + tcp 3 + str 22（同上，两端共用一个帧层） |
 
 `std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
 `std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
@@ -5002,6 +5015,117 @@ cmake --build build --target std-util
 五节：CIDR 解析/包含/子网划分；大端小端读写与换序；排序键（大小写/标点/数字）；
 断词与连字符插入；最后串成「主机清单 → 按网段归组 → 按人眼顺序排序 → 折行」
 （45 条检查）。
+
+### 第九十二批：HTTP/2（`hpack` / `http2` / `http2c` / `http2d`）
+
+以前 `std/` 只到 HTTP/1.1（`http` / `httpc` / `httpd`）。这一批把 HTTP/2 的**明文形态 h2c** 补齐：
+头压缩、帧层、客户端、服务端骨架四层，全部零分配、缓冲由调用方给。四个模块只依赖
+`std.core.types` / `std.text.str` / `std.net.tcp`，不链 TLS、不加第三方依赖。
+
+**`std/encoding/hpack.c6`**——HPACK 头压缩（RFC 7541）：
+
+```c
+Hpack h = { 0 };
+hpack_init(&h, tbuf, sizeof tbuf, 4096, arena, sizeof arena);   // 动态表字节区 + arena
+
+HpackField f[2] = { 0 };
+f[0].name = SS(":method");   f[0].value = SS("GET");
+f[1].name = SS("user-agent"); f[1].value = SS("h2c/1.0");
+int n = hpack_put_block(&h, f, 2, blk, sizeof blk);     // 静态/动态表命中给索引，值走 Huffman
+
+HpackField out[16] = { 0 };
+int cnt = 0;
+hpack_decode_block(&h, blk, n, out, 16, &cnt);          // 对端用增量索引时往动态表里放
+
+hpack_int_put / hpack_int_get           // 1..8 位前缀整数
+hpack_str_put / hpack_huff_len / hpack_huff_encode / hpack_huff_decode
+hpack_static / hpack_index / hpack_field_size / hpack_set_max
+hpack_err / hpack_why / hpack_size / hpack_count / hpack_max
+```
+
+三档编码策略（`HPACK_AUTO` / `HPACK_NO_INDEX` / `HPACK_NEVER`）：编码端**不**往动态表里插
+（这样同一份头块永远编成同样的字节），解码端按对端的指令插；`authorization` / `cookie` /
+`set-cookie` / `proxy-authorization` 强制 never-indexed，头名自动转小写。Huffman 表用
+「按码长分桶 + 每桶偏移」的扁平数组，解码不需要建树。
+
+**`std/net/http2.c6`**——帧层：
+
+```c
+h2_frame_write(buf, cap, H2_DATA, H2_END_STREAM, 1, "abc", 3);   // 返回 9 + 负载
+h2_frame_head(buf, n, &f);                                       // 半包 0 / 完整 1 / 坏帧 -1
+h2_payload_off(p, len, flags, has_priority, &off);               // 跳过 PADDED / PRIORITY 前缀
+h2_preface_check(p, n);                                          // 24 字节 preface，短的给 0
+h2_settings_write / h2_settings_parse / h2_setting_find
+h2_window_write / h2_window_parse
+h2_rst_write / h2_rst_parse
+h2_ping_write / h2_ping_parse                                    // 8 字节负载往返
+h2_goaway_write / h2_goaway_parse
+```
+
+`H2Pipe`（`h2_pipe_attach`/`send`/`recv`/`payload`/`discard`/`write`）把「读满一帧 / 写满一帧」
+收成一套同步原语，`http2c` 与 `http2d` 都建在它上面，所以两者拿 `socketpair` 就能互测。
+
+**`std/net/http2c.c6`**——h2c 客户端：
+
+```c
+H2Client c = h2c_connect("127.0.0.1", 8080, 3000, hb, sizeof hb, tb, sizeof tb,
+                         ar, sizeof ar);
+H2Response r = { 0 };
+HpackField hdrs[32] = { 0 };
+char body[8192] = { 0 };
+
+h2c_get(&c, SS("example.com"), SS("/hi"), &r, hdrs, 32, body, sizeof body);
+r.status;                                  // 200
+r.body;                                    // 视图，指向调用方的 body 缓冲
+h2c_header(&r, SS("content-type"));        // 取一个响应头
+
+/* 带 body：自动补 content-length；body 必须放得进首窗 */
+h2c_request(&c, SS("POST"), SS("example.com"), SS("/echo"), extra, 1, payload,
+            &r, hdrs, 32, body, sizeof body);
+```
+
+连上先发 preface + SETTINGS，等对端 SETTINGS 落地才发请求；SETTINGS / PING 自动应答，收到 DATA
+自动还 WINDOW_UPDATE，GOAWAY / RST_STREAM 让本次请求失败（原因在 `why()`）。一条连接串行发请求，
+流号 1/3/5…，CONTINUATION 与填充都拼装。请求体超首窗时**本地**拒绝，不会挂在等 WINDOW_UPDATE 上。
+
+**`std/net/http2d.c6`**——h2c 服务端骨架：
+
+```c
+Server srv = h2d_listen("127.0.0.1", 8080, 8);
+char hb[16384] = { 0 }, tb[4096] = { 0 }, ar[4096] = { 0 };
+Conn c = h2d_accept(&srv, hb, sizeof hb, tb, sizeof tb, ar, sizeof ar);
+
+Request req = { 0 };
+char body[4096] = { 0 };
+HpackField hdrs[32] = { 0 };
+
+while (h2d_next_request(&c, &req, body, sizeof body, hdrs, 32) == 1) {
+    req.method / req.path / req.authority / req.body;      // 请求已经收全
+    h2d_respond(&c, &req, 200, SS("text/plain"), SS("hi\n"), extra, 0);
+}
+h2d_respond_text(&c, &req, 404, "nope\n");                // 快捷入口
+```
+
+连接上来第一件事必须是 preface（HTTP/1 报文直接判协议错），一条连接一次一个流，并发的流回
+`RST_STREAM(REFUSED_STREAM)`；响应体必须放得进当前窗口，超了直接失败而不是排队。
+
+有意的边界（都写进模块注释）：**只做 h2c（明文、prior knowledge）**——不做 ALPN，也不把 TLS
+记录层塞进来（那层是 `std.net.https` / `std.net.tlsrec` 的活）；不做服务端推送、不做并发流、
+不做请求体跨窗口排队。协议本身是完整的：CONTINUATION 拼装、填充、优先前缀、SETTINGS 协商、
+WINDOW_UPDATE、RST_STREAM、PING、GOAWAY 都处理了，头压缩是整个 RFC 7541（含动态表与 Huffman）。
+
+### 集成示例：`examples/stdh2.c6`
+
+```sh
+cmake --build build --target std-h2
+```
+
+四节：HPACK 的静态表 / 整数 / Huffman / 动态表；帧层各类帧往返；`fork` 起 h2c 服务端，客户端在
+同一条连接上打 GET / POST / 404 三条流，再验「超首窗请求体被本地拒绝」；最后验 HTTP/1 报文被
+preface 拒绝（49 条检查）。
+
+真机互通方向用过 `curl --http2-prior-knowledge`（nghttp2）：`http2d` 的服务端回 200/404、响应头、
+60000 字节响应体、POST 回显，curl 关闭时发的 GOAWAY 也被正常收尾。
 
 ## 相关回归用例
 

@@ -3025,3 +3025,32 @@ err 号段补 `std.net.cidr`=0x6175、`std.core.endian`=0x6176、
 验收状态：`make stdtest` 377/377 通过（0 failure），每个批次的集成示例各自全绿
 （`std-mw` 60、`std-proto4` 56、`std-ops` 62、`std-docs` 48、`std-mgmt` 53、
 `std-util` 45 条检查）。
+
+### 11.107 标准库第九十二批（HTTP/2：HPACK / 帧层 / h2c 客户端 / h2c 服务端）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/encoding/hpack.c6` | HPACK（RFC 7541）：61 项静态表 + 动态表（尺寸更新/淘汰/清空）、1..8 位前缀整数、字符串与 Huffman 编解码、整块 put/decode；编码端不插表，敏感头强制 never-indexed | 4 | `hpack_init`；`Hpack` 的 `err/why/size/count/max/set_max`；`hpack_int_put/get`、`hpack_str_put`、`hpack_huff_len/encode/decode`、`hpack_static/index/field_size`、`hpack_put_field/put_block/decode_block` |
+| `std/net/http2.c6` | 帧层（RFC 9113）：帧头读写（半包 0）、PADDED/PRIORITY 前缀剥离、preface、SETTINGS/WINDOW_UPDATE/RST_STREAM/PING/GOAWAY 编解码；`H2Pipe` 同步读写 | 3 | `h2_frame_write/head`、`h2_head_write`、`h2_payload_off`、`h2_preface_check`、`h2_settings_write/parse/setting_find`、`h2_window_write/parse`、`h2_rst_write/parse`、`h2_ping_write/parse`、`h2_goaway_write/parse`、`h2_pipe_attach/send/recv/payload/discard/write` |
+| `std/net/http2c.c6` | h2c 客户端：preface+SETTINGS 握手、HEADERS(+CONTINUATION)/DATA、自动应答与还额、GOAWAY/RST 失败；一条连接串行多流 | 4 | `h2c_connect/attach`；`H2Client` 的 `ok/err/why/requests/next_stream`；`h2c_request/get`、`H2Response` 的 `status/body/hdrs` + `h2c_header` |
+| `std/net/http2d.c6` | h2c 服务端骨架：`next_request`（1/0/-1）拿完整请求、`respond/respond_text` 写响应；非 h2 报文判协议错、并发流回 REFUSED_STREAM | 3 | `h2d_listen/accept`；`Server` 的 `ok/port/set_timeout/close_socket`；`Conn` 的 `next_request/respond/respond_text/requests/err/why/close_conn`；`Request` 的 `method/scheme/authority/path/body/fields/stream` |
+
+边界（写进模块注释）：只做明文 h2c + prior knowledge——不做 ALPN、不把 TLS 记录层塞进来
+（那是 `std.net.https`/`std.net.tlsrec` 的活）、不做服务端推送与并发流、请求/响应体不跨窗口排队；
+协议本身完整（CONTINUATION 拼装、填充、优先前缀、SETTINGS 协商、WINDOW_UPDATE、RST_STREAM、
+PING、GOAWAY）。
+
+集成示例 `examples/stdh2.c6`（`cmake --build build --target std-h2`）49 条检查：HPACK、
+帧层、`fork` 起 h2c 服务端让客户端在同一条连接上打三条流、HTTP/1 报文被 preface 拒绝。
+回归用例 `std-h2` 进 `C6_STD_TARGETS` / `C6_TEST_ALL`，`stdtest` 的 `deps` 映射补了四个模块。
+真机互通方向用 `curl --http2-prior-knowledge`（nghttp2）打过 `http2d` 的服务端：200/404、
+响应头、60000 字节响应体、POST 回显，curl 收工时的 GOAWAY 正常收尾。
+
+`std/` 现在 **381** 个 `.c6` 文件（core 53 / data 85 / encoding 54 / net 56 / text 52 /
+container 33 / os 32 / async 13 / analysis 3）；四个模块的 `-test` 逐个跑过
+（hpack 4 + str 22 = 26、http2 3、http2c 36、http2d 35，0 failure）。
+
+顺带改定位：`docs/stdlib-coverage.md` 第 4 节原来写「只收判断型/编解码型、新模块只能是变体」，
+这批删掉这条自我设限，换成「开发者常用就收 / 代价可控 / 零分配风格一致」三条标准；QUIC 与
+HTTP/3 仍然不做，但理由从「类型学不符」改成「等于随包一个传输栈」的代价判断。这一批本身就是
+按新标准收进来的：HTTP/2 既不是变体，也不只是编解码。
