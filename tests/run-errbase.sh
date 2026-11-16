@@ -35,10 +35,26 @@ fi
 
 # 仓库里所有模块文件（模块名 = 文件路径去掉 .c6）
 # 跳过 .git：会话工作树（.git/dsh-worktrees/*）里是同一棵树的完整副本，扫进去
-# 每个模块都会出现两次，钉号时报 'link symbol ... defined twice'
+# 每个模块都会出现两次，钉号时报 'link symbol ... defined twice'。
+# 有版本库时以 `git grep` 为准（它只看版本库里的文件）：CMake 构建树里的**产物**
+# 不是仓库模块——protoc6 会往 <build>/tests/std-protobuf/pb/demo/ 写一份
+# demo/*.c6 生成头，按目录扫会把它当成新模块，下面"提交的表是不是最新"就永远判
+# 过期（真跑过一遍 std-protobuf 之后 errcheck 必红）。源码包（没有 .git）退回
+# 按目录扫，并把 CMake 的默认构建目录排掉。
+# `git rev-parse --is-inside-work-tree` 不够：源码树被放在**别的**仓库里时
+# （比如 AUR 的 PKGBUILD 目录 clone 在 /startdir，源码解压到 /startdir/src/c6）
+# 它也会答 true，而 ls-files 吐的是那个外层仓库的清单——空的。要求版本库根就是
+# 本源码根，才认版本库口径。
 modules() {
-    cd "$ROOT" && grep -rl '^module ' --include=*.c6 --exclude-dir=.git . \
-        | sed 's,^\./,,' | sort
+    top=$(cd "$ROOT" && git rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)" = "$(cd "$ROOT" && pwd -P)" ]; then
+        # git grep 和 ls-files 一样只看版本库里的文件，但**还要**按内容筛一遍：
+        # 不是每个 *.c6 都声明了模块（c6c/src/*.c6、examples/、bench/ 就没有），
+        # 拿 ls-files 的全量清单去比对，MAIN_MODULES 那条立刻就红。
+        cd "$ROOT" && git grep -l --no-color -e '^module ' -- '*.c6'
+    else
+        cd "$ROOT" && grep -rl '^module ' --include=*.c6 --exclude-dir=.git --exclude-dir=build .
+    fi | sed 's,^\./,,' | sort
 }
 
 # 定义 main 的模块文件必须从 '-emit-errbase' 的清单里剔掉：那个选项走的是
