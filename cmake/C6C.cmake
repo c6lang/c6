@@ -189,6 +189,12 @@ c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)
 c6c_target(ldcheck ENV C6C=${C6C_BIN} COMMAND ./tests/ld-check.sh)
 c6c_target(dyncheck ENV C6C=${C6C_BIN} COMMAND ./tests/dyn-check.sh)
 c6c_target(sharedcheck ENV C6C=${C6C_BIN} COMMAND ./tests/shared-check.sh)
+# printf 的口径（宽度/精度/标志/%x/%g/舍入/-0.0）：同一份矩阵用宿主 cc 与 c6c
+# 各跑一遍逐行 diff，c6c/lib/rt.c6 的 c6c_vfmt 一旦和 glibc 分叉就在这里露出来。
+c6c_target(printfcheck ENV C6C=${C6C_BIN} COMMAND ./tests/printf-check.sh)
+# 二进制转义（`"\xde"` 是**一个字节**，不是 UTF-8 的 0xc3 0x9e）：窄字面量里
+# 只有 `\u` 和源码里的 UTF-8 才该重新编码，这条线曾经把 std 的 5 个用例带偏。
+c6c_target(esccheck ENV C6C=${C6C_BIN} COMMAND ./tests/esc-check.sh)
 # 用 c6c 跑根目录 tests/regression.sh 里已经全绿的那批用例（列表单一数据源：
 # c6c/tests/regression-c6c.list）。交付物要能不带 tcc，这批回归就得能只靠 c6c 跑。
 c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)
@@ -322,13 +328,13 @@ c6c_target(g2c-check DEPENDS build-tcc ENV ROOT=${C6C_ROOT}
 # ---------------------------------------------------------------------------
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck printfcheck esccheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
           c99suite llvmtest test-c6c build-tcc tests1-check tests2-check regression-c6c
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")
