@@ -4800,3 +4800,23 @@ printf("%d %d\n", (int)r.error, (int)std.data.csv.PARSE);
 std-box 那条 `csv: 未闭合引号报 PARSE` 另有原因（多半是那个 `bad_text` 在示例
 里跟别的 csv 状态混在一起，或者 `next` 先返回了 0），下一轮直接从
 `examples/stdbox.c6` 的 `box_csv()` 里把 `r.error` 打出来看。
+
+### 第 236 轮：把两边都打出来，错的是**限定名那一侧**
+
+在 `examples/stdbox.c6` 的副本里插一行打印（仓库里没改）：
+
+```
+DBG csv error=234991623 q=234881031 badlen=15
+```
+
+- `r.error` = 234991623 = `0x0E01_B007` = `(1<<27)|(csv 的 slot 0x6010<<12)|7` ✓
+  这是 **csv 自己的**值，模块内部用裸名 `PARSE` 拿到的就是它 ✓；
+- `std.data.csv.PARSE` = 234881031 = `0x0E00_0007` = `(1<<27)|(err 的 slot 0x6000<<12)|7`
+  ✗ 这是 **std.core.err 的**值。
+
+所以红的是**限定名解析**：`std.data.csv.PARSE` 一路退到裸名 `PARSE`，而裸名表里
+留的是先登记的 std.core.err 那份。试过在枚举定义处额外登记
+`std__data__csv__PARSE` 让最长前缀那圈命中它，**没有效果**（打印的 q 不变），
+说明那条路没走到该分支（或在它之前就已经命中了别的符号），改动已撤回。
+下一轮从 `parse.c6` 最长前缀那圈（约 10450 行）把 `qd`/`qm` 每次拼出来的串
+打出来，看 `sym_find` 究竟命中了谁。
