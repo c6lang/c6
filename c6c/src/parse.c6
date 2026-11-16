@@ -15468,6 +15468,23 @@ static int pa_at_typename(void)
         && TOK_EQ(pa_peek(1), ".")) {
         u32 kq = 1;
 
+        /* 但 `obj.member = …` 是**表达式**，不是限定的类型名。判据：前缀在
+         * 符号表里已经是变量/函数（不是 typedef），它就不可能同时是模块名。
+         *
+         * 内核里"成员名和它自己的类型同名"极常见——`key.folio = folio;`
+         * （struct folio）、`owner.pid = …`（struct pid）、
+         * `root_task_group.cfs_rq = …`（struct cfs_rq）。少了这一条它们全被
+         * 判成声明，报"这里要 ';'（当前是 '='）"，实测 20 个文件卡在这条。
+         *
+         * 只放行非 typedef 的情况：真正的限定名 `tu.module.Point p;` 里
+         * `tu` 只是个命名空间装饰，不在符号表里，照旧走下面的判定。 */
+        {
+            Sym *pq = sym_find(tok_data(pa_cur()), pa_cur()->len);
+
+            if (pq && pq->kind != SC_TYPEDEF)
+                return 0;
+        }
+
         while (pa_peek(kq) && pa_peek(kq)->kind == TK_PUNCT && TOK_EQ(pa_peek(kq), ".")
                && pa_peek(kq + 1) && pa_peek(kq + 1)->kind == TK_IDENT)
             kq += 2;
