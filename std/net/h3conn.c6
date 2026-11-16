@@ -1,0 +1,627 @@
+/* std/net/h3conn：HTTP/3 连接层（RFC 9114 §3–§6）。
+ *
+ *     import std.net.h3conn;
+ *
+ *     H3Peer h = { 0 };
+ *     h.init(&qc);                       -- 挂到一条 QUIC 连接上
+ *     u64 id = h.start_request("GET", "https", "example.com", "/");
+ *     h.pump();                          -- 把对端流里的数据抽出来解帧
+ *     ...
+ *
+ * HTTP/3 的一条连接上有三种东西：
+ *
+ * - **控制流**（单向，流类型 0x00）：开头一个 SETTINGS 帧，之后是 GOAWAY、
+ *   MAX_PUSH_ID 之类的连接级帧；
+ * - **QPACK 编码器/解码器流**（单向，流类型 0x02 / 0x03）：动态表的插入与
+ *   确认指令，让头部块不必每帧重复；
+ * - **请求流**（双向）：请求是 HEADERS + 若干 DATA，响应在同一个流的反方向。
+ *
+ * 这一层只做「帧怎么排、头部块怎么编解码、数据往哪条流里放」，包与加密在
+ * `std.net.quicconn`，头部压缩在 `std.net.qpack`，帧格式在 `std.net.h3`。
+ *
+ * 用法上就两步：写的时候调 `start_request` / `send_response` / `send_data`
+ * （它们都直接往 QUIC 流里写，不帮你发包），收的时候调 `pump()`——它扫一遍
+ * 连接上所有有数据的流，按流类型把字节抽进对应的解析器，再逐帧解出来。发
+ * 包仍然由 `quicconn.flush()` 负责，所以顺序是：
+ *
+ *     h.start_request(...);  qc.flush(buf, cap, now);
+ *     qc.on_packet(...);     h.pump();
+ *
+ * 简化：
+ *
+ * - 动态表只做了「收指令、更新解码表」这一半，编码器永远只发静态表引用
+ *   和字面量（`huffman` 可选），因此不会出现阻塞等确认的头部块；
+ * - 推送（PUSH_PROMISE）、优先级、扩展帧都不处理，认不出来就当未知帧跳过；
+ * - 每个对端最多跟 8 条请求流（`H3C_MAX_FLOW`），请求体最多 8 KiB
+ *   （`H3C_BUF`）——超了报 FULL，由调用方自己加大缓冲。
+ */
+#include <string.h>
+
+module std.net.h3conn;
+import std.core.types;
+import std.net.h3;
+import std.net.qpack;
+import std.net.quic;
+import std.net.quicconn;
+import std.net.quicstream;
+
+enum Error { OK = 0, INVAL = 1, STATE = 2, FRAME = 3, QPACK = 4, FULL = 5 };
+
+#define H3C_CTRL        0x00
+#define H3C_PUSH        0x01
+#define H3C_ENC         0x02
+#define H3C_DEC         0x03
+#define H3C_REQ         0x40    /* 不是线上值，只是本模块内部的「请求流」标记 */
+#define H3C_UNKNOWN     (-1)
+#define H3C_MAX_FLOW    8
+#define H3C_BUF         8192
+
+struct H3Flow {
+    u64 id;
+    int type;                   /* 单向流的类型；H3C_REQ 表示双向请求流 */
+    int pos;                    /* 已经解析掉的字节数 */
+    int len;
+    int headers_seen;
+    int answered;               /* 服务器端：这条请求回过响应了吗 */
+    int data_len;
+    int fin;
+    int err;
+    H3Request req;              /* 这条流上解出来的请求（每条流各存一份） */
+    H3Response resp;            /* 这条流上解出来的响应 */
+    u8 buf[H3C_BUF];
+};
+
+struct H3Peer {
+    QConn *qc;
+    QpackTable enc;             /* 本端编码用的表（只会用到静态表） */
+    QpackTable dec;             /* 解对端头部块用的表 */
+    H3Settings settings;
+    int settings_seen;
+    u64 ctrl_id;
+    u64 enc_id;
+    u64 dec_id;
+    int has_ctrl;
+    int has_enc;
+    int has_dec;
+    H3Flow flows[H3C_MAX_FLOW];
+    int count;
+    H3Request req;
+    H3Response resp;
+    u8 body[H3C_BUF];
+    int body_len;
+    int err;
+};
+
+/* ---- 初始化：开三条单向流并把 SETTINGS 排上去 ---- */
+
+int init(H3Peer *p, QConn *qc)
+{
+    QStream *s = 0;
+    u8 buf[64] = { 0 };
+    H3Settings st = { 0 };
+    int n = 0;
+    int m = 0;
+
+    if (!p || !qc)
+        return -INVAL;
+    memset(p, 0, sizeof *p);
+    p->qc = qc;
+    p->enc.init(0);             /* 不发动态表插入，容量 0 就够 */
+    p->dec.init(0);
+    st.max_table_capacity = 0;
+    st.blocked_streams = 0;
+    st.max_field_section_size = 64 * 1024;
+    st.present = 7;             /* 三项都发出去 */
+    p->settings = st;
+
+    /* 控制流：流类型 0x00 + SETTINGS 帧 */
+    s = qc->streams_of()->open(1);
+    if (!s)
+        return -FULL;
+    p->ctrl_id = s->id_of();
+    p->has_ctrl = 1;
+    n = quic_varint_put(buf, (int)sizeof buf, H3C_CTRL);
+    if (n < 0)
+        return -FRAME;
+    m = h3_put_settings(buf + n, (int)sizeof buf - n, &st);
+    if (m < 0)
+        return -FRAME;
+    if (qc->write_stream(p->ctrl_id, buf, n + m) != n + m)
+        return -FULL;
+
+    /* QPACK 编码器流：只有流类型，暂时不发指令 */
+    s = qc->streams_of()->open(1);
+    if (!s)
+        return -FULL;
+    p->enc_id = s->id_of();
+    p->has_enc = 1;
+    n = quic_varint_put(buf, (int)sizeof buf, H3C_ENC);
+    if (n < 0 || qc->write_stream(p->enc_id, buf, n) != n)
+        return -FULL;
+
+    /* QPACK 解码器流：同上 */
+    s = qc->streams_of()->open(1);
+    if (!s)
+        return -FULL;
+    p->dec_id = s->id_of();
+    p->has_dec = 1;
+    n = quic_varint_put(buf, (int)sizeof buf, H3C_DEC);
+    if (n < 0 || qc->write_stream(p->dec_id, buf, n) != n)
+        return -FULL;
+    return 0;
+}
+
+u64 ctrl_id_of(H3Peer *p) { return p ? p->ctrl_id : 0; }
+u64 enc_id_of(H3Peer *p) { return p ? p->enc_id : 0; }
+u64 dec_id_of(H3Peer *p) { return p ? p->dec_id : 0; }
+int settings_seen_of(H3Peer *p) { return p ? p->settings_seen : 0; }
+H3Settings *settings_of(H3Peer *p) { return p ? &p->settings : 0; }
+H3Request *request_of(H3Peer *p) { return p ? &p->req : 0; }
+H3Response *response_of(H3Peer *p) { return p ? &p->resp : 0; }
+const u8 *body_of(H3Peer *p) { return p ? p->body : 0; }
+int body_len_of(H3Peer *p) { return p ? p->body_len : 0; }
+int err_of(H3Peer *p) { return p ? p->err : 0; }
+int flow_count(H3Peer *p) { return p ? p->count : 0; }
+H3Flow *flow_at(H3Peer *p, int i)
+{
+    if (!p || i < 0 || i >= p->count)
+        return 0;
+    return &p->flows[i];
+}
+
+u64 flow_id(H3Peer *p, int i)
+{
+    if (!p || i < 0 || i >= p->count)
+        return 0;
+    return p->flows[i].id;
+}
+
+/* ---- 流表 ---- */
+
+static H3Flow *h3c_flow_find(H3Peer *p, u64 id)
+{
+    int i = 0;
+
+    for (i = 0; i < p->count; i++)
+        if (p->flows[i].id == id)
+            return &p->flows[i];
+    return 0;
+}
+
+static H3Flow *h3c_flow_add(H3Peer *p, u64 id, int type)
+{
+    H3Flow *f = 0;
+
+    if (p->count >= H3C_MAX_FLOW)
+        return 0;
+    f = &p->flows[p->count++];
+    memset(f, 0, sizeof *f);
+    f->id = id;
+    f->type = type;
+    return f;
+}
+
+/* 一条流是双向请求流还是一条单向控制流？ */
+static int h3c_classify(H3Peer *p, u64 id)
+{
+    if (!p || !p->qc)
+        return H3C_UNKNOWN;
+    if (!qs_stream_uni(id))
+        return H3C_REQ;
+    /* 单向流的方向必须是「对端发起」，否则是本端自己开的 */
+    if (qs_stream_from_server(id) == p->qc->server)
+        return H3C_UNKNOWN;
+    return H3C_UNKNOWN;         /* 类型要读了流开头的变长整数才知道 */
+}
+
+/* ---- 帧与流类型解析 ---- */
+
+/* 把一个流里攒下的字节按 HTTP/3 帧切开。 */
+static int h3c_parse_frames(H3Peer *p, H3Flow *f)
+{
+    while (f->pos < f->len) {
+        H3Frame fr = { 0 };
+        int rc = h3_frame_parse(f->buf + f->pos, f->len - f->pos, &fr);
+
+        if (rc != 1)
+            return -FRAME;      /* 帧头都不完整：等更多数据 */
+        if (!fr.complete)
+            return 0;           /* 负载还没到齐 */
+        if (fr.type == H3_FRAME_HEADERS) {
+            const u8 *block = f->buf + f->pos + fr.hdr_len;
+            int blen = (int)fr.len;
+            /* 双向请求流的两个方向各走各的：只有服务器方向收到的是请求，
+             * 客户端方向收到的是响应（RFC 9114 §4.1）。 */
+            int expect_req = !qs_stream_uni(f->id) && p->qc->server;
+
+            if (expect_req && !f->headers_seen) {
+                int r = h3_request_decode(&p->dec, block, blen, &f->req);
+
+                if (r < 0)
+                    return -QPACK;
+                memcpy(&p->req, &f->req, sizeof p->req);
+                p->body_len = 0;        /* 新请求：请求体从头攒 */
+                f->headers_seen = 1;
+            } else {
+                int r = h3_response_decode(&p->dec, block, blen, &f->resp);
+
+                if (r < 0)
+                    return -QPACK;
+                memcpy(&p->resp, &f->resp, sizeof p->resp);
+                p->body_len = 0;        /* 新响应：响应体从头攒 */
+            }
+        } else if (fr.type == H3_FRAME_DATA) {
+            if (p->body_len + (int)fr.len <= H3C_BUF
+                && p->body_len + (int)fr.len <= (int)sizeof p->body) {
+                memcpy(p->body + p->body_len, f->buf + f->pos + fr.hdr_len,
+                       (size_t)fr.len);
+                p->body_len += (int)fr.len;
+                f->data_len += (int)fr.len;
+            } else {
+                return -FULL;
+            }
+        } else if (fr.type == H3_FRAME_SETTINGS) {
+            if (h3_settings_parse(f->buf + f->pos + fr.hdr_len, (int)fr.len,
+                                  &p->settings) < 0)
+                return -FRAME;
+            p->settings_seen = 1;
+        }
+        /* 其余帧类型（GOAWAY / MAX_PUSH_ID / 扩展帧）先跳过 */
+        f->pos += fr.total;
+    }
+    return 0;
+}
+
+/* 单向流开头是流类型（变长整数），读出来之后交给对应的处理。 */
+static int h3c_parse_stream_type(H3Peer *p, H3Flow *f)
+{
+    int used = 0;
+    int t = 0;
+
+    if (f->type != H3C_UNKNOWN)
+        return 0;
+    t = h3_stream_type(f->buf, f->len, &used);
+    if (t < 0)
+        return 0;               /* 字节还不够，下次再来 */
+    f->type = t;
+    f->pos = used;
+    if (t == H3C_CTRL)
+        p->ctrl_id = f->id;
+    else if (t == H3C_ENC)
+        p->enc_id = f->id;
+    else if (t == H3C_DEC)
+        p->dec_id = f->id;
+    return 0;
+}
+
+/* QPACK 编码器流上的指令：插入、复制、改容量。 */
+static int h3c_apply_qpack(H3Peer *p, H3Flow *f)
+{
+    while (f->pos < f->len) {
+        QpackInstr ins = { 0 };
+        int used = qpack_encoder_ins(&p->dec, f->buf + f->pos, f->len - f->pos,
+                                     &ins);
+
+        if (used <= 0)
+            return 0;           /* 指令不完整 */
+        f->pos += used;
+    }
+    return 0;
+}
+
+/* 从连接里把有数据的流都抽出来。返回处理的流数。 */
+int pump(H3Peer *p)
+{
+    QStreams *all = 0;
+    int i = 0;
+    int n = 0;
+
+    if (!p || !p->qc)
+        return -INVAL;
+    all = p->qc->streams_of();
+    for (i = 0; i < all->count_of(); i++) {
+        QStream *s = &all->s[i];
+        H3Flow *f = 0;
+        u8 tmp[1024] = { 0 };
+        int got = 0;
+        int rc = 0;
+
+        if (s->pending_read() == 0 && !s->fin_read_of())
+            continue;
+        f = h3c_flow_find(p, s->id_of());
+        if (!f) {
+            f = h3c_flow_add(p, s->id_of(), h3c_classify(p, s->id_of()));
+            if (!f)
+                return -FULL;
+        }
+        while ((got = p->qc->read_stream(s->id_of(), tmp, (int)sizeof tmp))
+               > 0) {
+            if (f->len + got > H3C_BUF)
+                return -FULL;
+            memcpy(f->buf + f->len, tmp, (size_t)got);
+            f->len += got;
+        }
+        if (f->type == H3C_UNKNOWN)
+            h3c_parse_stream_type(p, f);
+        if (f->type == H3C_ENC || f->type == H3C_DEC)
+            rc = h3c_apply_qpack(p, f);
+        else if (f->type == H3C_CTRL || f->type == H3C_REQ)
+            rc = h3c_parse_frames(p, f);
+        if (rc < 0) {
+            p->err = rc;
+            return rc;
+        }
+        if (s->fin_read_of())
+            f->fin = 1;
+        n++;
+    }
+    return n;
+}
+
+/* ---- 发请求 / 发响应 ---- */
+
+/* 开一条双向流并把请求头部块写进去，返回流号。 */
+u64 start_request(H3Peer *p, const char *method, const char *scheme,
+                  const char *authority, const char *path)
+{
+    QStream *s = 0;
+    u8 block[1024] = { 0 };
+    u8 frame[1200] = { 0 };
+    int blen = 0;
+    int flen = 0;
+
+    if (!p || !p->qc || !method || !scheme || !path)
+        return 0;
+    s = p->qc->streams_of()->open(0);
+    if (!s)
+        return 0;
+    blen = h3_request_encode(block, (int)sizeof block, &p->enc, method, scheme,
+                             authority, path, 1);
+    if (blen < 0)
+        return 0;
+    flen = h3_put_headers(frame, (int)sizeof frame, block, blen);
+    if (flen < 0)
+        return 0;
+    if (p->qc->write_stream(s->id_of(), frame, flen) != flen)
+        return 0;
+    if (!h3c_flow_find(p, s->id_of()))
+        h3c_flow_add(p, s->id_of(), H3C_REQ);
+    return s->id_of();
+}
+
+/* 在请求流上回一个响应头。 */
+int send_response(H3Peer *p, u64 id, int status)
+{
+    u8 block[256] = { 0 };
+    u8 frame[512] = { 0 };
+    int blen = 0;
+    int flen = 0;
+
+    if (!p || !p->qc)
+        return -INVAL;
+    blen = h3_status_encode(block, (int)sizeof block, &p->enc, status, 1);
+    if (blen < 0)
+        return -QPACK;
+    flen = h3_put_headers(frame, (int)sizeof frame, block, blen);
+    if (flen < 0)
+        return -FRAME;
+    if (p->qc->write_stream(id, frame, flen) != flen)
+        return -FULL;
+    return 0;
+}
+
+/* 在请求流上写一段 DATA。 */
+int send_data(H3Peer *p, u64 id, const void *data, int n)
+{
+    u8 frame[1200] = { 0 };
+    int flen = 0;
+
+    if (!p || !p->qc || n < 0 || (n > 0 && !data))
+        return -INVAL;
+    if (n + 16 > (int)sizeof frame)
+        return -FULL;
+    flen = h3_put_data(frame, (int)sizeof frame, data, n);
+    if (flen < 0)
+        return -FRAME;
+    if (p->qc->write_stream(id, frame, flen) != flen)
+        return -FULL;
+    return 0;
+}
+
+/* 一条流写完了：带 FIN。 */
+int finish_stream(H3Peer *p, u64 id)
+{
+    QStream *s = 0;
+
+    if (!p || !p->qc)
+        return -INVAL;
+    s = p->qc->streams_of()->find(id);
+    if (!s)
+        return -INVAL;
+    return s->mark_fin() == 0 ? 0 : -INVAL;
+}
+
+/* ---- 自测 ---- */
+
+static void h3c_pair(H3Peer *hc, H3Peer *hs, QConn *c, QConn *s)
+{
+    u8 scid_c[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    u8 scid_s[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++) {
+        c_ap[i] = (u8)(0x10 + i);
+        s_ap[i] = (u8)(0x80 + i);
+    }
+    c->init(0, scid_c, 8);
+    s->init(1, scid_s, 8);
+    c->set_dcid(scid_s, 8);
+    s->set_dcid(scid_c, 8);
+    c->set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    s->set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+    hc->init(c);
+    hs->init(s);
+}
+
+/* 把 from 的包全部灌给 to，返回灌了几个包。 */
+static int h3c_xfer(QConn *from, QConn *to, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int sent = 0;
+
+    while ((n = from->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (to->on_packet(pkt, n, now) < 0)
+            return -1;
+        sent++;
+        if (sent > 16)
+            break;
+    }
+    return sent;
+}
+
+test "HTTP/3：控制流与 SETTINGS" {
+    QConn c = { 0 };
+    QConn s = { 0 };
+    H3Peer hc = { 0 };
+    H3Peer hs = { 0 };
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+
+    h3c_pair(&hc, &hs, &c, &s);
+    /* 客户端开了三条单向流：控制流 2、编码器流 6、解码器流 10 */
+    if (hc.ctrl_id != 2 || hc.enc_id != 6 || hc.dec_id != 10)
+        return err(1, "三条单向流的编号应是 2/6/10");
+    if (hc.flow_count() != 0)
+        return err(2, "本地开的流不该算进对端流表");
+    /* 客户端把控制流上的字节发出去，服务器要能认出流类型并解出 SETTINGS */
+    n = c.flush(pkt, (int)sizeof pkt, 1000);
+    if (n <= 0)
+        return err(3, "控制流应该有包要发");
+    if (s.on_packet(pkt, n, 1000) != 0)
+        return err(4, "服务器应能收下控制流包");
+    n = hs.pump();
+    if (n != 3)
+        return err(5, "服务器应扫到三条单向流");
+    if (!hs.settings_seen_of())
+        return err(6, "应当收到 SETTINGS");
+    if (hs.settings_of()->max_field_section_size != 64 * 1024)
+        return err(7, "MAX_FIELD_SECTION_SIZE 应是 64 KiB");
+    if (hs.settings_of()->unknown != 0)
+        return err(8, "不该有不认识的设置项");
+    if (hs.ctrl_id_of() != 2)
+        return err(9, "服务器应记下对端的控制流号");
+    /* 反过来：服务器也有自己的控制流（服务器单向流是 3） */
+    n = h3c_xfer(&s, &c, 2000);
+    if (n <= 0)
+        return err(10, "服务器也有控制流要发");
+    n = hc.pump();
+    if (n != 3 || !hc.settings_seen_of())
+        return err(11, "客户端也应收到 SETTINGS");
+    if (hc.ctrl_id_of() != 3)
+        return err(12, "服务器的控制流应是 3");
+}
+
+test "HTTP/3：请求与响应往返" {
+    QConn c = { 0 };
+    QConn s = { 0 };
+    H3Peer hc = { 0 };
+    H3Peer hs = { 0 };
+    u64 id = 0;
+    int rc = 0;
+
+    h3c_pair(&hc, &hs, &c, &s);
+    /* 客户端发请求 */
+    id = hc.start_request("GET", "https", "example.com", "/index.html");
+    if (id != 0)
+        return err(1, "第一条请求流应是 0");
+    /* 请求先到服务器 */
+    if (h3c_xfer(&c, &s, 1000) <= 0)
+        return err(3, "请求应当发出去了");
+    if (hs.pump() <= 0)
+        return err(4, "服务器应处理到请求流");
+    if (hs.err_of() != 0)
+        return err(5, "解析请求时不应出错");
+    if (!hs.request_of()->has_method || hs.request_of()->method[0] != 'G')
+        return err(6, "请求方法应是 GET");
+    if (strcmp(hs.request_of()->path, "/index.html") != 0)
+        return err(7, "路径应是 /index.html");
+    if (strcmp(hs.request_of()->authority, "example.com") != 0)
+        return err(8, "authority 应是 example.com");
+    if (strcmp(hs.request_of()->scheme, "https") != 0)
+        return err(9, "scheme 应是 https");
+    /* 服务器回响应：200 + "hello" */
+    rc = hs.send_response(0, 200);
+    if (rc != 0)
+        return err(10, "发响应头失败");
+    if (hs.send_data(0, "hello", 5) != 0)
+        return err(11, "发响应体失败");
+    if (hs.finish_stream(0) != 0)
+        return err(12, "收尾失败");
+    if (h3c_xfer(&s, &c, 2000) <= 0)
+        return err(13, "响应应当发出去了");
+    if (hc.pump() <= 0)
+        return err(14, "客户端应处理到响应流");
+    if (hc.err_of() != 0)
+        return err(15, "解析响应时不应出错");
+    if (!hc.response_of()->has_status
+        || strcmp(hc.response_of()->status, "200") != 0)
+        return err(16, "状态码应是 200");
+    if (hc.body_len_of() != 5 || memcmp(hc.body_of(), "hello", 5) != 0)
+        return err(17, "响应体应是 hello");
+    /* 再发一条请求：流号按 4 递增，服务器解出来的应是后一条 */
+    if (hc.start_request("POST", "https", "example.com", "/x") != 4)
+        return err(18, "第二条请求流应是 4");
+    if (h3c_xfer(&c, &s, 3000) <= 0)
+        return err(19, "第二条请求应当发出去");
+    hs.pump();
+    if (hs.request_of()->method[0] != 'P'
+        || strcmp(hs.request_of()->path, "/x") != 0)
+        return err(20, "第二条请求应是 POST /x");
+}
+
+test "HTTP/3：静态表命中与错误处理" {
+    H3Peer p = { 0 };
+    QpackTable t = { 0 };
+    QConn c = { 0 };
+    QConn s = { 0 };
+    H3Peer hc = { 0 };
+    H3Peer hs = { 0 };
+
+    /* 不带 QUIC 连接时，编码这一半也能单独用 */
+    t.init(0);
+    if (h3_request_encode((u8 *)0, 0, &t, "GET", "https", "a", "/", 0) != -1)
+        return err(1, "空缓冲应报错");
+    /* 没有连接时的错误路径 */
+    if (p.pump() != -INVAL)
+        return err(2, "没连接时 pump 应报 INVAL");
+    if (p.start_request("GET", "https", "/", "/") != 0)
+        return err(3, "没连接时应返回 0");
+
+    /* 正常连接上，重复 pump 不会重复解帧 */
+    h3c_pair(&hc, &hs, &c, &s);
+    hc.start_request("GET", "https", "h", "/");
+    h3c_xfer(&c, &s, 1000);
+    hs.pump();
+    if (hs.request_of()->method[0] != 'G')
+        return err(4, "第一次应当解出请求");
+    if (hs.pump() != 0)
+        return err(5, "没有新数据时 pump 应返回 0，且不重复解析");
+    if (strcmp(hs.request_of()->path, "/") != 0)
+        return err(6, "重复 pump 不该改坏已解出的请求");
+    /* 响应状态码的静态表命中 */
+    {
+        u8 block[64] = { 0 };
+        H3Response r = { 0 };
+        int n = h3_status_encode(block, (int)sizeof block, &t, 404, 0);
+
+        if (n <= 0)
+            return err(7, "编码 404 失败");
+        if (h3_response_decode(&t, block, n, &r) < 0)
+            return err(8, "解码 404 失败");
+        if (strcmp(r.status, "404") != 0)
+            return err(9, "状态码应是 404");
+    }
+}

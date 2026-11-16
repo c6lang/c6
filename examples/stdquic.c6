@@ -1,0 +1,325 @@
+/* stdquic：标准库第九十二批（QUIC 与 HTTP/3）的拼装示例。
+ *
+ * 和前面各批的示例一样：没有 `module`（入口 `main` 只能写在模块外），每一节
+ * 自带检查，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 五节正好是从下往上五层：
+ *
+ *   - frames：变长整数、STREAM 帧的写法与 Frame 的解析；
+ *   - streams：流的收发缓冲、乱序补齐、流控额度；
+ *   - conn：一对 QConn 之间的一次 1-RTT 往返（发包、收流、挂 ACK、收 ACK）；
+ *   - http3：H3Client + H3Server 在内存里跑一次 GRT（命中 /health 与未命中）；
+ *   - demux：一个 QuicDaemon 按连接 ID 把两个数据报分给两条连接。
+ *
+ * 全部流量都在进程内存里，不绑端口、不联外网，所以离线也能跑。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdquic examples/stdquic.c6 \
+ *         std/core/types.c6 std/net/quic.c6 std/net/quicstream.c6 \
+ *         std/net/quichp.c6 std/net/quicrecovery.c6 std/net/quictls.c6 \
+ *         std/net/quicconn.c6 std/net/hpack.c6 std/net/qpack.c6 \
+ *         std/net/h3.c6 std/net/h3conn.c6 std/net/h3c.c6 std/net/h3d.c6 \
+ *         std/net/quicd.c6 std/encoding/aead.c6 std/encoding/aes.c6 \
+ *         std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 \
+ *         std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 \
+ *         std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.quic;
+import std.net.quicstream;
+import std.net.quictls;
+import std.net.quicconn;
+import std.net.qpack;
+import std.net.h3;
+import std.net.h3conn;
+import std.net.h3c;
+import std.net.h3d;
+import std.net.quicd;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int ok, const char *what)
+{
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static void fill(u8 *p, int n, int base)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        p[i] = (u8)(base + i);
+}
+
+/* 把 `from` 攒下的包全灌给 `to`，返回灌了几个。 */
+static int push_all(QConn *from, QConn *to, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int k = 0;
+
+    while ((n = from->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (to->on_packet(pkt, n, now) < 0)
+            return -1;
+        if (++k > 16)
+            break;
+    }
+    return k;
+}
+
+/* ---- 第一节：变长整数与帧 ---- */
+
+static void sec_frames(void)
+{
+    u8 buf[256] = { 0 };
+    Frame f = { 0 };
+    u64 v = 0;
+    int n = 0;
+
+    /* 15293 在 2 字节区间的上沿，写出来应该是 0x7b 0xbd */
+    n = quic_varint_put(buf, (int)sizeof buf, 15293);
+    check(n == 2 && buf[0] == 0x7b && buf[1] == 0xbd, "15293 应写成 2 字节 varint");
+    check(quic_varint_get(buf, n, &v) == 2 && v == 15293, "varint 读回来应一样");
+    /* 边界：1 字节 63、2 字节 16383、4 字节 1073741823 */
+    check(quic_varint_size(63) == 1 && quic_varint_size(64) == 2, "varint 长度分界");
+    check(quic_varint_put(buf, (int)sizeof buf, 63) == 1, "63 写 1 字节");
+    check(quic_varint_get(buf, 1, &v) == 1 && v == 63, "63 读回来应一样");
+    /* 输入不够时不能悄悄给出半截值 */
+    memset(buf, 0x40, sizeof buf);
+    check(quic_varint_get(buf, 1, &v) < 0, "2 字节 varint 只给 1 字节应失败");
+
+    /* STREAM 帧：带偏移、带长度、带 FIN */
+    memset(buf, 0, sizeof buf);
+    n = frame_put_stream(buf, (int)sizeof buf, 4, 1, 100, 1, "abc", 3, 1);
+    check(n > 0, "STREAM 帧应写得出来");
+    memset(&f, 0, sizeof f);
+    check(f.parse(buf, n) == 1 && f.ok, "STREAM 帧应解析得动");
+    check(f.is_stream(), "解析出来应是 STREAM 帧");
+    check(f.size == n, "帧长应和写出来的一致");
+    check(f.stream_id == 4, "流号应是 4");
+    check(f.offset == 100, "偏移应是 100");
+    check(f.data_len == 3 && f.fin == 1, "长度 3 且带 FIN");
+    check(memcmp(buf + f.data_off, "abc", 3) == 0, "负载应是 abc");
+
+    /* PING 与 PADDING 是另外两种「不带负载」的帧 */
+    check(frame_put_ping(buf, (int)sizeof buf) == 1, "PING 帧 1 字节");
+    check(frame_put_padding(buf, (int)sizeof buf, 5) == 5, "PADDING 帧按数量写");
+}
+
+/* ---- 第二节：流与流控 ---- */
+
+static void sec_streams(void)
+{
+    QStreams all = { 0 };
+    QStream *s = 0;
+    u8 got[64] = { 0 };
+
+    all.init(1);                /* 服务端视角 */
+    all.set_max_streams(0, 8);  /* 允许对端开 8 条双向流 */
+    all.set_max_streams(1, 8);
+    all.set_recv_max_data(64 * 1024);
+    check(all.count_of() == 0, "一开始没有流");
+    /* 客户端发起的双向流是 0；先收到乱序的两段，再补中间那段 */
+    check(all.on_data(0, 3, "def", 3, 0) == 0, "先收到偏移 3 的一段");
+    check(all.on_data(0, 0, "abc", 3, 0) == 0, "再收到偏移 0 的一段");
+    s = all.find(0);
+    check(s != 0 && s->pending_read() == 6, "补上之后应能读出 6 字节");
+    check(s->read(got, (int)sizeof got) == 6 && memcmp(got, "abcdef", 6) == 0,
+          "按序读出来应是 abcdef");
+    /* 重叠的那段不会重复算 */
+    check(all.on_data(0, 2, "cde", 3, 0) == 0, "重叠的一段");
+    check(s->pending_read() == 0, "重叠数据不该变多");
+    /* FIN 带 final_size：记下最终长度，读到末尾之后 fin_read 才置起 */
+    check(all.on_data(0, 6, "", 0, 1) == 0 && s->final_size_of() == 6,
+          "FIN 的 final_size 应是 6");
+    check(s->read(got, (int)sizeof got) == 0 && s->fin_read_of() == 1,
+          "读到末尾之后 fin_read 置起");
+    /* 流控：另起一张表，连接级收额度只有 4 字节 */
+    {
+        QStreams small = { 0 };
+
+        small.init(1);
+        small.set_max_streams(0, 8);
+        small.set_recv_max_data(4);
+        check(small.on_data(0, 0, "12345", 5, 0) < 0, "超过连接级收额度应被拒");
+        check(small.on_data(0, 0, "1234", 4, 0) == 0, "没超额度的应放行");
+        check(small.count_of() == 1, "放行之后才建流");
+    }
+}
+
+/* ---- 第三节：一条 1-RTT 连接 ---- */
+
+static void sec_conn(void)
+{
+    QConn c = { 0 };
+    QConn s = { 0 };
+    u8 sc[8] = { 0 };
+    u8 ss[8] = { 0 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    u8 pkt[1200] = { 0 };
+    u8 got[64] = { 0 };
+    int n = 0;
+
+    fill(sc, 8, 1);
+    fill(ss, 8, 9);
+    fill(c_ap, 32, 0x10);
+    fill(s_ap, 32, 0x80);
+    c.init(0, sc, 8);
+    s.init(1, ss, 8);
+    c.set_dcid(ss, 8);
+    s.set_dcid(sc, 8);
+    c.set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    s.set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+    check(c.keys_ready_of() && s.keys_ready_of(), "两边都装好 1-RTT 密钥");
+
+    /* 客户端写流 0，攒出一个包 */
+    check(c.write_stream(0, "hello quic", 10) == 10, "客户端写 10 字节进流 0");
+    n = c.flush(pkt, (int)sizeof pkt, 1000);
+    check(n > 0, "应攒出一个包");
+    check(c.packets_tx_of() == 1, "只发了一个包");
+    check(pkt[0] & 0x40, "包头的固定位要置起来");
+    /* 服务端收下来，流 0 上就有 10 字节 */
+    check(s.on_packet(pkt, n, 1000) == 0, "服务端收包成功");
+    check(s.stream_readable(0) == 10, "服务端能读出 10 字节");
+    check(s.read_stream(0, got, (int)sizeof got) == 10
+          && memcmp(got, "hello quic", 10) == 0, "读出来的内容一致");
+    check(s.ack_pending_of() == 1, "收到包要挂一个 ACK");
+    /* 服务端回一个只带 ACK 的包 */
+    n = s.flush(pkt, (int)sizeof pkt, 2000);
+    check(n > 0, "服务端要能回包");
+    check(s.ack_pending_of() == 0, "ACK 发完就清了");
+    check(c.on_packet(pkt, n, 2000) == 0, "客户端收下 ACK");
+    check(c.ack_ranges_of() >= 1, "客户端记下了对端的 ACK 范围");
+    /* 服务端在流 0 上回一段（双向流两个方向都能写） */
+    check(s.write_stream(0, "pong", 4) == 4, "服务端往流 0 写回 4 字节");
+    n = s.flush(pkt, (int)sizeof pkt, 3000);
+    check(c.on_packet(pkt, n, 3000) == 0, "客户端收下响应");
+    check(c.stream_readable(0) == 4, "客户端能读到 4 字节");
+    check(c.read_stream(0, got, (int)sizeof got) == 4 && memcmp(got, "pong", 4) == 0,
+          "响应内容是 pong");
+}
+
+/* ---- 第四节：HTTP/3 的一次 GET ---- */
+
+static void sec_http3(void)
+{
+    H3Client cl = { 0 };
+    H3Server sv = { 0 };
+    u8 sc[8] = { 0 };
+    u8 ss[8] = { 0 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+
+    fill(sc, 8, 1);
+    fill(ss, 8, 9);
+    fill(c_ap, 32, 0x10);
+    fill(s_ap, 32, 0x80);
+    cl.init(sc, 8);
+    cl.peer(ss, 8, "example.com");
+    cl.keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    sv.init(ss, 8);
+    sv.peer(sc, 8);
+    sv.keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+    check(sv.route("/health", 200, "ok") == 0, "登记一条路由");
+    check(sv.route("/", 200, "hello h3") == 0, "再登记一条");
+
+    /* 第一次请求：命中 /health */
+    check(cl.get("/health") == 0, "GET /health 排在流 0 上");
+    check(push_all(cl.conn_of(), sv.conn_of(), 1000) > 0, "请求包发出去了");
+    check(sv.poll() == 1, "服务端回了一条响应");
+    check(strcmp(sv.last_path_of(), "/health") == 0, "服务端记下的路径是 /health");
+    check(push_all(sv.conn_of(), cl.conn_of(), 2000) > 0, "响应包发出去了");
+    check(cl.poll() == 1, "客户端解出响应");
+    check(cl.status_of() == 200, "状态码 200");
+    check(strcmp(cl.body_of(), "ok") == 0, "响应体是 ok");
+
+    /* 第二次请求：没登记的路径回 404 */
+    check(cl.get("/missing") == 4, "GET /missing 排在流 4 上");
+    check(push_all(cl.conn_of(), sv.conn_of(), 3000) > 0, "第二个请求发出去了");
+    check(sv.poll() == 1, "服务端回了 404");
+    check(push_all(sv.conn_of(), cl.conn_of(), 4000) > 0, "404 响应发出去了");
+    check(cl.poll() == 1, "客户端解出 404");
+    check(cl.status_of() == 404, "状态码 404");
+    check(strcmp(cl.body_of(), "not found") == 0, "404 的响应体");
+    check(sv.handled_of() == 2, "服务端一共处理了两条请求");
+}
+
+/* ---- 第五节：一个端口上的分流 ---- */
+
+static void sec_demux(void)
+{
+    QuicDaemon d = { 0 };
+    QConn c1 = { 0 };
+    QConn s1 = { 0 };
+    QConn c2 = { 0 };
+    QConn s2 = { 0 };
+    u8 sc[8] = { 0 };
+    u8 sa[8] = { 0 };
+    u8 sb[8] = { 0 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+
+    fill(sc, 8, 1);
+    fill(sa, 8, 9);
+    fill(sb, 8, 0x40);
+    fill(c_ap, 32, 0x10);
+    fill(s_ap, 32, 0x80);
+    c1.init(0, sc, 8);
+    s1.init(1, sa, 8);
+    c1.set_dcid(sa, 8);
+    s1.set_dcid(sc, 8);
+    c1.set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    s1.set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+    c2.init(0, sc, 8);
+    s2.init(1, sb, 8);
+    c2.set_dcid(sb, 8);
+    s2.set_dcid(sc, 8);
+    c2.set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    s2.set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+
+    d.init(4);
+    check(d.add(&s1) == 0 && d.add(&s2) == 0, "两条连接都登记上了");
+    check(d.count_of() == 2, "一共登记了两条");
+    check(d.find(sa, 8) == &s1, "按 CID 找得到 s1");
+    check(d.find(sb, 8) == &s2, "按 CID 找得到 s2");
+
+    c1.write_stream(0, "one", 3);
+    n = c1.flush(pkt, (int)sizeof pkt, 1000);
+    check(d.deliver(pkt, n, 1000) == &s1, "c1 的包交给 s1");
+    c2.write_stream(0, "two", 3);
+    n = c2.flush(pkt, (int)sizeof pkt, 1000);
+    check(d.deliver(pkt, n, 1000) == &s2, "c2 的包交给 s2");
+    check(s1.stream_readable(0) == 3 && s2.stream_readable(0) == 3,
+          "两条连接各自收到了自己的 3 字节");
+    check(d.pkts_in_of() == 2 && d.dropped_of() == 0, "统计：收 2 个、丢 0 个");
+
+    /* 不认识的 CID 直接丢 */
+    memset(pkt, 0, sizeof pkt);
+    pkt[0] = 0x40;
+    memset(pkt + 1, 0xee, 8);
+    check(d.deliver(pkt, 40, 2000) == 0 && d.dropped_of() == 1,
+          "不认识的 CID 应被丢掉并计数");
+}
+
+int main(void)
+{
+    sec_frames();
+    sec_streams();
+    sec_conn();
+    sec_http3();
+    sec_demux();
+    printf("stdquic: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

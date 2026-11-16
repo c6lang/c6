@@ -1,0 +1,1847 @@
+/* std/net/quic：QUIC v1 的线上格式（RFC 9000 §16、§17、§19）——变量长整数、
+ * 连接 ID、长/短包头、帧编解码。
+ *
+ *     import std.net.quic;
+ *
+ *     u8 out[64] = { 0 };
+ *     int n = quic_varint_put(out, (int)sizeof out, 151288809941952652ull);
+ *     u64 v = 0;
+ *     int used = quic_varint_get(out, n, &v);      -- used == n == 8
+ *
+ *     Packet p = { 0 };
+ *     p.parse(buf, len, 0);                        -- 长包头：dcid_len 忽略
+ *     p.type;                                      -- QUIC_PKT_INITIAL 等
+ *     p.dcid; p.dcid_len; p.pn; p.pn_len; p.payload_off; p.payload_len;
+ *
+ *     Frame f = { 0 };
+ *     int rc = f.parse(buf + off, len - off);      -- 1 一个帧 / 0 不够 / -1 错
+ *     while (rc == 1) { off += f.size; rc = f.parse(buf + off, len - off); }
+ *
+ *     HeaderBuilder hb = { 0 };
+ *     hb.init(out, (int)sizeof out);
+ *     hb.long_header(QUIC_PKT_INITIAL, QUIC_VERSION_1, dcid, 8, scid, 0);
+ *     hb.length(1182);                             -- pn + 帧 + tag 的总长
+ *     hb.pn(4, 2);                                 -- 4 字节编码的包号 2
+ *
+ * 这一层只管**字节布局**，不碰加密、不管重传、不维护连接状态：头保护/AEAD 在
+ * `std.net.quichp`，握手在 `std.net.quictls`，连接状态机在 `std.net.quicconn`。
+ * 解析出来的都是视图（偏移 + 长度），不复制、不分配。
+ *
+ * 解析口径（严格按 RFC 9000 的 MUST）：
+ *
+ * - 变量长整数：首字节高 2 位就是长度档（00=1、01=2、10=4、11=8 字节），
+ *   值上限 `2^62-1`；多出来的高 2 位之外没有别的标志位；
+ * - 长包头：form=1、fixed=1、type 两位、reserved 两位**必须为 0**（否则
+ *   `err == RESERVED`）、pn_len 两位；Initial 有 Token Length + Token；
+ *   Retry 的 token 一直延伸到末尾 16 字节完整性标签之前；
+ * - 短包头：form=0、fixed=1、spin、reserved（2 位）**必须为 0**、key phase、
+ *   pn_len；短包头**没有** CID 长度字段，DCID 长度由调用方给（`parse` 的
+ *   第三个参数）；
+ * - 包号：解析只给**截断值**（`pn_trunc`）与字节数；还原完整包号用
+ *   `quic_pn_expand(largest, trunc, pn_len)`（RFC 9000 附录 A.3 的算法）；
+ * - 帧：类型是变量长整数；STREAM 的 OFF/LEN/FIN 是类型低 3 位；未知类型、
+ *   STREAM 的 ID/长度非法、ACK 区间下溢、CID 长度不在 1..20 都算格式错；
+ * - 缓冲区不够时返回 0（`ok == 0`、`err == OK`），调用方可以等更多字节；
+ *   格式错返回 -1 并写 `err`。
+ *
+ * 约定：
+ *
+ * - 所有 `parse` 都是方法（首参结构体指针），失败时 `ok == 0`，已有字段可能
+ *   被部分填上，调用方只看 `ok`；
+ * - `payload_len` 是 **Length 字段减去包号字节**（还包含 AEAD tag），要得到
+ *   明文字节数由调用方减 tag（Initial/Handshake/1-RTT 都是 16 字节）；
+ * - `packet_bytes()` 给出这个包在缓冲里占的总字节数（长包头可算，短包头
+ *   返回 -1——短包头的长度只能由解密结果决定）；
+ * - 构造器只写**未保护**的头：reserved 位写 0，包号按调用方给的字节数截断，
+ *   头保护由 `std.net.quichp` 施加。
+ */
+#include <string.h>
+
+module std.net.quic;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3, RESERVED = 4, VERSION = 5 };
+
+#define QUIC_VERSION_1   0x00000001u
+#define QUIC_VERSION_NEG 0x00000000u
+#define QUIC_CID_MAX     20
+#define QUIC_VARINT_MAX  0x3fffffffffffffffull
+
+/* 长包头首字节的两位 */
+#define QUIC_PKT_INITIAL   0
+#define QUIC_PKT_0RTT      1
+#define QUIC_PKT_HANDSHAKE 2
+#define QUIC_PKT_RETRY     3
+
+/* 帧类型（RFC 9000 §19） */
+#define QUIC_FRAME_PADDING              0x00
+#define QUIC_FRAME_PING                 0x01
+#define QUIC_FRAME_ACK                  0x02
+#define QUIC_FRAME_ACK_ECN              0x03
+#define QUIC_FRAME_RESET_STREAM         0x04
+#define QUIC_FRAME_STOP_SENDING         0x05
+#define QUIC_FRAME_CRYPTO               0x06
+#define QUIC_FRAME_NEW_TOKEN            0x07
+#define QUIC_FRAME_STREAM               0x08
+#define QUIC_FRAME_MAX_DATA             0x10
+#define QUIC_FRAME_MAX_STREAM_DATA      0x11
+#define QUIC_FRAME_MAX_STREAMS_BIDI     0x12
+#define QUIC_FRAME_MAX_STREAMS_UNI      0x13
+#define QUIC_FRAME_DATA_BLOCKED         0x14
+#define QUIC_FRAME_STREAM_DATA_BLOCKED  0x15
+#define QUIC_FRAME_STREAMS_BLOCKED_BIDI 0x16
+#define QUIC_FRAME_STREAMS_BLOCKED_UNI  0x17
+#define QUIC_FRAME_NEW_CONNECTION_ID    0x18
+#define QUIC_FRAME_RETIRE_CONNECTION_ID 0x19
+#define QUIC_FRAME_PATH_CHALLENGE       0x1a
+#define QUIC_FRAME_PATH_RESPONSE        0x1b
+#define QUIC_FRAME_CONNECTION_CLOSE     0x1c
+#define QUIC_FRAME_CONNECTION_CLOSE_APP 0x1d
+#define QUIC_FRAME_HANDSHAKE_DONE       0x1e
+#define QUIC_FRAME_DATAGRAM             0x30
+#define QUIC_FRAME_DATAGRAM_LEN         0x31
+
+/* STREAM 帧类型低 3 位 */
+#define QUIC_STREAM_FIN 0x01
+#define QUIC_STREAM_LEN 0x02
+#define QUIC_STREAM_OFF 0x04
+
+/* ---- 变量长整数（RFC 9000 §16） ---- */
+
+int quic_varint_size(u64 v)
+{
+    if (v <= 0x3full)
+        return 1;
+    if (v <= 0x3fffull)
+        return 2;
+    if (v <= 0x3fffffffull)
+        return 4;
+    if (v <= QUIC_VARINT_MAX)
+        return 8;
+    return -1;
+}
+
+/* 写一个变量长整数；返回字节数，容量不够/值越界给 -1。 */
+int quic_varint_put(u8 *out, int cap, u64 v)
+{
+    int n = quic_varint_size(v);
+
+    if (!out || n < 0 || cap < n)
+        return -1;
+    if (n == 1) {
+        out[0] = (u8)v;
+    } else if (n == 2) {
+        out[0] = (u8)(0x40u | (u8)(v >> 8));
+        out[1] = (u8)v;
+    } else if (n == 4) {
+        out[0] = (u8)(0x80u | (u8)(v >> 24));
+        out[1] = (u8)(v >> 16);
+        out[2] = (u8)(v >> 8);
+        out[3] = (u8)v;
+    } else {
+        out[0] = (u8)(0xc0u | (u8)(v >> 56));
+        out[1] = (u8)(v >> 48);
+        out[2] = (u8)(v >> 40);
+        out[3] = (u8)(v >> 32);
+        out[4] = (u8)(v >> 24);
+        out[5] = (u8)(v >> 16);
+        out[6] = (u8)(v >> 8);
+        out[7] = (u8)v;
+    }
+    return n;
+}
+
+/* 读一个变量长整数；返回吃掉的字节数，不够/为空给 -1。 */
+int quic_varint_get(const u8 *in, int n, u64 *out)
+{
+    int len = 0;
+    int i = 0;
+    u64 v = 0;
+
+    if (!in || n < 1)
+        return -1;
+    len = 1 << (in[0] >> 6);
+    if (n < len)
+        return -1;
+    v = (u64)(in[0] & 0x3f);
+    for (i = 1; i < len; i++)
+        v = (v << 8) | (u64)in[i];
+    if (out)
+        *out = v;
+    return len;
+}
+
+int quic_cid_valid(int len)
+{
+    return len >= 1 && len <= QUIC_CID_MAX;
+}
+
+/* RFC 9000 附录 A.3：用最大已收包号还原截断包号。 */
+u64 quic_pn_expand(u64 largest_pn, u64 trunc, int pn_len)
+{
+    u64 expected = 0;
+    u64 win = 0;
+    u64 half = 0;
+    u64 mask = 0;
+    u64 candidate = 0;
+
+    if (pn_len < 1 || pn_len > 4)
+        return trunc;
+    win = (u64)1 << (pn_len * 8);
+    half = win / 2;
+    mask = win - 1;
+    expected = largest_pn + 1;
+    candidate = (expected & ~mask) | (trunc & mask);
+    if (candidate + half <= expected && candidate < ((u64)1 << 62) - win)
+        candidate += win;
+    else if (candidate > expected + half && candidate >= win)
+        candidate -= win;
+    return candidate;
+}
+
+/* ---- 包头 ---- */
+
+struct Packet {
+    int ok;
+    int err;
+    int long_header;
+    int type;                   /* 长包头 0..3；短包头 -1；版本协商 -2 */
+    u32 version;
+    u8 dcid[QUIC_CID_MAX];
+    int dcid_len;
+    u8 scid[QUIC_CID_MAX];
+    int scid_len;
+    int token_off;
+    int token_len;
+    u64 length;                 /* 长包头的 Length（包号 + 负载 + tag） */
+    int pn_off;
+    int pn_len;
+    u64 pn_trunc;
+    u64 pn;                     /* 未调用 quic_pn_expand 前等于 pn_trunc */
+    int payload_off;
+    int payload_len;            /* Length - pn_len（含 tag） */
+    int key_phase;
+    int spin;
+    int vn_off;                 /* 版本协商的版本列表 */
+    int vn_len;
+};
+
+static u32 quic_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static void quic_put_be32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8);
+    p[3] = (u8)v;
+}
+
+/* 解析一个未施加头保护的包头。返回 1 成功 / 0 字节还不够 / -1 格式错。 */
+int parse(Packet *p, const u8 *buf, int len, int dcid_len)
+{
+    int pos = 1;
+    int first = 0;
+
+    if (!p)
+        return -1;
+    memset(p, 0, sizeof *p);
+    p->payload_len = -1;
+    p->type = -1;
+    if (!buf || len < 1) {
+        p->err = INVAL;
+        return -1;
+    }
+    first = buf[0];
+    p->long_header = (first & 0x80) != 0;
+    if (p->long_header) {
+        int dlen = 0;
+        int slen = 0;
+
+        p->type = (first >> 4) & 0x3;
+        /* Retry 的低 4 位是 Unused（服务端随便填，客户端必须忽略），
+         * 其余长包头的 0x0c 是保留位，必须为 0。 */
+        if (p->type != QUIC_PKT_RETRY && (first & 0x0c) != 0) {
+            p->err = RESERVED;
+            return -1;
+        }
+        p->pn_len = (first & 0x03) + 1;
+        if (len < 5) {
+            p->err = PARSE;
+            return 0;
+        }
+        p->version = quic_be32(buf + 1);
+        pos = 5;
+        if (p->version == QUIC_VERSION_NEG) {
+            /* 版本协商：DCID/SCID 之后是一串 u32 版本号 */
+            p->type = -2;
+            if (pos >= len) {
+                p->err = PARSE;
+                return 0;
+            }
+            dlen = buf[pos++];
+            if (dlen > QUIC_CID_MAX) {
+                p->err = PARSE;
+                return -1;
+            }
+            if (pos + dlen + 1 > len) {
+                p->err = PARSE;
+                return 0;
+            }
+            memcpy(p->dcid, buf + pos, (size_t)dlen);
+            p->dcid_len = dlen;
+            pos += dlen;
+            slen = buf[pos++];
+            if (slen > QUIC_CID_MAX) {
+                p->err = PARSE;
+                return -1;
+            }
+            if (pos + slen > len) {
+                p->err = PARSE;
+                return 0;
+            }
+            memcpy(p->scid, buf + pos, (size_t)slen);
+            p->scid_len = slen;
+            pos += slen;
+            p->vn_off = pos;
+            p->vn_len = len - pos;
+            if (p->vn_len < 4 || (p->vn_len % 4) != 0) {
+                p->err = PARSE;
+                return -1;
+            }
+            p->ok = 1;
+            return 1;
+        }
+        if (pos >= len) {
+            p->err = PARSE;
+            return 0;
+        }
+        dlen = buf[pos++];
+        if (dlen > QUIC_CID_MAX) {
+            p->err = PARSE;
+            return -1;
+        }
+        if (pos + dlen + 1 > len) {
+            p->err = PARSE;
+            return 0;
+        }
+        memcpy(p->dcid, buf + pos, (size_t)dlen);
+        p->dcid_len = dlen;
+        pos += dlen;
+        slen = buf[pos++];
+        if (slen > QUIC_CID_MAX) {
+            p->err = PARSE;
+            return -1;
+        }
+        if (pos + slen > len) {
+            p->err = PARSE;
+            return 0;
+        }
+        memcpy(p->scid, buf + pos, (size_t)slen);
+        p->scid_len = slen;
+        pos += slen;
+        if (p->type == QUIC_PKT_RETRY) {
+            /* Retry：token 一直到最后 16 字节完整性标签之前 */
+            if (len - pos < 16 + 1) {
+                p->err = PARSE;
+                return 0;
+            }
+            p->token_off = pos;
+            p->token_len = len - pos - 16;
+            p->ok = 1;
+            return 1;
+        }
+        if (p->type == QUIC_PKT_INITIAL) {
+            u64 tlen = 0;
+            int n = quic_varint_get(buf + pos, len - pos, &tlen);
+
+            if (n < 0) {
+                p->err = PARSE;
+                return len - pos < 8 ? 0 : -1;
+            }
+            pos += n;
+            if (tlen > (u64)(len - pos)) {
+                p->err = PARSE;
+                return 0;
+            }
+            p->token_off = pos;
+            p->token_len = (int)tlen;
+            pos += (int)tlen;
+        }
+        {
+            u64 plen = 0;
+            int n = quic_varint_get(buf + pos, len - pos, &plen);
+
+            if (n < 0) {
+                p->err = PARSE;
+                return len - pos < 8 ? 0 : -1;
+            }
+            pos += n;
+            p->length = plen;
+        }
+        if (p->length < (u64)p->pn_len) {
+            p->err = RANGE;
+            return -1;
+        }
+        p->pn_off = pos;
+        if (pos + p->pn_len > len) {
+            p->err = PARSE;
+            return 0;
+        }
+        {
+            u64 t = 0;
+            int i = 0;
+
+            for (i = 0; i < p->pn_len; i++)
+                t = (t << 8) | (u64)buf[pos + i];
+            p->pn_trunc = t;
+            p->pn = t;
+        }
+        p->payload_off = pos + p->pn_len;
+        p->payload_len = (int)(p->length - (u64)p->pn_len);
+        p->ok = 1;
+        return 1;
+    }
+    /* 短包头：没有长度字段，DCID 长度由调用方给 */
+    if (dcid_len < 0 || dcid_len > QUIC_CID_MAX) {
+        p->err = INVAL;
+        return -1;
+    }
+    if ((first & 0x18) != 0) {
+        p->err = RESERVED;
+        return -1;
+    }
+    p->spin = (first >> 5) & 1;
+    p->key_phase = (first >> 2) & 1;
+    p->pn_len = (first & 0x03) + 1;
+    if (len < 1 + dcid_len + p->pn_len) {
+        p->err = PARSE;
+        return 0;
+    }
+    memcpy(p->dcid, buf + 1, (size_t)dcid_len);
+    p->dcid_len = dcid_len;
+    p->pn_off = 1 + dcid_len;
+    {
+        u64 t = 0;
+        int i = 0;
+
+        for (i = 0; i < p->pn_len; i++)
+            t = (t << 8) | (u64)buf[p->pn_off + i];
+        p->pn_trunc = t;
+        p->pn = t;
+    }
+    p->payload_off = p->pn_off + p->pn_len;
+    p->payload_len = len - p->payload_off;
+    p->ok = 1;
+    return 1;
+}
+
+/* 这个包在缓冲里占多少字节；短包头算不出来给 -1。 */
+int packet_bytes(Packet *self)
+{
+    if (!self || !self->ok)
+        return -1;
+    if (!self->long_header)
+        return -1;
+    return self->payload_off + self->payload_len;
+}
+
+int is_long(Packet *self) { return self && self->ok && self->long_header; }
+
+/* 版本协商里的第 i 个版本；越界给 0。 */
+u32 version_at(Packet *self, const u8 *buf, int i)
+{
+    if (!self || !self->ok || !buf || self->type != -2)
+        return 0;
+    if (i < 0 || i * 4 + 4 > self->vn_len)
+        return 0;
+    return quic_be32(buf + self->vn_off + i * 4);
+}
+
+/* ---- 包头构造 ---- */
+
+struct HeaderBuilder {
+    u8 *buf;
+    int cap;
+    int n;
+    int ok;
+};
+
+void init(HeaderBuilder *b, u8 *buf, int cap)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->buf = buf;
+    b->cap = cap;
+    b->ok = (buf != 0 && cap > 0);
+}
+
+static void quic_hb_u8(HeaderBuilder *b, int v)
+{
+    if (!b->ok || b->n + 1 > b->cap) {
+        b->ok = 0;
+        return;
+    }
+    b->buf[b->n++] = (u8)v;
+}
+
+static void quic_hb_bytes(HeaderBuilder *b, const u8 *p, int n)
+{
+    if (!b->ok || n < 0 || (n > 0 && !p) || b->n + n > b->cap) {
+        b->ok = 0;
+        return;
+    }
+    if (n > 0)
+        memcpy(b->buf + b->n, p, (size_t)n);
+    b->n += n;
+}
+
+static void quic_hb_varint(HeaderBuilder *b, u64 v)
+{
+    int n = 0;
+
+    if (!b->ok)
+        return;
+    n = quic_varint_put(b->buf + b->n, b->cap - b->n, v);
+    if (n < 0) {
+        b->ok = 0;
+        return;
+    }
+    b->n += n;
+}
+
+/* 长包头：首字节 + 版本 + DCID + SCID。type 取 QUIC_PKT_*。 */
+int long_header(HeaderBuilder *b, int type, u32 version, const u8 *dcid,
+                int dcid_len, const u8 *scid, int scid_len)
+{
+    if (!b || !b->ok)
+        return -1;
+    if (type < QUIC_PKT_INITIAL || type > QUIC_PKT_RETRY)
+        return -1;
+    if (dcid_len < 0 || dcid_len > QUIC_CID_MAX)
+        return -1;
+    if (scid_len < 0 || scid_len > QUIC_CID_MAX)
+        return -1;
+    quic_hb_u8(b, 0xc0 | (type << 4));
+    quic_hb_u8(b, (int)(version >> 24));
+    quic_hb_u8(b, (int)(version >> 16));
+    quic_hb_u8(b, (int)(version >> 8));
+    quic_hb_u8(b, (int)version);
+    quic_hb_u8(b, dcid_len);
+    quic_hb_bytes(b, dcid, dcid_len);
+    quic_hb_u8(b, scid_len);
+    quic_hb_bytes(b, scid, scid_len);
+    return b->ok ? b->n : -1;
+}
+
+/* Initial 的 Token Length + Token；只在 Initial 包头里出现。 */
+int token(HeaderBuilder *b, const u8 *tok, int len)
+{
+    if (!b || !b->ok || len < 0 || (len > 0 && !tok))
+        return -1;
+    quic_hb_varint(b, (u64)len);
+    quic_hb_bytes(b, tok, len);
+    return b->ok ? b->n : -1;
+}
+
+/* Retry 的 token（裸字节，不带长度；16 字节完整性标签由调用方补）。 */
+int retry_token(HeaderBuilder *b, const u8 *tok, int len)
+{
+    if (!b || !b->ok || len < 0 || (len > 0 && !tok))
+        return -1;
+    quic_hb_bytes(b, tok, len);
+    return b->ok ? b->n : -1;
+}
+
+/* 长包头的 Length 字段：包号字节 + 负载 + AEAD tag。 */
+int length(HeaderBuilder *b, u64 len)
+{
+    if (!b || !b->ok || len > QUIC_VARINT_MAX)
+        return -1;
+    quic_hb_varint(b, len);
+    return b->ok ? b->n : -1;
+}
+
+/* 写截断包号：pn_len 取 1..4，value 只保留低 pn_len 字节。 */
+int pn(HeaderBuilder *b, int pn_len, u64 value)
+{
+    int i = 0;
+
+    if (!b || !b->ok || pn_len < 1 || pn_len > 4)
+        return -1;
+    if (b->n + pn_len > b->cap) {
+        b->ok = 0;
+        return -1;
+    }
+    b->buf[0] = (u8)(b->buf[0] | (u8)(pn_len - 1));
+    for (i = pn_len - 1; i >= 0; i--) {
+        b->buf[b->n + i] = (u8)value;
+        value >>= 8;
+    }
+    b->n += pn_len;
+    return b->n;
+}
+
+/* 短包头：首字节 + DCID（无长度字段，长度由参数给）。 */
+int short_header(HeaderBuilder *b, int key_phase, const u8 *dcid, int dcid_len)
+{
+    if (!b || !b->ok)
+        return -1;
+    if (dcid_len < 0 || dcid_len > QUIC_CID_MAX)
+        return -1;
+    quic_hb_u8(b, 0x40 | (key_phase ? 0x04 : 0));
+    quic_hb_bytes(b, dcid, dcid_len);
+    return b->ok ? b->n : -1;
+}
+
+int finish(HeaderBuilder *b) { return b && b->ok ? b->n : -1; }
+
+int ok_q(HeaderBuilder *b) { return b && b->ok; }
+
+/* ---- 帧 ---- */
+
+struct Frame {
+    int ok;
+    int err;
+    u64 type;
+    int size;                   /* 整个帧占的字节数 */
+    u64 stream_id;
+    u64 offset;
+    u64 length;
+    u64 final_size;
+    u64 error_code;
+    u64 frame_type;             /* CONNECTION_CLOSE 触发的帧类型 */
+    u64 largest;
+    u64 ack_delay;
+    u64 range_count;
+    u64 first_range;
+    u64 max;
+    u64 max_streams;
+    u64 seq;
+    u64 retire_prior_to;
+    int data_off;               /* STREAM/CRYPTO/DATAGRAM 负载，或 NEW_TOKEN 的 token */
+    int data_len;
+    int fin;
+    int has_off;
+    int has_len;
+    int ack_off;
+    u8 cid[QUIC_CID_MAX];
+    int cid_len;
+    u8 reset_token[16];
+    u8 challenge[8];
+};
+
+/* ACK 帧的区间游标：第一个区间是 [largest-first_range, largest]，之后每对
+ * (gap, range) 往更小的方向走。 */
+struct AckIt {
+    const u8 *buf;
+    int len;
+    int pos;
+    u64 largest;
+    u64 first_range;
+    u64 count;                  /* 总区间数 = range_count + 1 */
+    u64 index;
+    u64 hi;
+    u64 lo;
+    int bad;
+};
+
+int open(AckIt *it, const Frame *f, const u8 *buf, int len)
+{
+    if (!it || !f || !f->ok || f->type < QUIC_FRAME_ACK
+        || f->type > QUIC_FRAME_ACK_ECN || !buf)
+        return -1;
+    memset(it, 0, sizeof *it);
+    it->buf = buf;
+    it->len = len;
+    it->pos = f->ack_off;
+    it->largest = f->largest;
+    it->first_range = f->first_range;
+    it->count = f->range_count + 1;
+    it->hi = f->largest;
+    it->lo = f->largest - f->first_range;
+    return 0;
+}
+
+/* 取下一个区间（从大到小）；取完返回 0，越界/格式错返回 -1。 */
+int next(AckIt *it, u64 *lo, u64 *hi)
+{
+    if (!it || it->bad)
+        return -1;
+    if (it->index >= it->count)
+        return 0;
+    if (it->index > 0) {
+        u64 gap = 0;
+        u64 range = 0;
+        int n = quic_varint_get(it->buf + it->pos, it->len - it->pos, &gap);
+
+        if (n < 0) {
+            it->bad = 1;
+            return -1;
+        }
+        it->pos += n;
+        n = quic_varint_get(it->buf + it->pos, it->len - it->pos, &range);
+        if (n < 0) {
+            it->bad = 1;
+            return -1;
+        }
+        it->pos += n;
+        if (it->lo < gap + 2) {
+            it->bad = 1;
+            return -1;
+        }
+        it->hi = it->lo - gap - 2;
+        if (it->hi < range) {
+            it->bad = 1;
+            return -1;
+        }
+        it->lo = it->hi - range;
+    }
+    if (lo)
+        *lo = it->lo;
+    if (hi)
+        *hi = it->hi;
+    it->index++;
+    return 1;
+}
+
+/* 扫一遍 ACK 区间，确认单调递减且不下溢。 */
+static int quic_ack_check(const u8 *buf, int len, u64 largest, u64 first,
+                          u64 ranges)
+{
+    u64 lo = 0;
+    u64 hi = 0;
+    u64 i = 0;
+    int pos = 0;
+
+    if (first > largest)
+        return -1;
+    lo = largest - first;
+    for (i = 0; i < ranges; i++) {
+        u64 gap = 0;
+        u64 range = 0;
+        int n = quic_varint_get(buf + pos, len - pos, &gap);
+
+        if (n < 0)
+            return -1;
+        pos += n;
+        n = quic_varint_get(buf + pos, len - pos, &range);
+        if (n < 0)
+            return -1;
+        pos += n;
+        if (lo < gap + 2)
+            return -1;
+        hi = lo - gap - 2;
+        if (hi < range)
+            return -1;
+        lo = hi - range;
+    }
+    return 0;
+}
+
+/* 解析一个帧。返回 1 成功 / 0 字节还不够 / -1 格式错。 */
+int parse(Frame *f, const u8 *buf, int len)
+{
+    int pos = 0;
+    int n = 0;
+    u64 t = 0;
+
+    if (!f)
+        return -1;
+    memset(f, 0, sizeof *f);
+    if (!buf || len < 1) {
+        f->err = INVAL;
+        return -1;
+    }
+    n = quic_varint_get(buf, len, &t);
+    if (n < 0) {
+        f->err = PARSE;
+        return len < 8 ? 0 : -1;
+    }
+    f->type = t;
+    pos = n;
+    if (t == QUIC_FRAME_PADDING) {
+        f->size = 1;            /* 每个 0x00 字节是一个 PADDING 帧 */
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_PING || t == QUIC_FRAME_HANDSHAKE_DONE) {
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_ACK || t == QUIC_FRAME_ACK_ECN) {
+        u64 v[4] = { 0, 0, 0, 0 };
+        int i = 0;
+
+        for (i = 0; i < 4; i++) {
+            n = quic_varint_get(buf + pos, len - pos, &v[i]);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+        }
+        f->largest = v[0];
+        f->ack_delay = v[1];
+        f->range_count = v[2];
+        f->first_range = v[3];
+        f->ack_off = pos;
+        if (quic_ack_check(buf + pos, len - pos, f->largest, f->first_range,
+                           f->range_count) < 0) {
+            /* 可能是字节不够，也可能是真的下溢：先看这两者哪个成立 */
+            int need = 0;
+            int p = pos;
+            u64 i = 0;
+
+            for (i = 0; i < f->range_count; i++) {
+                u64 g = 0;
+                u64 r = 0;
+                int m = quic_varint_get(buf + p, len - p, &g);
+
+                if (m < 0) {
+                    need = 1;
+                    break;
+                }
+                p += m;
+                m = quic_varint_get(buf + p, len - p, &r);
+                if (m < 0) {
+                    need = 1;
+                    break;
+                }
+                p += m;
+            }
+            f->err = PARSE;
+            if (need)
+                return 0;
+            return -1;
+        }
+        {
+            int p = pos;
+            u64 i = 0;
+
+            for (i = 0; i < f->range_count; i++) {
+                u64 g = 0;
+                u64 r = 0;
+
+                p += quic_varint_get(buf + p, len - p, &g);
+                p += quic_varint_get(buf + p, len - p, &r);
+            }
+            pos = p;
+        }
+        if (t == QUIC_FRAME_ACK_ECN) {
+            for (i = 0; i < 3; i++) {
+                n = quic_varint_get(buf + pos, len - pos, &v[0]);
+                if (n < 0) {
+                    f->err = PARSE;
+                    return 0;
+                }
+                pos += n;
+            }
+        }
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_RESET_STREAM) {
+        u64 v[3] = { 0, 0, 0 };
+        int i = 0;
+
+        for (i = 0; i < 3; i++) {
+            n = quic_varint_get(buf + pos, len - pos, &v[i]);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+        }
+        if (v[0] > QUIC_VARINT_MAX || v[2] > QUIC_VARINT_MAX) {
+            f->err = RANGE;
+            return -1;
+        }
+        f->stream_id = v[0];
+        f->error_code = v[1];
+        f->final_size = v[2];
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_STOP_SENDING) {
+        u64 v[2] = { 0, 0 };
+        int i = 0;
+
+        for (i = 0; i < 2; i++) {
+            n = quic_varint_get(buf + pos, len - pos, &v[i]);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+        }
+        f->stream_id = v[0];
+        f->error_code = v[1];
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_CRYPTO) {
+        u64 off = 0;
+        u64 dlen = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &off);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        n = quic_varint_get(buf + pos, len - pos, &dlen);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (off > QUIC_VARINT_MAX || dlen > QUIC_VARINT_MAX
+            || off + dlen > QUIC_VARINT_MAX) {
+            f->err = RANGE;
+            return -1;
+        }
+        if (dlen > (u64)(len - pos)) {
+            f->err = PARSE;
+            return 0;
+        }
+        f->offset = off;
+        f->length = dlen;
+        f->has_len = 1;
+        f->data_off = pos;
+        f->data_len = (int)dlen;
+        f->size = pos + (int)dlen;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_NEW_TOKEN) {
+        u64 tlen = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &tlen);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (tlen == 0 || tlen > (u64)(len - pos)) {
+            f->err = tlen == 0 ? RANGE : PARSE;
+            return tlen == 0 ? -1 : 0;
+        }
+        f->data_off = pos;
+        f->data_len = (int)tlen;
+        f->size = pos + (int)tlen;
+        f->ok = 1;
+        return 1;
+    }
+    if (t >= QUIC_FRAME_STREAM && t <= (QUIC_FRAME_STREAM | 0x07)) {
+        u64 id = 0;
+        u64 off = 0;
+        u64 dlen = 0;
+
+        f->fin = (int)(t & QUIC_STREAM_FIN) != 0;
+        f->has_off = (int)(t & QUIC_STREAM_OFF) != 0;
+        f->has_len = (int)(t & QUIC_STREAM_LEN) != 0;
+        n = quic_varint_get(buf + pos, len - pos, &id);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (id > QUIC_VARINT_MAX) {
+            f->err = RANGE;
+            return -1;
+        }
+        f->stream_id = id;
+        if (f->has_off) {
+            n = quic_varint_get(buf + pos, len - pos, &off);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+            if (off > QUIC_VARINT_MAX) {
+                f->err = RANGE;
+                return -1;
+            }
+        }
+        f->offset = off;
+        if (f->has_len) {
+            n = quic_varint_get(buf + pos, len - pos, &dlen);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+            if (dlen > (u64)(len - pos)) {
+                f->err = PARSE;
+                return 0;
+            }
+            if (off + dlen > QUIC_VARINT_MAX) {
+                f->err = RANGE;
+                return -1;
+            }
+        } else {
+            dlen = (u64)(len - pos);
+        }
+        f->length = dlen;
+        f->data_off = pos;
+        f->data_len = (int)dlen;
+        f->size = pos + (int)dlen;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_MAX_DATA || t == QUIC_FRAME_DATA_BLOCKED) {
+        u64 v = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &v);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        f->max = v;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_MAX_STREAM_DATA || t == QUIC_FRAME_STREAM_DATA_BLOCKED) {
+        u64 id = 0;
+        u64 v = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &id);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        n = quic_varint_get(buf + pos, len - pos, &v);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        f->stream_id = id;
+        f->max = v;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_MAX_STREAMS_BIDI || t == QUIC_FRAME_MAX_STREAMS_UNI
+        || t == QUIC_FRAME_STREAMS_BLOCKED_BIDI
+        || t == QUIC_FRAME_STREAMS_BLOCKED_UNI) {
+        u64 v = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &v);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (v > ((u64)1 << 60)) {
+            f->err = RANGE;
+            return -1;
+        }
+        f->max_streams = v;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_NEW_CONNECTION_ID) {
+        u64 seq = 0;
+        u64 retire = 0;
+        int clen = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &seq);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        n = quic_varint_get(buf + pos, len - pos, &retire);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (pos >= len) {
+            f->err = PARSE;
+            return 0;
+        }
+        clen = buf[pos++];
+        if (!quic_cid_valid(clen)) {
+            f->err = RANGE;
+            return -1;
+        }
+        if (retire > seq) {
+            f->err = RANGE;
+            return -1;
+        }
+        if (pos + clen + 16 > len) {
+            f->err = PARSE;
+            return 0;
+        }
+        f->seq = seq;
+        f->retire_prior_to = retire;
+        f->cid_len = clen;
+        memcpy(f->cid, buf + pos, (size_t)clen);
+        pos += clen;
+        memcpy(f->reset_token, buf + pos, 16);
+        pos += 16;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_RETIRE_CONNECTION_ID) {
+        u64 v = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &v);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        f->seq = v;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_PATH_CHALLENGE || t == QUIC_FRAME_PATH_RESPONSE) {
+        if (len - pos < 8) {
+            f->err = PARSE;
+            return 0;
+        }
+        memcpy(f->challenge, buf + pos, 8);
+        pos += 8;
+        f->size = pos;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_CONNECTION_CLOSE
+        || t == QUIC_FRAME_CONNECTION_CLOSE_APP) {
+        u64 code = 0;
+        u64 ftype = 0;
+        u64 rlen = 0;
+
+        n = quic_varint_get(buf + pos, len - pos, &code);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (t == QUIC_FRAME_CONNECTION_CLOSE) {
+            n = quic_varint_get(buf + pos, len - pos, &ftype);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+            f->frame_type = ftype;
+        }
+        n = quic_varint_get(buf + pos, len - pos, &rlen);
+        if (n < 0) {
+            f->err = PARSE;
+            return 0;
+        }
+        pos += n;
+        if (rlen > (u64)(len - pos)) {
+            f->err = PARSE;
+            return 0;
+        }
+        f->error_code = code;
+        f->data_off = pos;
+        f->data_len = (int)rlen;
+        f->size = pos + (int)rlen;
+        f->ok = 1;
+        return 1;
+    }
+    if (t == QUIC_FRAME_DATAGRAM || t == QUIC_FRAME_DATAGRAM_LEN) {
+        u64 dlen = 0;
+
+        if (t == QUIC_FRAME_DATAGRAM_LEN) {
+            n = quic_varint_get(buf + pos, len - pos, &dlen);
+            if (n < 0) {
+                f->err = PARSE;
+                return 0;
+            }
+            pos += n;
+            if (dlen > (u64)(len - pos)) {
+                f->err = PARSE;
+                return 0;
+            }
+        } else {
+            dlen = (u64)(len - pos);
+        }
+        f->data_off = pos;
+        f->data_len = (int)dlen;
+        f->size = pos + (int)dlen;
+        f->ok = 1;
+        return 1;
+    }
+    f->err = PARSE;             /* 未知帧类型（RFC 9000 §12.4：FRAME_ENCODING_ERROR） */
+    return -1;
+}
+
+int is_stream(Frame *self)
+{
+    return self && self->ok && self->type >= QUIC_FRAME_STREAM
+           && self->type <= (QUIC_FRAME_STREAM | 0x07);
+}
+
+/* ---- 帧构造 ---- */
+
+static void quic_w_varint(u8 *out, int cap, int *pos, u64 v, int *ok)
+{
+    int n = 0;
+
+    if (!*ok)
+        return;
+    n = quic_varint_put(out + *pos, cap - *pos, v);
+    if (n < 0) {
+        *ok = 0;
+        return;
+    }
+    *pos += n;
+}
+
+static void quic_w_bytes(u8 *out, int cap, int *pos, const void *p, int n,
+                         int *ok)
+{
+    if (!*ok || n < 0 || (n > 0 && !p) || *pos + n > cap) {
+        *ok = 0;
+        return;
+    }
+    if (n > 0)
+        memcpy(out + *pos, p, (size_t)n);
+    *pos += n;
+}
+
+int frame_put_padding(u8 *out, int cap, int n)
+{
+    if (!out || cap < n || n < 0)
+        return -1;
+    memset(out, 0, (size_t)n);
+    return n;
+}
+
+int frame_put_ping(u8 *out, int cap)
+{
+    if (!out || cap < 1)
+        return -1;
+    out[0] = QUIC_FRAME_PING;
+    return 1;
+}
+
+int frame_put_ack(u8 *out, int cap, u64 largest, u64 delay, u64 range_count,
+                  u64 first_range)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || largest > QUIC_VARINT_MAX || first_range > largest)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_ACK, &ok);
+    quic_w_varint(out, cap, &pos, largest, &ok);
+    quic_w_varint(out, cap, &pos, delay, &ok);
+    quic_w_varint(out, cap, &pos, range_count, &ok);
+    quic_w_varint(out, cap, &pos, first_range, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_crypto(u8 *out, int cap, u64 off, const void *data, int n)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || n < 0 || off > QUIC_VARINT_MAX || (u64)n + off > QUIC_VARINT_MAX)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_CRYPTO, &ok);
+    quic_w_varint(out, cap, &pos, off, &ok);
+    quic_w_varint(out, cap, &pos, (u64)n, &ok);
+    quic_w_bytes(out, cap, &pos, data, n, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_stream(u8 *out, int cap, u64 id, int has_off, u64 off,
+                     int has_len, const void *data, int n, int fin)
+{
+    u64 type = QUIC_FRAME_STREAM;
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || n < 0 || id > QUIC_VARINT_MAX || off > QUIC_VARINT_MAX)
+        return -1;
+    if (has_off)
+        type |= QUIC_STREAM_OFF;
+    if (has_len)
+        type |= QUIC_STREAM_LEN;
+    if (fin)
+        type |= QUIC_STREAM_FIN;
+    quic_w_varint(out, cap, &pos, type, &ok);
+    quic_w_varint(out, cap, &pos, id, &ok);
+    if (has_off)
+        quic_w_varint(out, cap, &pos, off, &ok);
+    if (has_len)
+        quic_w_varint(out, cap, &pos, (u64)n, &ok);
+    quic_w_bytes(out, cap, &pos, data, n, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_reset_stream(u8 *out, int cap, u64 id, u64 app_err, u64 final_size)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || final_size > QUIC_VARINT_MAX)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_RESET_STREAM, &ok);
+    quic_w_varint(out, cap, &pos, id, &ok);
+    quic_w_varint(out, cap, &pos, app_err, &ok);
+    quic_w_varint(out, cap, &pos, final_size, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_stop_sending(u8 *out, int cap, u64 id, u64 app_err)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_STOP_SENDING, &ok);
+    quic_w_varint(out, cap, &pos, id, &ok);
+    quic_w_varint(out, cap, &pos, app_err, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_max_data(u8 *out, int cap, u64 max)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || max > QUIC_VARINT_MAX)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_MAX_DATA, &ok);
+    quic_w_varint(out, cap, &pos, max, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_max_stream_data(u8 *out, int cap, u64 id, u64 max)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || max > QUIC_VARINT_MAX)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_MAX_STREAM_DATA, &ok);
+    quic_w_varint(out, cap, &pos, id, &ok);
+    quic_w_varint(out, cap, &pos, max, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_max_streams(u8 *out, int cap, int uni, u64 n)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || n > ((u64)1 << 60))
+        return -1;
+    quic_w_varint(out, cap, &pos,
+                  uni ? QUIC_FRAME_MAX_STREAMS_UNI : QUIC_FRAME_MAX_STREAMS_BIDI,
+                  &ok);
+    quic_w_varint(out, cap, &pos, n, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_data_blocked(u8 *out, int cap, u64 max)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_DATA_BLOCKED, &ok);
+    quic_w_varint(out, cap, &pos, max, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_stream_data_blocked(u8 *out, int cap, u64 id, u64 max)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_STREAM_DATA_BLOCKED, &ok);
+    quic_w_varint(out, cap, &pos, id, &ok);
+    quic_w_varint(out, cap, &pos, max, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_streams_blocked(u8 *out, int cap, int uni, u64 n)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out)
+        return -1;
+    quic_w_varint(out, cap, &pos,
+                  uni ? QUIC_FRAME_STREAMS_BLOCKED_UNI
+                      : QUIC_FRAME_STREAMS_BLOCKED_BIDI,
+                  &ok);
+    quic_w_varint(out, cap, &pos, n, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_new_connection_id(u8 *out, int cap, u64 seq, u64 retire,
+                                const u8 *cid, int cid_len, const u8 *reset16)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || !quic_cid_valid(cid_len) || !cid || !reset16 || retire > seq)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_NEW_CONNECTION_ID, &ok);
+    quic_w_varint(out, cap, &pos, seq, &ok);
+    quic_w_varint(out, cap, &pos, retire, &ok);
+    quic_w_bytes(out, cap, &pos, &cid_len, 1, &ok);
+    quic_w_bytes(out, cap, &pos, cid, cid_len, &ok);
+    quic_w_bytes(out, cap, &pos, reset16, 16, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_retire_connection_id(u8 *out, int cap, u64 seq)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_RETIRE_CONNECTION_ID, &ok);
+    quic_w_varint(out, cap, &pos, seq, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_path_challenge(u8 *out, int cap, const u8 *data8)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || !data8)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_PATH_CHALLENGE, &ok);
+    quic_w_bytes(out, cap, &pos, data8, 8, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_path_response(u8 *out, int cap, const u8 *data8)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || !data8)
+        return -1;
+    quic_w_varint(out, cap, &pos, QUIC_FRAME_PATH_RESPONSE, &ok);
+    quic_w_bytes(out, cap, &pos, data8, 8, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_connection_close(u8 *out, int cap, int app, u64 code,
+                               u64 frame_type, const void *reason, int rlen)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || rlen < 0 || (rlen > 0 && !reason))
+        return -1;
+    quic_w_varint(out, cap, &pos,
+                  app ? QUIC_FRAME_CONNECTION_CLOSE_APP
+                      : QUIC_FRAME_CONNECTION_CLOSE,
+                  &ok);
+    quic_w_varint(out, cap, &pos, code, &ok);
+    if (!app)
+        quic_w_varint(out, cap, &pos, frame_type, &ok);
+    quic_w_varint(out, cap, &pos, (u64)rlen, &ok);
+    quic_w_bytes(out, cap, &pos, reason, rlen, &ok);
+    return ok ? pos : -1;
+}
+
+int frame_put_handshake_done(u8 *out, int cap)
+{
+    if (!out || cap < 1)
+        return -1;
+    out[0] = QUIC_FRAME_HANDSHAKE_DONE;
+    return 1;
+}
+
+int frame_put_datagram(u8 *out, int cap, int has_len, const void *data, int n)
+{
+    int pos = 0;
+    int ok = 1;
+
+    if (!out || n < 0 || (n > 0 && !data))
+        return -1;
+    quic_w_varint(out, cap, &pos,
+                  has_len ? QUIC_FRAME_DATAGRAM_LEN : QUIC_FRAME_DATAGRAM, &ok);
+    if (has_len)
+        quic_w_varint(out, cap, &pos, (u64)n, &ok);
+    quic_w_bytes(out, cap, &pos, data, n, &ok);
+    return ok ? pos : -1;
+}
+
+/* ---- 自测 ---- */
+
+static int quic_hex(const u8 *d, int n, const char *want)
+{
+    char got[256] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n && i * 2 + 1 < (int)sizeof got; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    return strcmp(got, want) == 0;
+}
+
+test "QUIC：变量长整数与包号还原" {
+    u8 buf[16] = { 0 };
+    u64 v = 0;
+    int n = 0;
+
+    if (!quic_hex((const u8 *)"\x00", 1, "00"))
+        return err(1, "hex 助手坏了");
+    /* RFC 9000 §16 的四个长度档 */
+    n = quic_varint_put(buf, (int)sizeof buf, 0);
+    if (n != 1 || buf[0] != 0x00)
+        return err(2, "0 应编码成 1 字节 0x00");
+    n = quic_varint_put(buf, (int)sizeof buf, 63);
+    if (n != 1 || buf[0] != 0x3f)
+        return err(3, "63 应编码成 1 字节 0x3f");
+    n = quic_varint_put(buf, (int)sizeof buf, 64);
+    if (n != 2 || buf[0] != 0x40 || buf[1] != 0x40)
+        return err(4, "64 应编码成 40 40");
+    n = quic_varint_put(buf, (int)sizeof buf, 16383);
+    if (n != 2 || buf[0] != 0x7f || buf[1] != 0xff)
+        return err(5, "16383 应编码成 7f ff");
+    n = quic_varint_put(buf, (int)sizeof buf, 16384);
+    if (n != 4 || buf[0] != 0x80 || buf[1] != 0x00 || buf[2] != 0x40
+        || buf[3] != 0x00)
+        return err(6, "16384 应编码成 80 00 40 00");
+    n = quic_varint_put(buf, (int)sizeof buf, 0x3fffffffull);
+    if (n != 4 || buf[0] != 0xbf || buf[3] != 0xff)
+        return err(7, "2^30-1 应编码成 4 字节 bf ff ff ff");
+    n = quic_varint_put(buf, (int)sizeof buf, 0x40000000ull);
+    if (n != 8 || buf[0] != 0xc0 || buf[7] != 0x00)
+        return err(8, "2^30 应编码成 8 字节 c0 00 00 00 40 00 00 00");
+    n = quic_varint_put(buf, (int)sizeof buf, QUIC_VARINT_MAX);
+    if (n != 8 || buf[0] != 0xff || buf[7] != 0xff)
+        return err(9, "2^62-1 应编码成 8 个 ff");
+    if (quic_varint_put(buf, (int)sizeof buf, QUIC_VARINT_MAX + 1) != -1)
+        return err(10, "2^62 应越界");
+    if (quic_varint_put(buf, 1, 64) != -1)
+        return err(11, "容量不够应失败");
+    /* 解码 + 吃掉的字节数 */
+    buf[0] = 0x40;
+    buf[1] = 0x40;
+    if (quic_varint_get(buf, 2, &v) != 2 || v != 64)
+        return err(12, "解码 40 40 应为 64");
+    if (quic_varint_get(buf, 1, &v) != -1)
+        return err(13, "只有首字节的 2 字节整数应失败");
+    buf[0] = 0xc0;
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x40;
+    buf[5] = 0x00;
+    buf[6] = 0x00;
+    buf[7] = 0x00;
+    if (quic_varint_get(buf, 8, &v) != 8 || v != 0x40000000ull)
+        return err(14, "解码 8 字节 2^30 不对");
+    /* 连接 ID 长度 1..20 */
+    if (quic_cid_valid(0) || !quic_cid_valid(1) || !quic_cid_valid(20)
+        || quic_cid_valid(21))
+        return err(15, "CID 长度只收 1..20");
+    /* RFC 9000 附录 A.3 的示例：largest=0xa82f30ea, trunc=0x9b32, 16 位 */
+    v = quic_pn_expand(0xa82f30eaull, 0x9b32ull, 2);
+    if (v != 0xa82f9b32ull)
+        return err(16, "包号还原应得 0xa82f9b32");
+}
+
+test "QUIC：帧编解码（含 RFC 9001 A.2 的 CRYPTO 帧）" {
+    /* A.2 的 CRYPTO 帧前 4 字节：06 00 40f1（offset=0，length=241） */
+    static const u8 crypto_hdr[4] = { 0x06, 0x00, 0x40, 0xf1 };
+    u8 buf[128] = { 0 };
+    Frame f = { 0 };
+    int n = 0;
+
+    if (f.parse(crypto_hdr, 4) != 0 || f.err != PARSE)
+        return err(1, "CRYPTO 负载没到齐时应返回 0");
+    /* 补 241 字节负载再解析 */
+    {
+        u8 big[260] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 4; i++)
+            big[i] = crypto_hdr[i];
+        for (i = 4; i < 245; i++)
+            big[i] = (u8)i;
+        if (f.parse(big, 245) != 1 || !f.ok)
+            return err(2, "完整 CRYPTO 帧应解析成功");
+        if (f.type != QUIC_FRAME_CRYPTO || f.offset != 0 || f.length != 241)
+            return err(3, "CRYPTO 的 offset/length 不对");
+        if (f.size != 245 || f.data_off != 4 || f.data_len != 241)
+            return err(4, "CRYPTO 的负载视图不对");
+        if (big[f.data_off + 100] != 104)
+            return err(5, "CRYPTO 负载偏移不对");
+    }
+    /* STREAM：带 OFF/LEN/FIN 的往返 */
+    n = quic_varint_put(buf, (int)sizeof buf, 0);      /* 只用来验证助手 */
+    if (n != 1)
+        return err(6, "varint 助手坏了");
+    n = frame_put_stream(buf, (int)sizeof buf, 4, 1, 100, 1,
+                         (const void *)"hello", 5, 1);
+    if (n <= 0)
+        return err(7, "STREAM 构造失败");
+    if (f.parse(buf, n) != 1)
+        return err(8, "STREAM 解析失败");
+    if (f.type != (QUIC_FRAME_STREAM | QUIC_STREAM_OFF | QUIC_STREAM_LEN
+                   | QUIC_STREAM_FIN))
+        return err(9, "STREAM 的类型位不对");
+    if (f.stream_id != 4 || !f.has_off || f.offset != 100 || !f.has_len
+        || f.length != 5 || !f.fin)
+        return err(10, "STREAM 字段不对");
+    if (f.data_len != 5 || memcmp(buf + f.data_off, "hello", 5) != 0)
+        return err(11, "STREAM 负载不对");
+    /* ACK：最大 10、delay 3、两个额外区间 */
+    {
+        u8 ack[32] = { 0 };
+        int pos = 0;
+        u64 lo = 0;
+        u64 hi = 0;
+        AckIt it = { 0 };
+
+        pos = frame_put_ack(ack, (int)sizeof ack, 10, 3, 2, 2);
+        if (pos <= 0)
+            return err(12, "ACK 构造失败");
+        /* 追加 (gap=1, range=0) 与 (gap=2, range=1) */
+        ack[pos++] = 0x01;
+        ack[pos++] = 0x00;
+        ack[pos++] = 0x02;
+        ack[pos++] = 0x01;
+        if (f.parse(ack, pos) != 1)
+            return err(13, "ACK 解析失败");
+        if (f.largest != 10 || f.first_range != 2 || f.range_count != 2)
+            return err(14, "ACK 头部字段不对");
+        if (it.open(&f, ack, pos) != 0)
+            return err(15, "ACK 游标打开失败");
+        if (it.next(&lo, &hi) != 1 || lo != 8 || hi != 10)
+            return err(16, "第一个 ACK 区间应为 [8,10]");
+        if (it.next(&lo, &hi) != 1 || lo != 5 || hi != 5)
+            return err(17, "第二个 ACK 区间应为 [5,5]");
+        if (it.next(&lo, &hi) != 1 || lo != 0 || hi != 1)
+            return err(18, "第三个 ACK 区间应为 [0,1]");
+        if (it.next(&lo, &hi) != 0)
+            return err(19, "ACK 区间应取完");
+        /* first_range > largest 是格式错 */
+        {
+            u8 bad[8] = { 0x02, 0x01, 0x00, 0x00, 0x02 };
+            Frame bf = { 0 };
+
+            if (bf.parse(bad, 5) != -1 || bf.err != PARSE)
+                return err(20, "ACK 的首区间大于最大包号应失败");
+        }
+    }
+    /* NEW_CONNECTION_ID */
+    {
+        u8 cid[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        u8 rt[16] = { 0 };
+        int pos = 0;
+
+        pos = frame_put_new_connection_id(buf, (int)sizeof buf, 3, 1, cid, 8, rt);
+        if (pos <= 0)
+            return err(21, "NEW_CONNECTION_ID 构造失败");
+        if (f.parse(buf, pos) != 1)
+            return err(22, "NEW_CONNECTION_ID 解析失败");
+        if (f.seq != 3 || f.retire_prior_to != 1 || f.cid_len != 8
+            || memcmp(f.cid, cid, 8) != 0)
+            return err(23, "NEW_CONNECTION_ID 字段不对");
+        /* cid_len = 0 是格式错 */
+        buf[2] = 0x00;          /* seq=3 是两字节 40 03，把长度字段挤掉 */
+        {
+            Frame bf = { 0 };
+            u8 bad[32] = { 0x18, 0x03, 0x01, 0x00 };
+
+            if (bf.parse(bad, 4) != -1)
+                return err(24, "CID 长度为 0 应失败");
+        }
+    }
+    /* CONNECTION_CLOSE（应用层）与 HANDSHAKE_DONE */
+    {
+        int pos = 0;
+
+        pos = frame_put_connection_close(buf, (int)sizeof buf, 1, 0x100,
+                                         0, "bye", 3);
+        if (pos <= 0 || f.parse(buf, pos) != 1)
+            return err(25, "应用层 CONNECTION_CLOSE 往返失败");
+        if (f.type != QUIC_FRAME_CONNECTION_CLOSE_APP || f.error_code != 0x100
+            || f.data_len != 3 || memcmp(buf + f.data_off, "bye", 3) != 0)
+            return err(26, "应用层 CONNECTION_CLOSE 字段不对");
+        pos = frame_put_connection_close(buf, (int)sizeof buf, 0, 0x0a, 0x06,
+                                         "bad", 3);
+        if (pos <= 0 || f.parse(buf, pos) != 1)
+            return err(27, "传输层 CONNECTION_CLOSE 往返失败");
+        if (f.frame_type != 0x06 || f.error_code != 0x0a)
+            return err(28, "传输层 CONNECTION_CLOSE 的 frame_type 不对");
+        if (frame_put_handshake_done(buf, (int)sizeof buf) != 1
+            || f.parse(buf, 1) != 1 || f.type != QUIC_FRAME_HANDSHAKE_DONE)
+            return err(29, "HANDSHAKE_DONE 解析失败");
+    }
+    /* PADDING 是一个字节一个帧；未知类型是格式错 */
+    buf[0] = 0x00;
+    buf[1] = 0x00;
+    if (f.parse(buf, 2) != 1 || f.type != QUIC_FRAME_PADDING || f.size != 1)
+        return err(30, "PADDING 应占 1 字节");
+    buf[0] = 0x1f;              /* 0x1f 是未分配的类型 */
+    if (f.parse(buf, 1) != -1)
+        return err(31, "未知帧类型应失败");
+}
+
+test "QUIC：包头解析（RFC 9001 A.2/A.3）与构造往返" {
+    /* A.2 未保护的客户端 Initial 头 */
+    u8 a2[22] = {
+        0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0x83, 0x94,
+        0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0x00, 0x00,
+        0x44, 0x9e, 0x00, 0x00, 0x00, 0x02
+    };
+    /* A.3 未保护的服务端 Initial 头 */
+    u8 a3[20] = {
+        0xc1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0,
+        0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5, 0x00,
+        0x40, 0x75, 0x00, 0x01
+    };
+    Packet p = { 0 };
+    HeaderBuilder hb = { 0 };
+    u8 out[64] = { 0 };
+    u8 dcid[8] = { 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    u8 scid[8] = { 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+    int n = 0;
+
+    if (p.parse(a2, 22, 0) != 1 || !p.ok)
+        return err(1, "A.2 头解析失败");
+    if (!p.long_header || p.type != QUIC_PKT_INITIAL || p.version != 1)
+        return err(2, "A.2 应是 version 1 的 Initial");
+    if (p.dcid_len != 8 || memcmp(p.dcid, dcid, 8) != 0)
+        return err(3, "A.2 的 DCID 不对");
+    if (p.scid_len != 0 || p.token_len != 0)
+        return err(4, "A.2 的 SCID/Token 应为空");
+    if (p.length != 1182 || p.pn_len != 4 || p.pn != 2)
+        return err(5, "A.2 的 Length/包号不对");
+    if (p.payload_off != 22 || p.payload_len != 1178)
+        return err(6, "A.2 的负载视图不对");
+    if (p.packet_bytes() != 1200)
+        return err(7, "A.2 包总长应为 1200");
+    /* 反方向：用构造器拼出同一串字节 */
+    hb.init(out, (int)sizeof out);
+    if (hb.long_header(QUIC_PKT_INITIAL, QUIC_VERSION_1, dcid, 8, 0, 0) != 15)
+        return err(8, "构造 A.2 头的前 15 字节失败");
+    if (hb.token(0, 0) != 16)
+        return err(9, "写 Token Length 失败");
+    if (hb.length(1182) != 18)
+        return err(10, "写 Length 失败");
+    if (hb.pn(4, 2) != 22)
+        return err(11, "写包号失败");
+    if (memcmp(out, a2, 22) != 0)
+        return err(12, "构造出来的 A.2 头与 RFC 不一致");
+    /* A.3：SCID 为 8 字节、包号 2 字节、Length=117 */
+    if (p.parse(a3, 20, 0) != 1)
+        return err(12, "A.3 头解析失败");
+    if (p.type != QUIC_PKT_INITIAL || p.dcid_len != 0 || p.scid_len != 8
+        || memcmp(p.scid, scid, 8) != 0)
+        return err(13, "A.3 的 CID 不对");
+    if (p.length != 117 || p.pn_len != 2 || p.pn != 1)
+        return err(14, "A.3 的 Length/包号不对");
+    hb.init(out, (int)sizeof out);
+    if (hb.long_header(QUIC_PKT_INITIAL, QUIC_VERSION_1, 0, 0, scid, 8) != 15)
+        return err(16, "构造 A.3 头失败");
+    if (hb.token(0, 0) != 16 || hb.length(117) != 18 || hb.pn(2, 1) != 20)
+        return err(17, "A.3 的 Length/包号写入失败");
+    if (memcmp(out, a3, 20) != 0)
+        return err(18, "构造出来的 A.3 头与 RFC 不一致");
+    /* 短包头：DCID 长度由调用方给；key phase / spin 往返 */
+    hb.init(out, (int)sizeof out);
+    if (hb.short_header(1, dcid, 8) != 9)
+        return err(18, "短包头构造失败");
+    if (hb.pn(4, 0x11223344) != 13)
+        return err(19, "短包头包号写入失败");
+    if (p.parse(out, 13, 8) != 1 || p.long_header || p.key_phase != 1
+        || p.pn_len != 4 || p.pn != 0x11223344)
+        return err(20, "短包头往返不一致");
+    if (p.payload_off != 13 || p.payload_len != 0)
+        return err(21, "短包头负载视图不对");
+    if (p.packet_bytes() != -1)
+        return err(22, "短包头的总字节数不可知，应返回 -1");
+    /* reserved 位非 0 必须拒绝（短包头的 0x18、长包头的 0x0c） */
+    out[0] = 0x48;              /* 短包头 reserved=01 */
+    if (p.parse(out, 13, 8) != -1 || p.err != RESERVED)
+        return err(23, "短包头 reserved 非 0 应失败");
+    a2[0] = 0xc3 | 0x04;
+    if (p.parse(a2, 22, 0) != -1 || p.err != RESERVED)
+        return err(24, "长包头 reserved 非 0 应失败");
+    a2[0] = 0xc3;
+    /* 截断的头返回 0（等更多字节），CID 长度越界直接 -1 */
+    if (p.parse(a2, 10, 0) != 0)
+        return err(25, "截断的长包头应返回 0");
+    a2[5] = 0x15;               /* DCID 长度 21 */
+    if (p.parse(a2, 22, 0) != -1)
+        return err(26, "DCID 长度 21 应失败");
+    a2[5] = 0x08;
+    /* 短包头的 DCID 长度参数越界 */
+    out[0] = 0x40;
+    if (p.parse(out, 13, 21) != -1 || p.err != INVAL)
+        return err(27, "短包头 DCID 长度 21 应失败");
+    /* Retry（RFC 9001 A.4）：低 4 位 Unused 是 0xf，客户端必须忽略 */
+    {
+        u8 rt[36] = {
+            0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0,
+            0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5, 0x74,
+            0x6f, 0x6b, 0x65, 0x6e, 0x04, 0xa2, 0x65, 0xba,
+            0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f,
+            0x0f, 0x24, 0x96, 0xba
+        };
+
+        if (p.parse(rt, 36, 0) != 1)
+            return err(28, "Retry 解析失败");
+        if (p.type != QUIC_PKT_RETRY || p.dcid_len != 0 || p.scid_len != 8)
+            return err(29, "Retry 的 CID 不对");
+        if (p.token_off != 15 || p.token_len != 5
+            || memcmp(rt + p.token_off, "token", 5) != 0)
+            return err(30, "Retry 的 token 视图不对");
+        /* 太短（凑不齐 token + 16 字节完整性标签）返回 0 */
+        if (p.parse(rt, 20, 0) != 0)
+            return err(31, "截断的 Retry 应返回 0");
+    }
+    /* 版本协商：版本 0 + 版本列表 */
+    {
+        u8 vn[20] = {
+            0xc0, 0x00, 0x00, 0x00, 0x00, 0x08, 0x83, 0x94,
+            0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x6b
+        };
+
+        if (p.parse(vn, 20, 0) != -1)
+            return err(31, "版本列表长度不是 4 的倍数应失败");
+        if (p.parse(vn, 19, 0) != 1)
+            return err(32, "版本协商解析失败");
+        if (p.type != -2 || p.version != 0 || p.vn_len != 4)
+            return err(33, "版本协商的字段不对");
+        if (p.version_at(vn, 0) != 1 || p.version_at(vn, 1) != 0)
+            return err(34, "版本列表内容不对");
+    }
+}

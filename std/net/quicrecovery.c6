@@ -1,0 +1,665 @@
+/* std/net/quicrecovery：QUIC 的丢包检测、RTT 估计、PTO 与 NewReno 拥塞控制
+ * （RFC 9002）。
+ *
+ *     import std.net.quicrecovery;
+ *
+ *     Recovery r = { 0 };
+ *     r.init(25000);                      -- max_ack_delay，微秒
+ *     r.on_sent(pn, now_us, 1, 1, 1200);  -- ack_eliciting, in_flight, 字节数
+ *     u64 lost[16] = { 0 };
+ *     u64 acked[1] = { 0 };
+ *     acked[0] = pn;
+ *     int n = r.on_ack(pn, now_us, 0, acked, 1, lost, 16);
+ *
+ * 时间一律用**微秒**（i64）。QUIC 里的时间戳本来就来自 `std.os.time` 的
+ * 单调钟，统一到微秒能避免「毫秒里做除法」把 kGranularity=1ms 的粒度吃掉。
+ *
+ * 三个部分：
+ *
+ * - RTT（§5.3）：首样本直接定 `smoothed_rtt` 与 `rttvar = latest/2`，之后
+ *   `rttvar = 3/4 rttvar + 1/4 |smoothed - adjusted|`、
+ *   `smoothed = 7/8 smoothed + 1/8 adjusted`；`adjusted` 只有在本样本的
+ *   latest 不小于 `min_rtt + ack_delay` 时才扣掉 ack_delay（§5.3 的坑：
+ *   不能把 ack_delay 扣成负数），并且握手确认前收到的 ack_delay 一律忽略；
+ * - 丢包检测（§6）：包号阈值（比已确认的最大包号早 3 个以上）与时间阈值
+ *   （`loss_delay = 9/8 * max(smoothed, latest)`，不小于 kGranularity）两条
+ *   任一命中就判丢；剩下的包要记住最早的 `loss_time`，那是丢包定时器的时刻；
+ * - NewReno（§7）：慢启动每确认一个字节窗口 +1 字节，拥塞避免每窗口 +1 个
+ *   MSS，拥塞事件把 `ssthresh` 砍半、窗口降到 `max(ssthresh, 2*MSS)`，
+ *   同一次恢复期内不再重复降窗。
+ *
+ * 状态都是定长数组（`QR_MAX_SENT` 个在途包），满了就把最老的当成丢包——在
+ * 真机上这等价于持续拥塞，而不是悄悄吞掉。
+ */
+#include <string.h>
+
+module std.net.quicrecovery;
+import std.core.types;
+
+enum Error { OK = 0, INVAL = 1, FULL = 2, RANGE = 3 };
+
+#define QR_MAX_DATAGRAM        1200
+#define QR_GRANULARITY_US      1000    /* kGranularity = 1ms */
+#define QR_PACKET_THRESHOLD    3
+#define QR_TIME_NUM            9
+#define QR_TIME_DEN            8
+#define QR_PERSISTENT_CNT      3
+#define QR_MAX_SENT            256
+#define QR_TIMER_NONE          (-1)
+
+/* ---- RTT（§5.3） ---- */
+
+struct Rtt {
+    i64 latest;
+    i64 min;
+    i64 smoothed;
+    i64 rttvar;
+    i64 max_ack_delay;
+    int have_sample;
+};
+
+void rtt_init(Rtt *r, i64 max_ack_delay_us)
+{
+    if (!r)
+        return;
+    memset(r, 0, sizeof *r);
+    r->max_ack_delay = max_ack_delay_us > 0 ? max_ack_delay_us : 0;
+}
+
+int has_sample(Rtt *r) { return r ? r->have_sample : 0; }
+
+/* 喂一个 RTT 样本。`ack_delay` 只在握手确认之后才参与计算。 */
+void rtt_sample(Rtt *r, i64 latest_rtt, i64 ack_delay, int handshake_confirmed)
+{
+    i64 adjusted = 0;
+    i64 delta = 0;
+
+    if (!r || latest_rtt < 0)
+        return;
+    if (ack_delay < 0)
+        ack_delay = 0;
+    r->latest = latest_rtt;
+    if (!r->have_sample) {
+        r->min = latest_rtt;
+        r->smoothed = latest_rtt;
+        r->rttvar = latest_rtt / 2;
+        r->have_sample = 1;
+        return;
+    }
+    if (latest_rtt < r->min)
+        r->min = latest_rtt;
+    adjusted = latest_rtt;
+    /* 只有样本本身够大时才扣 ack_delay，否则会扣成比 min_rtt 还小 */
+    if (handshake_confirmed && latest_rtt >= r->min + ack_delay)
+        adjusted = latest_rtt - ack_delay;
+    delta = r->smoothed - adjusted;
+    if (delta < 0)
+        delta = -delta;
+    r->rttvar = (3 * r->rttvar + delta + 2) / 4;
+    r->smoothed = (7 * r->smoothed + adjusted + 4) / 8;
+}
+
+i64 latest_rtt_of(Rtt *r) { return r ? r->latest : 0; }
+i64 min_rtt_of(Rtt *r) { return r ? r->min : 0; }
+i64 smoothed_rtt_of(Rtt *r) { return r ? r->smoothed : 0; }
+i64 rttvar_of(Rtt *r) { return r ? r->rttvar : 0; }
+
+/* PTO = smoothed + max(4*rttvar, kGranularity) + max_ack_delay */
+i64 rtt_pto(Rtt *r)
+{
+    i64 v = 0;
+
+    if (!r || !r->have_sample)
+        return QR_GRANULARITY_US;
+    v = 4 * r->rttvar;
+    if (v < QR_GRANULARITY_US)
+        v = QR_GRANULARITY_US;
+    return r->smoothed + v + r->max_ack_delay;
+}
+
+/* ---- 拥塞控制（§7，NewReno） ---- */
+
+struct Congestion {
+    u64 cwnd;
+    u64 bytes_in_flight;
+    u64 ssthresh;
+    i64 recovery_start;
+    int in_recovery;
+    int max_dgram;
+};
+
+void cc_init(Congestion *c, int max_datagram_size)
+{
+    u64 mss = 0;
+    u64 win = 0;
+
+    if (!c)
+        return;
+    memset(c, 0, sizeof *c);
+    if (max_datagram_size <= 0)
+        max_datagram_size = QR_MAX_DATAGRAM;
+    c->max_dgram = max_datagram_size;
+    mss = (u64)max_datagram_size;
+    /* kInitialWindow = min(10*MSS, max(2*MSS, 14720)) */
+    win = 10 * mss;
+    {
+        u64 other = 2 * mss > 14720 ? 2 * mss : 14720;
+
+        if (win > other)
+            win = other;
+    }
+    c->cwnd = win;
+    c->ssthresh = (u64)-1;
+    c->recovery_start = QR_TIMER_NONE;
+}
+
+u64 cwnd_of(Congestion *c) { return c ? c->cwnd : 0; }
+u64 bytes_in_flight_of(Congestion *c) { return c ? c->bytes_in_flight : 0; }
+u64 ssthresh_of(Congestion *c) { return c ? c->ssthresh : 0; }
+int recovering(Congestion *c) { return c ? c->in_recovery : 0; }
+int max_dgram_of(Congestion *c) { return c ? c->max_dgram : 0; }
+
+int cc_can_send(Congestion *c, u64 bytes)
+{
+    if (!c)
+        return 0;
+    return c->bytes_in_flight + bytes <= c->cwnd;
+}
+
+void cc_on_sent(Congestion *c, u64 bytes)
+{
+    if (!c)
+        return;
+    c->bytes_in_flight += bytes;
+}
+
+/* 包被确认：慢启动 +1 字节/字节，拥塞避免 +MSS/窗口。 */
+void cc_on_ack(Congestion *c, u64 acked, i64 now, i64 sent_time)
+{
+    (void)now;
+    if (!c || acked == 0)
+        return;
+    if (c->bytes_in_flight >= acked)
+        c->bytes_in_flight -= acked;
+    else
+        c->bytes_in_flight = 0;
+    /* 恢复期内发出的包不涨窗口（避免一次拥塞事件被记两次） */
+    if (c->in_recovery && sent_time <= c->recovery_start)
+        return;
+    if (c->cwnd < c->ssthresh)
+        c->cwnd += acked;
+    else if (c->cwnd > 0)
+        c->cwnd += (u64)c->max_dgram * acked / c->cwnd;
+}
+
+/* 拥塞事件：ssthresh 砍半、窗口降到 max(ssthresh, 2*MSS)。 */
+void cc_on_congestion(Congestion *c, i64 now, i64 sent_time)
+{
+    u64 mss = 0;
+
+    if (!c)
+        return;
+    mss = (u64)c->max_dgram;
+    if (c->in_recovery && sent_time <= c->recovery_start)
+        return;                 /* 同一个恢复期内的多个丢包只降一次 */
+    c->ssthresh = c->cwnd / 2;
+    if (c->ssthresh < 2 * mss)
+        c->ssthresh = 2 * mss;
+    c->cwnd = c->ssthresh;
+    c->in_recovery = 1;
+    c->recovery_start = now;
+}
+
+void cc_on_lost(Congestion *c, u64 bytes, i64 now, i64 sent_time)
+{
+    if (!c)
+        return;
+    if (c->bytes_in_flight >= bytes)
+        c->bytes_in_flight -= bytes;
+    else
+        c->bytes_in_flight = 0;
+    cc_on_congestion(c, now, sent_time);
+}
+
+/* 走完一个 RTT 之后调用：解除恢复期。 */
+void cc_on_recovery_done(Congestion *c, i64 now)
+{
+    if (!c)
+        return;
+    if (c->in_recovery && now > c->recovery_start) {
+        c->in_recovery = 0;
+        c->recovery_start = QR_TIMER_NONE;
+    }
+}
+
+/* ---- 在途包表与丢包检测（§6） ---- */
+
+struct SentPacket {
+    u64 pn;
+    i64 sent;
+    u64 size;
+    int ack_eliciting;
+    int in_flight;
+};
+
+struct Recovery {
+    Rtt rtt;
+    Congestion cc;
+    SentPacket sent[QR_MAX_SENT];
+    int count;
+    u64 largest_acked;
+    int have_largest;
+    int pto_count;
+    i64 loss_time;              /* QR_TIMER_NONE = 没有定时器 */
+    u64 lost_bytes_total;
+};
+
+void init(Recovery *r, i64 max_ack_delay_us)
+{
+    if (!r)
+        return;
+    memset(r, 0, sizeof *r);
+    r->rtt.rtt_init(max_ack_delay_us);
+    r->cc.cc_init(QR_MAX_DATAGRAM);
+    r->loss_time = QR_TIMER_NONE;
+}
+
+Rtt *rtt_of(Recovery *r) { return r ? &r->rtt : 0; }
+Congestion *cc_of(Recovery *r) { return r ? &r->cc : 0; }
+int in_flight_count(Recovery *r) { return r ? r->count : 0; }
+int pto_count_of(Recovery *r) { return r ? r->pto_count : 0; }
+i64 loss_time_of(Recovery *r) { return r ? r->loss_time : QR_TIMER_NONE; }
+u64 lost_bytes_of(Recovery *r) { return r ? r->lost_bytes_total : 0; }
+
+static int find_pn(Recovery *r, u64 pn)
+{
+    int i = 0;
+
+    for (i = 0; i < r->count; i++)
+        if (r->sent[i].pn == pn)
+            return i;
+    return -1;
+}
+
+static void drop_at(Recovery *r, int idx)
+{
+    int i = 0;
+
+    if (!r || idx < 0 || idx >= r->count)
+        return;
+    for (i = idx; i + 1 < r->count; i++)
+        r->sent[i] = r->sent[i + 1];
+    r->count--;
+}
+
+/* 记录一个已发包。表满时把最老的一条按丢包处理（等价于持续拥塞）。 */
+int on_sent(Recovery *r, u64 pn, i64 now, int ack_eliciting, int in_flight,
+            u64 size)
+{
+    int worst = 0;
+    int i = 0;
+
+    if (!r || now < 0)
+        return -1;
+    if (r->count >= QR_MAX_SENT) {
+        for (i = 1; i < r->count; i++)
+            if (r->sent[i].sent < r->sent[worst].sent)
+                worst = i;
+        if (r->sent[worst].in_flight)
+            r->cc.cc_on_lost(r->sent[worst].size, now,
+                       r->sent[worst].sent);
+        drop_at(r, worst);
+    }
+    r->sent[r->count].pn = pn;
+    r->sent[r->count].sent = now;
+    r->sent[r->count].size = size;
+    r->sent[r->count].ack_eliciting = ack_eliciting;
+    r->sent[r->count].in_flight = in_flight;
+    r->count++;
+    if (in_flight)
+        r->cc.cc_on_sent(size);
+    return 0;
+}
+
+/* 丢包判定的时间阈值：max(9/8 * max(smoothed, latest), kGranularity) */
+i64 loss_delay_of(Recovery *r)
+{
+    i64 base = 0;
+    i64 d = 0;
+
+    if (!r)
+        return QR_GRANULARITY_US;
+    base = r->rtt.smoothed > r->rtt.latest ? r->rtt.smoothed : r->rtt.latest;
+    d = base * QR_TIME_NUM / QR_TIME_DEN;
+    if (d < QR_GRANULARITY_US)
+        d = QR_GRANULARITY_US;
+    return d;
+}
+
+/* 收到 ACK：`acked` 是本次新确认的包号，`largest` 是其中最大的。
+ * 返回判丢的包数，丢掉的包号写进 `lost`（最多 cap 个）。 */
+int on_ack(Recovery *r, u64 largest, i64 now, i64 ack_delay,
+           const u64 *acked, int n_acked, u64 *lost, int cap)
+{
+    i64 delay = 0;
+    i64 lost_send_time = 0;
+    i64 send_time = 0;
+    int i = 0;
+    int nlost = 0;
+    int acked_in_flight = 0;
+    int j = 0;
+
+    if (!r || now < 0 || n_acked < 0 || (n_acked > 0 && !acked))
+        return -1;
+    r->pto_count = 0;
+    /* RTT 只用「最大确认包」的发送时间 */
+    i = find_pn(r, largest);
+    if (i >= 0) {
+        send_time = r->sent[i].sent;
+        if (r->sent[i].ack_eliciting)
+            r->rtt.rtt_sample(now - send_time, ack_delay, 0);
+    }
+    if (!r->have_largest || largest > r->largest_acked) {
+        r->largest_acked = largest;
+        r->have_largest = 1;
+    }
+    /* 先摘掉确认的包并记账 */
+    for (j = 0; j < n_acked; j++) {
+        i = find_pn(r, acked[j]);
+        if (i < 0)
+            continue;
+        if (r->sent[i].in_flight)
+            acked_in_flight += (int)r->sent[i].size;
+        drop_at(r, i);
+    }
+    delay = loss_delay_of(r);
+    lost_send_time = now - delay;
+    /* 再判丢：包号阈值 + 时间阈值 */
+    for (i = r->count - 1; i >= 0; i--) {
+        int is_lost = 0;
+
+        if (r->sent[i].pn <= r->largest_acked
+            && r->largest_acked - r->sent[i].pn >= QR_PACKET_THRESHOLD) {
+            is_lost = 1;
+        } else if (r->sent[i].sent <= lost_send_time) {
+            is_lost = 1;
+        } else if (r->sent[i].pn < r->largest_acked) {
+            /* 没丢但比已确认的小：它是时间阈值定时器的候选 */
+            i64 t = r->sent[i].sent + delay;
+
+            if (r->loss_time == QR_TIMER_NONE || t < r->loss_time)
+                r->loss_time = t;
+            continue;
+        }
+        if (!is_lost)
+            continue;
+        if (lost && nlost < cap)
+            lost[nlost] = r->sent[i].pn;
+        nlost++;
+        r->lost_bytes_total += r->sent[i].size;
+        if (r->sent[i].in_flight)
+            r->cc.cc_on_lost(r->sent[i].size, now, r->sent[i].sent);
+        drop_at(r, i);
+    }
+    if (acked_in_flight > 0)
+        r->cc.cc_on_ack((u64)acked_in_flight, now, send_time);
+    return nlost;
+}
+
+/* 丢包定时器到点：所有 `sent + loss_delay <= now` 的包都判丢。 */
+int on_loss_timeout(Recovery *r, i64 now, u64 *lost, int cap)
+{
+    i64 delay = 0;
+    int i = 0;
+    int nlost = 0;
+
+    if (!r || now < 0)
+        return -1;
+    delay = loss_delay_of(r);
+    r->loss_time = QR_TIMER_NONE;
+    for (i = r->count - 1; i >= 0; i--) {
+        if (r->sent[i].sent + delay > now) {
+            i64 t = r->sent[i].sent + delay;
+
+            if (r->loss_time == QR_TIMER_NONE || t < r->loss_time)
+                r->loss_time = t;
+            continue;
+        }
+        if (lost && nlost < cap)
+            lost[nlost] = r->sent[i].pn;
+        nlost++;
+        r->lost_bytes_total += r->sent[i].size;
+        if (r->sent[i].in_flight)
+            r->cc.cc_on_lost(r->sent[i].size, now, r->sent[i].sent);
+        drop_at(r, i);
+    }
+    return nlost;
+}
+
+/* 是否有包在等 PTO；有就给「还能等多久」，没有给 QR_TIMER_NONE。 */
+i64 pto_timeout(Recovery *r)
+{
+    i64 base = 0;
+
+    if (!r || r->count == 0)
+        return QR_TIMER_NONE;
+    base = r->rtt.rtt_pto();
+    if (r->pto_count > 0) {
+        int i = 0;
+
+        for (i = 0; i < r->pto_count && i < 16; i++)
+            base *= 2;
+    }
+    return base;
+}
+
+/* PTO 到点：计数 +1（退避翻倍），返回下一次的等待时间。 */
+i64 on_pto(Recovery *r)
+{
+    if (!r)
+        return QR_TIMER_NONE;
+    r->pto_count++;
+    return pto_timeout(r);
+}
+
+/* 下一个定时器该在什么时候响：loss_time 与「最早在途包 + PTO」取小。 */
+i64 next_timer(Recovery *r)
+{
+    i64 pto = 0;
+    i64 earliest = 0;
+    int i = 0;
+
+    if (!r || r->count == 0)
+        return QR_TIMER_NONE;
+    earliest = r->sent[0].sent;
+    for (i = 1; i < r->count; i++)
+        if (r->sent[i].sent < earliest)
+            earliest = r->sent[i].sent;
+    pto = earliest + pto_timeout(r);
+    if (r->loss_time != QR_TIMER_NONE && r->loss_time < pto)
+        return r->loss_time;
+    return pto;
+}
+
+/* ---- 自测 ---- */
+
+test "QUIC 恢复：RTT 与 PTO（RFC 9002 §5.3）" {
+    Rtt r = { 0 };
+    i64 pto = 0;
+
+    r.rtt_init(25000);        /* max_ack_delay = 25ms */
+    if (r.has_sample())
+        return err(1, "初始化后不应有样本");
+    /* 首样本：smoothed = latest，rttvar = latest/2 */
+    r.rtt_sample(100000, 0, 0);
+    if (!r.has_sample() || r.smoothed_rtt_of() != 100000
+        || r.rttvar_of() != 50000 || r.min_rtt_of() != 100000)
+        return err(2, "首样本的 smoothed/rttvar 不对");
+    pto = r.rtt_pto();
+    if (pto != 100000 + 200000 + 25000)
+        return err(3, "首样本的 PTO 应是 smoothed+4*rttvar+ack_delay");
+    /* 第二样本：扣掉 ack_delay 后还剩 110ms */
+    r.rtt_sample(120000, 10000, 1);
+    if (r.smoothed_rtt_of() != 101250)
+        return err(4, "smoothed 应是 101250");
+    if (r.rttvar_of() != 40000)
+        return err(5, "rttvar 应是 40000");
+    if (r.min_rtt_of() != 100000)
+        return err(6, "min_rtt 应保持 100000");
+    if (r.rtt_pto() != 101250 + 160000 + 25000)
+        return err(7, "第二样本的 PTO 不对");
+    /* 握手未确认：ack_delay 必须被忽略 */
+    r.rtt_sample(150000, 25000, 0);
+    if (r.smoothed_rtt_of() != 107344 || r.rttvar_of() != 42188)
+        return err(8, "握手未确认时不应扣 ack_delay");
+    /* ack_delay 大于 latest-min_rtt 时也不能扣成负数 */
+    {
+        Rtt r2 = { 0 };
+
+        r2.rtt_init(25000);
+        r2.rtt_sample(100000, 0, 1);
+        r2.rtt_sample(100001, 50000, 1);
+        if (r2.smoothed_rtt_of() < r2.min_rtt_of())
+            return err(9, "adjusted 不应小于 min_rtt");
+    }
+    /* 没有样本时 PTO 退化到 kGranularity */
+    {
+        Rtt r3 = { 0 };
+
+        r3.rtt_init(25000);
+        if (r3.rtt_pto() != 1000)
+            return err(10, "无样本时 PTO 应是 kGranularity");
+    }
+}
+
+test "QUIC 恢复：NewReno 拥塞控制（RFC 9002 §7）" {
+    Congestion c = { 0 };
+
+    c.cc_init(1200);
+    /* kInitialWindow = min(10*MSS, max(2*MSS, 14720)) = 12000 */
+    if (c.cwnd_of() != 12000 || c.bytes_in_flight_of() != 0)
+        return err(1, "初始窗口应是 12000");
+    if (!c.cc_can_send(12000) || c.cc_can_send(12001))
+        return err(2, "初始窗口的可用量不对");
+    c.cc_on_sent(1200);
+    if (c.bytes_in_flight_of() != 1200)
+        return err(3, "在途字节没记上");
+    /* 慢启动：确认多少涨多少 */
+    c.cc_on_ack(1200, 1000, 0);
+    if (c.cwnd_of() != 13200 || c.bytes_in_flight_of() != 0)
+        return err(4, "慢启动应把窗口涨到 13200");
+    /* 拥塞事件：ssthresh 砍半、窗口降到 6600 */
+    c.cc_on_lost(1200, 2000, 500);
+    if (c.cwnd_of() != 6600 || c.ssthresh_of() != 6600
+        || !c.recovering())
+        return err(5, "拥塞事件后的窗口/ssthresh 不对");
+    /* 恢复期内再丢：不再降窗 */
+    c.cc_on_lost(1200, 2500, 1800);
+    if (c.cwnd_of() != 6600)
+        return err(6, "同一次恢复期内不应再降窗");
+    /* 拥塞避免：每窗口涨一个 MSS（1200*1200/6600 = 218） */
+    c.cc_on_ack(1200, 3000, 2500);
+    if (c.cwnd_of() != 6600 + 218)
+        return err(7, "拥塞避免的增量应是 MSS*acked/cwnd");
+    /* 恢复期结束：窗口继续按拥塞避免涨 */
+    c.cc_on_recovery_done(5000);
+    if (c.recovering())
+        return err(8, "恢复期应结束");
+    c.cc_on_ack(1200, 6000, 5500);
+    /* 窗口已经变成 6818，增量 1200*1200/6818 = 211 */
+    if (c.cwnd_of() != 6600 + 218 + 211)
+        return err(9, "恢复期结束后的增量不对");
+    /* 小窗口下的下限：ssthresh 不低于 2*MSS */
+    {
+        Congestion c2 = { 0 };
+
+        c2.cc_init(1200);
+        c2.cwnd = 2000;
+        c2.cc_on_lost(100, 10, 0);
+        if (c2.cwnd_of() != 2400 || c2.ssthresh_of() != 2400)
+            return err(10, "ssthresh 下限应是 2*MSS");
+    }
+}
+
+test "QUIC 恢复：包号阈值与时间阈值的丢包检测" {
+    Recovery r = { 0 };
+    u64 lost[32] = { 0 };
+    u64 acked[1] = { 0 };
+    int n = 0;
+    int i = 0;
+
+    r.init(25000);
+    for (i = 0; i < 10; i++)
+        r.on_sent((u64)i, i * 1000, 1, 1, 1200);
+    if (r.in_flight_count() != 10)
+        return err(1, "应记下 10 个在途包");
+    /* 确认包 5：0..2 因包号阈值（差 >= 3）判丢 */
+    acked[0] = 5;
+    n = r.on_ack(5, 100000, 0, acked, 1, lost, 32);
+    /* 判定从表尾往前扫，所以 lost[] 里是倒序的 2/1/0 */
+    if (n != 3 || lost[0] != 2 || lost[1] != 1 || lost[2] != 0)
+        return err(2, "包号阈值应判丢 0/1/2");
+    if (r.in_flight_count() != 6)
+        return err(3, "判丢后应剩 6 个在途包");
+    /* 首样本是 95ms（包 5 在 5ms 发出、100ms 确认） */
+    if (r.rtt_of()->smoothed_rtt_of() != 95000)
+        return err(4, "首个 RTT 样本应是 95ms");
+    /* 时间阈值：loss_delay = 9/8 * 95ms = 106.875ms；
+     * 表里最小的「比已确认小但没判丢」的包是 3ms 发出的那个 */
+    if (r.loss_time_of() != 3000 + 106875)
+        return err(5, "loss_time 应是 109875us");
+    /* 定时器到点后所有在途包（3/4/6/7/8/9）都应判丢 */
+    n = r.on_loss_timeout(1000000, lost, 32);
+    if (n != 6)
+        return err(6, "时间阈值到点后应判丢 6 个包");
+    if (r.in_flight_count() != 0)
+        return err(7, "判丢之后不应还有在途包");
+    /* 拥塞事件确实发生了 */
+    if (!r.cc_of()->recovering() || r.cc_of()->ssthresh_of() >= 12000)
+        return err(8, "丢包应触发一次拥塞事件");
+    /* PTO 退避：每来一次翻倍，确认之后清零 */
+    {
+        Recovery r2 = { 0 };
+        i64 p1 = 0;
+        i64 p2 = 0;
+
+        r2.init(25000);
+        r2.on_sent(0, 0, 1, 1, 1200);
+        p1 = r2.pto_timeout();
+        if (p1 <= 0)
+            return err(9, "应有 PTO");
+        p2 = r2.on_pto();
+        if (p2 != 2 * p1)
+            return err(10, "PTO 应退避翻倍");
+        if (r2.on_pto() != 4 * p1)
+            return err(11, "第二次退避应是 4 倍");
+        if (r2.pto_count_of() != 2)
+            return err(12, "PTO 计数应是 2");
+        acked[0] = 0;
+        r2.on_ack(0, 1000, 0, acked, 1, lost, 32);
+        if (r2.pto_count_of() != 0)
+            return err(13, "确认之后 PTO 计数应清零");
+        /* 在途包都没了：没有定时器 */
+        if (r2.pto_timeout() != QR_TIMER_NONE
+            || r2.next_timer() != QR_TIMER_NONE)
+            return err(14, "没有在途包时不应有定时器");
+    }
+    /* next_timer 取 loss_time 与 PTO 的小者 */
+    {
+        Recovery r3 = { 0 };
+
+        r3.init(25000);
+        r3.on_sent(0, 0, 1, 1, 1200);
+        r3.on_sent(1, 1000, 1, 1, 1200);
+        acked[0] = 1;
+        r3.on_ack(1, 20000, 0, acked, 1, lost, 32);
+        /* 包 0 因包号阈值被判丢，表里只剩……没有在途包 */
+        /* 包 0 没判丢（差 1 个包号，未到阈值），它在等时间阈值：
+         * RTT 样本是 20000-1000 = 19000，loss_delay = 9/8*19000 = 21375，
+         * 定时器就在 0 + 21375 */
+        if (r3.in_flight_count() != 1 || r3.loss_time_of() != 21375)
+            return err(15, "包 0 应留在表里等时间阈值");
+        if (r3.next_timer() != 21375)
+            return err(16, "next_timer 应取 loss_time");
+    }
+}
