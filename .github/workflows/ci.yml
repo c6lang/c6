@@ -351,7 +351,10 @@ jobs:
   # -------------------------------------------------------------------------
   package-c6c:
     name: package c6c-only (${{ matrix.generator }})
-    needs: [test, no-tcc]
+    # 不挂 no-tcc：那条作业量的是 c6c 的语言行为（tests1/tests2 语料），
+    # 与打包无关；它红了也不该把打包产物挡掉——这里的作业自己用 gcc 引导
+    # c6c、打包、断言包内容。
+    needs: [test]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
