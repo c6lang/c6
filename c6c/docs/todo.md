@@ -4112,3 +4112,54 @@ cmake --build build --target check-install   # 通过
 
 **还差的**：共享库里的外部数据符号（GOT 间接寻址）、符号版本
 （`.gnu.version`）、`.a` 静态库、`--gc-sections`、`-Wl,-soname=` 别名。
+
+## 第 209 轮：把回归迁到 c6c（第一步：开关 + 基线 + 42/92）
+
+硬缺口③（**93 个交付物里不再有 tcc**）的最后一块：`tests/regression.sh` 那
+92 个 `std-*` 用例的被测编译器一直是 `$C6_TCC_DIR/c6`（tcc 那一侧），所以
+`C6_ENABLE_TCC=OFF` 的构建里干脆一个都不注册。这一轮先把**开关**和**基线**做出来。
+
+**做了什么**：
+
+* `tests/regression.sh`：被测编译器改成 `$C6_CC`（默认仍是 `$C6_TCC_DIR/c6`），
+  98 处调用点统一替换；selfhost / c99selfhost 那几个拿 tcc **源码**自举的用例
+  仍直接用 `$C6_TCC_DIR/c6`（它们不在迁移目标里）。
+* `c6c/tests/regression-c6c.sh` + `regression-c6c.list`：前者跑列表里的用例
+  （`--all` 跑全部 std-* 量基线，也可以点名几个），后者是"c6c 已全绿"的
+  单一数据源；CMake 目标 `cmake --build build --target regression-c6c`。
+* `cmake/C6Testing.cmake`：`C6_ENABLE_TCC=OFF` 时把这张表注册成 CTest 用例
+  （label `regression-c6c`，同时带 `c6c`）。以前那句话是"没有 tcc 就没有可测
+  对象"，现在改成了前半句仍成立、但 c6c 这一侧有 42 个真回归。
+* `c6c/lib/rt.c6` 补了一批 POSIX 面（**全 `weak`**，程序自己的强定义会盖掉）：
+  `poll` / `nanosleep` / `uname` / `rmdir` / `tcgetattr` / `chdir` / `sysinfo` /
+  `mkfifo` / `fsync` / `ftruncate`、`ntohs`/`ntohl`/`htons`/`htonl`、`cfmakeraw`，
+  以及整族 socket：`socket` / `bind` / `listen` / `accept` / `connect` /
+  `send` / `recv` / `sendto` / `recvfrom` / `setsockopt` / `getsockopt` /
+  `getsockname` / `getpeername` / `socketpair` / `shutdown`。
+  为什么必须 weak：std 里 `Chan.send` / `ACancel.poll` 那种**同名全局函数**是
+  程序自己的强定义，tcc 走 libc.so.6 时靠 ELF 符号覆盖，静态 rt.c6 只能用
+  weak 表达同一件事。
+
+**实测**：
+
+```
+./c6c/tests/regression-c6c.sh --all      # 38 → 42 / 92（这一批新增 4 个：
+                                         # std-async / std-async2 / std-async5 / std-crypto）
+cmake --build build --target regression-c6c   # 42/42（13.6 s）
+ctest -L regression-c6c -j 4（C6_ENABLE_TCC=OFF 的构建）  # 42/42，4.3 s
+cmake --build build --target lint embedcheck pkgcheck sharedcheck ldcheck dyncheck objcheck
+                                         # 全绿（rt.c6 改动没有回退）
+```
+
+**还差的 50 个**，四类：
+
+| 类 | 个数 | 卡在哪 |
+| --- | --- | --- |
+| libc 面 | ~16 | `getaddrinfo` / `opendir`+`readdir` / `tcsetattr` / `getrusage` 还没有（要补 syscall 与结构体） |
+| `-lm` | 10 | 用例命令行带 `-lm`；c6c 的默认产物是静态的，既没有 `-l` 也没有 libm，`std-linalg` 去掉 `-lm` 就能过，`std-geo` 真需要 `atan2` |
+| 跨 TU 符号 | 9 | 模板成员函数（`std__container__vec__Iter_int_has`）与 `static`/`$2` 名字（`p_atom$2`、`jp_value$2`、`take_n`、`next_set`）在别的 TU 里被引用 |
+| 行为差异 | ~15 | `test` 块里浮点打印、`cfmakeraw` 之后的 termios 细节、`std-net`/`std-util` 的段错误（各 1 个） |
+
+下一轮的顺序：先补 libc 面（`opendir`/`readdir`/`getrusage`/`tcsetattr` 各一条
+syscall，能把 std-fsx/std-ub/std-sys/std-term 一起点亮），再看跨 TU 符号那 9 个
+（那是多 TU 语义，得先定规则），最后才碰行为差异。

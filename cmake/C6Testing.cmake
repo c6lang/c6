@@ -219,12 +219,37 @@ if(BUILD_TESTING AND C6_ENABLE_TCC)
     endforeach()
   endforeach()
 elseif(BUILD_TESTING)
-  # C6_ENABLE_TCC=OFF：tcc 侧 115 个回归用例全部以 tcc/c6 为被测编译器，
-  # 没有 tcc 就没有可测对象。c6c 的验收不在这里，它在 label `c6c` 上
-  # （见 cmake/C6C.cmake），所以这里如实说明而不是静默注册一堆必红的用例。
+  # C6_ENABLE_TCC=OFF：tcc 侧那 115 个用例的被测编译器是 tcc/c6，没有 tcc
+  # 就没有可测对象。但**回归脚本本身不依赖 tcc**：`tests/regression.sh` 的被测
+  # 编译器现在是 `$C6_CC`，指到 c6c 就能跑。这里把 c6c 已经全绿的那一批注册成
+  # CTest 用例（单一数据源：c6c/tests/regression-c6c.list），label
+  # `regression-c6c`（同时带 `c6c`，所以 `ctest -L c6c` 也能捎上）。
+  # 还没绿的不注册——不注册必红用例，缺口清单在 c6c/docs/todo.md。
+  set(_c6_c6c_list "${CMAKE_CURRENT_SOURCE_DIR}/c6c/tests/regression-c6c.list")
+  set(_c6_c6c_cases "")
+  if(EXISTS "${_c6_c6c_list}")
+    # 只认"整行就是一个用例名"的行：注释行里有空格和中文，正好被这条滤掉
+    file(STRINGS "${_c6_c6c_list}" _c6_c6c_lines REGEX "^[a-z0-9][a-z0-9-]*$")
+    foreach(_line IN LISTS _c6_c6c_lines)
+      list(APPEND _c6_c6c_cases "${_line}")
+    endforeach()
+  endif()
+  list(LENGTH _c6_c6c_cases _c6_c6c_count)
+  foreach(_case IN LISTS _c6_c6c_cases)
+    set(_case_root "${CMAKE_CURRENT_BINARY_DIR}/tests/${_case}")
+    file(MAKE_DIRECTORY "${_case_root}")
+    add_test(NAME "c6c-regression/${_case}"
+             COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression.sh" "${_case}")
+    set_tests_properties("c6c-regression/${_case}" PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      ENVIRONMENT "C6_CC=${C6C_BIN};C6_TCC_DIR=tcc;C6_MAKE=${C6_MAKE_EXECUTABLE};C6_SELFTEST=${C6_SELFTEST};C6_ERRBASE=${C6_ERRBASE};C6_HOSTCC=${C6_HOSTCC};C6_CFLAGS=${C6_TCC_CFLAGS};C6_CASE_OUT=${_case_root};C6_TMP=${_case_root}/tmp"
+      LABELS "regression-c6c;c6c"
+      TIMEOUT 1800)
+  endforeach()
   message(STATUS
-    "c6: C6_ENABLE_TCC=OFF —— 不注册 tcc 侧 CTest 用例；跑 c6c 的验收用 "
-    "`ctest -L c6c -LE perf`，或者 `cmake --build build --target check-all-c6c`")
+    "c6: C6_ENABLE_TCC=OFF —— 注册 ${_c6_c6c_count} 个 c6c 回归用例（label "
+    "`regression-c6c`，被测编译器 ${C6C_BIN}）；tcc 侧用例不注册。"
+    "c6c 的其余验收用 `ctest -L c6c -LE perf` 或 `check-all-c6c`")
 endif()
 
 # ---------------------------------------------------------------------------
