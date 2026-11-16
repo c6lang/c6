@@ -144,6 +144,7 @@ cerr=0
 linkerr=0
 cstale=0
 nolink=0
+: >"$TMP/faillist"
 i=0
 for src in "$TCCDIR"/*.c; do
     [ -e "$src" ] || continue
@@ -171,12 +172,15 @@ for src in "$TCCDIR"/*.c; do
             cstale=$((cstale + 1))
         elif [ "${vl#LINK}" != "$vl" ]; then
             fail=$((fail + 1))
+            printf '%s\t%s\n' "$base" "$vl" >>"$TMP/faillist"
             [ "$VERBOSE" = 1 ] && printf '意外失败 %-20s %s（不在 tcc-na.txt 里）\n' "$base" "$vl"
         elif [ "${vl#CERR}" != "$vl" ]; then
             fail=$((fail + 1))
+            printf '%s\t%s\n' "$base" "${vl#CERR }" >>"$TMP/faillist"
             [ "$VERBOSE" = 1 ] && printf '意外失败 %-20s %s（不在 tcc-na.txt 里）\n' "$base" "${vl#CERR }"
         else
             fail=$((fail + 1))
+            printf '%s\t%s\n' "$base" "${vl#FAIL }" >>"$TMP/faillist"
             [ "$VERBOSE" = 1 ] && printf '意外失败 %-20s %s（不在 tcc-na.txt 里）\n' "$base" "${vl#FAIL }"
         fi
         ;;
@@ -184,6 +188,14 @@ for src in "$TCCDIR"/*.c; do
 done
 total=$((pass + fail + cerr + linkerr + cstale + nolink + na))
 echo "tcc tests2：通过 $pass / 架构性 n/a $na / 仅编译 $nolink / 上游 expect 旧 $cstale / 意外失败 $fail （共 $total）"
+if [ -s "$TMP/faillist" ]; then
+    # 名单无条件打出来：日志上只看到"意外失败 5"没法查是什么，逐条名字
+    # （连同 LINK/CERR/FAIL 的结论）才是能动手的东西。
+    echo "意外失败的用例（$fail 条，均不在 tcc-na.txt 里）："
+    while read -r _n _v; do
+        printf '  %-22s %s\n' "$_n" "$_v"
+    done <"$TMP/faillist"
+fi
 if [ -s "$TMP/missing.txt" ]; then
     echo "最缺的外部符号（前 12 个）：$(sort "$TMP/missing.txt" | uniq -c | sort -rn | head -12 | awk '{printf "%s(%s) ", $2, $1}')"
 fi
