@@ -28,7 +28,7 @@ case "$C6C" in
 /*) ;;
 *) C6C="$(pwd)/$C6C" ;;
 esac
-# 自带运行时的源码要从 c6c 目录里找（脚本按 `make -C c6c ldcheck` 跑）
+# 自带运行时的源码要从 c6c 目录里找（脚本按 `cmake --build build --target ldcheck` 跑）
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 RT="$HERE/lib/rt.c6"
 

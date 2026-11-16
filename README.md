@@ -105,7 +105,7 @@ ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
 `tcc/` 是可选的：`cmake -S . -B build -DC6_ENABLE_TCC=OFF` 一条都不编 tcc
 （不产出 `tcc/c6`、`libtcc`），只把 `c6c/` 用宿主 C 编译器引导出来，
 产物是 `c6c/build/c6c`，验收走 `ctest --test-dir build -L c6c -LE perf`。
-这就是 `make -C c6c build BOOTSTRAP=host HOSTCC=gcc` 的 CMake 等价入口，
+这就是 `cmake -S . -B build -DC6_ENABLE_TCC=OFF && cmake --build build --target c6c` 的入口，
 细节见 [c6c/README.md](c6c/README.md)；`tcc/` 的源码此时只当语料与差分 oracle。
 唯一的例外在验收里：`build-tcc` 量的是"c6c 编出的 tcc 能不能工作"，它的运行时
 `tcc/libtcc1.a` 必须由能用的 tcc 编，所以这一步会用宿主 cc 把 `tcc/tcc.c` 编一个

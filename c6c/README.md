@@ -2,25 +2,27 @@
 
 自举、脱离 tcc、多后端（native x86-64 / C99 / LLVM IR）的 c6 编译器。
 
-本目录是**独立项目边界**：自己的构建入口（CMake 目标 `c6c` 或自带 Makefile）、自己的许可证、不 `#include` `tcc/*.h`、
-不链接 `libtcc`、不复制 `tcc/` 的源码（`make c6c-lint` 机器可查）。仓库里的 `tcc/` 只承担
+本目录是**独立项目边界**：自己的构建入口（CMake target `c6c`，没有自己的 Makefile 了）、
+自己的许可证、不 `#include` `tcc/*.h`、不链接 `libtcc`、不复制 `tcc/` 的源码
+（`cmake --build build --target lint` 机器可查）。仓库里的 `tcc/` 只承担
 两件事：**引导第一步**（用它编出 c6c stage1）和**差分测试的 oracle**。
 
 这两件事里的第一件**已经可以不用 tcc**：c6c 的源码是 C99 兼容的单 TU
 （`src/c6c.c6` 把各模块 `#include` 进来），所以 stage0 可以换成宿主 C 编译器：
 
 ```sh
-make -C c6c build BOOTSTRAP=host HOSTCC=gcc     # 只要一个 C 编译器
-cmake -S . -B build -DC6_ENABLE_TCC=OFF         # 连 tcc 都不构建
+cmake -S . -B build -DC6_ENABLE_TCC=OFF && cmake --build build --target c6c
+# 只要一个宿主 C 编译器：连 tcc 都不构建（默认 ON 时 stage0 是 tcc/c6）
 ```
 
-`tcc/` 剩下的是"语料 + oracle"这一件事：`make build-tcc` / `tests1` / `tests2`
-仍然编它的源码来量 c6c 的深浅，但**不需要 tcc 的产品构建**（不经过 CMake 的
-tcc 目标、不安装、不出 `libtcc`）。其中 `build-tcc` 要的 `tcc/libtcc1.a` 是
-运行时，必须由能用的 tcc 编（宿主 cc 编的等价物会让成绩从 118/144 掉到
-102/144）；`tcc/c6` 缺席时 Makefile 用宿主 cc 把 `tcc/tcc.c` 编一个**参考
-tcc** 当夹具，再由它编运行时——不安装、不进交付物。CI 的 `no-tcc` 作业就是
-这条路的机器证据（构建完断言 `tcc/c6` 不存在，再跑 `ctest -L c6c`）。
+`tcc/` 剩下的是"语料 + oracle"这一件事：`build-tcc` / `tests1-check` /
+`tests2-check` 仍然编它的源码来量 c6c 的深浅，但**不需要 tcc 的产品构建**
+（不经过 CMake 的 tcc 目标、不安装、不出 `libtcc`）。其中 `build-tcc` 要的
+`tcc/libtcc1.a` 是运行时，必须由能用的 tcc 编（宿主 cc 编的等价物会让成绩从
+118/144 掉到 102/144）；`tcc/c6` 缺席时 `c6c-tcc-corpus` 这个 target 用宿主 cc
+把 `tcc/tcc.c` 编一个**参考 tcc** 当夹具，再由它编运行时——不安装、不进交付物。
+CI 的 `no-tcc` 作业就是这条路的机器证据（构建完断言 `tcc/c6` 不存在，再跑
+`ctest -L c6c`）。
 
 | 文档 | 内容 |
 |---|---|
@@ -47,14 +49,24 @@ ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4) 性能/内存
 ```
 
-不用 CMake 也行（c6c 自带 Makefile，入口等价）：
+细到单条闸门也是 target（以前 `make -C c6c <目标>` 的那些名字，现在都是 CMake
+target；`cmake --build build --target help` 能列全）：
 
 ```sh
-make -C c6c fast ROOT=$PWD          # 快速门禁（≈40 s）
-make -C c6c check-all ROOT=$PWD     # 验收 (1)(2)(3)
-make -C c6c bench-c6c ROOT=$PWD     # 验收 (4)
-make -C c6c tests2-check ROOT=$PWD  # 只跑 tcc 上游 tests2 的闸门
+cmake --build build --target fast            # 快速门禁（≈40 s）
+cmake --build build --target check-all-c6c   # 验收 (1)(2)(3)
+cmake --build build --target bench-c6c       # 验收 (4)
+cmake --build build --target tests2-check    # 只跑 tcc 上游 tests2 的闸门
+cmake --build build --target selfhost        # 只跑自举 fixpoint
+cmake --build build --target objcheck        # 只跑 -c 目标文件的回归
 ```
+
+| 原来的 `make -C c6c` 目标 | 现在的 CMake target |
+|---|---|
+| `build` / `libc6c` | `c6c` / `c6c-lib` |
+| `test` / `ctest` | `test-c6c` / `ctest-c6c`（`test` 是 CMake 内建 target） |
+| `fast` / `check-all` / `check-all-perf` | `fast` / `check-all-c6c` / `check-all-perf` |
+| 其余（`lint unit irtest hello runflag testflag objcheck ldcheck dyncheck bcheck dbgcheck asmcheck a64check archcheck embedcheck pkgcheck selfhost selftest stdtest diagtest test-c6c c99test c99suite llvmtest tcc-tests tests1-check tests2-check build-tcc g2c-check scoreboard scan bench bench-c6c`） | 同名 |
 
 `fast` 与 `check-all` 的口径一致——被测编译器就是 c6c 自己——只是 `fast` 把
 `selfhost`/`selftest`/`stdtest`/`test`/`diagtest`/`c99test`/`build-tcc` 这几条
@@ -67,7 +79,7 @@ make -C c6c tests2-check ROOT=$PWD  # 只跑 tcc 上游 tests2 的闸门
 | 3 | c6c 直接跑 tcc 上游用例 | 通过 **115/144**，其余是 7 条架构性 n/a（每条写死了卡点）、8 条上游只编不跑、14 条上游 expect 过期；**意外失败 0** |
 | 4 | native ≤135 ms、自编译 ≤100 ms、RSS ≤32 MB、线性度 ≤2.6x | ✅ **112 ms / 88 ms / 25 MB / 每行成本 0.39x** |
 
-`make -C c6c lint` 仍然机器检查目录边界（不 `#include` `tcc/*.h`、不链接
+`cmake --build build --target lint` 仍然机器检查目录边界（不 `#include` `tcc/*.h`、不链接
 `libtcc`、不复制 `tcc/` 源码）。
 
 ## 直接跑 c6 源码：`-run`
@@ -89,7 +101,7 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 还没有动态链接这件事。退出码照抄程序（被信号杀按 shell 惯例 `128+sig`），
 临时文件在子进程结束后删除，落在 `$TMPDIR`（默认 `/tmp`）。只支持 native
 后端；`-o`、`-c`、`-E`、`-fsyntax-only`、`--emit-c`、`--emit-llvm` 都跟它互斥。
-回归：`make -C c6c runflag`。
+回归：`cmake --build build --target runflag`。
 
 许可证：`LICENSE` 为 MIT，与 `tcc/`（LGPL-2.1）严格分离；若项目所有者另有安排，替换本文件即可。
 
@@ -109,7 +121,7 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 静默退出 0。不给 `-o` 时编到 `$TMPDIR` 的临时 ELF 再 `exec`（和 `-run` 同一条
 路径），给了 `-o` 就只写文件不跑。只支持 native 后端；`-c`、`-E`、
 `-fsyntax-only`、`--emit-c`、`--emit-llvm`、`-nostdlib` 都跟它互斥。
-回归：`make -C c6c testflag`。
+回归：`cmake --build build --target testflag`。
 
 ## 出目标文件：`-c`
 
@@ -136,7 +148,7 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 
 还没有的：c6c 自己的链接器（现在得借系统 `cc` 的）、`.bss`（零初始化数据也
 落在 `.data` 里）、weak / 可见性 / 段 GC、`-fPIC` 与 `-shared`。
-回归：`make -C c6c objcheck`（单/多 TU 真编、真链、真跑 + readelf 结构核对）。
+回归：`cmake --build build --target objcheck`（单/多 TU 真编、真链、真跑 + readelf 结构核对）。
 
 ## 链接：`c6c -o prog a.o b.o`
 
@@ -172,7 +184,7 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
   如实报错。
 * 不做：`.a` 静态库、`-shared`/`-fPIC`、段 GC、符号版本、调试信息重定位。
 
-回归：`make -C c6c ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
+回归：`cmake --build build --target ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
 重定位 / 构造函数顺序 / 跨 `.o` TLS / 缺符号报错 / `readelf` 结构核对）。
 
 ## 动态链接：`c6c -Wl,--dynamic -o prog a.o rt.o`
@@ -216,7 +228,7 @@ libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查�
 * 默认仍是静态链接：动态是**显式**选项（`-Wl,--dynamic`），拼错的链接器
   选项会直接报错，不会被当成告警开关静默忽略。
 
-回归：`make -C c6c dyncheck`（14 条：不加 `--allow-undefined` 也能链、链接器
+回归：`cmake --build build --target dyncheck`（14 条：不加 `--allow-undefined` 也能链、链接器
 自报导入个数、数据符号点名警告、产物真跑且 libc 返回值对、`readelf` 逐项核对
 ET_EXEC / 两个 `PT_LOAD` / `PT_INTERP` / `PT_DYNAMIC` / `DT_NEEDED` /
 `BIND_NOW` / JUMP_SLOT 条数、`ldd` 认得 libc、默认静态仍会对未定义符号报错）。
@@ -245,7 +257,7 @@ cc -x assembler -nostdlib -static -o prog prog.s && ./prog
 （函数 …）`）并**拒绝写文件**——不做"静默产出一份错的 .s"。也就是说现在还不能
 用 `-S` 编自带运行时（`rt.c6`）的程序，要用 `-nostdlib`。
 
-回归：`make -C c6c asmcheck`（12 条：循环/调用/数组/递归/结构体/switch/全局量/
+回归：`cmake --build build --target asmcheck`（12 条：循环/调用/数组/递归/结构体/switch/全局量/
 位运算八个程序都是"c6c → .s → 系统 as → 真跑"，退出码与 native 后端逐一对齐；
 `.intel_syntax` / `_start` / C 名符号都在；没实现的 op 会拒绝写文件）。
 
@@ -274,7 +286,7 @@ addr2line -e prog -f 0x…                 # → main prog.c6:10
   调试信息——要调试就走 `-c` + 系统 cc；
 * 不加 `-g` 时目标文件里一个 `.debug_*` 段都没有（默认行为不变）。
 
-回归：`make -C c6c dbgcheck`（9 条：六个段齐全、地址字段带重定位、行号表覆盖
+回归：`cmake --build build --target dbgcheck`（9 条：六个段齐全、地址字段带重定位、行号表覆盖
 源码每一行、DIE 里有 add/main、系统 cc 链得上跑得出、`addr2line` 与 `gdb` 都
 认得出 `dbg.c6:10`、不加 `-g` 时没有调试段）。
 
@@ -297,7 +309,7 @@ addr2line -e prog -f 0x…                 # → main prog.c6:10
 * 默认关闭：不加 `-b` 生成的目标文件里一条检查都没有（不改变默认行为，
   也不额外依赖运行时的 `c6c_bound_fail`）。
 
-回归：`make -C c6c bcheck`（9 条：越界写/越界读各拦一次、消息点名下标与边界、
+回归：`cmake --build build --target bcheck`（9 条：越界写/越界读各拦一次、消息点名下标与边界、
 界内访问加不加 `-b` 输出一致、不加 `-b` 不检查、二维行越界、结构体数组字段
 越界、指针下标与 VLA 不误报、`-run -b` 同效）。
 
@@ -307,7 +319,7 @@ addr2line -e prog -f 0x…                 # → main prog.c6:10
 `-DC6C_NO_MAIN` 关掉 `main()` 就能编成库：
 
 ```sh
-make -C c6c libc6c            # → c6c/build/libc6c.a + libc6c.so
+cmake --build build --target c6c-lib      # → c6c/build/libc6c.a + libc6c.so
 ```
 
 ```c
@@ -339,7 +351,7 @@ API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
 `tcc_set_error_func` 收了回调但诊断仍走 stderr；`tcc_add_file` 只收
 `.c6`/`.c` 源文件，不收 `.o`/`.a`；`tcc_set_options` 只认 `-I`/`-D`/`-U`。
 
-回归：`make -C c6c embedcheck`（6 条：动态库 / 静态库 / 落盘后独立跑 /
+回归：`cmake --build build --target embedcheck`（6 条：动态库 / 静态库 / 落盘后独立跑 /
 编译失败被报告 / 二次编译被拒绝 / `tcc_*` 兼容层）。
 
 ## 安装与包契约：没有 tcc 也能装出全套
@@ -372,7 +384,7 @@ cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 注意 `include/` 里只放宿主用的两个头：c6 自己的 `stdio.h`/`stddef.h` 在
 `lib/c6/include/`，装到系统 includedir 会把宿主程序的系统头文件盖掉。
 
-回归：`make -C c6c pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
+回归：`cmake --build build --target pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
 `include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
 `-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
 
@@ -405,7 +417,7 @@ qemu-aarch64 ./prog.elf; echo $?        # 与 x86-64 后端的退出码一致
 `_start`。浮点、变参、VLA、内联汇编、TLS、>8 实参一律明确报错（
 `c6c: aarch64 后端暂不支持 …`）并拒绝写文件。
 
-回归：`make -C c6c a64check`（11 条：八个程序都是「c6c 出 aarch64 汇编 → clang
+回归：`cmake --build build --target a64check`（11 条：八个程序都是「c6c 出 aarch64 汇编 → clang
 汇编 → ld.lld 链接 → qemu 真跑」，退出码与 x86-64 后端逐一相同；汇编里是
 aarch64 指令、`_start` 走 `svc #0`；未实现的 op 拒绝写文件）。
 
@@ -413,7 +425,7 @@ aarch64 指令、`_start` 走 `svc #0`；未实现的 op 拒绝写文件）。
 
 c6c 自己的 native 后端只出 x86-64 机器码；但 IR（`src/ir.c6`，24 字节定长记录）
 是**与目标无关**的，`--emit-llvm` 出来的 `.ll` 交给任何 LLVM 目标后端都能落到
-别的架构。这条链在这里被真跑验过（`make -C c6c archcheck`）：
+别的架构。这条链在这里被真跑验过（`cmake --build build --target archcheck`）：
 
 ```sh
 ./c6c/build/c6c --emit-llvm -nostdlib calc.c6 -o calc.ll
@@ -429,6 +441,6 @@ qemu-aarch64 ./calc.elf; echo $?        # → 91，和 x86-64 后端一致
 （`lib/rt.c6`）里的 syscall 跳板是 x86-64 内联汇编，所以跨目标只覆盖"自己算、
 不碰运行时"的程序；`llc` 会把零初始化变成 `memset` 调用，宿主侧得自己补。
 
-回归：`make -C c6c archcheck`（4 条：x86-64 对照 91、IR→aarch64 汇编里是 aarch64
+回归：`cmake --build build --target archcheck`（4 条：x86-64 对照 91、IR→aarch64 汇编里是 aarch64
 指令且没有 x86 寄存器、产物是 ARM aarch64 ELF、qemu 上跑出 91；缺
 llc/clang/ld.lld/qemu-aarch64 时自动跳过）。
