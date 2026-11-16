@@ -1059,7 +1059,7 @@ static void pa_error(const char *fmt, ...)
             pa_err_cap = 20;
     }
     if (PA_ERRS > (u32)pa_err_cap) {
-        fprintf(stderr, "c6c: 错误太多，停止\n");
+        diag_emit("c6c: 错误太多，停止");
         exit(1);
     }
     if (getenv("C6C_DBG_COUNTS"))
@@ -1067,16 +1067,25 @@ static void pa_error(const char *fmt, ...)
     {
         /* 文件 id 0 是**合法**的首个文件——不能拿 0 当"没有位置" */
         SrcFile *sf = file_by_id(t->file);
+        char msg[1024] = {0};
+        int n = 0;
 
         if (!sf && FILES.head)
             sf = FILES.head;
-        fprintf(stderr, "c6c: %s:%u: ", sf ? src_path_of(sf) : "<internal>",
-                sf ? src_line_of(sf, t->off) : 0);
+        n = snprintf(msg, sizeof(msg), "c6c: %s:%u: ", sf ? src_path_of(sf) : "<internal>",
+                     sf ? src_line_of(sf, t->off) : 0);
+        if (n < 0)
+            n = 0;
+        if (n > (int)sizeof(msg) - 2)
+            n = (int)sizeof(msg) - 2;
+        va_start(ap, fmt);
+        vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, ap);
+        va_end(ap);
+        msg[sizeof(msg) - 1] = 0;
+        /* 走 diag_emit：宿主用 tcc_set_error_func 设了回调就交给它，否则还是
+         * 一行 path:line: 打到 stderr（字节与以前一样）。 */
+        diag_emit(msg);
     }
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
 }
 
 static void pa_expect_ch(int ch)
@@ -1100,15 +1109,23 @@ static void pa_warn_tcc(const char *fmt, ...)
     va_list ap = {0};
     Tok *t = pa_cur();
     SrcFile *sf = file_by_id(t->file);
+    char msg[1024] = {0};
+    int n = 0;
 
     if (!sf && FILES.head)
         sf = FILES.head;
-    fprintf(stderr, "%s:%u: warning: ", sf ? src_path_of(sf) : "<internal>",
-            sf ? src_line_of(sf, t->off) : 0);
+    n = snprintf(msg, sizeof(msg), "%s:%u: warning: ",
+                 sf ? src_path_of(sf) : "<internal>",
+                 sf ? src_line_of(sf, t->off) : 0);
+    if (n < 0)
+        n = 0;
+    if (n > (int)sizeof(msg) - 2)
+        n = (int)sizeof(msg) - 2;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    msg[sizeof(msg) - 1] = 0;
+    diag_emit(msg);
 }
 
 /* --- 类型说明符与声明符 --- */
@@ -20798,18 +20815,21 @@ static int pa_finish(const char *out)
     synth_test_main();          /* 全局作用域还在，才能找到 printf */
     scope_leave();
     if (PA_ERRS || DG.errors) {
-        fprintf(stderr, "c6c: %d 个错误，不写输出\n", PA_ERRS + DG.errors);
+        char msg[128] = {0};
+
+        snprintf(msg, sizeof(msg), "c6c: %u 个错误，不写输出", PA_ERRS + (u32)DG.errors);
+        diag_emit(msg);
         return 1;
     }
     if (PA_LINK_UNDEF && !PA_RELOC) {
         /* `extern __thread` 到最后没人定义：tls_finish 已经按链接期的口径
          * 报过名字了，这里只负责别写出一个读 0 的产物。
          * -c 例外：可重定位文件里"未定义"是正常状态，由链接器去别处找。 */
-        fprintf(stderr, "c6c: 有未定义的外部符号，不写输出\n");
+        diag_emit("c6c: 有未定义的外部符号，不写输出");
         return 1;
     }
     if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC) {
-        fprintf(stderr, "c6c: 没有 main（可执行文件需要入口）\n");
+        diag_emit("c6c: 没有 main（可执行文件需要入口）");
         return 1;
     }
     if (PA_SYNTAX_ONLY)

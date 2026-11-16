@@ -188,6 +188,7 @@ c6c_target(ctest-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/run.sh
 c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)
 c6c_target(ldcheck ENV C6C=${C6C_BIN} COMMAND ./tests/ld-check.sh)
 c6c_target(dyncheck ENV C6C=${C6C_BIN} COMMAND ./tests/dyn-check.sh)
+c6c_target(sharedcheck ENV C6C=${C6C_BIN} COMMAND ./tests/shared-check.sh)
 c6c_target(bcheck ENV C6C=${C6C_BIN} COMMAND ./tests/bcheck.sh)
 c6c_target(dbgcheck ENV C6C=${C6C_BIN} COMMAND ./tests/dbgcheck.sh)
 c6c_target(asmcheck ENV C6C=${C6C_BIN} COMMAND ./tests/asmcheck.sh)
@@ -326,13 +327,13 @@ c6c_target(g2c-check DEPENDS build-tcc ENV ROOT=${C6C_ROOT}
 # ---------------------------------------------------------------------------
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck tests2-check tests1-check ctutest c99suite llvmtest
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
-          objcheck ldcheck dyncheck bcheck dbgcheck asmcheck a64check archcheck
+          objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
           c99suite llvmtest ctutest test-c6c build-tcc tests1-check tests2-check
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")
