@@ -7,6 +7,25 @@
 
 ## 未发布
 
+### 修复：隐式 int 告警只在"非函数声明"发；宏体里的 `__LINE__`/`__FILE__` 报调用点
+
+- `parse_typespec` 的隐式 int 告警收缩到 tcc 的真实口径：形参表里不发
+  （`int f(int x, ...)` 的省略号、K&R `int f(a, b)` 的裸标识符都走
+  `parse_typespec` 的兜底旧路径，实测 tcc 零告警），并且延迟到声明符解析完、
+  只对**非函数**声明发（tcc `decl()` 的 `else if (oldint)` 前面是 VT_FUNC
+  分支）——`f();` / `f(){}` 不告警。此前 `c6c/include/stdio.h` 的变参原型
+  每条多一行 `type defaults to int`，tests2 118 条全红、`testflag` 的
+  "stderr 干净 / 过滤空 / 没有 test 块"三条同因挂掉。
+- `pp.c6`：宏展开时记下**最外层**调用点的 file/off，宏体里的 `__LINE__` /
+  `__FILE__` 用它而不是 `#define` 那一行（tests2/129_scopes 的 `myassert`
+  宏在函数体里展开，expect 逐行要调用点行号）。
+- `tcc-na.txt` 补两条架构性 n/a 并写死卡点：`102_alignas`（`_Alignas` 只
+  解析不落地，全局布局与 `__alignof__` 都不认用户对齐）、`129_scopes`
+  （`__LINE__` 已修，剩下 `sizeof(enum{…})` 常量泄漏到外层块、两块遮蔽与
+  静态初始化的作用域语义差）。
+- 验证：tests2 记分板 117 通过 / 10 n/a / 0 意外失败；testflag 19/0；
+  前端回归 52/0；c6c 回归 47/0；编译期诊断 316 报错 / 0 漏报。
+
 ### 许可：仓库根新增 `LICENSE`（LGPL-2.1，逐字继承 tcc）
 
 - `tcc/COPYING`（LGPL-2.1 全文）逐字复制为根 `LICENSE`：c6 是 TinyCC 的分支，
