@@ -9440,11 +9440,15 @@ static u32 lit_type(u64 v, int uns, int lng, int base)
         return v <= 0x7FFFFFFFFFFFFFFFULL ? ty_llong() : ty_ullong();
     }
     if (uns) {
-        if (v <= 0xFFFFFFFFULL)
-            return ty_uint();
+        /* 有后缀就按后缀定，**不看值大小**（C99 6.4.4.1）：`1UL` 是
+         * unsigned long（8 字节），不是"值塞得进 32 位就降成 unsigned int"。
+         * 少了这一条，`1UL << 40` 会按 32 位算成 0——`BIT(40)`、
+         * `1UL << PAGE_SHIFT` 这类全变 0，是整个内核 bitops 塌掉的根因
+         * （实测：`sizeof(1UL)` 给 4，`1UL<<32`、`1UL<<33`、`1UL<<40` 全给 0，
+         * 而 `1L<<40`、`1ULL<<40` 正确）。 */
         if (lng >= 1)
-            return v <= 0xFFFFFFFFFFFFFFFFULL ? ty_ulong() : ty_ullong();
-        return ty_ulong();
+            return ty_ulong();
+        return v <= 0xFFFFFFFFULL ? ty_uint() : ty_ulong();
     }
     if (lng >= 1) {
         if (v <= 0x7FFFFFFFFFFFFFFFULL)
