@@ -1,10 +1,15 @@
 # 生成并安装 CMake 包配置（find_package(c6)）与 pkgconf 元数据。
-
+#
 # 描述的对象按构建形态分两种：
 #   * 有 tcc（C6_ENABLE_TCC=ON）：tcc 的 libtcc + 它的 libtcc1.a；
 #   * 没有 tcc（OFF）：c6c 自己的嵌入库 libc6c（c6_* API + tcc_* 兼容层）。
 # 两种都要把 find_package(c6) / pkgconf 元数据装对——"没有 tcc 就没有库"
 # 这个前提在库形态落地以后就不成立了。
+#
+# c6c 自己的包名（find_package(c6c) / c6c.pc）见 C6CInstall.cmake；两边的
+# 生成机制是同一套：cmake/C6Metadata.cmake 的 c6_install_cmake_package() 与
+# c6_install_pc()。
+#
 # 注意：这里的 ${...} 是**配置期**展开，\${...} 才是留给 pkgconf 的变量引用。
 if(C6_ENABLE_TCC)
   set(C6_PC_LIBS "-ltcc")
@@ -19,74 +24,39 @@ endif()
 # ---------------------------------------------------------------------------
 
 if(C6_INSTALL_CMAKE_PACKAGE)
-  set(C6_PACKAGE_DIR "${C6_LIBDIR_REL}/cmake/c6")
   set(C6_BINDIR "${CMAKE_INSTALL_FULL_BINDIR}")
   set(C6_LIBDIR "${CMAKE_INSTALL_FULL_LIBDIR}")
   set(C6_INCLUDEDIR "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
   set(C6_TCCDIR "${C6_INSTALL_TCCDIR}")
-
-  configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6Config.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6Config.cmake"
-    INSTALL_DESTINATION "${C6_PACKAGE_DIR}"
-    PATH_VARS C6_BINDIR C6_LIBDIR C6_INCLUDEDIR C6_TCCDIR
-  )
-  write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/c6ConfigVersion.cmake"
-    VERSION "${C6_VERSION_NUMERIC}"
-    COMPATIBILITY SameMajorVersion
-  )
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6Targets.cmake.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/c6Targets.cmake" @ONLY)
-  install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/c6Config.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6ConfigVersion.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6Targets.cmake"
-    DESTINATION "${C6_PACKAGE_DIR}")
+  # C6CheckInstall.cmake 的 check-install 要按这个落点核对安装树
+  set(C6_PACKAGE_DIR "${C6_LIBDIR_REL}/cmake/c6")
+  c6_install_cmake_package(c6 "${C6_PACKAGE_DIR}"
+    c6Config.cmake.in c6Targets.cmake.in
+    C6_BINDIR C6_LIBDIR C6_INCLUDEDIR C6_TCCDIR)
 endif()
 
 # ---------------------------------------------------------------------------
-# 6. pkgconf 库配置：pkgconf --cflags --libs c6 / libtcc
+# 6. pkgconf 库配置：pkgconf --cflags --libs c6 / c6lib / libtcc
 # ---------------------------------------------------------------------------
 
 if(C6_INSTALL_PKGCONF)
-  # prefix 用 ${pcfiledir} 反推，安装到别的前缀/DESTDIR 里也能直接用
-  # （同一套算法见 cmake/C6Options.cmake 的 c6_pcfile_prefix）。
-  c6_pcfile_prefix(C6_PC_PREFIX "${C6_PKGCONFIG_DIR}")
-
-  set(C6_PC_NAME "c6")
   if(C6_ENABLE_TCC)
-    set(C6_PC_DESCRIPTION "c6 - TinyCC with language extensions (libtcc embedding API)")
+    set(_c6_pc_desc "c6 - TinyCC with language extensions (libtcc embedding API)")
   else()
-    set(C6_PC_DESCRIPTION "c6 - TinyCC-compatible C compiler (c6c embeddable library)")
+    set(_c6_pc_desc "c6 - TinyCC-compatible C compiler (c6c embeddable library)")
   endif()
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6.pc.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/c6.pc" @ONLY)
-  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/c6.pc"
-          DESTINATION "${C6_PKGCONFIG_DIR_REL}")
+  c6_install_pc(c6 "c6" "${_c6_pc_desc}" "${C6_PC_LIBS}" "${C6_PC_VARS}")
 
   # c6c 的嵌入库：pkgconf --cflags --libs c6lib → -lc6c
   if(C6_INSTALL_C6LIB)
-    set(_c6_pc_libs_saved "${C6_PC_LIBS}")
-    set(_c6_pc_vars_saved "${C6_PC_VARS}")
-    set(C6_PC_NAME "c6lib")
-    set(C6_PC_DESCRIPTION "c6lib - c6c embeddable compiler (c6_* API + tcc_* compat)")
-    set(C6_PC_LIBS "-lc6c")
-    set(C6_PC_VARS "c6=\${bindir}/c6${C6_TCC_EXESUF}")
-    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6.pc.in"
-                   "${CMAKE_CURRENT_BINARY_DIR}/c6lib.pc" @ONLY)
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/c6lib.pc"
-            DESTINATION "${C6_PKGCONFIG_DIR_REL}")
-    set(C6_PC_LIBS "${_c6_pc_libs_saved}")
-    set(C6_PC_VARS "${_c6_pc_vars_saved}")
+    c6_install_pc(c6lib "c6lib"
+      "c6lib - c6c embeddable compiler (c6_* API + tcc_* compat)"
+      "-lc6c" "c6=\${bindir}/c6${C6_TCC_EXESUF}")
   endif()
 
   if(C6_INSTALL_LIBTCC_PC AND C6_ENABLE_TCC)
-    set(C6_PC_NAME "libtcc")
-    set(C6_PC_DESCRIPTION "libtcc - TinyCC/c6 embeddable C compiler library")
-    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6.pc.in"
-                   "${CMAKE_CURRENT_BINARY_DIR}/libtcc.pc" @ONLY)
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/libtcc.pc"
-            DESTINATION "${C6_PKGCONFIG_DIR_REL}")
+    c6_install_pc(libtcc "libtcc"
+      "libtcc - TinyCC/c6 embeddable C compiler library"
+      "${C6_PC_LIBS}" "${C6_PC_VARS}")
   endif()
 endif()

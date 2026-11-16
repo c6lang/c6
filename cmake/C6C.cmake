@@ -44,21 +44,12 @@ set(C6C_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # Python3 是 c6c 跑分/回归的依赖，详见 README 与 docs/manual/testing.md。
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-include(ProcessorCount)
-ProcessorCount(C6C_JOBS)
-if(C6C_JOBS EQUAL 0)
-  set(C6C_JOBS 4)
-endif()
+# 并发数沿用 C6Options.cmake 算好的那一个（同一个 ProcessorCount，别算两遍）
+set(C6C_JOBS "${C6_TCC_JOBS}")
 
-# 引导编译器 tcc/c6 在 shared 形态（-DC6_TCC_SHARED_LIBTCC=ON）下自己就链到
-# libtcc.so：构建树里的 c6 没有 rpath，直接执行会报 libtcc.so 找不到。所以凡是
-# 要**执行** c6 的地方都补 LD_LIBRARY_PATH，口径与 C6Testing.cmake 一致。
+# 执行引导编译器 c6 时要补的 LD_LIBRARY_PATH（shared 形态，见 C6Metadata.cmake）
 set(_c6c_ld_env "")
-if(C6_ENABLE_TCC AND NOT C6_TCC_STATIC)
-  set(_c6c_ld_path "${C6_TCC_DIR}:$ENV{LD_LIBRARY_PATH}")
-  string(REGEX REPLACE ":+$" "" _c6c_ld_path "${_c6c_ld_path}")
-  set(_c6c_ld_env "LD_LIBRARY_PATH=${_c6c_ld_path}")
-endif()
+c6_ld_env(_c6c_ld_env)
 
 file(GLOB C6C_SRCS CONFIGURE_DEPENDS "${C6C_DIR}/src/*.c6")
 

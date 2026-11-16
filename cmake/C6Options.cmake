@@ -92,19 +92,6 @@ function(c6_prefix_relative out path)
   set(${out} "${_rel}" PARENT_SCOPE)
 endfunction()
 
-# .pc 文件里的 prefix：用 ${pcfiledir} 反推安装前缀，装到别的前缀 / DESTDIR
-# 暂存树里也能直接用（pkgconf 会按 pc 文件自己的位置展开 pcfiledir）。
-# c6.pc / c6lib.pc / libtcc.pc / c6c.pc 共用这一条，别各算各的。
-function(c6_pcfile_prefix out pkgconfig_dir)
-  file(RELATIVE_PATH _rel "${pkgconfig_dir}" "${CMAKE_INSTALL_PREFIX}")
-  string(REGEX REPLACE "/+$" "" _rel "${_rel}")
-  if(_rel STREQUAL "" OR _rel STREQUAL ".")
-    set(${out} "\${pcfiledir}" PARENT_SCOPE)
-  else()
-    set(${out} "\${pcfiledir}/${_rel}" PARENT_SCOPE)
-  endif()
-endfunction()
-
 # 归一化写回 cache，而不是用普通 set() 遮蔽用户传入的 cache 值：后者会让
 # 第二次 configure 又读到未归一化的旧值，CMakeCache 里也看不出 -D 的结果。
 set(_c6_tccdir_doc

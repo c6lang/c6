@@ -7,6 +7,27 @@
 
 ## 未发布
 
+### 构建：c6 与 c6c 的安装元数据收敛到 `cmake/C6Metadata.cmake`
+
+- `.pc` 生成、`find_package(...)` 包配置、`LD_LIBRARY_PATH` 注入三件事原本各自
+  在多个模块里重复：`.pc` 的 `${pcfiledir}` 前缀反推写过一遍又一遍，包配置的四
+  件套（`configure_package_config_file` + `write_basic_package_version_file` +
+  `configure_file(Targets)` + `install`）在 `C6LibraryConfig.cmake` 与
+  `C6CInstall.cmake` 各有一份 30 行样板，执行构建树的 c6 要补的环境变量在
+  `C6Testing.cmake` / `C6Wasm.cmake` / `C6C.cmake` 写了三遍。现在统一成
+  `c6_ld_env()` / `c6_pcfile_prefix()` / `c6_install_pc()` /
+  `c6_install_cmake_package()` 四个函数。
+- 四个 pkgconf 包（`c6` / `c6lib` / `libtcc` / `c6c`）共用 `cmake/c6.pc.in`，
+  **删掉** `cmake/c6c.pc.in`；`tccdir=` 行与"变量"注释参数化，c6c 不再输出无意义
+  的 `tccdir=`。`c6.pc` / `c6lib.pc` / `libtcc.pc` 的输出与改造前逐字节相同。
+- 并发数不再算两遍：`C6C.cmake` 直接复用 `C6Options.cmake` 的 `C6_TCC_JOBS`。
+- `check-install` / `pkgcheck` 里的落点变量（`C6_PACKAGE_DIR`、
+  `C6C_PACKAGE_DIR`）显式保留，未生成包配置时留空值。
+- 验证：`pkgcheck` 10/10、`check-install` 通过、`check-all-c6c` 全绿（fixpoint
+  逐字节相同、std 381/0、tests2 117/0 意外失败、c-testsuite 149/150 且 0 失败、
+  前端回归 52/0、c6c 回归 52/0）；ON（tcc 引导）与 OFF（宿主 cc 引导）都
+  configure + build 通过。
+
 ### 安装：c6c 有了自己的 `find_package(c6c)` 与 `c6c.pc`；`C6C.cmake` 拆成五个模块
 
 - **c6c 的包元数据**：此前无论哪种 flavour，安装树里只有 `c6.pc` / `c6lib.pc` /
