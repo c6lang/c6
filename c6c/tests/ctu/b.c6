@@ -1,0 +1,25 @@
+/* ctu 后端验收 TU B —— 递归 / unsigned / 指针形参（`*p` 读写）。
+ * 和 a.c6 一样只用普通 C，验收脚本会用 gcc 直接编一份参照物。 */
+
+int b_scale2 = 3;
+
+int b_add(int x, int y)
+{
+    return x + y + b_scale2;
+}
+
+unsigned b_fib(unsigned n)
+{
+    if (n < 2)
+        return n;
+    return b_fib(n - 1) + b_fib(n - 2);
+}
+
+int b_swap_add(int *p, int *q)
+{
+    int t = *p;
+
+    *p = *q;
+    *q = t;
+    return *p - *q;
+}
