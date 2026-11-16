@@ -989,6 +989,15 @@ static int DEF_DEPTH;      /* 前向声明：块嵌套深度（定义在后面�
 
 static int C6_TU_SEEN;      /* 这个编译单元里有 .c6 文件（主文件就是） */
 
+/* 自动挂上的自带运行时（lib/rt.c6）的源文件 id，0 = 还没挂。
+ *
+ * 它**不参与** C6_TU_SEEN 的判定：运行时是 c6c 自己无条件塞进来的，跟用户
+ * 这一单编的是不是 c6 无关。少了这一条，编任何纯 C 文件都会因为 rt.c6 被
+ * 预处理到而把整个 TU 认成 c6——于是**外部头文件**里的函数体开始按 c6 的
+ * 规矩查，"`int bytes;` 必须初始化"在内核 include/linux/overflow.h 上直接
+ * 开火（实测：只 include <linux/list.h> 就多出 3 条这一类假诊断）。 */
+static u32 C6_RT_FILE;
+
 /* in_c6_tu() 的按文件缓存：文件 id → 后缀类别（1 = `.c6`，2 = `.h`，3 = 别的）。
  * 这个判断每个 token 都要被问一次（`c6_kw()` 撒在声明、表达式、语句解析的每个
  * 岔路口），原来每问一次就 strlen(路径) + memcmp 走一遍路径字符串——c6c 自己
@@ -1069,6 +1078,9 @@ static int in_c6_tu(void)
             C6K_CLASS[id] = k;
     }
     if (k == 1) {
+        /* 自动挂上的运行时不算数：它是 c6c 自己塞的，不代表用户编的是 c6 */
+        if ((u32)id == C6_RT_FILE)
+            return 0;
         /* 记一笔：从 .c6 里 include 进来的头文件（`.h`）也按 c6 的规矩查
          * （tests/errors/loc.c6 的 test_sizeof_in_header：头文件里不能
          * `int g;` 这样定义未初始化的对象）。 */
@@ -20833,8 +20845,12 @@ static int pa_push_rt(const char *argv0)
     {
         SrcFile *rf = src_load(rt);
 
-        if (rf)
+        if (rf) {
+            /* 记下来：c6 判定要能认出它、并且不因为它就把整个 TU 认成 c6
+             * （见 C6_RT_FILE 的说明）。 */
+            C6_RT_FILE = rf->id;
             pp_push_file(rf, -1);
+        }
     }
     return 0;
 }
