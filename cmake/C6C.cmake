@@ -247,6 +247,14 @@ c6c_target(c99suite ENV C6C=${C6C_BIN} ROOT=${C6C_ROOT}
   COMMAND ./tests/c99-suite.sh -j ${C6C_JOBS}
   COMMENT "c6c: c99suite（third_party/c-testsuite 150 条，语言层闸门）")
 
+# --- per-TU C 后端（--emit-ctu，见 src/ctu.c6）---
+# 这条路交出去的是**真 C**，所以参照物就是宿主 cc 自己：同一份源走 ctu 后端与
+# 直接当 C 编，两个程序的输出必须逐字节相同。交叉构建（rtos-c6 的 xtensa）
+# 另有 tests/ctu/rtos-smoke.sh，要目标工具链，不进这条门禁。
+c6c_target(ctutest ENV C6C=${C6C_BIN} CC=${CMAKE_C_COMPILER}
+  COMMAND ./tests/ctu/run.sh
+  COMMENT "c6c: ctutest（--emit-ctu 的 per-TU C 后端与宿主 cc 参照逐字节比）")
+
 c6c_target(tests1-check ENV C6C=${C6C_BIN} ROOT=${C6C_ROOT}
   COMMAND ./tests/tcc-tests1.sh
   COMMENT "c6c: tests1-check（tcc 上游 tests/ 老式单文件用例）")
@@ -320,14 +328,14 @@ c6c_target(g2c-check DEPENDS build-tcc ENV ROOT=${C6C_ROOT}
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
-          embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
+          embedcheck pkgcheck tests2-check tests1-check ctutest c99suite llvmtest
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
-          c99suite llvmtest test-c6c build-tcc tests1-check tests2-check
+          c99suite llvmtest ctutest test-c6c build-tcc tests1-check tests2-check
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")
 
 add_custom_target(check-all-perf
@@ -369,6 +377,10 @@ if(BUILD_TESTING)
   add_test(NAME c6c-lint
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target lint)
   set_tests_properties(c6c-lint PROPERTIES LABELS "c6c" TIMEOUT 300)
+
+  add_test(NAME c6c-ctutest
+           COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target ctutest)
+  set_tests_properties(c6c-ctutest PROPERTIES LABELS "c6c" TIMEOUT 300)
 
   add_test(NAME c6c-check-all
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
