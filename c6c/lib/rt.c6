@@ -4351,6 +4351,63 @@ const char *inet_ntop(int af, const void *src, char *dst, unsigned int size)
     return dst;
 }
 
+/* getnameinfo：解析器这一层只拿它把对端地址写成人能看的样子
+ * （std/net/udp.c6 传 NI_NUMERICHOST，只要数字形式）。所以这里只做数字：
+ * IPv4 借上面的 inet_ntop，IPv6 手写 8 组十六进制（不做 `::` 压缩）；
+ * 要 PTR 反查得真 resolver，rt.c6 没有——返回 -2（EAI_NONAME）比编个假名字诚实。
+ *
+ * rt.c6 不包含系统头，sockaddr 的布局按 Linux x86_64 手算：
+ *   sockaddr_in  { u16 family; u16 port_be; u8 addr[4]; }
+ *   sockaddr_in6 { u16 family; u16 port_be; u32 flow; u8 addr[16]; u32 scope; }
+ * 家族号 AF_INET = 2、AF_INET6 = 10；返回值是 glibc 的 EAI_*（0 = 成功，
+ * -6 = EAI_FAMILY，-12 = EAI_OVERFLOW）。 */
+int getnameinfo(const void *sa, unsigned int salen, char *host,
+                unsigned int hostlen, char *serv, unsigned int servlen, int flags)
+{
+    const unsigned char *p = (const unsigned char *)sa;
+    unsigned int fam = 0;
+
+    (void)salen;
+    (void)flags;
+    if (!sa)
+        return -2;                      /* EAI_NONAME */
+    fam = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+    if (host && hostlen) {
+        if (fam == 2) {                 /* AF_INET */
+            if (!inet_ntop(2, p + 4, host, hostlen))
+                return -12;             /* EAI_OVERFLOW */
+        } else if (fam == 10) {         /* AF_INET6：8 组 %x，冒号隔开 */
+            char t[64] = {0};
+            unsigned int i = 0, off = 0;
+
+            for (i = 0; i < 8; i++) {
+                unsigned int g = ((unsigned int)p[8 + i * 2] << 8)
+                    | (unsigned int)p[9 + i * 2];
+                int w = snprintf(t + off, sizeof t - off, i ? ":%x" : "%x", g);
+
+                if (w <= 0 || off + (unsigned int)w >= sizeof t)
+                    return -12;
+                off += (unsigned int)w;
+            }
+            if (off + 1 > hostlen)
+                return -12;
+            memcpy(host, t, (unsigned long)off + 1);
+        } else {
+            return -6;                  /* EAI_FAMILY */
+        }
+    }
+    if (serv && servlen) {
+        char t[16] = {0};
+        unsigned int port = ((unsigned int)p[2] << 8) | (unsigned int)p[3];
+        int w = snprintf(t, sizeof t, "%u", port);
+
+        if (w <= 0 || (unsigned int)w + 1 > servlen)
+            return -12;
+        memcpy(serv, t, (unsigned long)w + 1);
+    }
+    return 0;
+}
+
 /* 第二批发现在链文件、fcntl、口令库、信号集上的那几条：同一批用例（std/fsx、
  * std/ub、std/sys、std/term、std/wire）下一层缺的符号。 */
 int symlink(const char *target, const char *path)

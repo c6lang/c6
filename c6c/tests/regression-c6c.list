@@ -28,6 +28,7 @@ std-cfg2
 std-check
 std-clean
 std-cli
+std-client
 std-color
 std-cont
 std-creds
