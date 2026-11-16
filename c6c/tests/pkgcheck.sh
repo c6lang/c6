@@ -53,13 +53,13 @@ ok "安装完成（--prefix 到临时目录）"
 
 # --- 1. 安装树 ---
 miss=""
-for f in bin/c6 include/c6lib.h include/libtcc.h lib/libc6c.a lib/libc6c.so \
+for f in bin/c6 bin/c6c include/c6lib.h include/libtcc.h lib/libc6c.a lib/libc6c.so \
          lib/c6/rt.c6 lib/c6/include/stddef.h lib/c6/include/stdarg.h \
          lib/pkgconfig/c6.pc lib/pkgconfig/c6lib.pc lib/cmake/c6/c6Config.cmake; do
     [ -e "$PREFIX/$f" ] || miss="$miss $f"
 done
 if [ -z "$miss" ]; then
-    ok "安装树齐全（bin/c6 / 嵌入库 / 兼容头 / lib/c6 自带头与运行时 / pc / cmake）"
+    ok "安装树齐全（bin/c6 + bin/c6c / 嵌入库 / 兼容头 / lib/c6 自带头与运行时 / pc / cmake）"
 else
     bad "安装树齐全" "缺：$miss"
 fi
@@ -151,6 +151,19 @@ if "$PREFIX/bin/c6" -o "$WORK/self" "$WORK/self.c6" >"$WORK/self.log" 2>&1; then
     fi
 else
     bad "装出来的 c6 编译" "$(tail -3 "$WORK/self.log")"
+fi
+
+# bin/c6c 是同一个自举编译器的第二个名字（默认配置里它与 tcc 版 c6 并存）：
+# 它按 argv[0] 推目录的规则同样要成立。
+if "$PREFIX/bin/c6c" -o "$WORK/self6c" "$WORK/self.c6" >"$WORK/self6c.log" 2>&1; then
+    got=$("$WORK/self6c")
+    if [ "$got" = "self ok 3" ]; then
+        ok "bin/c6c 也自找 include/ 与 rt.c6"
+    else
+        bad "bin/c6c 编出的程序" "输出『$got』"
+    fi
+else
+    bad "bin/c6c 编译" "$(tail -3 "$WORK/self6c.log")"
 fi
 
 echo "c6c 安装契约：通过 $pass / 失败 $fail"

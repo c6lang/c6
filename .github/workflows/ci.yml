@@ -311,20 +311,28 @@ jobs:
           # CPack 的中间目录不能进 artifact/release：否则 sha256sum * 会碰到目录
           rm -rf packages/_CPack_Packages
           ls -lh packages/
+          # 自举编译器 c6c 必须和它的自带头文件、rt.c6 成套出现：c6c 按 argv[0]
+          # 找 <bin>/../lib/c6/{include,rt.c6}，缺一个就编不了任何程序。
           case "${{ matrix.generator }}" in
             DEB)
               dpkg-deb --info packages/*.deb
               dpkg-deb --contents packages/*.deb | head -40
               dpkg-deb --contents packages/*.deb | grep -q 'usr/share/doc/c6/docs/README.md'
+              dpkg-deb --contents packages/*.deb | grep -q 'usr/bin/c6c'
+              dpkg-deb --contents packages/*.deb | grep -q 'usr/lib/c6/rt.c6'
               ;;
             RPM)
               rpm -qip packages/*.rpm
               rpm -qlp packages/*.rpm | head -40
               rpm -qlp packages/*.rpm | grep -q 'usr/share/doc/c6/docs/README.md'
+              rpm -qlp packages/*.rpm | grep -q 'usr/bin/c6c'
+              rpm -qlp packages/*.rpm | grep -q 'usr/lib/c6/rt.c6'
               ;;
             TGZ)
               tar tzf packages/*.tar.gz | head -40
               tar tzf packages/*.tar.gz | grep -q 'usr/share/doc/c6/docs/README.md'
+              tar tzf packages/*.tar.gz | grep -q 'usr/bin/c6c'
+              tar tzf packages/*.tar.gz | grep -q 'usr/lib/c6/rt.c6'
               ;;
           esac
 
