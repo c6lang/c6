@@ -37,6 +37,7 @@ std-disk
 std-doc
 std-docs
 std-ds
+std-embed
 std-enc
 std-exec
 std-font
