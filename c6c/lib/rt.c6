@@ -563,6 +563,8 @@ enum {
 #define C6C_CLONE_SIGHAND 0x00000800l
 #define C6C_CLONE_THREAD 0x00010000l
 #define C6C_CLONE_SYSVSEM 0x00040000l
+#define C6C_CLONE_CHILD_SETTID 0x01000000l
+#define C6C_CLONE_CHILD_CLEARTID 0x00200000l
 #define C6C_FUTEX_WAIT_ 0
 #define C6C_FUTEX_WAKE_ 1
 
@@ -606,7 +608,7 @@ typedef struct C6Co {
     int unwind;                 /* 销毁挂起的任务：下次恢复就回卷 */
     int val_mgd;                /* 任务的 val 槽持有一份托管引用 */
     int nogate;                 /* `co f()`：语句处就直接跑，不停在起点闸门上 */
-    int exited;                 /* 线程已经走到"不再碰 C6Co"那一步了 */
+    int exited;                 /* 线程已经走到 epilogue 了（退役判据看 tid，见 c6c_co_retire） */
     void *stack;
     long tid;
     struct C6Co *next;
@@ -616,7 +618,7 @@ static C6Co *C6_CO_ALL;         /* 还活着的协程 */
 static C6Co *C6_CO_IDLE;        /* 跑完了、栈还能再用的槽 */
 static C6Co *C6_CO_CUR;         /* 当前在跑的那个（同一时刻只有一个） */
 
-long __c6_co_spawn(unsigned long flags, void *sp, void *slot);
+long __c6_co_spawn(unsigned long flags, void *sp, void *slot, void *ctid);
 
 /* 执行权令牌：同一时刻只有 TURN 指向的那个在跑，NULL 表示主线程在跑。
  *
@@ -665,8 +667,14 @@ void __c6_co_entry(void *slot)
     c->done = 1;
     c->state = 3;
     C6_CO_CUR = 0;
-    c->exited = 1;                      /* 从这一句起不再碰 C6Co 的内存 */
-    c6c_co_give(c->resumer);            /* 交回控制权，之后不再醒来 */
+    /* 交出控制权之前把 resumer 存进本地：进了 c6c_co_give 之后这一槽随时可能
+     * 被下一个协程复用（槽里的字段会被改写），再去读 c->resumer 就晚了。 */
+    {
+        C6Co *back = c->resumer;
+
+        c->exited = 1;
+        c6c_co_give(back);              /* 交回控制权，之后不再醒来 */
+    }
     c6c_sys1(C6C_SYS_EXIT, 0);
     for (;;)
         ;
@@ -863,22 +871,42 @@ static C6Co *c6c_co_alloc(void)
     return c;
 }
 
-/* 退役：从"活着"的链表摘下来，挂回空闲链表（栈跟着槽复用） */
+/* 退役：从"活着"的链表摘下来，挂回空闲链表（栈跟着槽复用）。
+ *
+ * 挂回之前必须等**线程真的退出**。exited 标志是线程自己在 epilogue 里置的，
+ * 置完它还站在自己的栈上跑 c6c_co_give() 和 exit 那几条指令；这时候把栈交给
+ * 下一个协程，新线程一 push 就把旧线程的返回地址踩成垃圾，旧线程 ret 到地址 0
+ * （CI 上 async 用例偶发段错误就是这个）。线程退出时内核把 CLONE_CHILD_CLEARTID
+ * 指的那个字清零并 futex 唤醒，所以这里等 c->tid 变 0 就够了——不用自旋，
+ * 也不用赌调度。等不到（这个槽的线程还活着）就不挂回空闲链：漏一个槽也比
+ * 两个线程共用一份栈强。 */
 static void c6c_co_retire(C6Co *c)
 {
     C6Co **pp = &C6_CO_ALL;
+    long spins = 0;
 
     for (; *pp; pp = &(*pp)->next)
         if (*pp == c) {
             *pp = c->next;
             break;
         }
-    /* 交令牌之前旧线程就把 exited 置好了，这里只需要一个防御性自旋 */
-    {
-        long spins = 0;
+    /* 等线程退出：每轮最多睡 10ms，上限 200 轮（正常情况第一次就醒）。 */
+    while (c->tid && spins++ < 200) {
+        struct timespec ts = {0};
+        long tid = c->tid;
 
-        while (!c->exited && spins++ < 10000000l)
-            c6c_sys1(24 /* sched_yield */, 0);
+        if (!tid)
+            break;                      /* 已经退干净了 */
+        ts.tv_sec = 0;
+        ts.tv_nsec = 10000000l;
+        c6c_sys6(C6C_SYS_FUTEX_, (long)&c->tid, C6C_FUTEX_WAIT_, tid,
+                 (long)&ts, 0, 0);
+    }
+    if (c->tid) {
+        /* 等了 2 秒还没退：说明这个槽的线程还活着（被退休的协程卡在挂起点上
+         * 之类）。这份栈**绝对不能**再给别人——宁可漏掉一个槽，也不能让两个
+         * 线程踩同一份栈。 */
+        return;
     }
     c->next = C6_CO_IDLE;
     C6_CO_IDLE = c;
@@ -913,9 +941,12 @@ void *__c6_co_launch(void *h)
     if (!c)
         return 0;
     sp = ((unsigned long)c->stack + C6_CO_STACK) / 16ul * 16ul - 16ul;
+    /* SETTID + CLEARTID 指向同一个字 c->tid：线程一退出，内核把它清零并 futex
+     * 唤醒，c6c_co_retire() 就靠这个字判断"栈能不能给别人了"。 */
     tid = __c6_co_spawn(C6C_CLONE_VM | C6C_CLONE_FS | C6C_CLONE_FILES
-                        | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM,
-                        (void *)sp, c);
+                        | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM
+                        | C6C_CLONE_CHILD_SETTID | C6C_CLONE_CHILD_CLEARTID,
+                        (void *)sp, c, (void *)&c->tid);
     if (tid < 0)
         return 0;
     c->tid = tid;

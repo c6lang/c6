@@ -64,12 +64,17 @@ static const u8 ASM_SWAPSTACK[36] = {
     0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
 };
 
-/* long __c6_co_spawn(unsigned long flags, void *sp, void *slot)
+/* long __c6_co_spawn(unsigned long flags, void *sp, void *slot, void *ctid)
  * 和 __c6_th_spawn 一模一样，只是子线程进的是 __c6_co_entry（协程入口：
- * 先等第一次 resume，再跑函数体，跑完把控制权交回去）。 */
+ * 先等第一次 resume，再跑函数体，跑完把控制权交回去）。
+ *
+ * 第 4 个参数 ctid 同时当 clone 的 ptid/ctid 用（系统调用参数是 r10/rdx）：
+ * 配上 CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID，线程一退出内核就把这个字
+ * 清零并 futex 唤醒——退役的槽要等到这一刻才敢把栈给下一个协程（不然旧
+ * 线程还在自己的栈上跑 epilogue，新协程一上来就把它的返回地址踩了）。 */
 static const u8 ASM_CO_SPAWN[34] = {
-    0x49, 0x89, 0xd1, 0xb8, 0x38, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x4d,
-    0x31, 0xd2, 0x4d, 0x31, 0xc0, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x74, 0x01,
+    0x49, 0x89, 0xd1, 0x49, 0x89, 0xca, 0xb8, 0x38, 0x00, 0x00, 0x00, 0x48,
+    0x89, 0xca, 0x4d, 0x31, 0xc0, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x74, 0x01,
     0xc3, 0x4c, 0x89, 0xcf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4
 };
 
@@ -150,9 +155,9 @@ static const AsmBlob ASMBLOBS[] = {
       ".text\n.globl __c6_unlock_\n__c6_unlock_:\n\tmovl $0, (%rdi)\n\tret\n" },
     { "__c6_co_spawn", ASM_CO_SPAWN, 34, 1, { { 29, "__c6_co_entry" } },
       ".text\n.globl __c6_co_spawn\n__c6_co_spawn:\n"
-      "\tmov %rdx, %r9\n\tmov $56, %eax\n\txor %rdx, %rdx\n"
-      "\txor %r10, %r10\n\txor %r8, %r8\n\tsyscall\n\ttest %rax, %rax\n"
-      "\tje 1f\n\tret\n1:\n\tmov %r9, %rdi\n\tcall __c6_co_entry\n\thlt\n" },
+      "\tmov %rdx, %r9\n\tmov %rcx, %r10\n\tmov $56, %eax\n\tmov %rcx, %rdx\n"
+      "\txor %r8, %r8\n\tsyscall\n\ttest %rax, %rax\n\tje 1f\n\tret\n"
+      "1:\n\tmov %r9, %rdi\n\tcall __c6_co_entry\n\thlt\n" },
     { "__c6_atomic_inc", ASM_ATOMIC_INC, 16, 0, { { 0, 0 } },
       ".text\n.globl __c6_atomic_inc\n__c6_atomic_inc:\n"
       "\tmov $1, %rax\n\tlock xadd %rax, (%rdi)\n\tinc %rax\n\tret\n" },
