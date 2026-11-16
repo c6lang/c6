@@ -42,6 +42,25 @@
 
 ## 0.6.2 — 2026-11-16
 
+### protobuf：线格式运行时 + `protoc6` 生成器
+
+- 新增 `std/data/protobuf.c6`（`std.data.protobuf`，err 号段 `0x6179`）：零分配的线格式
+  读写——`pb_writer`/`pb_reader`、`PbWriter` 的 `write_key`/`write_tag_*`/`write_fixed*`/
+  `write_str`/`put`/`mark`/`mark_end`、`PbReader.next` + `PbField.as_*`、`skip`（未知字段
+  与 group 配对）、`packed` 迭代器 `PbIter`。4 个 `test` 块覆盖规范向量（`08 96 01` /
+  `12 07 testing` / 嵌套 / packed）、zigzag 与 10 字节负数、坏数据与写端容量、尺寸回填。
+- 新增 `tools/protoc6`：`protofile.c6` 做 `.proto` 的解析与校验（proto2/proto3、嵌套消息
+  与枚举、`map`、`oneof`、`packed`/`default`、19000-19999 保留号、重号/重名/未解析类型），
+  `protoc6.c6` 生成 C6 结构体与 `init`/`size`/`encode`/`decode`（proto3 隐式 presence、
+  proto2 required 位图与默认值、repeated/map 固定容量、未知字段与线型不符都跳过、解码
+  全有或全无、递归消息类型在生成阶段报错）。
+- 用例：`tests/protobuf/{addressbook,basic,packed,maponeof}.proto` + `roundtrip.c6`（黄金
+  字节、全类型往返、proto2 默认值与 required、map/oneof/未知字段、失败路径）；回归用例
+  `std-protobuf`（进 `C6_STD_TARGETS` / `C6_TEST_ALL`）先编 `protoc6`、生成、跑 `-test`，
+  再跑集成示例 `examples/stdprotobuf.c6`。
+- `std/data/protobuf.c6` 补上 `ok()`（读端与 `PbIter` 各一个），`errbase.def` 与
+  `docs/reference/grammar.md` §8.1 的号段表同步。
+
 ### CI：发版说明直接取自版本提交的正文
 
 - release job 的正文改成取**版本提交**（主题正好是 `c6 <VERSION>`）的正文：发版
@@ -443,7 +462,7 @@ v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口�
   完整握手、SNMP v3、LDAP/RADIUS/SIP、Office/Parquet/7z、GPX/KML/GeoJSON、
   base36/62 变体、词典级断词/排序），以及「什么时候到头」的三条判定标准与结论。
 
-### 标准库第九十三批：QUIC 与 HTTP/3
+### 标准库第九十四批：QUIC 与 HTTP/3
 
 - **`std/net/quic.c6`**：QUIC 报文层。变长整数、长/短包头解析、头构造器
   `HeaderBuilder`、全部帧型（`Frame.parse` + `frame_put_*`）、ACK 区间游标 `AckIt`、
@@ -471,7 +490,7 @@ v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口�
 - 与第九十二批的关系：上一批的 `std/net/hpack` 是 HTTP/2 的；这一批的
   `std/net/hpack` 是同一套思路的 QUIC 版（模块名不冲突，路径不同）
 - 集成示例 `examples/stdquic.c6`（`ctest --test-dir build -R '^std-quic$'`，72 条检查）；
-  err 号段 0x6179…0x6186；`std/` 到 **395** 个模块。
+  err 号段 0x6179…0x6186；`std/` 到 **396** 个模块。
 ### 标准库第九十二批：HTTP/2（HPACK / 帧层 / h2c 客户端 / h2c 服务端）
 
 - **`std/encoding/hpack.c6`**：HPACK 头压缩（RFC 7541）。61 项静态表 + 动态表（尺寸更新、

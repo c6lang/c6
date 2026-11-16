@@ -3055,7 +3055,33 @@ container 33 / os 32 / async 13 / analysis 3）；四个模块的 `-test` 逐个
 HTTP/3 仍然不做，但理由从「类型学不符」改成「等于随包一个传输栈」的代价判断。这一批本身就是
 按新标准收进来的：HTTP/2 既不是变体，也不只是编解码。
 
-### 11.108 标准库第九十三批（QUIC 与 HTTP/3）
+## protobuf：线格式运行时 + `protoc6` 工具链
+
+`std/data/protobuf.c6`（`std.data.protobuf`，err 号段 `0x6187`）把 protobuf 的线格式做全：
+`pb_writer`/`pb_reader` 两个工厂，`PbWriter` 的 `write_key`/`write_tag_*`/`write_fixed*`
+/`write_str`/`put`/`mark`/`mark_end`，`PbReader.next` + `PbField` 的 `as_*` 访问器，
+`skip`（未知字段、group 配对、定长与长度前缀负载都走完），`packed` 迭代器 `PbIter`。
+坏数据一律 fail-closed：截断的 varint、越界的长度、字段号 0、线类型 6/7、不闭合的
+group 都返回 -1；写端溢出置 `bad` 并忽略后续写入。
+
+工具链在 `tools/protoc6`：`protofile.c6` 解析 `.proto`（proto2/proto3、嵌套消息与枚举、
+`map`、`oneof`、`packed`/`default`、19000-19999 保留号、重号重名、类型解析按
+inner → outer → package → global 查作用域），`protoc6.c6` 生成 C6 结构体与
+`init`/`size`/`encode`/`decode`。生成代码只依赖 `std.data.protobuf` 与 `std.text.str`：
+零分配、repeated/map 用固定容量（`--rep-cap`，默认 8）、字符串是输入上的视图、
+解码全有或全无（先解到临时结构体，成功才落到 `*out`）、未知字段与线型不符的已知字段
+都按 protoc 的语义跳过、递归的消息类型在生成阶段报错（C6 结构体按值嵌入会无限大）。
+
+验收：`std/data/protobuf.c6` 4 个 `test` 块 30 条 0 failure；`tests/protobuf/roundtrip.c6`
+5 个 `test` 块（黄金字节、全类型往返、proto2 默认值与 required、map/oneof/未知字段、
+失败路径）；回归用例 `std-protobuf` 先编 `protoc6`、把四份 `.proto` 生成到 `$C6_OUT/pb`、
+跑 `-test`，再编跑 `examples/stdprotobuf.c6`（30 条检查）；`c6-errcheck` 在
+`errbase.def` 补上 `protoc6.protofile` 之后重跑通过。
+
+`std/` 现在 **382** 个 `.c6` 文件（core 53 / data 86 / encoding 54 / net 56 /
+text 52 / container 33 / os 32 / async 13 / analysis 3）。
+
+### 11.109 标准库第九十四批（QUIC 与 HTTP/3）
 
 | 模块 | 内容 | test 块 | 方法入口 |
 |---|---|---:|---|
@@ -3082,7 +3108,7 @@ HTTP/3 仍然不做，但理由从「类型学不符」改成「等于随包一�
 `std.net.quicstream`=0x6181、`std.net.quicconn`=0x6182、`std.net.h3conn`=0x6183、
 `std.net.quicd`=0x6184、`std.net.h3c`=0x6185、`std.net.h3d`=0x6186。
 
-`std/` 现在 **395** 个 `.c6` 文件；十四个模块的 test 块逐个跑过（3/3/5/3/3/3/5/3/3/4/
+`std/` 现在 **396** 个 `.c6` 文件；十四个模块的 test 块逐个跑过（3/3/5/3/3/3/5/3/3/4/
 3/3/2/2 条，0 failure）。注意与上一批的 `std/encoding/hpack` 区分：这一批的头压缩是 `std/net/hpack`
 （QUIC 侧的 HPACK 用法），两者同名不同模块，符号不会撞（方法按接收者取名）。
 `docs/stdlib-coverage.md` 的「不做」清单同步改写：QUIC/HTTP3

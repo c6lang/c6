@@ -187,6 +187,7 @@
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 | `std/data/bencode.c6` | `std.data.bencode` | Bencode（BEP 3，零分配）：`benc_writer` + `BencWriter` 的 `write_int`/`write_str`/`write_list`/`write_dict`/`write_end`、`benc_reader` + `BencReader.next` 的标记流（`BENC_INT`/`BENC_STR`/`BENC_LIST`/`BENC_DICT`/`BENC_END`）、`error_at`；整数/长度拒绝前导零与溢出，字典键排序交给调用方 |
 | `std/data/msgpack.c6` | `std.data.msgpack` | MessagePack（零分配）：`mp_writer` + `MpWriter` 的 `write_nil`/`write_bool`/`write_uint`/`write_int`/`write_f64`/`write_str`/`write_bin`/`write_array`/`write_map`、`mp_reader` + `MpReader.next` 得到 `MpTag`（类型/值/视图/元素个数）；读端支持定型整数、fixstr/str8/16/32、bin8/16/32、float32/float64，扩展类型与保留码 `c1` 一律 -1 |
+| `std/data/protobuf.c6` | `std.data.protobuf` | protobuf 线格式（零分配）：`pb_writer`/`pb_reader` 两个工厂 + `PbWriter` 的 `write_key`/`write_tag_*`/`write_fixed*`/`write_str`/`put`/`mark`/`mark_end`、`PbReader.next` 得到 `PbField`（字段号/线类型/视图/整数）与 `as_*` 访问器、`packed` 迭代器 `PbIter`；`skip` 支持未知字段与 group 配对；配套 `tools/protoc6` 把 `.proto` 生成结构体与 `init`/`size`/`encode`/`decode` |
 | `std/data/cbor.c6` | `std.data.cbor` | CBOR（RFC 8949，零分配）：`cbor_writer` + `CborWriter` 的 `write_uint`/`write_int`/`write_bytes`/`write_text`/`write_array`/`write_map`/`write_bool`/`write_null`/`write_f64`、`cbor_reader` + `CborReader.next` 得到 `CborTag`；主类型 0..5 全支持、半/单/双精度都转 f64；不定长、标签（主类型 6）、`f7`/`f8` 一律 -1 |
 | `std/data/pem.c6` | `std.data.pem` | PEM（RFC 7468）：`pem_encode`（每行 64 列、先算长度再写）、`pem_reader` + `PemReader.next` 得到 `PemBlock`（`label` + Base64 视图、多块迭代、CRLF/前后噪声容忍）、`PemBlock.decode_der` 走 `std.encoding.base64`；标签 1..48 个可打印 ASCII（不含 `-`、首尾不能是空格） |
 | `std/data/wav.c6` | `std.data.wav` | RIFF/WAVE 头解析（零分配）：`wav_parse` 给出格式/声道/采样率/位宽/对齐/`data_offset`/`data_size`，`WavInfo.frames` 按 block_align 算帧数；跳过 LIST/JUNK 等未知块（含奇数长度补齐），fmt 必须在 data 之前，截断/坏 magic 时 `valid=0` |
@@ -478,6 +479,7 @@
 | `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`cmake --build build --target std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
 | `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`cmake --build build --target std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
 | `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`cmake --build build --target std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
+| `examples/stdprotobuf.c6` | （无模块） | protobuf 这条线的拼装示例（`cmake --build build --target std-protobuf`）：手写 tag 核对规范向量（`08 96 01` / `12 07 testing`）、用 `protoc6` 生成的编解码走一本通讯录（嵌套/map/oneof/optional）、未知字段与 group 跳过、坏输入拒绝 |
 | `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`cmake --build build --target std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
 | `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`cmake --build build --target std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
 | `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`cmake --build build --target std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
@@ -544,7 +546,7 @@
 | `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`cmake --build build --target std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
 | `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`cmake --build build --target std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
 | `examples/stdh2.c6` | （无模块） | 第九十二批（HTTP/2）的拼装示例（`cmake --build build --target std-h2`）：HPACK / 帧层各一节，`fork` 起 h2c 服务端让 h2c 客户端在同一条连接上打三条流，最后验 HTTP/1 报文被 preface 拒绝（49 条检查） |
-| `examples/stdquic.c6` | （无模块） | 第九十三批（QUIC 与 HTTP/3）的拼装示例（`ctest --test-dir build -R '^std-quic$'`）：变长整数与帧、流与流控、一条 1-RTT 连接、一次 HTTP/3 GET、按 CID 分流共五节（72 条检查） |
+| `examples/stdquic.c6` | （无模块） | 第九十四批（QUIC 与 HTTP/3）的拼装示例（`ctest --test-dir build -R '^std-quic$'`）：变长整数与帧、流与流控、一条 1-RTT 连接、一次 HTTP/3 GET、按 CID 分流共五节（72 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4875,7 +4877,7 @@ cmake --build build --target std-docs
 节点与参数/属性游标；RTF 抽取（`fonttbl` 跳过、`\u20320` → 「你」）；最后串成
 「KDL 读输出目录 + mbox 取主题 + plural 生成数量 + RTF 抽正文」（48 条检查）。
 
-### 第九十三批：QUIC 与 HTTP/3（`quic` / `aead` / `hpack` / `qpack` / `h3` / `quichp` / `quictls` / `quicrecovery` / `quicstream` / `quicconn` / `h3conn` / `h3c` / `h3d` / `quicd`）
+### 第九十四批：QUIC 与 HTTP/3（`quic` / `aead` / `hpack` / `qpack` / `h3` / `quichp` / `quictls` / `quicrecovery` / `quicstream` / `quicconn` / `h3conn` / `h3c` / `h3d` / `quicd`）
 
 十四个模块、九层，从「一个字节怎么解释」一路铺到「一条 GET 怎么拿到响应」。这一批
 破了两个惯例：一是「每批 4 个模块」（QUIC 全栈拆成 4 个就没法互相验证），二是
