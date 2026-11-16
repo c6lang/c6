@@ -1,0 +1,1061 @@
+/* std/net/quicconn：QUIC 连接（RFC 9000 §5–§13 的最小可用子集）。
+ *
+ *     import std.net.quicconn;
+ *
+ *     QConn c = { 0 };
+ *     c.init(0, scid, 8);                 -- 客户端，自选 8 字节 CID
+ *     c.set_dcid(dcid, 8);
+ *     c.set_keys(TLS13_AES_128_GCM_SHA256, rx_secret, tx_secret);
+ *     c.write_stream(0, "GET /", 5);
+ *     u8 out[1500] = { 0 };
+ *     int n = c.flush(out, sizeof out);   -- 一个带 STREAM 帧的 1-RTT 包
+ *     ...
+ *     c.on_packet(in, in_len, now_us);    -- 收包：解保护、解密、分发帧
+ *
+ * 这个模块把前面几层拼成一条连接：
+ *
+ * - 包头与帧：`std.net.quic`（`Packet.parse`、`Frame.parse`、`frame_put_*`）；
+ * - 包保护：`std.net.quichp`（头保护）+ `std.encoding.aead`（负载）；
+ * - 密钥：`std.net.quictls`（`tls13_quic_key` 从流量密钥派生 key/iv/hp）；
+ * - 流与流控：`std.net.quicstream`；
+ * - 丢包与拥塞：`std.net.quicrecovery`。
+ *
+ * 收到的包这样处理：
+ *
+ * 1. 先按包头布局定位包号（短包头是 1 + CID 长度，长包头要扫过 token 和
+ *    Length），**在此之前包号长度还藏在被保护的首字节里**，所以先取出采样、
+ *    算出 5 字节掩码，只还原首字节，读出 `pn_len = (first & 3) + 1`，再还原
+ *    包号本身——这正是 RFC 9001 §5.4.2 要求的两步走；
+ * 2. `quic_pn_expand` 用「已收到的最大包号」把截断包号还原成完整包号；
+ * 3. nonce = iv XOR 包号，AAD 就是整段包头；
+ * 4. 解出来的明文逐帧分发：CRYPTO 进握手缓冲，STREAM 进流，ACK 喂给丢包
+ *    检测，MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS 放额度，其余按需要忽略。
+ *
+ * 发一个包反过来走：先拼明文帧，再加密，最后加头保护；包号记进恢复模块，
+ * 这样对端的 ACK 回来时能算出 RTT 和丢包。
+ *
+ * 简化的地方（都在注释里标了「简化」）：
+ *
+ * - 只做 1-RTT：Initial / Handshake 包的收发留给调用方（或者后续的
+ *   `std.net.quicd`），密钥由外部装进来，模块不跑 TLS 状态机；
+ * - 一个包只装一个方向的数据，不做多包合并与 PADDING 到 1200 字节；
+ * - 接收方向按「偏移单调」处理 CRYPTO，乱序的握手数据直接按协议错拒绝；
+ * - ACK 的 ack_delay 不换算到微秒的 2 的幂，直接当微秒用。
+ */
+#include <string.h>
+
+module std.net.quicconn;
+import std.core.types;
+import std.net.quic;
+import std.net.quichp;
+import std.net.quicstream;
+import std.net.quicrecovery;
+import std.net.quictls;
+import std.encoding.aead;
+
+enum Error { OK = 0, INVAL = 1, PARSE = 2, STATE = 3, CRYPTO = 4, CLOSED = 5,
+             FLOW = 6, FULL = 7 };
+
+/* 状态用宏而不是枚举：枚举成员会被改写成带模块号段的值（grammar.md §8.1），
+ * 状态码要能直接打印、直接比较字面量，所以不走那条路。 */
+#define QC_IDLE         0
+#define QC_HANDSHAKE    1
+#define QC_ESTABLISHED  2
+#define QC_CLOSED       3
+
+#define QC_CRYPTO_BUF   4096
+#define QC_MAX_ACK      16
+#define QC_MAX_DGRAM    1200
+#define QC_INITIAL_MAX_DATA  (1024 * 1024)  /* 默认流控额度：1 MiB */
+#define QC_INITIAL_STREAMS   8
+
+struct QConn {
+    int server;
+    int state;
+    int err;
+    u64 close_err;
+    int close_app;
+
+    u32 version;
+    u8 scid[QUIC_CID_MAX];
+    int scid_len;
+    u8 dcid[QUIC_CID_MAX];
+    int dcid_len;
+
+    /* 包号与 ACK 状态：区间按降序存，`ack_hi[i] >= ack_lo[i]` */
+    u64 next_pn;
+    u64 largest_pn;
+    int have_pn;
+    u64 ack_hi[QC_MAX_ACK];
+    u64 ack_lo[QC_MAX_ACK];
+    int ack_n;
+    int ack_pending;
+
+    /* 1-RTT 密钥 */
+    int cipher;
+    int keys_ready;
+    u8 rx_iv[12];
+    u8 tx_iv[12];
+    Aead rx_aead;
+    Aead tx_aead;
+    HpKey rx_hp;
+    HpKey tx_hp;
+
+    /* CRYPTO 流（握手消息字节流） */
+    u8 crypto_in[QC_CRYPTO_BUF];
+    int crypto_in_len;
+    u8 crypto_out[QC_CRYPTO_BUF];
+    int crypto_out_len;
+
+    /* 应用层 */
+    QStreams streams;
+    Recovery rec;
+
+    /* 统计 */
+    u64 bytes_rx;
+    u64 bytes_tx;
+    int pkt_rx;
+    int pkt_tx;
+    int handshake_done;
+    int peer_close;
+    int close_sent;
+};
+
+/* ---- 生命周期 ---- */
+
+int init(QConn *c, int server, const void *scid, int scid_len)
+{
+    if (!c || scid_len < 0 || scid_len > QUIC_CID_MAX
+        || (scid_len > 0 && !scid))
+        return -INVAL;
+    memset(c, 0, sizeof *c);
+    c->server = server ? 1 : 0;
+    c->state = QC_IDLE;
+    c->version = QUIC_VERSION_1;
+    if (scid_len > 0)
+        memcpy(c->scid, scid, (size_t)scid_len);
+    c->scid_len = scid_len;
+    c->streams.init(c->server);
+    /* 默认额度：真实连接由传输参数协商，这里给一组能直接跑起来的初值 */
+    c->streams.set_max_data(QC_INITIAL_MAX_DATA);
+    c->streams.set_recv_max_data(QC_INITIAL_MAX_DATA);
+    c->streams.set_max_streams(0, QC_INITIAL_STREAMS);
+    c->streams.set_max_streams(1, QC_INITIAL_STREAMS);
+    c->rec.init(25000);
+    return 0;
+}
+
+int set_dcid(QConn *c, const void *dcid, int dcid_len)
+{
+    if (!c || dcid_len < 0 || dcid_len > QUIC_CID_MAX
+        || (dcid_len > 0 && !dcid))
+        return -INVAL;
+    if (dcid_len > 0)
+        memcpy(c->dcid, dcid, (size_t)dcid_len);
+    c->dcid_len = dcid_len;
+    return 0;
+}
+
+/* 装一对 1-RTT 流量密钥：rx 用来解密对端的包，tx 用来加密自己发的包。
+ *
+ * 两侧的密钥是交叉的——客户端把 `c_ap` 当 tx、`s_ap` 当 rx，服务器反过来。 */
+int set_keys(QConn *c, int cipher, const void *rx_secret, const void *tx_secret)
+{
+    QuicTlsKey k = { 0 };
+    int aead_kind = 0;
+    int hp_kind = QUIC_HP_AES;
+
+    if (!c || !rx_secret || !tx_secret)
+        return -INVAL;
+    if (cipher == TLS13_AES_128_GCM_SHA256) {
+        aead_kind = AEAD_AES_128_GCM;
+    } else if (cipher == TLS13_AES_256_GCM_SHA384) {
+        aead_kind = AEAD_AES_256_GCM;
+        hp_kind = QUIC_HP_AES;
+    } else if (cipher == TLS13_CHACHA20_POLY1305_SHA256) {
+        aead_kind = AEAD_CHACHA20_POLY1305;
+        hp_kind = QUIC_HP_CHACHA20;
+    } else {
+        return -INVAL;
+    }
+    c->cipher = cipher;
+    /* 发送方向 */
+    if (tls13_quic_key(&k, cipher, tx_secret) != 1)
+        return -CRYPTO;
+    c->tx_aead.init(aead_kind, k.key, k.key_len);
+    c->tx_hp.init(hp_kind, k.hp, k.key_len);
+    memcpy(c->tx_iv, k.iv, 12);
+    /* 接收方向 */
+    if (tls13_quic_key(&k, cipher, rx_secret) != 1)
+        return -CRYPTO;
+    c->rx_aead.init(aead_kind, k.key, k.key_len);
+    c->rx_hp.init(hp_kind, k.hp, k.key_len);
+    memcpy(c->rx_iv, k.iv, 12);
+    if (!c->tx_aead.ok() || !c->rx_aead.ok() || !c->tx_hp.ok()
+        || !c->rx_hp.ok())
+        return -CRYPTO;
+    c->keys_ready = 1;
+    if (c->state == QC_IDLE)
+        c->state = QC_HANDSHAKE;
+    return 0;
+}
+
+int state_of(QConn *c) { return c ? c->state : QC_CLOSED; }
+int keys_ready_of(QConn *c) { return c ? c->keys_ready : 0; }
+int err_of(QConn *c) { return c ? c->err : 0; }
+u64 close_err_of(QConn *c) { return c ? c->close_err : 0; }
+int close_app_of(QConn *c) { return c ? c->close_app : 0; }
+int handshake_done_of(QConn *c) { return c ? c->handshake_done : 0; }
+int peer_close_of(QConn *c) { return c ? c->peer_close : 0; }
+u64 next_pn_of(QConn *c) { return c ? c->next_pn : 0; }
+int packets_rx_of(QConn *c) { return c ? c->pkt_rx : 0; }
+int packets_tx_of(QConn *c) { return c ? c->pkt_tx : 0; }
+u64 bytes_rx_of(QConn *c) { return c ? c->bytes_rx : 0; }
+u64 bytes_tx_of(QConn *c) { return c ? c->bytes_tx : 0; }
+QStreams *streams_of(QConn *c) { return c ? &c->streams : 0; }
+Recovery *recovery_of(QConn *c) { return c ? &c->rec : 0; }
+u32 version_of(QConn *c) { return c ? c->version : 0; }
+int crypto_in_len_of(QConn *c) { return c ? c->crypto_in_len : 0; }
+int crypto_out_len_of(QConn *c) { return c ? c->crypto_out_len : 0; }
+
+/* 主动关闭：立刻进入 CLOSED，并记下要发 CONNECTION_CLOSE 的错误码。 */
+int close(QConn *c, int app, u64 code)
+{
+    if (!c)
+        return -INVAL;
+    c->state = QC_CLOSED;
+    c->close_app = app ? 1 : 0;
+    c->close_err = code;
+    return 0;
+}
+
+/* ---- CRYPTO 流 ---- */
+
+/* 把要发的握手消息排进缓冲（调用方负责按 TLS 记录的顺序排）。 */
+int put_crypto(QConn *c, const void *msg, int n)
+{
+    if (!c || !msg || n < 0)
+        return -INVAL;
+    if (c->crypto_out_len + n > QC_CRYPTO_BUF)
+        return -FULL;
+    memcpy(c->crypto_out + c->crypto_out_len, msg, (size_t)n);
+    c->crypto_out_len += n;
+    return 0;
+}
+
+/* 取走已经攒下的握手消息（发送成功之后由调用方调）。 */
+int take_crypto(QConn *c, void *out, int cap)
+{
+    int n = 0;
+
+    if (!c || !out || cap <= 0)
+        return -INVAL;
+    n = c->crypto_out_len < cap ? c->crypto_out_len : cap;
+    if (n > 0) {
+        memcpy(out, c->crypto_out, (size_t)n);
+        memmove(c->crypto_out, c->crypto_out + n,
+                (size_t)(c->crypto_out_len - n));
+        c->crypto_out_len -= n;
+    }
+    return n;
+}
+
+/* 收到的握手消息字节流（从偏移 0 开始的连续前缀）。 */
+const u8 *crypto_in_bytes(QConn *c) { return c ? c->crypto_in : 0; }
+
+/* ---- 应用数据 ---- */
+
+/* 往一条流里写数据（流不存在就按编号建一条）。 */
+int write_stream(QConn *c, u64 id, const void *data, int n)
+{
+    QStream *s = 0;
+
+    if (!c || !data || n < 0)
+        return -INVAL;
+    if (c->state == QC_CLOSED)
+        return -CLOSED;
+    s = c->streams.find(id);
+    if (!s)
+        s = c->streams.create(id, c->streams.recv_max_data,
+                              c->streams.max_data);
+    if (!s)
+        return -FULL;
+    return s->write(data, n);
+}
+
+/* 从一条流里读数据。 */
+int read_stream(QConn *c, u64 id, void *out, int cap)
+{
+    QStream *s = 0;
+
+    if (!c || !out || cap <= 0)
+        return -INVAL;
+    s = c->streams.find(id);
+    if (!s)
+        return 0;
+    return s->read(out, cap);
+}
+
+u64 stream_pending(QConn *c, u64 id)
+{
+    QStream *s = 0;
+
+    if (!c)
+        return 0;
+    s = c->streams.find(id);
+    return s ? s->pending_write() : 0;
+}
+
+u64 stream_readable(QConn *c, u64 id)
+{
+    QStream *s = 0;
+
+    if (!c)
+        return 0;
+    s = c->streams.find(id);
+    return s ? s->pending_read() : 0;
+}
+
+/* ---- ACK 状态 ---- */
+
+/* 把收到的包号并进区间表。区间按降序、互不相邻地存放。 */
+static int qc_ack_insert(QConn *c, u64 pn)
+{
+    int i = 0;
+
+    if (c->ack_n > 0 && pn == c->ack_hi[0] + 1) {
+        c->ack_hi[0] = pn;
+        return 0;
+    }
+    if (c->ack_n > 0 && pn >= c->ack_lo[0] && pn <= c->ack_hi[0])
+        return 0;               /* 重复包：只在 ACK 里合并，不影响状态 */
+    if (c->ack_n >= QC_MAX_ACK) {
+        /* 表满：把最老的区间并进上一个（丢掉精确性，但 ACK 仍然正确） */
+        c->ack_lo[c->ack_n - 2] = c->ack_lo[c->ack_n - 1];
+        c->ack_n--;
+    }
+    for (i = c->ack_n; i > 0; i--) {
+        c->ack_hi[i] = c->ack_hi[i - 1];
+        c->ack_lo[i] = c->ack_lo[i - 1];
+    }
+    c->ack_hi[0] = pn;
+    c->ack_lo[0] = pn;
+    c->ack_n++;
+    return 1;
+}
+
+int ack_pending_of(QConn *c) { return c ? c->ack_pending : 0; }
+int ack_ranges_of(QConn *c) { return c ? c->ack_n : 0; }
+u64 ack_hi_of(QConn *c, int i)
+{
+    if (!c || i < 0 || i >= c->ack_n)
+        return 0;
+    return c->ack_hi[i];
+}
+
+u64 ack_lo_of(QConn *c, int i)
+{
+    if (!c || i < 0 || i >= c->ack_n)
+        return 0;
+    return c->ack_lo[i];
+}
+
+int on_frame(QConn *c, Frame *f, const u8 *base, int len, i64 now);
+
+/* ---- 收包 ---- */
+
+/* 定位包号在包里的偏移：只有短包头能直接算，长包头要跳过 token 与 Length。 */
+static int qc_pn_off(const u8 *pkt, int len, int dcid_len, int *long_hdr)
+{
+    int pos = 0;
+    int dlen = 0;
+    int slen = 0;
+    int tl = 0;
+    u64 v = 0;
+
+    if (!pkt || len < 1 || !long_hdr)
+        return -1;
+    if ((pkt[0] & 0x80) == 0) {
+        *long_hdr = 0;
+        pos = 1 + dcid_len;
+        return pos < len ? pos : -1;
+    }
+    *long_hdr = 1;
+    if (len < 7)
+        return -1;
+    pos = 5;
+    dlen = pkt[pos++];
+    if (dlen > QUIC_CID_MAX || pos + dlen + 1 > len)
+        return -1;
+    pos += dlen;
+    slen = pkt[pos++];
+    if (slen > QUIC_CID_MAX || pos + slen > len)
+        return -1;
+    pos += slen;
+    if (((pkt[0] >> 4) & 0x3) == QUIC_PKT_INITIAL) {
+        tl = quic_varint_get(pkt + pos, len - pos, &v);
+        if (tl < 0)
+            return -1;
+        pos += tl + (int)v;
+        if (pos > len)
+            return -1;
+    }
+    tl = quic_varint_get(pkt + pos, len - pos, &v);
+    if (tl < 0)
+        return -1;
+    pos += tl;
+    return pos + 1 <= len ? pos : -1;
+}
+
+/* 处理一个 1-RTT 包（短包头）。返回 0 成功，负数是错误码。 */
+int on_packet(QConn *c, const void *pkt, int len, i64 now)
+{
+    const u8 *in = (const u8 *)pkt;
+    u8 buf[QC_MAX_DGRAM] = { 0 };
+    u8 sample[QUIC_HP_SAMPLE_LEN] = { 0 };
+    u8 mask[QUIC_HP_MASK_LEN] = { 0 };
+    u8 nonce[12] = { 0 };
+    u8 plain[QC_MAX_DGRAM] = { 0 };
+    Packet p = { 0 };
+    int pn_off = 0;
+    int long_hdr = 0;
+    int pn_len = 0;
+    int plen = 0;
+    int pos = 0;
+    int rc = 0;
+    u64 pn = 0;
+
+    if (!c || !pkt || len <= 0 || len > QC_MAX_DGRAM || now < 0)
+        return -INVAL;
+    if (c->state == QC_CLOSED)
+        return -CLOSED;
+    if (!c->keys_ready)
+        return -STATE;
+    memcpy(buf, in, (size_t)len);
+    pn_off = qc_pn_off(buf, len, c->scid_len, &long_hdr);
+    if (pn_off < 0)
+        return -PARSE;
+    /* 第一步：取出采样，只还原首字节，读出包号长度 */
+    if (c->rx_hp.sample_take(buf, len, pn_off, sample) < 0)
+        return -PARSE;
+    if (c->rx_hp.mask(sample, mask) < 0)
+        return -CRYPTO;
+    buf[0] ^= (u8)(mask[0] & (long_hdr ? 0x0f : 0x1f));
+    pn_len = (buf[0] & 0x03) + 1;
+    if (pn_off + pn_len > len)
+        return -PARSE;
+    /* 第二步：还原包号本身 */
+    {
+        int i = 0;
+
+        for (i = 0; i < pn_len; i++)
+            buf[pn_off + i] ^= mask[1 + i];
+    }
+    /* 走一遍标准解析，拿到 payload 的位置与长度 */
+    rc = p.parse(buf, len, c->scid_len);
+    if (rc != 1) {
+        c->err = p.err;
+        return -PARSE;
+    }
+    if (p.payload_len <= AEAD_TAG_LEN)
+        return -PARSE;
+    pn = quic_pn_expand(c->have_pn ? c->largest_pn : 0, p.pn_trunc, pn_len);
+    /* nonce = iv XOR 包号，AAD 是整段包头 */
+    tls13_quic_nonce(c->rx_iv, pn, nonce);
+    plen = c->rx_aead.open(nonce, buf, p.payload_off, buf + p.payload_off,
+                           p.payload_len, plain, (int)sizeof plain);
+    if (plen < 0)
+        return -CRYPTO;
+    /* 包号记账 */
+    if (!c->have_pn || pn > c->largest_pn) {
+        c->largest_pn = pn;
+        c->have_pn = 1;
+    }
+    qc_ack_insert(c, pn);
+    c->ack_pending = 1;
+    c->pkt_rx++;
+    c->bytes_rx += (u64)len;
+    /* 逐帧分发 */
+    pos = 0;
+    while (pos < plen) {
+        Frame f = { 0 };
+
+        rc = f.parse(plain + pos, plen - pos);
+        if (rc != 1)
+            return -PARSE;
+        if (f.size <= 0 || pos + f.size > plen)
+            return -PARSE;
+        /* f->data_off / f->ack_off 都是相对帧首的偏移，这里传帧首 */
+        rc = c->on_frame(&f, plain + pos, plen - pos, now);
+        if (rc < 0)
+            return rc;
+        pos += f.size;
+        if (c->state == QC_CLOSED)
+            break;
+    }
+    return 0;
+}
+
+/* 更新对端包号到确认状态：给丢包检测喂一个 ACK 帧。 */
+static int qc_ack_frame(QConn *c, Frame *f, const u8 *base, int len,
+                        i64 now)
+{
+    AckIt it = { 0 };
+    u64 acked[64] = { 0 };
+    u64 lost[64] = { 0 };
+    int n = 0;
+    u64 lo = 0;
+    u64 hi = 0;
+
+    if (!c || !f || !base)
+        return -INVAL;
+    if (it.open(f, base, len) != 0)
+        return -PARSE;
+    while (it.next(&lo, &hi) == 1 && n < 64) {
+        u64 v = 0;
+
+        for (v = lo; v <= hi && n < 64; v++)
+            acked[n++] = v;
+    }
+    if (n == 0)
+        return 0;
+    c->rec.on_ack(f->largest, now, (i64)f->ack_delay, acked, n, lost, 64);
+    return 0;
+}
+
+/* 收到的帧怎么处理：返回值 < 0 表示整个包要丢弃。 */
+int on_frame(QConn *c, Frame *f, const u8 *base, int len, i64 now)
+{
+    if (!c || !f || !base)
+        return -INVAL;
+    if (f->is_stream()) {
+        int rc = c->streams.on_data(f->stream_id, f->offset,
+                                    f->data_len > 0 ? base + f->data_off : 0,
+                                    f->data_len, f->fin);
+
+        if (rc < 0)
+            return -FLOW;
+        return 0;
+    }
+    switch ((int)f->type) {
+    case QUIC_FRAME_PADDING:
+        return 0;
+    case QUIC_FRAME_PING:
+        return 0;
+    case QUIC_FRAME_ACK:
+    case QUIC_FRAME_ACK_ECN:
+        return qc_ack_frame(c, f, base, len, now);
+    case QUIC_FRAME_CRYPTO:
+        /* 简化：只接受从当前位置接着来的握手数据 */
+        if ((i64)f->offset == (i64)c->crypto_in_len) {
+            if (c->crypto_in_len + f->data_len > QC_CRYPTO_BUF)
+                return -FULL;
+            memcpy(c->crypto_in + c->crypto_in_len, base + f->data_off,
+                   (size_t)f->data_len);
+            c->crypto_in_len += f->data_len;
+            return 0;
+        }
+        if ((i64)f->offset + (i64)f->data_len <= (i64)c->crypto_in_len)
+            return 0;           /* 重发的老数据：直接丢掉 */
+        return -CRYPTO;
+    case QUIC_FRAME_MAX_DATA:
+        return c->streams.set_max_data(f->max) == 0 ? 0 : -INVAL;
+    case QUIC_FRAME_MAX_STREAM_DATA:
+        {
+            QStream *s = c->streams.find(f->stream_id);
+
+            if (!s)
+                return 0;       /* 流还没建：额度先不记 */
+            return s->set_send_max(f->max) == 0 ? 0 : -INVAL;
+        }
+    case QUIC_FRAME_MAX_STREAMS_BIDI:
+    case QUIC_FRAME_MAX_STREAMS_UNI:
+        return c->streams.set_max_streams(
+                   f->type == QUIC_FRAME_MAX_STREAMS_UNI, f->max_streams) == 0
+                   ? 0 : -INVAL;
+    case QUIC_FRAME_DATA_BLOCKED:
+    case QUIC_FRAME_STREAM_DATA_BLOCKED:
+    case QUIC_FRAME_STREAMS_BLOCKED_BIDI:
+    case QUIC_FRAME_STREAMS_BLOCKED_UNI:
+    case QUIC_FRAME_NEW_CONNECTION_ID:
+    case QUIC_FRAME_RETIRE_CONNECTION_ID:
+    case QUIC_FRAME_PATH_CHALLENGE:
+    case QUIC_FRAME_NEW_TOKEN:
+        return 0;               /* 简化：这些帧只记录不处理 */
+    case QUIC_FRAME_RESET_STREAM:
+        {
+            QStream *s = c->streams.find(f->stream_id);
+
+            if (s)
+                s->stop(f->error_code);
+            return 0;
+        }
+    case QUIC_FRAME_STOP_SENDING:
+        {
+            QStream *s = c->streams.find(f->stream_id);
+
+            if (s)
+                s->reset_send(f->error_code);
+            return 0;
+        }
+    case QUIC_FRAME_HANDSHAKE_DONE:
+        c->handshake_done = 1;
+        c->state = QC_ESTABLISHED;
+        return 0;
+    case QUIC_FRAME_CONNECTION_CLOSE:
+    case QUIC_FRAME_CONNECTION_CLOSE_APP:
+        c->peer_close = 1;
+        c->close_err = f->error_code;
+        c->close_app = f->type == QUIC_FRAME_CONNECTION_CLOSE_APP;
+        c->state = QC_CLOSED;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* ---- 发包 ---- */
+
+/* 有没有东西要发（ACK 也算）。 */
+int has_output(QConn *c)
+{
+    int i = 0;
+
+    if (!c)
+        return 0;
+    if (c->ack_pending || c->crypto_out_len > 0 || c->state == QC_CLOSED)
+        return 1;
+    for (i = 0; i < c->streams.count_of(); i++) {
+        QStream *s = &c->streams.s[i];
+
+        if (s->pending_write() > 0 || s->fin_pending_of() > 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* 拼明文帧：ACK + CRYPTO + 各流的 STREAM。返回用的字节数。 */
+static int qc_build_frames(QConn *c, u8 *out, int cap)
+{
+    int pos = 0;
+    int n = 0;
+    int i = 0;
+
+    if (c->ack_pending && c->ack_n > 0) {
+        n = frame_put_ack(out + pos, cap - pos, c->ack_hi[0], 0,
+                          (u64)(c->ack_n - 1), c->ack_hi[0] - c->ack_lo[0]);
+        if (n < 0)
+            return -1;
+        pos += n;
+    }
+    if (c->crypto_out_len > 0) {
+        n = frame_put_crypto(out + pos, cap - pos, 0, c->crypto_out,
+                             c->crypto_out_len);
+        if (n < 0)
+            return -1;
+        pos += n;
+    }
+    /* 数据帧：每条流按额度取一段，装到装不下为止 */
+    for (i = 0; i < c->streams.count_of() && pos + 32 < cap; i++) {
+        QStream *s = &c->streams.s[i];
+        u8 chunk[900] = { 0 };
+        int take = 0;
+        int room = cap - pos - 32;
+
+        if (s->pending_write() == 0 && !s->fin_pending_of())
+            continue;
+        if (room > (int)sizeof chunk)
+            room = (int)sizeof chunk;
+        take = c->streams.take_data(s, chunk, room);
+        if (take < 0)
+            continue;
+        if (take == 0 && s->fin_sent_of())
+            continue;
+        n = frame_put_stream(out + pos, cap - pos, s->id_of(), 1,
+                             s->send_off_of() - (u64)take, 1, chunk, take,
+                             s->fin_pending_of());
+        if (n < 0)
+            return -1;
+        pos += n;               /* FIN 由 take() 在取空后自动置位 */
+    }
+    if (c->state == QC_CLOSED && c->close_err != 0 && c->close_app >= 0
+        && c->close_sent == 0) {
+        n = frame_put_connection_close(out + pos, cap - pos, c->close_app,
+                                       c->close_err, 0, 0, 0);
+        if (n < 0)
+            return -1;
+        pos += n;
+        c->close_sent = 1;
+    }
+    return pos;
+}
+
+/* 发一个 1-RTT 包（短包头 + 加密 + 头保护）。返回写出的字节数。 */
+int flush(QConn *c, void *out, int cap, i64 now)
+{
+    u8 *o = (u8 *)out;
+    u8 frames[QC_MAX_DGRAM] = { 0 };
+    u8 hdr[64] = { 0 };
+    u8 nonce[12] = { 0 };
+    HeaderBuilder hb = { 0 };
+    int flen = 0;
+    int hlen = 0;
+    int ct = 0;
+    int total = 0;
+    int pn_len = 4;
+    u64 pn = 0;
+
+    if (!c || !out || cap < 32 || now < 0)
+        return -INVAL;
+    if (!c->keys_ready)
+        return -STATE;
+    if (c->state == QC_CLOSED && c->close_sent)
+        return 0;
+    if (!c->has_output())
+        return 0;
+    if (c->dcid_len <= 0)
+        return -STATE;
+    flen = qc_build_frames(c, frames, (int)sizeof frames);
+    if (flen < 0)
+        return -PARSE;
+    if (flen == 0)
+        return 0;
+    pn = c->next_pn;
+    hb.init(o, cap);
+    hb.short_header(0, c->dcid, c->dcid_len);
+    hb.pn(pn_len, pn);
+    if (!hb.ok_q())
+        return -PARSE;
+    hlen = hb.finish();
+    if (hlen <= 0 || hlen > (int)sizeof hdr)
+        return -PARSE;
+    memcpy(hdr, o, (size_t)hlen);
+    tls13_quic_nonce(c->tx_iv, pn, nonce);
+    ct = c->tx_aead.seal(nonce, hdr, hlen, frames, flen, o + hlen, cap - hlen);
+    if (ct < 0)
+        return -CRYPTO;
+    total = hlen + ct;
+    /* 采样从包号之后 4 字节起算，所以 pn_off 是「头长 - 包号长」 */
+    if (c->tx_hp.protect_at(o, total, hlen - pn_len, pn_len, 0) < 0)
+        return -CRYPTO;
+    /* 记账：包号前进，ACK 与已发的帧清掉，包进恢复模块的在途表 */
+    c->next_pn++;
+    c->ack_pending = 0;
+    c->ack_n = 0;
+    c->crypto_out_len = 0;
+    c->pkt_tx++;
+    c->bytes_tx += (u64)total;
+    c->rec.on_sent(pn, now, 1, 1, (u64)total);
+    return total;
+}
+
+/* ---- 自测 ---- */
+
+static int qc_same(const u8 *a, const u8 *b, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+/* 造一对客户端/服务器：密钥交叉着装，CID 互相指对方。 */
+static void qc_pair(QConn *a, QConn *b)
+{
+    u8 scid_a[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    u8 scid_b[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++) {
+        c_ap[i] = (u8)(0x10 + i);
+        s_ap[i] = (u8)(0x80 + i);
+    }
+    a->init(0, scid_a, 8);
+    b->init(1, scid_b, 8);
+    a->set_dcid(scid_b, 8);
+    b->set_dcid(scid_a, 8);
+    a->set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    b->set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+}
+
+test "QUIC 连接：1-RTT 往返（加密 + 头保护 + STREAM）" {
+    QConn a = { 0 };
+    QConn b = { 0 };
+    u8 pkt[QC_MAX_DGRAM] = { 0 };
+    u8 got[64] = { 0 };
+    int n = 0;
+    int rc = 0;
+
+    qc_pair(&a, &b);
+    if (!a.keys_ready_of() || !b.keys_ready_of())
+        return err(1, "装密钥之后应当就绪");
+    if (a.state_of() != QC_HANDSHAKE)
+        return err(2, "装密钥之后应进入握手态");
+    if (a.has_output())
+        return err(3, "还没写数据时不该有输出");
+
+    /* 客户端往流 0 里写 5 字节，发一个包 */
+    if (a.write_stream(0, "hello", 5) != 5)
+        return err(4, "应能写进 5 字节");
+    n = a.flush(pkt, (int)sizeof pkt, 1000);
+    if (n <= 5 + 16)
+        return err(5, "包太小");
+    /* 短包头：首字节保留位、固定位、包号长度都要对 */
+    if ((pkt[0] & 0x80) != 0)
+        return err(6, "1-RTT 应是短包头");
+    if (a.packets_tx_of() != 1 || a.next_pn_of() != 1)
+        return err(7, "发完一个包之后包号应是 1");
+
+    /* 服务器收：解开之后流 0 应有 5 字节可读 */
+    rc = b.on_packet(pkt, n, 1000000);
+    if (rc != 0)
+        return err(8, "服务器应能解开这个包");
+    if (b.stream_readable(0) != 5)
+        return err(9, "流 0 应有 5 字节可读");
+    if (b.read_stream(0, got, (int)sizeof got) != 5
+        || !qc_same(got, (const u8 *)"hello", 5))
+        return err(10, "读出来的应是 hello");
+    if (b.ack_pending_of() != 1 || b.ack_ranges_of() != 1)
+        return err(11, "收包之后应挂一个 ACK");
+    if (b.ack_hi_of(0) != 0 || b.ack_lo_of(0) != 0)
+        return err(12, "ACK 区间应是 [0,0]");
+
+    /* 服务器回一个只带 ACK 的包；客户端吃下之后自己的 ACK 记账也要更新 */
+    n = b.flush(pkt, (int)sizeof pkt, 1000);
+    if (n <= 0)
+        return err(13, "服务器应能发出 ACK 包");
+    rc = a.on_packet(pkt, n, 1000000);
+    if (rc != 0)
+        return err(14, "客户端应能解开服务器的包");
+    /* 客户端刚收了一个包，它自己也要给服务器回 ACK */
+    if (a.ack_pending_of() != 1)
+        return err(15, "收到包之后应挂一个待发的 ACK");
+    /* 在途表里那个包被确认了：没有丢包，PTO 计数为 0 */
+    if (a.recovery_of()->in_flight_count() != 0)
+        return err(16, "包被确认之后在途表应空");
+    /* 自己的 ack 区间也被服务器的 ACK 覆盖 */
+    if (a.ack_hi_of(0) != 0)
+        return err(17, "客户端应记下收到的包号");
+}
+
+test "QUIC 连接：头保护与解密失败" {
+    QConn a = { 0 };
+    QConn b = { 0 };
+    u8 pkt[QC_MAX_DGRAM] = { 0 };
+    int n = 0;
+
+    qc_pair(&a, &b);
+    a.write_stream(0, "x", 1);
+    n = a.flush(pkt, (int)sizeof pkt, 1000);
+    if (n <= 0)
+        return err(1, "应能发出一个包");
+    /* 篡改 tag 里的一个字节：解密必须失败（采样区在 n-20 附近，
+     * 改那里会先被头保护拦下来，所以改末尾的 tag） */
+    pkt[n - 3] ^= 0xff;
+    if (b.on_packet(pkt, n, 0) != -CRYPTO)
+        return err(2, "篡改负载应报 CRYPTO");
+    if (b.packets_rx_of() != 0)
+        return err(3, "解密失败的包不计入统计");
+    /* 篡改首字节的固定位：解保护之后解析失败 */
+    pkt[n - 3] ^= 0xff;
+    pkt[0] ^= 0x40;
+    if (b.on_packet(pkt, n, 0) >= 0)
+        return err(4, "首字节被篡改的包应被拒");
+    /* 没有密钥时不能收也不能发 */
+    {
+        QConn c = { 0 };
+        u8 cid[8] = { 0 };
+
+        c.init(0, cid, 8);
+        if (c.on_packet(pkt, n, 0) != -STATE)
+            return err(5, "没密钥时收包应报 STATE");
+        c.write_stream(0, "y", 1);
+        if (c.flush(pkt, (int)sizeof pkt, 1000) != -STATE)
+            return err(6, "没密钥时发包应报 STATE");
+        /* 没有对端 CID 也不行 */
+        c.set_keys(TLS13_AES_128_GCM_SHA256, cid, cid);
+        if (c.flush(pkt, (int)sizeof pkt, 1000) != -STATE)
+            return err(7, "没有 DCID 时应报 STATE");
+    }
+    /* 关闭之后两个方向都不动 */
+    a.close(1, 0x1234);
+    if (a.state_of() != QC_CLOSED || a.close_err_of() != 0x1234
+        || !a.close_app_of())
+        return err(8, "关闭状态没记对");
+    if (a.write_stream(0, "z", 1) != -CLOSED)
+        return err(9, "关闭之后不该还能写");
+    {
+        QConn d = { 0 };
+        QConn e = { 0 };
+
+        qc_pair(&d, &e);
+        d.close(0, 0x0a);
+        if (e.on_packet(pkt, n, 0) >= 0)
+            return err(10, "对不上密钥的包应被拒");
+    }
+}
+
+test "QUIC 连接：握手控制帧分发" {
+    QConn a = { 0 };
+    QConn b = { 0 };
+    u8 pkt[QC_MAX_DGRAM] = { 0 };
+    u8 msg[16] = { 0 };
+    u8 out[16] = { 0 };
+    int n = 0;
+
+    qc_pair(&a, &b);
+    /* 握手消息：客户端排 7 字节，服务器收进 crypto_in */
+    memcpy(msg, "srvhello", 7);
+    if (a.put_crypto(msg, 7) != 0)
+        return err(1, "应能排进握手消息");
+    if (a.crypto_out_len_of() != 7 || !a.has_output())
+        return err(2, "排进去之后就该有输出");
+    n = a.flush(pkt, (int)sizeof pkt, 1000);
+    if (a.crypto_out_len_of() != 0)
+        return err(3, "发出之后握手缓冲应清空");
+    if (b.on_packet(pkt, n, 0) != 0)
+        return err(4, "服务器应能收下握手包");
+    if (b.crypto_in_len_of() != 7)
+        return err(5, "握手缓冲应有 7 字节");
+    if (!qc_same(b.crypto_in_bytes(), (const u8 *)"srvhello", 7))
+        return err(6, "握手字节不对");
+    /* 重复的握手数据被丢掉，不重复追加 */
+    n = a.flush(pkt, (int)sizeof pkt, 1000);
+    if (n != 0)
+        return err(7, "没有新握手消息时不该发包");
+
+    /* 服务器开流、写数据、发出去；客户端应能读到 */
+    b.write_stream(1, "resp", 4);
+    n = b.flush(pkt, (int)sizeof pkt, 1000);
+    if (n <= 0)
+        return err(8, "服务器应能发出响应包");
+    if (a.on_packet(pkt, n, 0) != 0)
+        return err(9, "客户端应能收下响应");
+    if (a.stream_readable(1) != 4)
+        return err(10, "客户端应看到 4 字节");
+    if (a.read_stream(1, out, 4) != 4 || !qc_same(out, (const u8 *)"resp", 4))
+        return err(11, "响应内容不对");
+
+    /* HANDSHAKE_DONE：客户端收到之后进入已建立态 */
+    {
+        u8 frames[64] = { 0 };
+        u8 hdr[32] = { 0 };
+        u8 nonce[12] = { 0 };
+        u8 pkt2[QC_MAX_DGRAM] = { 0 };
+        HeaderBuilder hb = { 0 };
+        int flen = 0;
+        int hlen = 0;
+        int ct = 0;
+        int total = 0;
+
+        flen = frame_put_handshake_done(frames, (int)sizeof frames);
+        hb.init(pkt2, (int)sizeof pkt2);
+        hb.short_header(0, a.scid, 8);   /* 发给客户端：DCID 是 a 的 SCID */
+        hb.pn(4, 0);
+        hlen = hb.finish();
+        memcpy(hdr, pkt2, (size_t)hlen);
+        tls13_quic_nonce(b.tx_iv, 0, nonce);
+        ct = b.tx_aead.seal(nonce, hdr, hlen, frames, flen, pkt2 + hlen,
+                            (int)sizeof pkt2 - hlen);
+        if (ct < 0)
+            return err(12, "手工加密失败");
+        total = hlen + ct;
+        if (b.tx_hp.protect_at(pkt2, total, hlen - 4, 4, 0) < 0)
+            return err(13, "手工加头保护失败");
+        if (a.on_packet(pkt2, total, 0) != 0)
+            return err(14, "客户端应能收下 HANDSHAKE_DONE");
+        if (!a.handshake_done_of() || a.state_of() != QC_ESTABLISHED)
+            return err(15, "收到 HANDSHAKE_DONE 之后应已建立");
+    }
+}
+
+test "QUIC 连接：ACK 合并与流控帧" {
+    QConn a = { 0 };
+    QConn b = { 0 };
+    u8 pkt[QC_MAX_DGRAM] = { 0 };
+    int n = 0;
+    int i = 0;
+
+    qc_pair(&a, &b);
+    /* 客户端连发 3 个包，服务器应当合并成一个 [0,2] 的区间 */
+    for (i = 0; i < 3; i++) {
+        u8 one[1] = { (u8)('a' + i) };
+
+        a.write_stream(0, one, 1);
+        n = a.flush(pkt, (int)sizeof pkt, 1000);
+        if (n <= 0)
+            return err(1, "应能发出包");
+        if (b.on_packet(pkt, n, (i64)(i + 1) * 1000) != 0)
+            return err(2, "服务器应能收下包");
+    }
+    if (b.ack_ranges_of() != 1 || b.ack_hi_of(0) != 2
+        || b.ack_lo_of(0) != 0)
+        return err(3, "三个连续包应合并成一个区间 [0,2]");
+    if (b.stream_readable(0) != 3)
+        return err(4, "三个字节都应在流里");
+    /* 服务器的 ACK 回到客户端：三个包都被确认 */
+    n = b.flush(pkt, (int)sizeof pkt, 1000);
+    if (a.on_packet(pkt, n, 5000) != 0)
+        return err(5, "客户端应能收下 ACK");
+    if (a.recovery_of()->in_flight_count() != 0)
+        return err(6, "三个包都应离开在途表");
+    if (a.recovery_of()->rtt_of()->has_sample() != 1)
+        return err(7, "应当采到一个 RTT 样本");
+    if (a.recovery_of()->rtt_of()->smoothed_rtt_of() <= 0)
+        return err(8, "RTT 样本应是正的");
+    /* MAX_DATA / MAX_STREAM_DATA 放额度 */
+    {
+        u8 frames[128] = { 0 };
+        u8 hdr[32] = { 0 };
+        u8 nonce[12] = { 0 };
+        u8 pkt2[QC_MAX_DGRAM] = { 0 };
+        HeaderBuilder hb = { 0 };
+        int flen = 0;
+        int hlen = 0;
+        int ct = 0;
+        int total = 0;
+
+        flen = 0;
+        i = frame_put_max_data(frames + flen, (int)sizeof frames - flen,
+                               (u64)QC_INITIAL_MAX_DATA * 2);
+        if (i < 0)
+            return err(9, "拼 MAX_DATA 失败");
+        flen += i;
+        i = frame_put_max_streams(frames + flen, (int)sizeof frames - flen, 0,
+                                  16);
+        if (i < 0)
+            return err(10, "拼 MAX_STREAMS 失败");
+        flen += i;
+        i = frame_put_handshake_done(frames + flen, (int)sizeof frames - flen);
+        if (i < 0)
+            return err(11, "拼 HANDSHAKE_DONE 失败");
+        flen += i;
+        hb.init(pkt2, (int)sizeof pkt2);
+        hb.short_header(0, a.scid, 8);
+        hb.pn(4, 1);
+        hlen = hb.finish();
+        memcpy(hdr, pkt2, (size_t)hlen);
+        tls13_quic_nonce(b.tx_iv, 1, nonce);
+        ct = b.tx_aead.seal(nonce, hdr, hlen, frames, flen, pkt2 + hlen,
+                            (int)sizeof pkt2 - hlen);
+        if (ct < 0)
+            return err(12, "手工加密失败");
+        total = hlen + ct;
+        b.tx_hp.protect_at(pkt2, total, hlen - 4, 4, 0);
+        if (a.on_packet(pkt2, total, 0) != 0)
+            return err(13, "客户端应能收下控制帧");
+        if (a.streams_of()->max_data_of() != (u64)QC_INITIAL_MAX_DATA * 2)
+            return err(14, "MAX_DATA 应把额度翻倍");
+        if (a.streams_of()->max_streams_bidi != 16)
+            return err(15, "MAX_STREAMS 应把双向流名额提到 16");
+        if (!a.handshake_done_of())
+            return err(16, "HANDSHAKE_DONE 应被记下");
+        /* 放额度之后能写更多 */
+        if (a.write_stream(0, "0123456789", 10) != 10)
+            return err(17, "放额度之后应能继续写");
+    }
+}

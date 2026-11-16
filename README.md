@@ -812,6 +812,7 @@ cmake --build build --target std-ops      # 编译并运行 examples/stdops.c6�
 cmake --build build --target std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
 cmake --build build --target std-mgmt     # 编译并运行 examples/stdmgmt.c6（第九十批 Prometheus/Gemini/SNMP/NNTP）
 cmake --build build --target std-util     # 编译并运行 examples/stdutil.c6（第九十一批 CIDR/字节序/排序键/断词）
+ctest --test-dir build -R '^std-quic$'  # 编译并运行 examples/stdquic.c6（第九十二批 QUIC/HTTP/3 全栈）
 # 覆盖面盘点（还缺什么、什么时候到头）：docs/stdlib-coverage.md
 cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```

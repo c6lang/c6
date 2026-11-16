@@ -2,10 +2,11 @@
 
 这份文档回答一个问题：**「继续扩 `std/`，什么时候才算到头？」**
 
-结论先给：到目前为止（377 个模块、九十一批、`cmake --build build --target stdtest` 377/377 全绿），
-**按族覆盖已经没有空缺**，新增模块只能在同一族里造变体，或者必须引入外部数据
-（词典）与大运行时（QUIC/TLS 1.3 完整栈）。所以本轮的收尾动作是：把覆盖面写成
-这份可核对的矩阵，而不是继续堆数量。
+结论先给：到目前为止（**391 个模块、九十二批**、`cmake --build build --target stdtest`
+391/391 全绿），**按族覆盖已经没有空缺**，连当初列进「不做」清单的两条大字头——
+QUIC/HTTP/3 与 TLS 1.3 完整握手——也在第九十二批做掉了。剩下的缺口只剩一类：
+**必须引入外部数据（词典）或第三方大运行时**的东西。所以本轮的收尾动作仍然是
+把覆盖面写成这份可核对的矩阵，而不是继续堆数量。
 
 ---
 
@@ -15,14 +16,14 @@
 |---|---:|---|
 | `std/core/` | 53 | 类型、内存、位运算、数值与线性代数、单元与几何、运行时原语 |
 | `std/data/` | 85 | 文档/媒体/系统镜像/字幕/网络配置等格式的解析与生成 |
-| `std/encoding/` | 53 | 文本编码（base 家族、转义）、校验和、哈希、压缩、KDF |
-| `std/net/` | 53 | 传输、应用协议、安全与策略、运维与可观测 |
+| `std/encoding/` | 54 | 文本编码（base 家族、转义）、校验和、哈希、压缩、KDF、AEAD |
+| `std/net/` | 66 | 传输、应用协议、安全与策略、运维与可观测、QUIC/HTTP/3 |
 | `std/text/` | 52 | 字符串、搜索、分析、排版辅助 |
 | `std/container/` | 33 | 顺序/关联容器、图与树、位图、缓存 |
 | `std/os/` | 32 | 文件、进程、线程、时间、终端、系统信息 |
 | `std/async/` | 13 | 语言级 `async`/`await` 的运行时与横切面 |
 | `std/analysis/` | 3 | 用 c6 写的 c6 静态分析（lex/parse/ub） |
-| **合计** | **377** | |
+| **合计** | **391** | |
 
 ---
 
@@ -31,7 +32,7 @@
 标记：**✅ 完整**＝该族的主干都已覆盖；**◐ 部分**＝只做了常用子集；**— 不做**＝
 明确排除（理由见第 3 节）。
 
-### 2.1 `std/encoding`（53）
+### 2.1 `std/encoding`（54）
 
 | 族 | 代表模块 | 状态 |
 |---|---|---|
@@ -40,7 +41,7 @@
 | 校验和 | crc16 / crc32c / adler32 / fnv / luhn / hamming / classic | ✅ |
 | 非加密哈希 | murmur3 / xxhash / siphash | ✅ |
 | 加密哈希 | md5 / sha1 / sha256 / sha512 / sha3 / blake2s | ✅ |
-| 对称与认证 | chacha20 / poly1305 / aes(核心轮函数) / otp | ◐ 无分组模式与 AEAD 组合层（刻意留给调用方） |
+| 对称与认证 | chacha20 / poly1305 / aes(核心轮函数) / otp / aead(AES-GCM + ChaCha20-Poly1305) | ✅（AEAD 组合层在第九十二批补上） |
 | KDF | hkdf / pbkdf2 | ✅ |
 | 压缩 | rle / lz4 / snappy / deflate / zlib / gzip / lzw / huffman / bwt / mtf / delta | ✅ |
 | 结构化序列化 | asn1 / pem(在 data) / varint | ✅ |
@@ -62,7 +63,7 @@
 | 地理与轨迹 | gpx / kml / geojson / maidenhead / geohash / dms | — **未做**（见第 3 节：与 xml/json 组合即可，收益低） |
 | Office / Parquet / 7z | — | — 不做 |
 
-### 2.3 `std/net`（53）
+### 2.3 `std/net`（66）
 
 | 族 | 代表模块 | 状态 |
 |---|---|---|
@@ -70,9 +71,10 @@
 | 名字解析 | dns / resolver | ◐ 不做 DNSSEC 验签 |
 | 应用协议（客户端） | httpc / ws / sse / socks5 / mqtt / redis / postgres / mysql / ftp / smtp / irc / telnet / gopher / whois / ident / nntp / gemini / coap / ssdp / stun / tftp / ntp | ✅ |
 | HTTP 服务端栈 | http / httpd / router / assets / session / multipart / cookie / httpcache / ratelimit | ✅ |
-| 安全与策略 | tlskdf / tlsrec / https / httpsa / x25519 / hsts / robots | ◐ 记录层 + 密钥调度，无完整握手状态机 |
+| 安全与策略 | tlskdf / tlsrec / https / httpsa / x25519 / hsts / robots | ✅（`quictls` 补上 TLS 1.3 握手消息层与 QUIC 密钥表） |
 | 运维与可观测 | syslog / snmp / netflow / prometheus / wol | ✅ |
-| QUIC / HTTP3 | — | — 不做 |
+| QUIC / HTTP/3 | quic / quichp / quicrecovery / quicstream / quicconn / quicd / h3conn / h3c / h3d | ✅（1-RTT + 头保护 + 丢包恢复 + QPACK + 客户端/服务端驱动） |
+| HTTP/2 头压缩 | hpack | ✅（与 QPACK 共用一套静态表实现） |
 | LDAP / RADIUS / SIP | — | — 不做 |
 | SNMP v3（USM/加密） | — | — 不做（v2c 已覆盖常见运维） |
 
@@ -116,8 +118,8 @@
 
 | 缺口 | 为什么不做 |
 |---|---|
-| QUIC / HTTP/3 | 需要完整 TLS 1.3 握手、丢包恢复与拥塞控制；体量与「判断型/编解码型」的标准库定位不符 |
-| TLS 1.3 完整握手 | 现有 `tlskdf`/`tlsrec`/`https` 覆盖到「记录层 + 密钥调度」，握手状态机（含证书链校验策略）留给应用 |
+| QUIC / HTTP/3 | **已做**（第九十二批，14 个模块）。仍然不做的是 0-RTT、连接迁移、多路径与地址验证令牌的服务端策略 |
+| TLS 1.3 完整握手 | **已做**（`std/net/quictls`：ClientHello→Finished 的消息层、密钥调度与证书链校验）；不做的只是证书**策略**（信任锚、吊销） |
 | SNMP v3（USM/DES/AES） | v2c 已覆盖运维实际用量的绝大多数；v3 引入用户/密钥协商 |
 | LDAP / RADIUS / SIP | 协议面很宽（ASN.1 结构 + 大量可选字段），且最常见的场景是「调外部服务」 |
 | Office（xlsx/docx）/ Parquet / 7z | 需要巨型规范与大量压缩/加密分支 |
@@ -134,12 +136,16 @@
    编码/协议方言）；
 3. **不引入外部数据或大运行时**：不需要随包词典、不需要新的第三方依赖。
 
-按这三条，当前状态是：**第 1 条成立，第 2 条成立**（本批之后我们评估过的候选项都
-落在「变体」或「不做」里），因此**本轮收尾**。
+按这三条，当前状态是：**第 1 条成立**（`std/net` 里当初标「不做」的 QUIC/HTTP3 与
+TLS 1.3 握手已经在第九十二批补上，只剩第 3 节里几条写明理由的例外），**第 2 条成立**，
+**第 3 条成立**（那 14 个模块全部是零依赖的纯 c6 代码，最大的 `quictls` 也只用到
+`std/encoding` 里的 sha256/hkdf/aead）。剩下能想到的候选项都落在「变体」或
+「需要外部数据」里，因此**本轮收尾**。
 
 ## 5. 以后真要再加，怎么加
 
-沿用已经跑通九十一批的节奏（每批 4 个模块）：
+沿用已经跑通九十二批的节奏（每批 4 个模块；第九十二批是唯一的例外，
+按「QUIC 全栈」这个整体一次做了 14 个）：
 
 1. 选 4 个同主题、能写成方法 + 游标/句柄的模块；
 2. 每个模块 2 个 `test` 块（真实规范向量 + 坏输入），API 一律「首参结构体指针 ⇒

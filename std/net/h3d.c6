@@ -1,0 +1,399 @@
+/* std/net/h3d：HTTP/3 服务端（把「收到请求」映射到「回一个固定响应」）。
+ *
+ *     import std.net.h3d;
+ *
+ *     H3Server s = { 0 };
+ *     s.init(scid, 8);
+ *     s.peer(dcid, 8);
+ *     s.keys(TLS13_AES_128_GCM_SHA256, rx_secret, tx_secret);
+ *     s.route("/", 200, "hello");
+ *     s.route("/health", 200, "ok");
+ *     ...
+ *     if (s.feed(in, n, now) >= 0) {
+ *         s.poll();                          -- 有请求就回响应
+ *         while (s.flush(out, sizeof out, now) > 0)
+ *             sendto(out, n);
+ *     }
+ *
+ * 路由表是一张静态表：路径**完全相等**才算命中，没命中回 404。这够用来做
+ * 健康检查、调试端点、示例程序；要动态内容，就在 `poll()` 之后自己看
+ * `last_path_of()` 决定回什么——本模块不装回调，因为回调会让调用方多背一层
+ * 生命周期管理，而 HTTP/3 的麻烦本来就在连接层。
+ *
+ * 一条请求只回一次：`H3Flow.answered` 记着，重复 `poll()` 不会重复响应。
+ */
+#include <string.h>
+
+module std.net.h3d;
+import std.core.types;
+import std.net.h3conn;
+import std.net.quicconn;
+import std.net.quicstream;
+import std.net.quictls;
+
+enum Error { OK = 0, INVAL = 1, STATE = 2, H3 = 3, IO = 4, FULL = 5 };
+
+#define HD_OPEN     1
+#define HD_CLOSED   2
+
+#define HD_MAX_ROUTES 8
+#define HD_PATH       96
+#define HD_BODY       512
+
+struct H3Route {
+    char path[HD_PATH];
+    int status;
+    char body[HD_BODY];
+    int used;
+};
+
+struct H3Server {
+    QConn qc;
+    H3Peer h3;
+    H3Route routes[HD_MAX_ROUTES];
+    int route_count;
+    int handled;
+    int state;
+    int err;
+    char last_path[HD_PATH];
+};
+
+int init(H3Server *s, const void *scid, int scid_len)
+{
+    if (!s || !scid || scid_len <= 0 || scid_len > QUIC_CID_MAX)
+        return -INVAL;
+    memset(s, 0, sizeof *s);
+    if (s->qc.init(1, scid, scid_len) != 0)
+        return -INVAL;
+    s->state = HD_CLOSED;
+    return 0;
+}
+
+int peer(H3Server *s, const void *dcid, int dcid_len)
+{
+    if (!s || !dcid || dcid_len <= 0 || dcid_len > QUIC_CID_MAX)
+        return -INVAL;
+    return s->qc.set_dcid(dcid, dcid_len);
+}
+
+int keys(H3Server *s, int cipher, const void *rx_secret, const void *tx_secret)
+{
+    if (!s || !rx_secret || !tx_secret)
+        return -INVAL;
+    if (s->qc.set_keys(cipher, rx_secret, tx_secret) != 0)
+        return -STATE;
+    if (s->h3.init(&s->qc) != 0)
+        return -H3;
+    s->state = HD_OPEN;
+    return 0;
+}
+
+int state_of(H3Server *s) { return s ? s->state : HD_CLOSED; }
+int err_of(H3Server *s) { return s ? s->err : 0; }
+int handled_of(H3Server *s) { return s ? s->handled : 0; }
+int route_count_of(H3Server *s) { return s ? s->route_count : 0; }
+QConn *conn_of(H3Server *s) { return s ? &s->qc : 0; }
+H3Peer *h3_of(H3Server *s) { return s ? &s->h3 : 0; }
+
+const char *last_path_of(H3Server *s)
+{
+    if (!s)
+        return "";
+    return s->last_path;
+}
+
+/* 登记一条路由；同路径再次登记就是改内容。 */
+int route(H3Server *s, const char *path, int status, const char *body)
+{
+    size_t plen = 0;
+    size_t blen = 0;
+    int i = 0;
+
+    if (!s || !path || !body)
+        return -INVAL;
+    plen = strlen(path);
+    blen = strlen(body);
+    if (plen == 0 || plen >= HD_PATH || blen >= HD_BODY)
+        return -INVAL;
+    if (s->state == HD_CLOSED) {
+        s->err = STATE;
+        return -STATE;
+    }
+    for (i = 0; i < s->route_count; i++) {
+        if (strcmp(s->routes[i].path, path) == 0) {
+            s->routes[i].status = status;
+            memcpy(s->routes[i].body, body, blen + 1);
+            return 0;
+        }
+    }
+    if (s->route_count >= HD_MAX_ROUTES) {
+        s->err = FULL;
+        return -FULL;
+    }
+    memcpy(s->routes[s->route_count].path, path, plen + 1);
+    memcpy(s->routes[s->route_count].body, body, blen + 1);
+    s->routes[s->route_count].status = status;
+    s->routes[s->route_count].used = 1;
+    s->route_count++;
+    return 0;
+}
+
+/* 查表：返回下标，没命中返回 -1。 */
+static int hd_find(H3Server *s, const char *path)
+{
+    int i = 0;
+
+    for (i = 0; i < s->route_count; i++)
+        if (strcmp(s->routes[i].path, path) == 0)
+            return i;
+    return -1;
+}
+
+/* 取一个要发出去的包；没有就返回 0。 */
+int flush(H3Server *s, void *out, int cap, i64 now)
+{
+    if (!s || !out || cap <= 0)
+        return -INVAL;
+    if (s->state != HD_OPEN)
+        return 0;
+    return s->qc.flush(out, cap, now);
+}
+
+/* 收一个包。 */
+int feed(H3Server *s, const void *pkt, int n, i64 now)
+{
+    int rc = 0;
+
+    if (!s || !pkt || n <= 0)
+        return -INVAL;
+    if (s->state != HD_OPEN)
+        return -STATE;
+    rc = s->qc.on_packet(pkt, n, now);
+    if (rc < 0) {
+        s->err = IO;
+        return rc;
+    }
+    return rc;
+}
+
+/* 处理请求：解出新请求就按路由表回响应。返回这次回了几条。 */
+int poll(H3Server *s)
+{
+    int n = 0;
+    int i = 0;
+    int done = 0;
+
+    if (!s)
+        return -INVAL;
+    if (s->state != HD_OPEN)
+        return 0;
+    n = s->h3.pump();
+    if (n < 0) {
+        s->err = H3;
+        return n;
+    }
+    for (i = 0; i < s->h3.count; i++) {
+        H3Flow *f = s->h3.flow_at(i);
+        int idx = 0;
+        int status = 404;
+        const char *body = "not found";
+
+        if (!f || f->type != H3C_REQ || !f->headers_seen || f->answered)
+            continue;
+        idx = hd_find(s, f->req.path);
+        if (idx >= 0) {
+            status = s->routes[idx].status;
+            body = s->routes[idx].body;
+        }
+        if (s->h3.send_response(f->id, status) != 0)
+            return -H3;
+        if (s->h3.send_data(f->id, body, (int)strlen(body)) != 0)
+            return -H3;
+        if (s->h3.finish_stream(f->id) != 0)
+            return -H3;
+        f->answered = 1;
+        s->handled++;
+        memcpy(s->last_path, f->req.path, strlen(f->req.path) + 1);
+        done++;
+    }
+    return done;
+}
+
+/* 关掉连接。 */
+int close(H3Server *s, u64 code)
+{
+    if (!s)
+        return -INVAL;
+    s->qc.close(1, code);
+    s->state = HD_CLOSED;
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+struct HdPair {
+    QConn c;
+    H3Peer ch3;
+    H3Server s;
+};
+
+static void hd_pair(struct HdPair *p)
+{
+    u8 sc[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    u8 ss[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++) {
+        c_ap[i] = (u8)(0x10 + i);
+        s_ap[i] = (u8)(0x80 + i);
+    }
+    p->c.init(0, sc, 8);
+    p->c.set_dcid(ss, 8);
+    p->c.set_keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    p->ch3.init(&p->c);
+    p->s.init(ss, 8);
+    p->s.peer(sc, 8);
+    p->s.keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+}
+
+/* 把客户端攒下的包全灌给服务器。 */
+static int hd_to_server(H3Peer *ch3, QConn *c, H3Server *s, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int k = 0;
+
+    (void)ch3;
+    while ((n = c->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (s->feed(pkt, n, now) < 0)
+            return -1;
+        if (++k > 16)
+            break;
+    }
+    return k;
+}
+
+/* 反过来：服务器的包灌给客户端。 */
+static int hd_to_client(H3Server *s, QConn *c, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int k = 0;
+
+    while ((n = s->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (c->on_packet(pkt, n, now) < 0)
+            return -1;
+        if (++k > 16)
+            break;
+    }
+    return k;
+}
+
+test "HTTP/3 服务端：路由命中与 404" {
+    struct HdPair p = { { 0 } };
+    u64 id = 0;
+
+    hd_pair(&p);
+    if (p.s.state_of() != HD_OPEN)
+        return err(1, "装好密钥之后应开门");
+    if (p.s.route("/", 200, "hello") != 0)
+        return err(2, "登记路由失败");
+    if (p.s.route("/health", 200, "ok") != 0)
+        return err(3, "登记第二条路由失败");
+    if (p.s.route_count_of() != 2)
+        return err(4, "路由条数不对");
+    /* 命中 /health */
+    id = p.ch3.start_request("GET", "https", "example.com", "/health");
+    if (hd_to_server(&p.ch3, &p.c, &p.s, 1000) <= 0)
+        return err(5, "请求没发出去");
+    if (p.s.poll() != 1 || p.s.handled_of() != 1)
+        return err(6, "应回一条响应");
+    if (strcmp(p.s.last_path_of(), "/health") != 0)
+        return err(7, "记下的路径不对");
+    if (hd_to_client(&p.s, &p.c, 2000) <= 0)
+        return err(8, "响应没发出去");
+    if (p.ch3.pump() < 0 || !p.ch3.response_of()->has_status)
+        return err(9, "客户端应解出响应");
+    if (strcmp(p.ch3.response_of()->status, "200") != 0)
+        return err(10, "状态码应是 200");
+    if (strcmp((const char *)p.ch3.body, "ok") != 0)
+        return err(11, "响应体应是 ok");
+    /* 没注册的路径回 404 */
+    if (p.ch3.start_request("GET", "https", "example.com", "/nope") == id)
+        return err(12, "第二条请求应换一条流");
+    hd_to_server(&p.ch3, &p.c, &p.s, 3000);
+    if (p.s.poll() != 1)
+        return err(13, "404 也要回一条");
+    hd_to_client(&p.s, &p.c, 4000);
+    if (p.ch3.pump() < 0)
+        return err(14, "抽数据失败");
+    if (strcmp(p.ch3.response_of()->status, "404") != 0)
+        return err(15, "没命中应回 404");
+    if (strcmp((const char *)p.ch3.body, "not found") != 0)
+        return err(16, "404 的响应体不对");
+    /* 已经回过的请求不再重复回应 */
+    if (p.s.poll() != 0)
+        return err(17, "没有新请求时 poll 应返回 0");
+}
+
+test "HTTP/3 服务端：路由表、状态与边界" {
+    struct HdPair p = { { 0 } };
+    u8 pkt[1200] = { 0 };
+    u8 ss[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+    int i = 0;
+    char long_path[160] = { 0 };
+
+    /* 没开门之前不能登记路由 */
+    {
+        H3Server t = { 0 };
+
+        t.init(ss, 8);
+        if (t.route("/", 200, "x") != -STATE)
+            return err(1, "关着门登记路由应报 STATE");
+    }
+    hd_pair(&p);
+    /* 同路径再登记是改内容，不是加一条 */
+    p.s.route("/a", 200, "one");
+    p.s.route("/a", 500, "two");
+    if (p.s.route_count_of() != 1)
+        return err(2, "同路径应覆盖");
+    /* 参数检查 */
+    if (p.s.route(0, 200, "x") != -INVAL || p.s.route("/x", 200, 0) != -INVAL)
+        return err(3, "空指针应报 INVAL");
+    if (p.s.route("", 200, "x") != -INVAL)
+        return err(4, "空路径应报 INVAL");
+    memset(long_path, 'a', sizeof long_path - 1);
+    if (p.s.route(long_path, 200, "x") != -INVAL)
+        return err(5, "超长路径应报 INVAL");
+    /* 表满 */
+    for (i = p.s.route_count_of(); i < HD_MAX_ROUTES; i++) {
+        char path[16] = { 0 };
+
+        path[0] = '/';
+        path[1] = (char)('a' + i);
+        path[2] = 0;
+        if (p.s.route(path, 200, "y") != 0)
+            return err(6, "填满路由表失败");
+    }
+    if (p.s.route("/overflow", 200, "y") != -FULL)
+        return err(7, "路由表满了应报 FULL");
+    /* 垃圾包 */
+    memset(pkt, 0xee, sizeof pkt);
+    if (p.s.feed(pkt, 40, 1000) >= 0)
+        return err(8, "垃圾包应被拒");
+    if (p.s.err_of() != IO)
+        return err(9, "IO 错误应被记下");
+    if (p.s.feed(0, 10, 1000) != -INVAL)
+        return err(10, "空包应报 INVAL");
+    /* 关掉之后不再收也不再发 */
+    if (p.s.close(0) != 0 || p.s.state_of() != HD_CLOSED)
+        return err(11, "关闭没生效");
+    if (p.s.feed(pkt, 40, 2000) != -STATE)
+        return err(12, "关闭之后不该再收包");
+    if (p.s.flush(pkt, (int)sizeof pkt, 2000) != 0)
+        return err(13, "关闭之后 flush 应返回 0");
+    if (p.s.poll() != 0)
+        return err(14, "关闭之后 poll 应返回 0");
+}

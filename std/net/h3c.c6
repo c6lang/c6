@@ -1,0 +1,382 @@
+/* std/net/h3c：HTTP/3 客户端驱动（把 quicconn + h3conn 拼成一条「请求」）。
+ *
+ *     import std.net.h3c;
+ *
+ *     H3Client c = { 0 };
+ *     c.init(scid, 8);
+ *     c.peer(dcid, 8);
+ *     c.keys(TLS13_AES_128_GCM_SHA256, rx_secret, tx_secret);
+ *     c.get("/index.html");
+ *     while (c.flush(buf, sizeof buf, now) > 0)
+ *         sendto(buf, n);              -- 交给调用方的 socket
+ *     ...
+ *     if (c.feed(in, n, now) >= 0 && c.poll() > 0)
+ *         printf("%d %s\n", c.status_of(), c.body_of());
+ *
+ * 这个模块只做「一条请求的生命周期」：装密钥、发 HEADERS、收 HEADERS 与
+ * DATA、把状态码与响应体摆好。真正的包收发仍然在调用方手里（`flush` /
+ * `feed`），因为同一份驱动要能跑在阻塞 socket、事件循环、内存自测三种环境
+ * 里，自测就是靠最后一种。
+ *
+ * 状态机很简单：
+ *
+ *     HC_IDLE --keys()--> HC_READY --get()--> 请求已排队
+ *        |                                       |
+ *        +-------- close() ----> HC_CLOSED <-----+
+ *
+ * `poll()` 是可重复调用的：没有新数据时返回 0，解出响应之后返回 1 并把状态
+ * 码、响应体放到 `status_of()` / `body_of()` 上。
+ */
+#include <string.h>
+
+module std.net.h3c;
+import std.core.types;
+import std.net.h3conn;
+import std.net.quicconn;
+import std.net.quicstream;
+import std.net.quictls;
+import std.encoding.aead;
+
+enum Error { OK = 0, INVAL = 1, STATE = 2, H3 = 3, IO = 4 };
+
+#define HC_IDLE     0
+#define HC_READY    1
+#define HC_CLOSED   2
+
+#define HC_BUF      4096
+
+struct H3Client {
+    QConn qc;
+    H3Peer h3;
+    int state;
+    int cipher;
+    char host[256];
+    u64 stream;                 /* 最近一次请求的流号 */
+    int status;
+    int got_response;
+    int err;
+};
+
+/* `scid` 是本端自选的连接 ID（对端发回来的包会带着它）。 */
+int init(H3Client *c, const void *scid, int scid_len)
+{
+    if (!c || scid_len <= 0 || scid_len > QUIC_CID_MAX || !scid)
+        return -INVAL;
+    memset(c, 0, sizeof *c);
+    if (c->qc.init(0, scid, scid_len) != 0)
+        return -INVAL;
+    c->state = HC_IDLE;
+    c->cipher = TLS13_AES_128_GCM_SHA256;
+    return 0;
+}
+
+/* 记下对端的连接 ID 与主机名。 */
+int peer(H3Client *c, const void *dcid, int dcid_len, const char *host)
+{
+    size_t n = 0;
+
+    if (!c || dcid_len <= 0 || dcid_len > QUIC_CID_MAX || !dcid)
+        return -INVAL;
+    if (strlen(host ? host : "") >= sizeof c->host)
+        return -INVAL;
+    if (c->qc.set_dcid(dcid, dcid_len) != 0)
+        return -INVAL;
+    n = strlen(host ? host : "");
+    if (n > 0)
+        memcpy(c->host, host, n);
+    c->host[n] = 0;
+    return 0;
+}
+
+/* 装 1-RTT 密钥并开始 HTTP/3 会话（发控制流与 SETTINGS）。 */
+int keys(H3Client *c, int cipher, const void *rx_secret, const void *tx_secret)
+{
+    if (!c || !rx_secret || !tx_secret)
+        return -INVAL;
+    if (c->qc.set_keys(cipher, rx_secret, tx_secret) != 0)
+        return -STATE;
+    c->cipher = cipher;
+    if (c->h3.init(&c->qc) != 0)
+        return -H3;
+    c->state = HC_READY;
+    return 0;
+}
+
+int state_of(H3Client *c) { return c ? c->state : HC_CLOSED; }
+int err_of(H3Client *c) { return c ? c->err : 0; }
+u64 stream_of(H3Client *c) { return c ? c->stream : 0; }
+int status_of(H3Client *c) { return c ? c->status : 0; }
+int have_response(H3Client *c) { return c ? c->got_response : 0; }
+const char *body_of(H3Client *c)
+{
+    if (!c || !c->got_response)
+        return "";
+    return (const char *)c->h3.body;
+}
+
+int body_len_of(H3Client *c)
+{
+    if (!c)
+        return 0;
+    return c->h3.body_len;
+}
+
+QConn *conn_of(H3Client *c) { return c ? &c->qc : 0; }
+H3Peer *h3_of(H3Client *c) { return c ? &c->h3 : 0; }
+
+/* 发一个 GET 请求，返回请求流的编号（0 表示失败）。 */
+u64 get(H3Client *c, const char *path)
+{
+    u64 id = 0;
+
+    if (!c || !path)
+        return 0;
+    if (c->state != HC_READY) {
+        c->err = STATE;
+        return 0;
+    }
+    id = c->h3.start_request("GET", "https",
+                             c->host[0] ? c->host : "localhost", path);
+    if (id == 0) {
+        c->err = H3;
+        return 0;
+    }
+    c->stream = id;
+    c->got_response = 0;
+    c->status = 0;
+    return id;
+}
+
+/* 在请求流上补一段请求体（GET 用不着，POST/上传用）。 */
+int send_data(H3Client *c, const void *data, int n)
+{
+    if (!c || !data || n < 0 || c->stream == 0)
+        return -INVAL;
+    if (c->state != HC_READY) {
+        c->err = STATE;
+        return -STATE;
+    }
+    return c->h3.send_data(c->stream, data, n);
+}
+
+/* 请求体写完（带 FIN）。 */
+int finish(H3Client *c)
+{
+    if (!c || c->stream == 0)
+        return -INVAL;
+    return c->h3.finish_stream(c->stream);
+}
+
+/* 取一个要发出去的包；没有就返回 0。 */
+int flush(H3Client *c, void *out, int cap, i64 now)
+{
+    if (!c || !out || cap <= 0)
+        return -INVAL;
+    if (c->state == HC_CLOSED)
+        return 0;
+    if (c->state != HC_READY) {
+        c->err = STATE;
+        return -STATE;
+    }
+    return c->qc.flush(out, cap, now);
+}
+
+/* 收一个包。 */
+int feed(H3Client *c, const void *pkt, int n, i64 now)
+{
+    int rc = 0;
+
+    if (!c || !pkt || n <= 0)
+        return -INVAL;
+    if (c->state == HC_CLOSED)
+        return -STATE;
+    rc = c->qc.on_packet(pkt, n, now);
+    if (rc < 0) {
+        c->err = IO;
+        return rc;
+    }
+    return rc;
+}
+
+/* 抽数据、解响应。解出新的响应返回 1，否则 0。 */
+int poll(H3Client *c)
+{
+    int n = 0;
+
+    if (!c)
+        return -INVAL;
+    if (c->state == HC_CLOSED)
+        return 0;
+    n = c->h3.pump();
+    if (n < 0) {
+        c->err = H3;
+        return n;
+    }
+    if (!c->got_response && c->h3.resp.has_status) {
+        c->status = 0;
+        {
+            const char *s = c->h3.resp.status;
+            int i = 0;
+
+            for (i = 0; s[i] >= '0' && s[i] <= '9'; i++)
+                c->status = c->status * 10 + (s[i] - '0');
+        }
+        c->got_response = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* 关掉连接（只改状态，不发 CONNECTION_CLOSE 之外的任何东西）。 */
+int close(H3Client *c, u64 code)
+{
+    if (!c)
+        return -INVAL;
+    c->qc.close(1, code);
+    c->state = HC_CLOSED;
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static void hc_pair(H3Client *cl, QConn *srv, H3Peer *sh3)
+{
+    u8 sc[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    u8 ss[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+    u8 c_ap[32] = { 0 };
+    u8 s_ap[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++) {
+        c_ap[i] = (u8)(0x10 + i);
+        s_ap[i] = (u8)(0x80 + i);
+    }
+    cl->init(sc, 8);
+    cl->peer(ss, 8, "example.com");
+    cl->keys(TLS13_AES_128_GCM_SHA256, s_ap, c_ap);
+    srv->init(1, ss, 8);
+    srv->set_dcid(sc, 8);
+    srv->set_keys(TLS13_AES_128_GCM_SHA256, c_ap, s_ap);
+    sh3->init(srv);
+}
+
+/* 把客户端攒下的包全灌给服务器，返回灌了几个。 */
+static int hc_push_client(H3Client *cl, QConn *srv, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int sent = 0;
+
+    while ((n = cl->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (srv->on_packet(pkt, n, now) < 0)
+            return -1;
+        sent++;
+        if (sent > 16)
+            break;
+    }
+    return sent;
+}
+
+/* 反过来：服务器的包灌给客户端。 */
+static int hc_push_server(QConn *srv, H3Client *cl, i64 now)
+{
+    u8 pkt[1200] = { 0 };
+    int n = 0;
+    int sent = 0;
+
+    while ((n = srv->flush(pkt, (int)sizeof pkt, now)) > 0) {
+        if (cl->feed(pkt, n, now) < 0)
+            return -1;
+        sent++;
+        if (sent > 16)
+            break;
+    }
+    return sent;
+}
+
+test "HTTP/3 客户端：一次 GET 的完整往返" {
+    H3Client cl = { 0 };
+    QConn srv = { 0 };
+    H3Peer sh3 = { 0 };
+    u64 id = 0;
+
+    hc_pair(&cl, &srv, &sh3);
+    if (cl.state_of() != HC_READY || !cl.conn_of()->keys_ready_of())
+        return err(1, "装好密钥之后应就绪");
+    id = cl.get("/index.html");
+    if (id != 0)
+        return err(2, "第一条请求流应是 0");
+    if (hc_push_client(&cl, &srv, 1000) <= 0)
+        return err(3, "请求应当发出去了");
+    if (sh3.pump() <= 0 || sh3.err_of() != 0)
+        return err(4, "服务器应解出请求");
+    if (strcmp(sh3.request_of()->method, "GET") != 0
+        || strcmp(sh3.request_of()->path, "/index.html") != 0)
+        return err(5, "请求行不对");
+    /* 服务器回 200 + "hi" */
+    sh3.send_response(id, 200);
+    sh3.send_data(id, "hi", 2);
+    sh3.finish_stream(id);
+    if (hc_push_server(&srv, &cl, 2000) <= 0)
+        return err(6, "响应应当发出去了");
+    if (cl.poll() != 1)
+        return err(7, "客户端应解出响应");
+    if (!cl.have_response() || cl.status_of() != 200)
+        return err(8, "状态码应是 200");
+    if (cl.body_len_of() != 2 || strcmp(cl.body_of(), "hi") != 0)
+        return err(9, "响应体应是 hi");
+    /* 重复 poll 不再报新响应 */
+    if (cl.poll() != 0)
+        return err(10, "重复 poll 不该再报新响应");
+    /* 再发一个请求：流号 4 */
+    if (cl.get("/other") != 4)
+        return err(11, "第二条请求流应是 4");
+    if (cl.status_of() != 0 || cl.have_response())
+        return err(12, "新请求应把旧响应清掉");
+}
+
+test "HTTP/3 客户端：状态、错误与边界" {
+    H3Client cl = { 0 };
+    QConn srv = { 0 };
+    H3Peer sh3 = { 0 };
+    u8 pkt[1200] = { 0 };
+    u8 sc[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    u8 ss[8] = { 9, 10, 11, 12, 13, 14, 15, 16 };
+
+    /* 没有密钥时不能发请求 */
+    cl.init(sc, 8);
+    cl.peer(ss, 8, "h");
+    if (cl.get("/x") != 0 || cl.err_of() != STATE)
+        return err(1, "没装密钥时 get 应报 STATE");
+    if (cl.flush(pkt, (int)sizeof pkt, 0) != -STATE)
+        return err(2, "没装密钥时 flush 应报 STATE");
+    /* 参数检查 */
+    if (cl.init(0, 8) != -INVAL || cl.peer(0, 8, "h") != -INVAL)
+        return err(3, "空指针应报 INVAL");
+    if (cl.peer(ss, 0, "h") != -INVAL)
+        return err(4, "CID 长度为 0 应报 INVAL");
+    if (cl.keys(TLS13_AES_128_GCM_SHA256, 0, 0) != -INVAL)
+        return err(5, "空密钥应报 INVAL");
+
+    /* 正常连接下探一些边界情况 */
+    hc_pair(&cl, &srv, &sh3);
+    if (cl.get(0) != 0)
+        return err(6, "空路径应失败");
+    if (cl.send_data("x", 1) == 0)
+        return err(7, "没有请求流时不该能发数据");
+    /* 对不认识的包：报错并记下来 */
+    memset(pkt, 0xee, sizeof pkt);
+    if (cl.feed(pkt, 40, 1000) >= 0)
+        return err(8, "垃圾包应被拒");
+    if (cl.err_of() != IO)
+        return err(9, "IO 错误应被记下");
+    /* 关闭之后两个方向都停 */
+    if (cl.close(0) != 0 || cl.state_of() != HC_CLOSED)
+        return err(10, "关闭没生效");
+    if (cl.flush(pkt, (int)sizeof pkt, 2000) != 0)
+        return err(11, "关闭之后不该再发包");
+    if (cl.poll() != 0)
+        return err(12, "关闭之后 poll 应返回 0");
+    if (cl.body_of()[0] != 0)
+        return err(13, "没有响应时 body 应是空串");
+}
