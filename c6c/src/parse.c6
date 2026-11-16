@@ -996,6 +996,31 @@ static u32 cplx_neg(u32 a, u32 cty);
 static u32 gen_int_lit(u64 c, u32 ty);
 static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty);
 
+typedef struct InitSave {
+    u32 n;
+    int trunc;
+    u32 cur;
+    u32 max;
+    u32 lvd;
+    u32 count;
+    int cntok;
+    u32 *off;
+    u32 *ty;
+    u32 *bits;
+    u32 *boff;
+    u32 *lvty;
+    u32 *lvoff;
+} InitSave;
+
+/* 复合字面量（`(Str){ … }`）可能出现在**另一个初始化器里**：
+ * `Str a[3] = { (Str){ … }, (Str){ … }, … }`。它内部的 gen_init_obj 会把全局
+ * 的叶子表（LF_）、游标（INIT_CUR / INIT_MAX）和层栈（LV_）整个重建，外面那个
+ * 初始化器接着走时游标已经指向别处——表现就是"只有第一个元素被写进去，剩下两个
+ * 被 skip_init_list 当成多余的值吞掉"（std-search2 的倒排统计因此对不上）。
+ * 进出各存/取一次，外面那个初始化器完全不受影响。 */
+static void init_save(InitSave *st);
+static void init_restore(InitSave *st);
+
 /* 上限可调：环境变量 C6C_MAX_ERRORS（默认 20），调大是为了能一次看清
  * 大文件（比如 tcc.h）里所有独立的错误点。 */
 static int pa_err_cap = -1;
@@ -12449,10 +12474,15 @@ static u32 gen_unary(void)
                 return gen_postfix_ops(av3);
             }
         }
+typedef struct InitSave InitSave;
+
         if (pa_is_ch('{')) {
             /* 复合字面量 (T){...}：在栈上开个临时对象，就地初始化，值是它的地址 */
             u32 slot = 0;
             u32 addr = irfn_vreg(&FN);
+            InitSave isv = { 0 };
+
+            init_save(&isv);
 
             if (ty_is_array(ty) && ty_size(ty) == 0) {
                 /* (int[]){...}：元素个数由初始化器决定，先按 1 KB 开，
@@ -12471,6 +12501,7 @@ static u32 gen_unary(void)
                 GEN_TY = ty_ptr(et);
                 /* 复合字面量是后缀表达式的一部分：`(int[]){7,8}[1]`、
                  * `(struct P){1,2}.y` 都要接着走后缀链（C99 6.5.2）。 */
+                init_restore(&isv);
                 return gen_postfix_ops(addr);
             }
             slot = frame_slots_for(ty_size(ty));
@@ -12481,6 +12512,7 @@ static u32 gen_unary(void)
             PEND_ADDR = addr;
             GEN_TY = ty_is_array(ty) ? ty_ptr(ty_target(ty)) : ty;
             /* 同上：复合字面量后面可以直接跟 `.成员`/`[下标]` */
+            init_restore(&isv);
             return gen_postfix_ops(addr);
         }
         v = gen_unary();
@@ -14832,6 +14864,57 @@ static u32 INIT_MAX;       /* 填过的最大叶子下标 + 1（顶层数组长�
 static u32 LV_TY[INIT_LV_MAX];
 static u32 LV_OFF[INIT_LV_MAX];
 static u32 LV_DEPTH;
+
+static void init_save(InitSave *st)
+{
+    memset(st, 0, sizeof *st);
+    st->n = LF_N;
+    st->trunc = LF_TRUNC;
+    st->cur = INIT_CUR;
+    st->max = INIT_MAX;
+    st->lvd = LV_DEPTH;
+    st->count = INIT_COUNT;
+    st->cntok = INIT_CNT_OK;
+    if (LF_N > 0) {
+        st->off = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->ty = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->bits = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->boff = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->off, LF_OFF, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->ty, LF_TY, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->bits, LF_BITS, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->boff, LF_BOFF, sizeof(u32) * (size_t)LF_N);
+    }
+    if (LV_DEPTH > 0) {
+        st->lvty = arena_alloc(&A_main, sizeof(u32) * (size_t)LV_DEPTH);
+        st->lvoff = arena_alloc(&A_main, sizeof(u32) * (size_t)LV_DEPTH);
+        memcpy(st->lvty, LV_TY, sizeof(u32) * (size_t)LV_DEPTH);
+        memcpy(st->lvoff, LV_OFF, sizeof(u32) * (size_t)LV_DEPTH);
+    }
+}
+
+static void init_restore(InitSave *st)
+{
+    u32 k = 0;
+
+    for (k = 0; k < st->n; k++) {
+        LF_OFF[k] = st->off[k];
+        LF_TY[k] = st->ty[k];
+        LF_BITS[k] = st->bits[k];
+        LF_BOFF[k] = st->boff[k];
+    }
+    for (k = 0; k < st->lvd; k++) {
+        LV_TY[k] = st->lvty[k];
+        LV_OFF[k] = st->lvoff[k];
+    }
+    LF_N = st->n;
+    LF_TRUNC = st->trunc;
+    INIT_CUR = st->cur;
+    INIT_MAX = st->max;
+    LV_DEPTH = st->lvd;
+    INIT_COUNT = st->count;
+    INIT_CNT_OK = st->cntok;
+}
 
 static int INIT_IS_GLOB;     /* 1 = 数据段初始化（goff），0 = 局部（addr vreg） */
 static u32 INIT_GOFF;
