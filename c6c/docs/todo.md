@@ -4781,3 +4781,22 @@ int main(void) { int e = 0; e = std.data.csv.PARSE; printf("%d\n", e); }
 低位 `0x1B007` 不是 7 —— 看起来是"把**同名字段的其它枚举值**也用同一份基址
 OR 了一遍"。下一轮从 `parse.c6` 里最长前缀那圈（约 10450 行）跟着 `qd`/`qm`
 两个拼法打印一次，看最后 `sym_find` 命中的到底是哪个符号。
+
+### 第 235 轮：上面那条结论被自己的复现推翻了
+
+按 stdbox 的编译顺序（`std/core/err.c6` 在 `std/data/csv.c6` 之前）写了个最小复现：
+
+```c
+Str bad = { S("a,\"unterminated") };
+CsvReader r = csv_reader(bad);
+while (r.next(&f) > 0) ;
+printf("%d %d\n", (int)r.error, (int)std.data.csv.PARSE);
+```
+
+输出 `error=234991623 qualified=234991623` —— **两边相等**，而且都带着模块号段
+基址（`(1<<27)|(csv 的 slot<<12)|7`）。所以"两个符号值对不上"这个判断是错的：
+`enum Error` 在模块里本来就会被加上号段，模块内部和外部拿到的是同一个。
+
+std-box 那条 `csv: 未闭合引号报 PARSE` 另有原因（多半是那个 `bad_text` 在示例
+里跟别的 csv 状态混在一起，或者 `next` 先返回了 0），下一轮直接从
+`examples/stdbox.c6` 的 `box_csv()` 里把 `r.error` 打出来看。
