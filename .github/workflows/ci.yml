@@ -347,6 +347,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # checkout 必须排在下载产物**之前**：checkout 默认会在工作区跑
+      # `git clean -ffdx`，把下载到 `dist/` 的包（未跟踪文件）一并删掉。
+      # 0.6.1 时发布 job 里还没有 checkout（说明取自 CHANGELOG），所以没暴露；
+      # v0.6.2 第一次带上它，release 就红了：`Pattern 'dist/*' does not match
+      # any files`——dist 被 clean 掉了，而 artifacts 明明下载成功。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tag 注解要历史，浅克隆里读不到
+
       - uses: actions/download-artifact@v4
         with:
           pattern: packages-*
@@ -363,10 +372,6 @@ jobs:
       # **版本提交**（主题是 `c6 <VERSION>`）的正文 —— 发版时把「改了什么、
       # 怎么验收的」写进那条提交就够了，CI 只负责取用、排版、追加产物清单。
       # tag 注解只当兜底（打 tag 的人通常把标题写在里面），标题也取自它。
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0        # tag 注解要历史，浅克隆里读不到
-
       - name: Release notes from version commit
         id: notes
         run: |
