@@ -7,6 +7,18 @@
 
 ## 未发布
 
+### `-l<name>` 收下 + 数学/组库/线程同步的边角：回归 45 → 47 / 92
+
+- `c6c/src/main.c6` 接受 `-l<name>`（`-lm` 最常见）并**不生效**：c6c 的产物是
+  静态的，libc/libm 的常用面由 `c6c/lib/rt.c6` 自带；真缺符号时链接期照旧报
+  「未定义的符号」，不会变成运行时炸。此前整批用例挂在「未知选项 '-lm'」上。
+- `c6c/lib/rt.c6`：补 `atan2`（std/geo 卡在它）、`exp2`、`fdim`、`nextafter`；
+  `getgrgid`（解析 `/etc/group`，`struct group` 按 glibc ABI 摆）；
+  `sem_trywait`/`sem_timedwait`/`sem_getvalue`、`pthread_rwlock_tryrdlock`/
+  `trywrlock`、`pthread_barrier_*`、`pthread_spin_*`。
+- 回归：45 → 47 / 92（新增 `std-linalg`、`std-math3`，无回退）。`std-sys` /
+  `std-thread` / `std-geo` 从"链不上"变成"跑起来但自检有差"。
+
 ### 运行时第二批 + `errno`：回归 42 → 45 / 92
 
 - `c6c/src/main.c6` 预定义 `_GNU_SOURCE 1`（和 tcc 一个口径）：glibc 把
