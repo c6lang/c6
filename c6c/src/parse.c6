@@ -3015,6 +3015,16 @@ static i64 const_cast_to(i64 v, u32 ty)
         return (i64)u;
     }
 }
+static u32 generic_ctl_ty(u32 t)
+{
+    t = ty_unqual(t);
+    if (ty_is_array(t))
+        return ty_ptr(ty_unqual(ty_target(t)));
+    if (ty_is_func(t))
+        return ty_ptr(t);
+    return t;
+}
+
 static i64 const_unary(void)
 {
     if (pa_accept_ch('-'))
@@ -3121,7 +3131,7 @@ static i64 const_unary(void)
             u32 save0 = FN.n;
 
             (void)gen_assign();
-            cty = GEN_TY;
+            cty = generic_ctl_ty(GEN_TY);
             FN.n = save0;
             PEND_LVAL = 0;
         }
@@ -10678,7 +10688,7 @@ static u32 gen_postfix(void)
             u32 save0 = FN.n;
 
             (void)gen_assign();
-            cty = GEN_TY;
+            cty = generic_ctl_ty(GEN_TY);
             FN.n = save0;
             PEND_LVAL = 0;
         }
@@ -16227,7 +16237,13 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
          * 游标还在 `(` 上，`?` 在括号后面看不见。 */
         if (pa_cur()->kind != TK_EOF
             && (pa_is_ch('(') || pa_is_ch('?') || pa_is_ch('!')
-                || (pa_cur()->kind == TK_NUM))) {
+                || (pa_cur()->kind == TK_NUM)
+                /* `_Generic(…, T: 全局对象名, …)`：常量层选中分支以后值是个
+                 * **符号下标**（CONST_SYM=1），得按地址常量补重定位，不能把
+                 * 下标当整数写进数据段。内核 include/linux/sysfs.h:297 的
+                 * ATTRIBUTE_GROUPS 就是这个形状——`.attrs = _Generic(_name##_attrs,
+                 * struct attribute **: _name##_attrs, …)`，落在全局初始化器里。 */
+                || PA_IS_IDENT("_Generic"))) {
             u32 save = FN.n;
             u32 save_sym = CONST_SYM;
             i64 cv = 0;
@@ -21667,6 +21683,27 @@ static void gen_one_global(u32 ty, Declarator *d)
         if (ak) {
             glob_addr_parse(s->goff, amp, ak == 2, 0);
             return;
+        }
+        if (!amp) {
+            /* 没有 `&` 的数组名/函数名：它们**退化**成指向首元素的指针，
+             * 本身就是地址常量。glob_addr_start() 返回 0 表示"后面没有
+             * `[`/`.`/`->`/`(`/`+`/`-`"，那就是裸名字，照地址常量收。
+             *
+             * 内核 include/linux/sysfs.h:297 的 ATTRIBUTE_GROUPS 展开成
+             *     .attrs = _Generic(_name##_attrs,
+             *                        struct attribute **: _name##_attrs, …)
+             * 常量层选中那个分支以后，值就是数组名本身。不认它就掉到下面
+             * 的 const_expr，把数组当"整数"求出来写进数据段（静默错值）。 */
+            Tok *t0 = pa_cur();
+            Sym *as = NULL;
+
+            if (t0 && t0->kind == TK_IDENT)
+                as = sym_find(tok_data(t0), t0->len);
+            if (as && (as->kind == SC_GLOBAL || as->is_func)
+                && (ty_is_array(as->type) || as->is_func)) {
+                glob_addr_parse(s->goff, 0, 0, 0);
+                return;
+            }
         }
         if (amp)
             pa_error("全局地址初始化器只支持 &全局/函数");
