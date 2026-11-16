@@ -4422,3 +4422,60 @@ call   __c6_gc_release    ; 把旧字节当指针 release
   `deque: 迭代顺序与求和`（`Deque@int.iter()`，实例身份那条线，下一轮）；
   std-kit 的崩溃点往后挪到 num 段之后；std-demo 仍在别的段错误上。
 - 基线不变（57 / 92）：三个用例都还没全绿。
+
+## 第 215 轮：模板实例的"两个类型 id"（deque 迭代器只吐第一个元素）
+
+std-tour 上一轮剩下的那条断言：
+
+```
+deque   窗口=[3 4 5 6] 加上 1 2 后 sum=6      （应该是 21）
+foreach (int x = d->iter())  →  1 1 1 1 1 1
+```
+
+`DIter@T.next()` 里 `i++` 没生效、`has()` 永远真：接收者按**另一份布局**在读。
+
+**最小复现**（模块 + 调用方两个 TU）：
+
+```c
+/* itm.c6 */
+module itm;
+struct Box@T { T *p; int n; };
+struct It@T {
+    Box@T *b;
+    int i;
+    int has() { return i < b->n; }
+    T next() { T x = b->p[i]; i = i + 1; return x; }
+};
+```
+
+```c
+import itm;
+int a[3] = { 1, 2, 3 };
+Box@int b = { a, 3 };
+It@int it = { &b, 0 };
+while (it.has()) printf("%d ", it.next());     /* 期望 1 2 3 */
+```
+
+- 同一个文件里写这两段（单 TU）：**正常**。
+- 拆成两个 TU：**一次都不进循环**（`has()` 直接假）。
+- 在模块里再补一句 `int it_size(void) { return sizeof(It@int); }`：**又正常了**。
+  典型的"物化顺序决定布局"的海森堡 bug。
+
+**根因方向**：`tmpl_inst` 里那句注释已经写明了——"第二个 TU 里再写一遍同一个
+实例是合法的（类型表跨 TU 共享，占位类型 id 会不一样）"。也就是说同一个实例名
+`It_int` 会有**两个类型 id**，各自 replay 一次体；方法符号名只有一个
+（`It_int_next`），链接时谁赢看 TU 顺序，而调用方的变量用的是**自己那个 id** 的
+布局。两边布局本该一样，但只要有一次 replay 没跑到（或跑到时某个成员类型还
+不完整），偏移就分叉了。
+
+**下一步**（下一轮从这里切进去）：
+
+1. `tmpl_inst` 新建占位之前先按实例名查 `TINST_NM`：已经有就直接复用那个 id
+   （而不是再造一个），并保证那个 id 的体已经/将会被 replay 一次。
+2. 或者把实例缓存从"每个模板定义一份"改成"全局按 (模板名, 实参) 一份"，
+   让跨 TU 的实例天然同一个 id。
+3. 回归口径：`c6c/tests/` 加一份两 TU 的 fixture（像 `tmpl-check.sh` 那样），
+   断言 `It@int` 在两个 TU 里 `sizeof` 一致、`it.next()` 真的推进。
+
+当前基线仍 **57 / 92**：std-tour 73 条断言只差这一条，std-kit / std-demo 还各有
+别的段错误。
