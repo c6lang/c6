@@ -4706,3 +4706,33 @@ Str l[3] = {
 永远 ENOENT。`pty_spawn()` 用它起子进程，子进程 127 退出、无输出，std-sys 的
 pty 段两条断言全挂。现已按 POSIX 补齐 PATH 查找，并把负 errno 翻成
 `errno = -r; return -1`。
+
+## 第 231 轮：`((T){…})` 前面有带强转的复合字面量时解析错位（**未修，已定位到最小复现**）
+
+最小复现（`c6c` 报 `这里要 '}'（当前是 ')'）`，tcc 侧正常）：
+
+```c
+typedef struct Str { char[:] s; } Str;
+typedef struct P { int a; } P;
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+static int h2(P a, Str b) { return a.a + b.s.len; }
+...
+h2((P){ (int)2 }, ((Str){ S("a") }));   /* ✗ */
+```
+
+排查结论（都是实测，不是猜）：
+- 只留一个实参、把第二个换成不带最外层括号的 `(Str){ … }`、或把第一个实参的
+  初始化值从 `(int)2` 换成 `2` / `(2)` / `-2`，都**通过** —— 所以既要"第一个复合
+  字面量里带一个强转"，又要"第二个复合字面量套着括号"；
+- 给第二个实参**多加一层括号**（`(((Str){ … }))`）就不报错 ✗ → 现象是"多吃了一个
+  `(`"，但吃在哪一步还没查出来；
+- 同一形状不限于函数实参，两条声明连着写也复现：
+  `P p = (P){ (int)2 }; Str s = ((Str){ S("a") });`
+- 在 `init_save`/`init_restore` 上打过 `LF_N/INIT_CUR/INIT_MAX/LV_DEPTH` 的临时
+  trace：复现时**只有一次** save/restore，且进出数值一致（`LF_N=2 cur=0 max=0
+  lvd=2`），所以不是第 226 轮那个初始化器游标问题的同类；另外注意 `INIT_MAX`
+  在这条路径上是 0 而 `LF_N` 是 2，两者的不变式本身就值得单独查一次。
+
+影响：`std-client`（examples/stdclient.c6 的 `SS(...)` 宏）因此编译不过，是
+9 个红用例之一。绕过它不影响正确性但会改示例写法的可读性，所以先记着，下一轮
+继续从 `gen_init_obj` 的实参/声明初始化入口查。
