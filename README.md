@@ -111,6 +111,10 @@ ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
 `tcc/libtcc1.a` 必须由能用的 tcc 编，所以这一步会用宿主 cc 把 `tcc/tcc.c` 编一个
 参考 tcc 当夹具（不安装、不进交付物）。
 
+安装时 c6c 默认也装成 `bin/c6c`，和 tcc 版 `c6` 并存（`-DC6_INSTALL_C6C=OFF` 可
+关掉）；`C6_ENABLE_TCC=OFF` 时它就是 `bin/c6`。两种情况下它都跟自己的自带头文件与
+运行时（`<prefix>/lib/c6/`）一起装，二进制搬家也能自己找到。
+
 `cmake -S . -B build` 通过 `add_subdirectory(tcc)` 直接使用 `tcc/CMakeLists.txt`：它按上游
 `tcc/configure` 的规则在构建目录生成 `config.mak` / `config.h` / `config.texi`，把安装目录
 与编译开关全部从 c6 侧传进去。配置阶段对源码树零写入；构建阶段的 `tcc-config`
@@ -179,6 +183,7 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_INSTALL_DOCS` | `ON` | 安装 c6 的 `docs/`、`README.md`、`CHANGELOG.md` 与 `copyright` |
 | `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
+| `C6_INSTALL_C6C` | `ON` | 安装自举编译器 `bin/c6c`（与 tcc 版 `c6` 并存；`C6_ENABLE_TCC=OFF` 时它同时是 `bin/c6`） |
 | `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
 | `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
 | `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
@@ -230,8 +235,9 @@ cc $(pkgconf --cflags --libs c6) app.c -o app
 
 ### 打包与发布
 
-CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除编译器与
-`libtcc` 外还带上 c6 自己的文档：`docs/` 的 33 篇文档（保留子目录结构）与
+CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除 tcc 版 `c6` 与
+`libtcc` 外还有自举编译器 `bin/c6c`（连同它自己的 `lib/c6/`：自带头文件与
+`rt.c6` 运行时），以及 c6 自己的文档：`docs/` 的 33 篇文档（保留子目录结构）与
 `README.md` / `CHANGELOG.md` / `copyright` 装在 `/usr/share/doc/c6/`，上游
 tcc 的 `tcc-doc.html` 仍装在 `<datarootdir>/doc/tcc/`。用
 `-DC6_INSTALL_DOCS=OFF` 可关闭，`-DC6_INSTALL_C6_DOCDIR=...` 可改位置。
