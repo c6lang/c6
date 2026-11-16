@@ -15200,6 +15200,13 @@ static void init_brace(u32 ty, u32 off)
     LV_OFF[my] = off;
     LV_DEPTH = my + 1;
     init_body(my);
+    /* 嵌套的 `{…}`（结构体元素）只把游标推到末尾、**不走** `init_store`，
+     * 于是 `init_mark()` 没记账、`INIT_MAX` 一直是 0。不完整数组
+     * （`static struct E t[] = {…}`）的长度就是按 `INIT_MAX` 算的，
+     * 结果 `sizeof t` 是 0（std 的 mime 表靠 sizeof 数条目，一条都查不到）。
+     * 这里按本层写到的最后位置补一次记账。 */
+    if (INIT_CUR > INIT_MAX)
+        INIT_MAX = INIT_CUR;
     LV_DEPTH = my;
     pa_expect_ch('}');
     /* 零字节的聚合成员（`struct {} empty;`）不占叶子，游标要**停在原地**：

@@ -68,10 +68,12 @@ std-proto4
 std-search
 std-sec
 std-ser
+std-serve
 std-subs
 std-time
 std-tour
 std-transcode
 std-ub
+std-web
 std-wire
 std-words
