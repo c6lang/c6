@@ -4050,3 +4050,65 @@ cmake --build build --target check-install   # 通过（两种 flavour 都装、
 还没做：多次编译的全局状态重置（现在是拒绝 + fork 兜底）、`tcc_add_file` 收
 `.o`/`.a`、库搜索路径（`-L`/`-l`）——这三件都在 §「还差的」里，排在一起是因为
 它们都要动链接器/全局状态，不是补几个函数的事。
+
+## 第 208 轮：`-shared` / `-fPIC` 共享库
+
+硬缺口①（链接器）的尾巴里最后一件能做动的：c6c 现在能出 `.so`。
+
+**做了什么**：
+
+* `c6c -shared a.o b.o -o libx.so` → `ET_DYN`。基址 0（VA 就是段内偏移，
+  加载基址由 ld.so 选）、没有入口、没有 `PT_INTERP`、程序头 4 个（两个 LOAD
+  + DYNAMIC + GNU_STACK）。输入必须是 `.o`，`-shared lib.c6` 直接报错。
+* `-fPIC` / `-fpic` 收下不报错：native 后端出来的代码本来就位置无关（全局
+  地址走 `lea rip+rel32` + 重定位），所以"PIC 代码生成"不用另写一套。
+* `ld.c6`：`LD_BASE_VA` 从宏改成**变量**（静态 0x400000 / 共享 0），新开关
+  `LD_SHARED`；`ld_link` 在共享模式下跳过「找 main」「合成 `_start`」
+  「把 ctor/dtor 补进 `_start` 的 call」这三步。
+* 数据里的绝对地址（字符串指针、初始化器、`.init_array` 里的函数指针）变成
+  `.rela.dyn` 的 `R_X86_64_RELATIVE`：`ld_apply` 遇到 `R_X86_64_64` 时记
+  （站点 VA、addend），`ld_dyn_plan` 先数条数定尺寸，写盘时逐条落。
+* 导出符号进 `.dynsym`：定义的全局/弱符号（函数 `STT_FUNC`、数据
+  `STT_OBJECT`），名字进 `.dynstr`，SysV `.hash` 的 nchain 跟着长；
+  `DT_SONAME` = 输出文件名；`DT_INIT_ARRAY`/`DT_FINI_ARRAY` 让
+  `__attribute__((constructor))` 在 `dlopen` 那一刻就跑。
+* 产物末尾补一张 16 项的**节头表**（`.text` / `.rodata` / `.dynstr` /
+  `.dynsym` / `.hash` / `.rela.plt` / `.plt` / `.rela.dyn` / `.got.plt` /
+  `.data` / `.init_array` / `.fini_array` / `.bss` / `.dynamic` /
+  `.shstrtab`）：ld.so 不看它，但 GNU ld 把 `.so` 当**输入**时只认节头。
+* 导出符号的 `st_shndx` 按"函数在 .text、数据在 .data、bss 里在 .bss"填：
+  ld.so 只用它判 ABS，但 `nm -D` 会照它打 `T`/`D`/`B`。
+* 外部**数据**符号如实拒绝（共享库里的外部数据要走 GOT 间接寻址；COPY
+  重定位只适合固定基址的可执行文件），外部函数照旧走 PLT。
+
+**踩的三个坑**：
+
+1. **SysV `.hash` 一直是错的**：以前 nchain 少写一个字、chain 每位写成 `j+2`
+   （应为 `j+1`），静态可执行文件没人查这张表所以一直没露馅——`dlopen`
+   一上来 `dlsym` 就返回 NULL。改成标准"一个桶串全链"后通过。
+2. **节头表不是可选装饰**：第一版没有节头，`dlopen` 能用，但
+   `cc -o use use.c -L. -lshare` 直接 `file in wrong format`——GNU ld 只从节头
+   读 `.dynsym`。补上之后 `readelf --dyn-syms` / `nm -D` 也一起可用了。
+3. **数条数要跟重定位阶段用同一套字段偏移**：`ld_count_abs_relocs` 第一版把
+   `sh_size` 读成 `sh_flags` 的低半截（`base+20` 而不是 `base+32`），数出来
+   0 条，链接时当场报「RELATIVE 重定位比预计的多」。另外 `shared` 是 c6 的
+   关键字（`@shared`），`main.c6` 的选项字段只能叫 `so_out`。
+
+**实测**：
+
+```
+cmake --build build --target sharedcheck   # 19/19（新增）
+  ok e_type 是 ET_DYN / 入口 0 / 没有 PT_INTERP / 程序头 4 个
+  ok DT_SONAME 是 libshare.so / DT_INIT_ARRAY 在 / 字符串指针走 RELATIVE
+  ok 节头表齐全 / 函数导出成 T / 数据导出成 D
+  ok dlopen + dlsym：add=42 counter=7 bump=101（构造器 booted=42）
+  ok cc 直接链 .so（-L … -lshare）跑通：direct add=3 booted=42
+  ok 边界：-shared 给源文件报错、共享库里的外部数据符号如实拒绝、
+     -fPIC 收下、不加 -shared 仍是 ET_EXEC
+cmake --build build --target ldcheck dyncheck objcheck embedcheck pkgcheck lint
+  # 13/13 · 18/18 · 11/11 · 10/10 · 8/8 · 通过
+cmake --build build --target check-install   # 通过
+```
+
+**还差的**：共享库里的外部数据符号（GOT 间接寻址）、符号版本
+（`.gnu.version`）、`.a` 静态库、`--gc-sections`、`-Wl,-soname=` 别名。
