@@ -7,6 +7,40 @@
 
 ## 未发布
 
+### 验收：干净 chroot / Arch 打包环境下的四处假红
+
+在 Arch 容器里按 `c6-git` 的 `extra-x86_64-build` 流程（`check()` 就是裸 `ctest`）
+跑了一遍，四处"看着是代码坏了、其实是验收脚本自己"的红：
+
+- `c6c` 的隐式 int 告警（`type defaults to int`）以前只要 `parse_typespec()` 没
+  解析出 base 就发，而 `int` / `unsigned long` / `signed short` 这些**只有修饰符**
+  的写法也是走到那里才补出 base 的——一条 C TU 上固定刷 218 条（bundled 头里的
+  声明），tests2 的输出比对整片判"不符"。现在两个判据：`saw_int`（见过 int /
+  long / short / unsigned / signed 之一就不算隐式 int）+ 必须真的站在对象声明符
+  上（名字后面跟 `;` `=` `,` `[`）。后者是照 tcc 的 `decl()` 来的：函数声明/定义、
+  旧式（K&R）形参表、强转类型名都不发（`60_errors_and_warnings.c` 的
+  `test_default_int_type` 就把 `n;`（warn）与 `f();`（don't warn）并排摆着）。
+  修完 `c6c-tests2` 从"意外失败 118"回到"意外失败 0"（本机 gcc 作 oracle 时）。
+- `tests/run-errbase.sh` 的模块清单以前用 `grep -r` 扫整个源码树，protoc6 写进
+  `<build>/tests/std-protobuf/pb/demo/*.c6` 的**生成头**会被当成新模块，
+  "提交的表是不是最新"因此永远判过期——真跑过一遍 `std-protobuf` 之后 `errcheck`
+  必红。改成：版本库根 == 源码根时用 `git grep`（只看版本库里的文件，产物天然不
+  在内），否则退回按目录扫并排掉 `build/`。只看
+  `git rev-parse --is-inside-work-tree` 不够：源码树被放在**别的**仓库里时（AUR 的
+  PKGBUILD 目录 clone 在 `/startdir`、源码解压到 `/startdir/src/c6` 就是这样）它也
+  答 true，吐出来的是外层仓库的空清单。
+- `c6c/tests/run-tests.sh` 的前端 sweep 会把 `tests/protobuf/roundtrip.c6` 也
+  `-fsyntax-only` 一遍，而它 include 的是 protoc6 生成的头，这一层没有生成步骤，
+  100% 报"找不到头文件"（`c6c: tests 前端 通过 123 / 失败 1`）。改成像
+  `tests/errors/` 一样跳过——生成 + 编译 + 运行本来就是 c6 那条 `std-protobuf`
+  用例（`tests/regression.sh` 先跑 `tools/protoc6` 再用 `-I <out>/pb` 编）。这条
+  判断要放在 `-fsyntax-only` **之前**，否则失败在前端就已经记上了。
+- `llvmtest`：找不到 `llc` 时 `cmake/C6C.cmake` 照样注册这条用例，聚合目标里也
+  照样依赖它，于是干净 chroot（没装 LLVM）里 `check-all-c6c` 直接红，报的是
+  `timeout: failed to run command 'C6C_LLC-NOTFOUND'`。现在找不到 llc 就不注册、
+  聚合目标里摘掉、配置阶段留一行 status；`c6c/tests/llvm-diff.sh` 自己也如实跳过，
+  单独跑也不会假红。
+
 ### 运行期：`memcpy` 走 `rep movsb`（1 GiB 吞吐 0.083 → 6.95 GB/s）
 
 - `src/asmblob.c6` 加一块 10 字节跳板 `__c6_memcpy_rep`
@@ -27,7 +61,6 @@
   `run-flag` 15–0、`bcheck` 9–0、`embedcheck` 6–0、`lint` 全绿。
 - 还没做的：`memset`（0.10 GB/s）与 `memcmp` / `strlen` / `strcmp` 仍是逐字节循环，
   `data_alloc` 每次分配都要 `memset`，量级可能比 `memcpy` 更大，另开一项处理。
-
 ### 共享库：`c6c -shared`（ET_DYN）
 
 - `c6c -shared a.o b.o -o libx.so` 出共享库：`ET_DYN`、基址 0（VA 就是段内偏移，
