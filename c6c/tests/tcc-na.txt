@@ -11,3 +11,5 @@
 99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
 94_generic	要**指向对象的**限定符进类型 id：`const int *` 必须和 `int *` 不同 id（指针层限定符已经有了，缺的是 `const` 修饰基类型这一层；`_Generic(ptr, int *:1, int * const:2, default:20)` 现在是 2、应为 20）
 112_backtrace	要 tcc 的 `-dt` 自动展开 `test_*` 宏并反复重跑 + `-b` 边界检查运行时；上游 tests2/Makefile 给这条用例加了 `FLAGS += -dt -b`，c6c 没有 `-dt`（同族的 113_btdll 已按"需要 tcc_backtrace"记为 n/a）
+102_alignas	`_Alignas` 在声明位置**只解析不落地**（parse.c6 的 `_Alignas` 分支原注释就是"直接忽略"）：全局对象按 `ty_align_of(类型)` 布局、`__alignof__(对象)` 也只看类型，所以 `alignof(i1)==16` 等断言是 `0 0 1 0`（应为 `1 1 1 1`）。要过这条得给 Sym 加对齐字段 + `data_alloc` 用 max(类型对齐, 用户对齐) + `__alignof__` 认对象；告警口径（第一行 `type defaults to int`）已对齐，卡的是对齐语义本身
+129_scopes	`__LINE__` 在宏体里报调用点行号**已修**；剩下的全是作用域语义差：`sizeof(enum{in=1})` 里的枚举常量泄漏到外层块（12/17/22/27 行那几处 "//OOPS" 要求 `!in`）、105 行 `f5() == 10 + 4`、126 行 `i6 == 11 && f6(22) == 22` 的块内遮蔽、末尾 `xx7 (2)` 输出 `0 0`（应 `12 34`）。要过这条得让 sizeof/类型名里的 tag 声明按语句作用域回收，并修块作用域遮蔽与静态初始化

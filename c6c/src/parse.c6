@@ -5879,9 +5879,27 @@ static u32 parse_closure_type(void)
     return ty_closure(ty_func(rty, pts, np, variadic));
 }
 
+/* 形参表里**不发**"隐式 int"告警：tcc 的 type-defaults-to-int 只对缺类型的
+ * 声明发（decl() 的 oldint），对形参表里的裸标识符（K&R `int f(a, b)`）和
+ * 省略号都不告警——实测 `tcc kr.c` 零告警。c6c 的 parse_param_list 会把
+ * `...` 和 K&R 裸标识符喂给 parse_typespec 兜底成 int（幻影形参，nparams
+ * 不自增、无实害），有了告警之后这条旧路径每条变参原型都多一行噪声
+ * （c6c/include/stdio.h 的 23-26 曾让 tests2 全线飘红）。 */
+static int PA_NO_II_WARN;
+
+/* 隐式 int 的**待定告警**：parse_typespec 兜底成 int 时先记一笔，等声明符
+ * 解析完再看最终类型告警——tcc 的 warning 在 decl() 里只对**非函数**声明发
+ * （`} else if (oldint)` 前面是 VT_FUNC 分支），所以 `f();` / `f(){}` 不告警、
+ * `n;` 告警（tests2/60_errors_and_warnings 的 "f(); // don't warn" 逐字要它）。
+ * 由 gen_decl_from_spec / gen_local_decl 在 parse_declarator 之后消费。 */
+static int PA_II_PENDING;
+
 static u32 parse_typespec(void)
 {
     u32 base = 0;
+
+    /* 每条新声明重新计：上一笔待定告警由声明收尾处消费（见 PA_II_PENDING） */
+    PA_II_PENDING = 0;
     int nlong = 0;
     int nshort = 0;
     int uns = 0;
@@ -6328,8 +6346,8 @@ static u32 parse_typespec(void)
          * 置位），不是隐式 int；多打一条就把整个 TU 的输出全污染了（stddef.h
          * 的 `typedef unsigned long size_t;` 曾让 tests2 118 条全红）。
          * c6 源码总是显式类型，不打噪声。 */
-        if (!saw_int && !in_c6_tu())
-            pa_warn_tcc("type defaults to int");
+        if (!saw_int && !in_c6_tu() && !PA_NO_II_WARN)
+            PA_II_PENDING = 1;
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
         else if (nlong == 1)
@@ -6592,8 +6610,12 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
     int own_layer = d->own_params_taken ? 0 : 1;
     int save_knr = d->knr;
     int save_variadic = d->variadic;
+    int save_nowarn = PA_NO_II_WARN;
     u32 r = 0;
 
+    /* 见 PA_NO_II_WARN：形参表里 `...` / K&R 裸标识符走 parse_typespec 的
+     * 隐式 int 兜底是合法旧路径，不许告警。 */
+    PA_NO_II_WARN = 1;
     d->own_params_taken = 1;
     /* 声明符对象可能被复用，`...` 的标记不能从上一个声明符漏进来 */
     d->variadic = 0;
@@ -6669,6 +6691,7 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
     pa_expect_ch(')');
     r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
 fin:
+    PA_NO_II_WARN = save_nowarn;
     if (!own_layer) {
         /* 不是自己那层：用完就退回，别把返回类型/形参类型里的形参名字
          * 混进这个函数定义的形参表里。 */
@@ -16110,6 +16133,10 @@ static void gen_local_decl(int need_semi)
         PA_MGD_PTR = base_mgd_ptr;
         PA_MGD_KIND = base_mgd_kind;
         ty = parse_declarator(base, &d);
+        /* 块作用域同理（`static n;` 这类隐式 int 声明） */
+        if (PA_II_PENDING && !d.is_func)
+            pa_warn_tcc("type defaults to int");
+        PA_II_PENDING = 0;
         PA_VLA_OK = 0;
         gen_one_local(ty, &d);
         dc = SAW_CLEANUP ? SAW_CLEANUP : base_cleanup;
@@ -20387,6 +20414,10 @@ static void gen_decl_from_spec(u32 base)
         PA_MGD_KIND = base_mgd_kind;
         PA_TLS = base_tls;
         ty = parse_declarator(base, &d);
+        /* tcc 口径：隐式 int 只对非函数声明告警（见 PA_II_PENDING）。 */
+        if (PA_II_PENDING && !d.is_func)
+            pa_warn_tcc("type defaults to int");
+        PA_II_PENDING = 0;
         /* `name __attribute__((alias("目标")))` / `name __asm__("目标")`：
          * 属性可能写在后缀（参数表 / 数组）之后，所以只能等声明符解析完再看。 */
         al = SAW_ALIAS ? SAW_ALIAS : SAW_ASMNAME;
