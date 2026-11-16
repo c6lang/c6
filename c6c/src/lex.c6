@@ -30,7 +30,8 @@ typedef struct Tok {
     u16 file;
     u8 flags;
     void *hs;        /* 隐藏集（宏展开用；NULL = 空），见 pp.c6 */
-    char *syn;       /* token 的文本：源码 token = 源码缓冲 + off，合成的 = 自带缓冲 */
+    const char *syn; /* token 的文本：源码 token = 源码缓冲 + off，合成的 = 自带缓冲。
+                      * 只读——token 的文本从不原地改写，所以是 const。 */
 } Tok;
 
 /* 和字面量比名字。**不要用 strlen(s)**：tok_eq 是最高频函数之一（profiler 里
@@ -575,7 +576,7 @@ static void lex_punct(Lex *L, Tok *t)
             t->kind = TK_PUNCT;
             t->off = start;
             t->len = dgl;
-            t->syn = (char *)dg;
+            t->syn = dg;
             return;
         }
     }
