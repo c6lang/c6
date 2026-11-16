@@ -29,6 +29,13 @@ ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1${2:+：$2}"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# readelf 的输出是**按 locale 翻译**的：中文 locale 下程序头表头是「程序头：」、
+# 首行是「Elf 文件类型为 EXEC (Executable file)」，C locale 下是 "Program Headers:"
+# / "Elf file type is EXEC (Executable file)"。开发机是 zh_CN、CI 的 runner 是
+# C，同一份产物会看到两种文字——所以凡是解析它的地方都走这个固定 C locale 的
+# 包装，两边拿到同一串英文，断言才不会跟着机器语言变。
+readelf() { LC_ALL=C command readelf "$@"; }
 case "$C6C" in
 /*) ;;
 *) C6C="$(pwd)/$C6C" ;;
@@ -110,7 +117,7 @@ if have readelf; then
     # 产物没有段表，重定位要从动态段读：--use-dynamic
     rel=$(readelf -rW --use-dynamic "$WORK/prog" 2>/dev/null)
 
-    printf '%s\n' "$ph" | grep -q "^Elf 文件类型" && type=$(printf '%s\n' "$ph" | sed -n 's/.*类型为 \([A-Z_]*\).*/\1/p')
+    type=$(printf '%s\n' "$ph" | sed -n 's/^Elf file type is \([A-Z_]*\).*/\1/p')
     if [ "${type:-}" = "EXEC" ]; then
         ok "产物是 ET_EXEC"
     else
