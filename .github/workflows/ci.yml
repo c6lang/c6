@@ -251,10 +251,23 @@ jobs:
             echo "::error::VERSION（${_ver}）与 c6c/src/c6c.c6 的 C6C_VERSION（${_macro}）不一致"
             exit 1
           fi
-          # 发布说明直接取自 CHANGELOG 的「## <版本> — <日期>」段落（release job
-          # 拿它填 Release body，见下面 release job），所以先确认它在。
+          # CHANGELOG 仍是给人看的变更史（同时随包装进 /usr/share/doc/c6/），
+          # 所以该版本的段落必须在。
           if ! grep -q "^## ${_ver} — " CHANGELOG.md; then
             echo "::error::CHANGELOG.md 里没有「## ${_ver} — 」段落"
+            exit 1
+          fi
+          # 发版说明的**唯一来源**是「主题为 `c6 <版本>` 的那个提交」的正文
+          # （release job 只做取用和排版，见下面 release job）。在这里先确认
+          # 它在、正文非空——否则三种包都打完了才在最后一步红。
+          _c=$(git log --format='%H%x09%s' HEAD \
+                 | awk -F'\t' -v want="c6 ${_ver}" '$2 == want { print $1; exit }')
+          if [ -z "$_c" ]; then
+            echo "::error::找不到主题为「c6 ${_ver}」的版本提交：它是发版说明的来源"
+            exit 1
+          fi
+          if ! git log -1 --format='%b' "$_c" | grep -q '[^[:space:]]'; then
+            echo "::error::版本提交 $(git rev-parse --short "$_c") 没有正文"
             exit 1
           fi
 
@@ -347,13 +360,14 @@ jobs:
           sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
 
       # Release 的说明不靠手抄、也不靠 GitHub 的自动 commit 列表：正文取自
-      # CHANGELOG 里该版本的段落（tag 注解作为兜底），标题取自 tag 注解的首行。
-      # 于是「发版说明」和仓库里的变更史是同一份文字，改 CHANGELOG 就够了。
+      # **版本提交**（主题是 `c6 <VERSION>`）的正文 —— 发版时把「改了什么、
+      # 怎么验收的」写进那条提交就够了，CI 只负责取用、排版、追加产物清单。
+      # tag 注解只当兜底（打 tag 的人通常把标题写在里面），标题也取自它。
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0        # tag 注解要历史，浅克隆里读不到
 
-      - name: Release notes from CHANGELOG
+      - name: Release notes from version commit
         id: notes
         run: |
           set -eu
@@ -361,18 +375,27 @@ jobs:
           _tag=${GITHUB_REF_NAME}
           _notes="$RUNNER_TEMP/notes.md"
 
-          # 「## 0.6.1 — 2026-11-16」到下一个「## 」之前，就是这一版的说明。
-          awk -v ver="$_ver" '
-            index($0, "## " ver " — ") == 1 { on = 1; next }
-            on && /^## / { exit }
-            on { print }
-          ' CHANGELOG.md > "$_notes"
+          # 版本提交：主题正好是 `c6 <版本>`，取最新的一条。
+          # 按主题整串比，不用 --grep：后者是子串/正则匹配，`c6 0.6.1` 会连
+          # `c6 0.6.10` 一起捞进来。
+          _c=$(git log --format='%H%x09%s' "$_tag" \
+                 | awk -F'\t' -v want="c6 $_ver" '$2 == want { print $1; exit }')
+          # 退一步：最后一个动 VERSION 的提交（版本提交被 rebase/squash 掉时）。
+          if [ -z "$_c" ]; then
+            _c=$(git log -1 --format='%H' "$_tag" -- VERSION)
+          fi
+          git log -1 --format='%b' "$_c" > "$_notes"
+
+          # 再退一步：版本提交没有正文时用**附注 tag** 的注解（打 tag 的人通常写了
+          # 摘要）。轻量 tag 的 %(contents) 会回落到它指向的提交消息——那正是上面
+          # 已经判定为空的东西，所以这里只认附注 tag。
           if ! grep -q '[^[:space:]]' "$_notes"; then
-            # 兜底：CHANGELOG 里没有就用 tag 注解（写 tag 的人通常写了摘要）。
-            git tag -l --format='%(contents)' "$_tag" > "$_notes"
+            if [ "$(git cat-file -t "$_tag" 2>/dev/null)" = "tag" ]; then
+              git tag -l --format='%(contents)' "$_tag" > "$_notes"
+            fi
           fi
           if ! grep -q '[^[:space:]]' "$_notes"; then
-            echo "::error::CHANGELOG 里没有 $_ver 的段落，tag 注解也是空的"
+            echo "::error::版本提交 $(git rev-parse --short "$_c") 没有正文，tag 注解也是空的"
             exit 1
           fi
 
@@ -386,6 +409,9 @@ jobs:
           } >> "$_notes"
 
           _title=$(git tag -l --format='%(contents:subject)' "$_tag")
+          if [ -z "$_title" ] && [ -n "$_c" ]; then
+            _title=$(git log -1 --format='%s' "$_c")
+          fi
           [ -n "$_title" ] || _title="c6 $_ver"
           printf 'title=%s\n' "$_title" >> "$GITHUB_OUTPUT"
           echo "--- Release body ---"

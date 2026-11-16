@@ -22,7 +22,12 @@
 
 @contents
 
-@node Top, Introduction, (dir), (dir)
+@c c6：Top 节点的 (dir) 前后指针去掉。texinfo 7 出 HTML 时会把 Top 的
+@c "Previous" 链成对 (dir) 外部手册的交叉引用，而 htmlxref.cnf 里没有 dir
+@c 这一条，于是每次构建都打一条
+@c "tcc-doc.texi:25: warning: no HTML cross-references entry found for `dir'"。
+@c 节点指针可省（makeinfo 自己按 @menu / 结构推导），去掉后 HTML/Info 输出不变。
+@node Top, Introduction
 @top Tiny C Compiler Reference Documentation
 
 This manual documents version @value{VERSION} of the Tiny C Compiler.
