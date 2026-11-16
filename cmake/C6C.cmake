@@ -189,6 +189,9 @@ c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)
 c6c_target(ldcheck ENV C6C=${C6C_BIN} COMMAND ./tests/ld-check.sh)
 c6c_target(dyncheck ENV C6C=${C6C_BIN} COMMAND ./tests/dyn-check.sh)
 c6c_target(sharedcheck ENV C6C=${C6C_BIN} COMMAND ./tests/shared-check.sh)
+# 用 c6c 跑根目录 tests/regression.sh 里已经全绿的那批用例（列表单一数据源：
+# c6c/tests/regression-c6c.list）。交付物要能不带 tcc，这批回归就得能只靠 c6c 跑。
+c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)
 c6c_target(bcheck ENV C6C=${C6C_BIN} COMMAND ./tests/bcheck.sh)
 c6c_target(dbgcheck ENV C6C=${C6C_BIN} COMMAND ./tests/dbgcheck.sh)
 c6c_target(asmcheck ENV C6C=${C6C_BIN} COMMAND ./tests/asmcheck.sh)
@@ -327,7 +330,7 @@ add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
-          c99suite llvmtest test-c6c build-tcc tests1-check tests2-check
+          c99suite llvmtest test-c6c build-tcc tests1-check tests2-check regression-c6c
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost）")
 
 add_custom_target(check-all-perf

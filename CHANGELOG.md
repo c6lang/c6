@@ -7,6 +7,26 @@
 
 ## 未发布
 
+### 回归换编译器跑：`C6_CC` + c6c 侧 42 个用例
+
+- `tests/regression.sh` 的被测编译器从写死的 `$C6_TCC_DIR/c6` 改成 `$C6_CC`
+  （默认值不变），98 处调用点统一替换；selfhost / c99selfhost 那几个拿 tcc
+  **源码**自举的用例仍直接用 `$C6_TCC_DIR/c6`。于是 `C6_CC=c6c/build/c6c
+  tests/regression.sh <用例>` 就整批换编译器跑。
+- `c6c/tests/regression-c6c.list` 是「c6c 已经跑绿」的单一数据源，
+  `c6c/tests/regression-c6c.sh` 跑这张表（`--all` 跑全部 std-* 量基线，也可以
+  点名几个），CMake 目标 `cmake --build build --target regression-c6c`。
+- `C6_ENABLE_TCC=OFF` 的构建不再一个回归用例都不注册：`cmake/C6Testing.cmake`
+  把这张表注册成 CTest 用例（label `regression-c6c`，同时带 `c6c`）。
+- `c6c/lib/rt.c6` 补了一批 POSIX 面，全部 `weak`（程序里同名强定义会盖掉，
+  对应 tcc 走 libc.so.6 时的符号覆盖）：`poll` `nanosleep` `uname` `rmdir`
+  `tcgetattr` `chdir` `sysinfo` `mkfifo` `fsync` `ftruncate`、
+  `ntohs`/`ntohl`/`htons`/`htonl`、`cfmakeraw`，以及整族 socket（`socket`
+  `bind` `listen` `accept` `connect` `send` `recv` `sendto` `recvfrom`
+  `setsockopt` `getsockopt` `getsockname` `getpeername` `socketpair` `shutdown`）。
+- 实测基线 38 → 42 / 92（新增 `std-async` / `std-async2` / `std-async5` /
+  `std-crypto`）；缺口四类与下一轮顺序写在 `c6c/docs/todo.md` 第 209 轮。
+
 ### 共享库：`c6c -shared`（ET_DYN）
 
 - `c6c -shared a.o b.o -o libx.so` 出共享库：`ET_DYN`、基址 0（VA 就是段内偏移，

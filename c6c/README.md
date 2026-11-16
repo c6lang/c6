@@ -448,6 +448,31 @@ cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 `include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
 `-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
 
+## 回归：让 `tests/regression.sh` 换编译器跑
+
+根目录那 92 个 `std-*` 用例写在 `tests/regression.sh` 里，被测编译器现在是
+**`$C6_CC`**（默认 `$C6_TCC_DIR/c6`，也就是 tcc 那一侧）。把它指到 c6c 就整批换
+编译器：
+
+```sh
+C6_CC=c6c/build/c6c tests/regression.sh std-demo     # 单个用例
+cmake --build build --target regression-c6c         # 已全绿的那批（列表见下）
+./c6c/tests/regression-c6c.sh --all                 # 量基线：全部 std-* 用例
+```
+
+* `c6c/tests/regression-c6c.list` 是**单一数据源**：c6c 已经跑绿的用例名一行一个；
+* `C6_ENABLE_TCC=OFF` 时 `cmake/C6Testing.cmake` 把这张表注册成 CTest 用例
+  （label `regression-c6c`，同时也带 `c6c`），所以没有 tcc 的构建里也有真回归：
+  `ctest --test-dir build-notcc -L regression-c6c -j 4`；
+* selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
+  仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
+
+当前基线（第 209 轮实测）：**42 / 92 全绿**，还差 50 个。缺口分四类，都在
+`c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面还缺 `getaddrinfo` /
+`opendir` / `tcsetattr` / `getrusage`；`-lm` 还没有对应的动态依赖；模板成员函数
+与 `static` 函数跨 TU 的符号（`Iter_int_has`、`p_atom$2` 那种）；以及若干
+`test` 块的**行为**差异（浮点打印、`cfmakeraw` 后的 termios 细节）。
+
 ## 第二套 native 后端：aarch64
 
 `--target=aarch64 -S` 让 c6c 自己生成 **aarch64 汇编**（`src/aout.c6`）——指令

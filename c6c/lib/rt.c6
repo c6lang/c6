@@ -3114,6 +3114,145 @@ int mkstemp(char *tmpl)
     return fd < 0 ? -1 : fd;
 }
 
+/* ---------- 网络 / 等待：socket 家族、poll、uname、rmdir、tcgetattr ----------
+ *
+ * 这几个名字以前是 tcc 链的 libc 给的；c6c 自带运行时顶上去之后，std/net、
+ * std/async、std/term、std/sys、std/fsx 那几组用例编译到链接期就报「未定义的
+ * 符号」。实现都是薄壳：系统调用号 + 内核结构体的布局（Linux x86-64 那份），
+ * 和别处的 syscall 包装一个口径——原样返回内核的返回值（负数就是 -errno），
+ * 不做 errno 转换（rt.c6 没有全局 errno）。
+ *
+ * **全部 `weak`**：std 里 `Chan.send` / `ACancel.poll` 那种同名全局函数是
+ * 程序自己的强定义，链接时该盖掉这里的弱定义（tcc 走 libc.so.6 时靠的是
+ * ELF 符号覆盖，效果一样）。没被覆盖时，这里的实现兜住 libc 那一侧。
+ */
+#define C6C_SYS_POLL        7
+#define C6C_SYS_SOCKET      41
+#define C6C_SYS_CONNECT     42
+#define C6C_SYS_ACCEPT      43
+#define C6C_SYS_SENDTO      44
+#define C6C_SYS_RECVFROM    45
+#define C6C_SYS_SHUTDOWN    48
+#define C6C_SYS_BIND        49
+#define C6C_SYS_LISTEN      50
+#define C6C_SYS_GETSOCKNAME 51
+#define C6C_SYS_GETPEERNAME 52
+#define C6C_SYS_SOCKETPAIR  53
+#define C6C_SYS_SETSOCKOPT  54
+#define C6C_SYS_GETSOCKOPT  55
+#define C6C_SYS_UNAME       63
+#define C6C_SYS_RMDIR       84
+
+__attribute__((weak)) int poll(void *fds, unsigned long nfds, int timeout)
+{
+    return (int)c6c_sys3(C6C_SYS_POLL, (long)fds, (long)nfds, (long)timeout);
+}
+
+__attribute__((weak)) int nanosleep(const void *req, void *rem)
+{
+    return (int)c6c_sys2(C6C_SYS_NANOSLEEP, (long)req, (long)rem);
+}
+
+__attribute__((weak)) int rmdir(const char *path)
+{
+    return (int)c6c_sys1(C6C_SYS_RMDIR, (long)path);
+}
+
+/* 内核的 struct utsname：6 个 65 字节的字段，顺序固定 */
+__attribute__((weak)) int uname(void *buf)
+{
+    return (int)c6c_sys1(C6C_SYS_UNAME, (long)buf);
+}
+
+/* 终端属性：TCGETS 原样交给 ioctl（调用方给 struct termios *，这一层不看内容） */
+__attribute__((weak)) int tcgetattr(int fd, void *t)
+{
+    return (int)ioctl(fd, C6C_TCGETS, t);
+}
+
+__attribute__((weak)) int socket(int domain, int type, int proto)
+{
+    return (int)c6c_sys3(C6C_SYS_SOCKET, domain, type, proto);
+}
+
+__attribute__((weak)) int bind(int fd, const void *addr, unsigned int len)
+{
+    return (int)c6c_sys3(C6C_SYS_BIND, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int listen(int fd, int backlog)
+{
+    return (int)c6c_sys2(C6C_SYS_LISTEN, fd, backlog);
+}
+
+__attribute__((weak)) int accept(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_ACCEPT, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int connect(int fd, const void *addr, unsigned int len)
+{
+    return (int)c6c_sys3(C6C_SYS_CONNECT, fd, (long)addr, (long)len);
+}
+
+/* send / recv 就是 sendto / recvfrom 去掉地址那一半 */
+__attribute__((weak)) long send(int fd, const void *buf, unsigned long n, int flags)
+{
+    return c6c_sys4(C6C_SYS_SENDTO, fd, (long)buf, (long)n, (long)flags);
+}
+
+__attribute__((weak)) long recv(int fd, void *buf, unsigned long n, int flags)
+{
+    return c6c_sys4(C6C_SYS_RECVFROM, fd, (long)buf, (long)n, (long)flags);
+}
+
+__attribute__((weak)) long sendto(int fd, const void *buf, unsigned long n, int flags,
+                                 const void *addr, unsigned int len)
+{
+    return c6c_sys6(C6C_SYS_SENDTO, fd, (long)buf, (long)n, (long)flags, (long)addr,
+                    (long)len);
+}
+
+__attribute__((weak)) long recvfrom(int fd, void *buf, unsigned long n, int flags,
+                                   void *addr, unsigned int *len)
+{
+    return c6c_sys6(C6C_SYS_RECVFROM, fd, (long)buf, (long)n, (long)flags, (long)addr,
+                    (long)len);
+}
+
+__attribute__((weak)) int setsockopt(int fd, int level, int opt, const void *val,
+                                     unsigned int len)
+{
+    /* 没有 c6c_sys5，用 6 参那个补一个 0：内核只读它定义的参数个数，多余的不看 */
+    return (int)c6c_sys6(C6C_SYS_SETSOCKOPT, fd, level, opt, (long)val, (long)len, 0);
+}
+
+__attribute__((weak)) int getsockopt(int fd, int level, int opt, void *val,
+                                     unsigned int *len)
+{
+    return (int)c6c_sys6(C6C_SYS_GETSOCKOPT, fd, level, opt, (long)val, (long)len, 0);
+}
+
+__attribute__((weak)) int getsockname(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_GETSOCKNAME, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int getpeername(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_GETPEERNAME, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int socketpair(int domain, int type, int proto, int *sv)
+{
+    return (int)c6c_sys4(C6C_SYS_SOCKETPAIR, domain, type, proto, (long)sv);
+}
+
+__attribute__((weak)) int shutdown(int fd, int how)
+{
+    return (int)c6c_sys2(C6C_SYS_SHUTDOWN, fd, how);
+}
+
 static int c6c_setenv_find(const char *name, long nl)
 {
     int i = 0;
@@ -3491,6 +3630,84 @@ int unlink(const char *path)
     long r = c6c_sys1(87 /* unlink */, (long)path);
 
     return (int)r;
+}
+
+/* chdir：一条 syscall（80）。getcwd 在上面那条 syscall（79）里。 */
+int chdir(const char *path)
+{
+    return (int)c6c_sys1(80 /* chdir */, (long)path);
+}
+
+/* 字节序：x86-64 是小端，所以 ntoh* / hton* 就是字节交换。
+ * 它们平时是 <arpa/inet.h> 里的宏，但 std/net 那几个模块是按**函数**调用的
+ * （tcc 链的 libc 里有同名符号），所以这里给真函数。 */
+unsigned short ntohs(unsigned short v)
+{
+    return (unsigned short)(((v >> 8) & 0xffu) | ((v << 8) & 0xff00u));
+}
+
+unsigned short htons(unsigned short v)
+{
+    return ntohs(v);
+}
+
+unsigned int ntohl(unsigned int v)
+{
+    return ((v >> 24) & 0xffu) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u)
+           | ((v << 24) & 0xff000000u);
+}
+
+unsigned int htonl(unsigned int v)
+{
+    return ntohl(v);
+}
+
+/* struct termios（Linux x86-64）：4 个 unsigned + c_line + c_cc[32]（一共 60 字节）。
+ * 只在 cfmakeraw 里用到，所以用一个私有镜像结构，免得和 <termios.h> 的定义撞车。 */
+typedef struct C6CTermios {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[32];
+} C6CTermios;
+
+/* cfmakeraw：glibc 那套位掩码的等价值（std/term 的 raw 模式要靠它） */
+void cfmakeraw(void *t)
+{
+    C6CTermios *tt = (C6CTermios *)t;
+
+    if (!tt)
+        return;
+    tt->c_iflag &= ~(0x1u | 0x2u | 0x8u | 0x20u | 0x40u | 0x80u | 0x100u | 0x400u);
+    tt->c_oflag &= ~0x1u;                   /* OPOST */
+    tt->c_lflag &= ~(0x1u | 0x2u | 0x8u | 0x40u | 0x8000u);
+    tt->c_cflag &= ~(0x30u | 0x100u);       /* CSIZE | PARENB */
+    tt->c_cflag |= 0x30u;                   /* CS8 */
+    tt->c_cc[6] = 1;                        /* VMIN */
+    tt->c_cc[5] = 0;                        /* VTIME */
+}
+
+int sysinfo(void *info)
+{
+    return (int)c6c_sys1(99 /* sysinfo */, (long)info);
+}
+
+/* mkfifo：x86-64 上没有独立的 syscall，走 mknod(133)。 */
+int mkfifo(const char *path, unsigned int mode)
+{
+    return (int)c6c_sys3(133 /* mknod */, (long)path, (long)0x1000u, (long)mode);
+}
+
+int fsync(int fd)
+{
+    return (int)c6c_sys1(74 /* fsync */, fd);
+}
+
+int ftruncate(int fd, long len)
+{
+    return (int)c6c_sys2(77 /* ftruncate */, fd, len);
 }
 
 int execvp(const char *file, char *const argv[])
