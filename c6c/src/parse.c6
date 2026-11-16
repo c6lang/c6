@@ -6312,10 +6312,14 @@ static u32 parse_typespec(void)
         saw_complex = 0;
     }
     if (!base) {
-        /* C TU 里不带类型说明符的声明按隐式 int 处理，但要发 tcc 口径的
-         * warning（tests2/102_alignas.expect 与 60_errors_and_warnings.expect
-         * 的第一段都逐字要它）；c6 源码总是显式类型，不要打噪声。 */
-        if (!in_c6_tu())
+        /* 只有**完全不带类型说明符**（`x;`、`_Alignas(16) i3;`）才是隐式 int，
+         * 要发 tcc 口径的 warning（tests2/102_alignas.expect 与
+         * 60_errors_and_warnings.expect 逐字要它）。`unsigned` / `long` /
+         * `unsigned long` 这类组合也走本分支——但那只是在选宽度（saw_int 已
+         * 置位），不是隐式 int；多打一条就把整个 TU 的输出全污染了（stddef.h
+         * 的 `typedef unsigned long size_t;` 曾让 tests2 118 条全红）。
+         * c6 源码总是显式类型，不打噪声。 */
+        if (!saw_int && !in_c6_tu())
             pa_warn_tcc("type defaults to int");
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
