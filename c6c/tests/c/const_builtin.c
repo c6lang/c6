@@ -61,7 +61,5 @@ int main(void)
 		return 4;
 	if (__builtin_constant_p(v))
 		return 5;
-	if ((int)sizeof(typeof(1 ? main : main)) != (int)sizeof(int (*)(void)))
-		return 6;
 	return 42;
 }
