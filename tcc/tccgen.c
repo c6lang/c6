@@ -13096,7 +13096,21 @@ static const struct C6ErrStdSlot {
     { "std.core.endian",        C6_ERR_SLOT_STD + 374 },
     { "std.text.collate",       C6_ERR_SLOT_STD + 375 },
     { "std.text.hyphen",        C6_ERR_SLOT_STD + 376 },
-    { "std.data.protobuf",      C6_ERR_SLOT_STD + 377 },
+    { "std.net.quic",          C6_ERR_SLOT_STD + 377 },
+    { "std.net.hpack",         C6_ERR_SLOT_STD + 378 },
+    { "std.net.qpack",         C6_ERR_SLOT_STD + 379 },
+    { "std.net.h3",            C6_ERR_SLOT_STD + 380 },
+    { "std.encoding.aead",     C6_ERR_SLOT_STD + 381 },
+    { "std.net.quichp",        C6_ERR_SLOT_STD + 382 },
+    { "std.net.quictls",       C6_ERR_SLOT_STD + 383 },
+    { "std.net.quicrecovery",  C6_ERR_SLOT_STD + 384 },
+    { "std.net.quicstream",    C6_ERR_SLOT_STD + 385 },
+    { "std.net.quicconn",      C6_ERR_SLOT_STD + 386 },
+    { "std.net.h3conn",        C6_ERR_SLOT_STD + 387 },
+    { "std.net.quicd",         C6_ERR_SLOT_STD + 388 },
+    { "std.net.h3c",           C6_ERR_SLOT_STD + 389 },
+    { "std.net.h3d",           C6_ERR_SLOT_STD + 390 },
+    { "std.data.protobuf",     C6_ERR_SLOT_STD + 391 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

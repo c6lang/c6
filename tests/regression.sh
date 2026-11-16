@@ -34,9 +34,9 @@ mkdir -p "$C6_OUT" "$C6_SELFHOST" "$C6_BARE" "$C6_TMP"
 
 # 下面三行既是文档，也是 CTest 标签 / 互斥组的单一数据源，不要改名。
 
-C6_STD_TARGETS="stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2"
+C6_STD_TARGETS="stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 std-quic"
 C6_CHECK_PARALLEL="selftest errcheck c99test c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc test fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
-C6_TEST_ALL="selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
+C6_TEST_ALL="selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 std-quic fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
 
 case "${1:-}" in
 std-demo)
@@ -187,6 +187,12 @@ std-cipher)
   mkdir -p "$C6_OUT"
   "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -o $C6_OUT/stdcipher examples/stdcipher.c6 std/core/types.c6 std/core/bits.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/encoding/random.c6
   $C6_OUT/stdcipher
+  ;;
+
+std-quic)
+  mkdir -p "$C6_OUT"
+  "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -o $C6_OUT/stdquic examples/stdquic.c6 std/core/types.c6 std/net/quic.c6 std/net/quicstream.c6 std/net/quichp.c6 std/net/quicrecovery.c6 std/net/quictls.c6 std/net/quicconn.c6 std/net/hpack.c6 std/net/qpack.c6 std/net/h3.c6 std/net/h3conn.c6 std/net/h3c.c6 std/net/h3d.c6 std/net/quicd.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6
+  $C6_OUT/stdquic
   ;;
 
 std-data)
@@ -767,6 +773,20 @@ stdtest)
   std/net/syslog.c6) deps="std/text/str.c6" ;;
   std/net/stun.c6) deps="std/text/str.c6" ;;
   std/net/tftp.c6) deps="std/text/str.c6" ;;
+  std/net/quic.c6) deps="" ;;
+  std/net/hpack.c6) deps="" ;;
+  std/net/qpack.c6) deps="std/net/hpack.c6" ;;
+  std/net/h3.c6) deps="std/net/quic.c6 std/net/hpack.c6 std/net/qpack.c6" ;;
+  std/encoding/aead.c6) deps="std/core/bits.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6" ;;
+  std/net/quichp.c6) deps="std/core/bits.c6 std/encoding/aes.c6 std/encoding/chacha20.c6" ;;
+  std/net/quictls.c6) deps="std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/encoding/aead.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6" ;;
+  std/net/quicrecovery.c6) deps="" ;;
+  std/net/quicstream.c6) deps="" ;;
+  std/net/h3c.c6) deps="std/net/h3conn.c6 std/net/quicconn.c6 std/net/quicstream.c6 std/net/quic.c6 std/net/h3.c6 std/net/qpack.c6 std/net/hpack.c6 std/net/quicrecovery.c6 std/net/quictls.c6 std/net/quichp.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6" ;;
+  std/net/h3d.c6) deps="std/net/h3conn.c6 std/net/quicconn.c6 std/net/quicstream.c6 std/net/quic.c6 std/net/h3.c6 std/net/qpack.c6 std/net/hpack.c6 std/net/quicrecovery.c6 std/net/quictls.c6 std/net/quichp.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6" ;;
+  std/net/quicd.c6) deps="std/net/quic.c6 std/net/quicconn.c6 std/net/quicstream.c6 std/net/quicrecovery.c6 std/net/quictls.c6 std/net/quichp.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6" ;;
+  std/net/h3conn.c6) deps="std/net/h3.c6 std/net/qpack.c6 std/net/quicconn.c6 std/net/quicstream.c6 std/net/quic.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6 std/net/quicrecovery.c6 std/net/quichp.c6 std/net/quictls.c6 std/net/hpack.c6" ;;
+  std/net/quicconn.c6) deps="std/net/quic.c6 std/net/quicstream.c6 std/net/quicrecovery.c6 std/net/quictls.c6 std/net/quichp.c6 std/encoding/aead.c6 std/encoding/aes.c6 std/encoding/chacha20.c6 std/encoding/poly1305.c6 std/core/bits.c6 std/encoding/sha256.c6 std/encoding/hkdf.c6 std/net/tlskdf.c6 std/text/str.c6 std/data/x509.c6 std/encoding/asn1.c6" ;;
   std/os/log.c6) deps="std/text/str.c6" ;;
   std/data/sqlite.c6) deps="std/text/str.c6" ;;
   std/net/postgres.c6) deps="std/text/str.c6" ;;

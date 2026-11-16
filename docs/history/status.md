@@ -3057,7 +3057,7 @@ HTTP/3 仍然不做，但理由从「类型学不符」改成「等于随包一�
 
 ## protobuf：线格式运行时 + `protoc6` 工具链
 
-`std/data/protobuf.c6`（`std.data.protobuf`，err 号段 `0x6179`）把 protobuf 的线格式做全：
+`std/data/protobuf.c6`（`std.data.protobuf`，err 号段 `0x6187`）把 protobuf 的线格式做全：
 `pb_writer`/`pb_reader` 两个工厂，`PbWriter` 的 `write_key`/`write_tag_*`/`write_fixed*`
 /`write_str`/`put`/`mark`/`mark_end`，`PbReader.next` + `PbField` 的 `as_*` 访问器，
 `skip`（未知字段、group 配对、定长与长度前缀负载都走完），`packed` 迭代器 `PbIter`。
@@ -3080,3 +3080,36 @@ inner → outer → package → global 查作用域），`protoc6.c6` 生成 C6 
 
 `std/` 现在 **382** 个 `.c6` 文件（core 53 / data 86 / encoding 54 / net 56 /
 text 52 / container 33 / os 32 / async 13 / analysis 3）。
+
+### 11.109 标准库第九十四批（QUIC 与 HTTP/3）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/quic.c6` | 报文层：变长整数、长/短包头、头构造器、全部帧型、ACK 区间游标、包号展开 | 3 | `Packet.parse/is_long/packet_bytes`；`HeaderBuilder.init/long_header/token/length/pn/short_header/finish`；`Frame.parse/is_stream`；`frame_put_*`；`AckIt.open/next` |
+| `std/encoding/aead.c6` | AEAD 组合层：AES-128/256-GCM、ChaCha20-Poly1305（nonce 派生 + 加密 + tag） | 3 | `AeadKey.init/seal/open/key_len/nonce_len` |
+| `std/net/hpack.c6` | HPACK：静态表 61 项、动态表、霍夫曼、前缀整数、游标解码 | 5 | `HpackTable.init/insert/find`；`hpack_encode_*`；`hpack_decode`；`hpack_huff_*` |
+| `std/net/qpack.c6` | QPACK：静态表 99 项、动态表、阻塞计数、编码器/解码器流指令 | 3 | `QpackTable.init/*`；`qpack_prefix_encode/decode`；`qpack_field_*`；`qpack_encoder_ins/decoder_ins` |
+| `std/net/h3.c6` | HTTP/3 语法层：帧、SETTINGS、请求/响应伪头、单向流类型 | 3 | `h3_frame_parse`；`h3_settings_encode/decode`；`h3_request_encode/decode`；`h3_status_encode`；`h3_stream_type` |
+| `std/net/quichp.c6` | 头保护：AES-ECB / ChaCha20 采样、5 字节掩码、首字节与包号 | 3 | `HpKey.init/ok/kind_of/sample_take/mask/apply/protect_at` |
+| `std/net/quictls.c6` | TLS 1.3 握手消息层 + QUIC 密钥表（RFC 8448 / 9001）、证书链走 x509 | 5 | `tls_hello_parse`；`tls13_quic_key`；`tls13_handshake_secret/finished/transcript_hash`；`tls_msg_*` |
+| `std/net/quicrecovery.c6` | RTT/PTO、丢包检测、NewReno | 3 | `Recovery.init/set_max_datagram/on_sent/on_ack/on_lost/pto_timeout/can_send/*_of` |
+| `std/net/quicstream.c6` | 流状态机：编号、乱序/重叠补齐、final_size、收发缓冲、流控 | 3 | `QStreams.init/find/create/open/on_data/set_*_data/set_max_streams/take_data/credit`；`QStream.init/put/read/write/take/mark_fin/pending_read` |
+| `std/net/quicconn.c6` | 1-RTT 连接：包号、头保护、帧分发、ACK、CRYPTO 缓冲 | 4 | `QConn.init/set_dcid/set_keys/on_packet/flush/write_stream/read_stream/put_crypto/take_crypto/close/*_of` |
+| `std/net/h3conn.c6` | HTTP/3 会话：三条单向流 + SETTINGS、按流解帧、请求/响应/正文 | 3 | `H3Peer.init/pump/start_request/send_response/send_data/finish_stream/flow_at/request_of/response_of` |
+| `std/net/quicd.c6` | 一个端口上按 CID 分流多个连接、批量刷包 | 3 | `QuicDaemon.init/add/remove/find/at/deliver/flush_all/*_of` |
+| `std/net/h3c.c6` | HTTP/3 客户端驱动：装密钥 → GET → poll → 状态码/正文 | 2 | `H3Client.init/peer/keys/get/send_data/finish/flush/feed/poll/status_of/body_of/close` |
+| `std/net/h3d.c6` | HTTP/3 服务端：路由表（命中 / 404）、一条请求只回一次 | 2 | `H3Server.init/peer/keys/route/poll/flush/feed/last_path_of/handled_of/close` |
+
+集成示例 `examples/stdquic.c6`（用例 `std-quic`）72 条检查：变长整数与帧、流的乱序
+补齐与流控、一对 `QConn` 的 1-RTT 往返、`H3Client` + `H3Server` 两次 GET（命中与
+404）、`QuicDaemon` 按 CID 分流。err 号段补 `std.net.quic`=0x6179、`std.net.hpack`=
+0x617a、`std.net.qpack`=0x617b、`std.net.h3`=0x617c、`std.encoding.aead`=0x617d、
+`std.net.quichp`=0x617e、`std.net.quictls`=0x617f、`std.net.quicrecovery`=0x6180、
+`std.net.quicstream`=0x6181、`std.net.quicconn`=0x6182、`std.net.h3conn`=0x6183、
+`std.net.quicd`=0x6184、`std.net.h3c`=0x6185、`std.net.h3d`=0x6186。
+
+`std/` 现在 **396** 个 `.c6` 文件；十四个模块的 test 块逐个跑过（3/3/5/3/3/3/5/3/3/4/
+3/3/2/2 条，0 failure）。注意与上一批的 `std/encoding/hpack` 区分：这一批的头压缩是 `std/net/hpack`
+（QUIC 侧的 HPACK 用法），两者同名不同模块，符号不会撞（方法按接收者取名）。
+`docs/stdlib-coverage.md` 的「不做」清单同步改写：QUIC/HTTP3
+与 TLS 1.3 完整握手两条标为**已做**，剩下的缺口只剩「必须引入外部数据（词典）」一类。

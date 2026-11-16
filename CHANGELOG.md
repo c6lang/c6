@@ -462,6 +462,35 @@ v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口�
   完整握手、SNMP v3、LDAP/RADIUS/SIP、Office/Parquet/7z、GPX/KML/GeoJSON、
   base36/62 变体、词典级断词/排序），以及「什么时候到头」的三条判定标准与结论。
 
+### 标准库第九十四批：QUIC 与 HTTP/3
+
+- **`std/net/quic.c6`**：QUIC 报文层。变长整数、长/短包头解析、头构造器
+  `HeaderBuilder`、全部帧型（`Frame.parse` + `frame_put_*`）、ACK 区间游标 `AckIt`、
+  包号展开。RFC 9000 附录 A 的向量逐字节核对。
+- **`std/encoding/aead.c6`**：AEAD 组合层（AES-128/256-GCM、ChaCha20-Poly1305）：
+  nonce 派生 + 加密 + 出 tag 一次调用，RFC 8439 §2.8.2 与 NIST 向量。
+- **`std/net/hpack.c6` / `std/net/qpack.c6`**：HPACK（RFC 7541）与 QPACK（RFC 9204）
+  静态表（QPACK 99 项）、动态表、霍夫曼编解码、编码器/解码器流指令。
+- **`std/net/h3.c6`**：HTTP/3 语法层。帧、SETTINGS、请求/响应伪头、单向流类型。
+- **`std/net/quichp.c6`**：QUIC 头保护（AES-ECB / ChaCha20 采样 + 掩码 + 首字节）。
+- **`std/net/quictls.c6`**：TLS 1.3 握手消息层与 QUIC 密钥表（RFC 8448 / 9001 向量）、
+  证书链校验走 `std/data/x509`。
+- **`std/net/quicrecovery.c6`**：RTT/PTO 估算、丢包检测（包号 + 时间双条件）、
+  NewReno 拥塞控制。
+- **`std/net/quicstream.c6`**：流状态机：编号、乱序与重叠补齐、`final_size`、
+  收发缓冲滑动窗口、流级与连接级流控。
+- **`std/net/quicconn.c6`**：1-RTT 收发一条龙：包号、头保护（两侧）、帧分发、
+  ACK 区间、CRYPTO 缓冲、流表。
+- **`std/net/h3conn.c6`**：HTTP/3 会话：控制流 + 两条 QPACK 流 + SETTINGS、按流解帧、
+  请求/响应/正文。
+- **`std/net/h3c.c6` / `std/net/h3d.c6`**：客户端驱动（`get` → `poll` → 状态码/正文）
+  与服务端路由表（命中 / 404，一条请求只回一次）。
+- **`std/net/quicd.c6`**：一个端口上按连接 ID 分流（短包头按前缀匹配、长包头读自带
+  DCID 长度），`flush_all` 轮流刷所有连接。
+- 与第九十二批的关系：上一批的 `std/net/hpack` 是 HTTP/2 的；这一批的
+  `std/net/hpack` 是同一套思路的 QUIC 版（模块名不冲突，路径不同）
+- 集成示例 `examples/stdquic.c6`（`ctest --test-dir build -R '^std-quic$'`，72 条检查）；
+  err 号段 0x6179…0x6186；`std/` 到 **396** 个模块。
 ### 标准库第九十二批：HTTP/2（HPACK / 帧层 / h2c 客户端 / h2c 服务端）
 
 - **`std/encoding/hpack.c6`**：HPACK 头压缩（RFC 7541）。61 项静态表 + 动态表（尺寸更新、

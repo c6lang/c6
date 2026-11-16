@@ -1,0 +1,374 @@
+/* std/net/quichp：QUIC 包头保护（RFC 9001 §5.4）——AES-ECB 与 ChaCha20 两种
+ * 掩码，以及对首字节/包号的施加与还原。
+ *
+ *     import std.net.quichp;
+ *
+ *     HpKey hp = { 0 };
+ *     hp.init(QUIC_HP_AES, hp_key, 16);          -- 或 QUIC_HP_CHACHA20 + 32 字节
+ *     u8 sample[16] = { 0 };
+ *     hp.sample_take(pkt, pkt_len, pn_off, sample);
+ *     hp.apply(sample, &first, 1, pn, pn_len);   -- 第三参数：1 = 长首部
+ *
+ * 包头保护是对称的：加密时把掩码异或进去，解密时再异或一次，所以只有一个
+ * `apply`。首字节的掩码只有低位有意义——长首部 `& 0x0f`（保留位 + 包号长度），
+ * 短首部 `& 0x1f`（Key Phase + 包号长度），其余位是首部本身的内容，不能动。
+ *
+ * 采样点在**包号偏移 + 4** 处固定取 16 字节（§5.4.2），跟实际包号长度无关，
+ * 所以短包号（1~3 字节）时要确保密文至少还有 4 字节余量，否则包不合法。
+ *
+ * 两种掩码的差别只在 PRF：
+ *
+ * - AES：`mask = AES-ECB(hp_key, sample)`，取前 5 字节；
+ * - ChaCha20：`sample[0..3]` 当**小端**计数器，`sample[4..15]` 当 nonce，
+ *   对全零明文跑一次块函数，取前 5 字节。
+ */
+#include <string.h>
+
+module std.net.quichp;
+import std.core.types;
+import std.encoding.aes;
+import std.encoding.chacha20;
+
+enum Error { OK = 0, INVAL = 1, SHORT = 2, RANGE = 3 };
+
+#define QUIC_HP_AES      1
+#define QUIC_HP_CHACHA20 2
+
+#define QUIC_HP_SAMPLE_LEN 16
+#define QUIC_HP_MASK_LEN   5
+
+struct HpKey {
+    int kind;
+    int key_len;
+    int valid;
+    u8 key[32];
+    Aes aes;
+};
+
+/* AES 用 16/32 字节 key，ChaCha20 用 32 字节。 */
+int hp_key_len_for(int kind)
+{
+    switch (kind) {
+    case QUIC_HP_AES: return 16;    /* 256 位 AES 传 32 也要能过，见 init */
+    case QUIC_HP_CHACHA20: return 32;
+    default: return 0;
+    }
+}
+
+const char *hp_kind_name(int kind)
+{
+    switch (kind) {
+    case QUIC_HP_AES: return "aes";
+    case QUIC_HP_CHACHA20: return "chacha20";
+    default: return "unknown";
+    }
+}
+
+int ok(HpKey *self) { return self && self->valid; }
+int kind_of(HpKey *self) { return self && self->valid ? self->kind : 0; }
+
+/* 初始化：AES 接受 16 或 32 字节（AES-128/256），ChaCha20 只接受 32 字节。 */
+void init(HpKey *self, int kind, const void *key, int key_len)
+{
+    if (!self)
+        return;
+    memset(self, 0, sizeof *self);
+    if (!key)
+        return;
+    if (kind == QUIC_HP_AES && (key_len == 16 || key_len == 32)) {
+        self->kind = kind;
+        self->key_len = key_len;
+        memcpy(self->key, key, (size_t)key_len);
+        self->aes = aes_key(key, (usize)key_len);
+        self->valid = self->aes.ok();
+        return;
+    }
+    if (kind == QUIC_HP_CHACHA20 && key_len == 32) {
+        self->kind = kind;
+        self->key_len = key_len;
+        memcpy(self->key, key, (size_t)key_len);
+        self->valid = 1;
+    }
+}
+
+/* 从包里取采样：`pn_off + 4` 起 16 字节；不够 -1。 */
+int sample_take(HpKey *self, const void *pkt, int pkt_len, int pn_off,
+                void *sample16)
+{
+    int off = pn_off + 4;
+
+    (void)self;
+    if (!pkt || !sample16 || pn_off < 0 || pkt_len < 0)
+        return -1;
+    if (off + QUIC_HP_SAMPLE_LEN > pkt_len)
+        return -1;
+    memcpy(sample16, (const u8 *)pkt + off, QUIC_HP_SAMPLE_LEN);
+    return 0;
+}
+
+/* 算 5 字节掩码：0 成功 / -1 参数错。 */
+int mask(HpKey *self, const void *sample16, void *mask5)
+{
+    u8 blk[64] = { 0 };         /* ChaCha20 块函数输出 64 字节，只用前 5 字节 */
+    u8 *out = (u8 *)mask5;
+
+    if (!self || !self->valid || !sample16 || !mask5)
+        return -1;
+    if (self->kind == QUIC_HP_AES) {
+        self->aes.encrypt_block((const u8 *)sample16, blk);
+        memcpy(out, blk, QUIC_HP_MASK_LEN);
+        return 0;
+    }
+    {
+        const u8 *s = (const u8 *)sample16;
+        u32 counter = (u32)s[0] | ((u32)s[1] << 8) | ((u32)s[2] << 16)
+                      | ((u32)s[3] << 24);
+
+        if (chacha20_block(self->key, s + 4, counter, blk) < 0)
+            return -1;
+        memcpy(out, blk, QUIC_HP_MASK_LEN);
+        return 0;
+    }
+}
+
+/* 施加/还原保护：改 `first16` 指向的首字节与 pn 的 pn_len 个字节。
+ *
+ * `long_header` 非零表示长首部（掩码 `& 0x0f`），零表示短首部（`& 0x1f`）。
+ * 同一份数据调用两次就是还原。 */
+int apply(HpKey *self, const void *sample16, u8 *first, int long_header,
+          u8 *pn, int pn_len)
+{
+    u8 m[QUIC_HP_MASK_LEN] = { 0 };
+    u8 bits = long_header ? 0x0f : 0x1f;
+    int i = 0;
+
+    if (!self || !self->valid || !sample16 || !first)
+        return -1;
+    if (pn_len < 0 || pn_len > 4 || (pn_len > 0 && !pn))
+        return -1;
+    if (self->mask(sample16, m) < 0)
+        return -1;
+    *first ^= (u8)(m[0] & bits);
+    for (i = 0; i < pn_len; i++)
+        pn[i] ^= m[1 + i];
+    return 0;
+}
+
+/* 一步到位：`pkt` 里 `pn_off` 是包号、`pn_len` 是包号字节数，就地改写首字节
+ * 与包号。`long_header` 同上。返回 0 / -1。 */
+int protect_at(HpKey *self, u8 *pkt, int pkt_len, int pn_off, int pn_len,
+               int long_header)
+{
+    u8 sample[QUIC_HP_SAMPLE_LEN] = { 0 };
+
+    if (!pkt || pn_off < 1 || pn_len < 1 || pn_len > 4)
+        return -1;
+    if (self->sample_take(pkt, pkt_len, pn_off, sample) < 0)
+        return -1;
+    if (self->apply(sample, pkt, long_header, pkt + pn_off, pn_len) < 0)
+        return -1;
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static int hex_eq(const u8 *d, int n, const char *want)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        int hi = want[i * 2];
+        int lo = want[i * 2 + 1];
+        int v = 0;
+
+        if (hi >= '0' && hi <= '9')
+            v = (hi - '0') << 4;
+        else if (hi >= 'a' && hi <= 'f')
+            v = (hi - 'a' + 10) << 4;
+        else
+            return 0;
+        if (lo >= '0' && lo <= '9')
+            v |= lo - '0';
+        else if (lo >= 'a' && lo <= 'f')
+            v |= lo - 'a' + 10;
+        else
+            return 0;
+        if (d[i] != (u8)v)
+            return 0;
+    }
+    return 1;
+}
+
+test "QUIC 包头保护：AES 掩码（RFC 9001 A.2/A.3）" {
+    /* A.2 客户端 Initial 的 hp key 与采样 */
+    u8 hp1[16] = {
+        0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10,
+        0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2
+    };
+    u8 s1[16] = {
+        0xd1, 0xb1, 0xc9, 0x8d, 0xd7, 0x68, 0x9f, 0xb8,
+        0xec, 0x11, 0xd2, 0x42, 0xb1, 0x23, 0xdc, 0x9b
+    };
+    /* A.3 服务器 Initial 的 hp key 与采样 */
+    u8 hp3[16] = {
+        0xc2, 0x06, 0xb8, 0xd9, 0xb9, 0xf0, 0xf3, 0x76,
+        0x44, 0x43, 0x0b, 0x49, 0x0e, 0xea, 0xa3, 0x14
+    };
+    u8 s3[16] = {
+        0x2c, 0xd0, 0x99, 0x1c, 0xd2, 0x5b, 0x0a, 0xac,
+        0x40, 0x6a, 0x58, 0x16, 0xb6, 0x39, 0x41, 0x00
+    };
+    HpKey hp = { 0 };
+    u8 m[5] = { 0 };
+
+    hp.init(QUIC_HP_AES, hp1, 16);
+    if (!hp.ok() || hp.kind_of() != QUIC_HP_AES
+        || strcmp(hp_kind_name(hp.kind_of()), "aes") != 0)
+        return err(1, "AES 掩码 key 初始化失败");
+    if (hp.mask(s1, m) != 0 || !hex_eq(m, 5, "437b9aec36"))
+        return err(2, "A.2 的掩码应是 437b9aec36");
+    hp.init(QUIC_HP_AES, hp3, 16);
+    if (hp.mask(s3, m) != 0 || !hex_eq(m, 5, "2ec0d8356a"))
+        return err(3, "A.3 的掩码应是 2ec0d8356a");
+    /* 长首部：首字节只动低 4 位，包号整段异或 */
+    {
+        u8 hdr[5] = { 0xc1, 0x00, 0x00, 0x00, 0x01 };
+
+        /* 包号在偏移 3（版本号之后是 DCID 长度/DCID/SCID 长度/SCID/Token/长度），
+         * 这里只截取「首字节 + 四字节版本 + 两字节包号」的骨架来验掩码 */
+        if (hp.apply(s3, hdr, 1, hdr + 3, 2) != 0)
+            return err(4, "长首部施加掩码失败");
+        if (!hex_eq(hdr, 5, "cf0000c0d9"))
+            return err(5, "A.3 的保护后首部应是 cf0000c0d9");
+        /* 再施加一次就还原（保护是对称的） */
+        if (hp.apply(s3, hdr, 1, hdr + 3, 2) != 0)
+            return err(6, "还原失败");
+        if (!hex_eq(hdr, 5, "c100000001"))
+            return err(7, "还原后应是 c100000001");
+    }
+    /* 短首部：首字节动低 5 位 */
+    {
+        u8 first = 0x42;
+        u8 pn[3] = { 0x00, 0xbf, 0xf4 };
+        u8 m2[5] = { 0x43, 0x7b, 0x9a, 0xec, 0x36 };
+
+        hp.init(QUIC_HP_AES, hp1, 16);
+        if (hp.apply(s1, &first, 0, pn, 3) != 0)
+            return err(8, "短首部施加掩码失败");
+        if (first != (u8)(0x42 ^ (m2[0] & 0x1f)))
+            return err(9, "短首部的首字节掩码位不对");
+        if (pn[0] != (u8)(0x00 ^ m2[1]) || pn[2] != (u8)(0xf4 ^ m2[3]))
+            return err(10, "短首部的包号掩码不对");
+    }
+    /* 参数检查 */
+    {
+        HpKey bad = { 0 };
+        u8 fb = 0;
+
+        bad.init(QUIC_HP_AES, hp1, 8);
+        if (bad.ok())
+            return err(11, "8 字节 AES key 应失败");
+        bad.init(QUIC_HP_CHACHA20, hp1, 16);
+        if (bad.ok())
+            return err(12, "ChaCha20 只接受 32 字节 key");
+        hp.init(QUIC_HP_AES, hp1, 16);
+        if (hp.apply(s1, &fb, 0, (u8 *)0, 5) != -1)
+            return err(13, "包号长度 5 应判错");
+        if (hp.mask(0, m) != -1)
+            return err(14, "空采样应判错");
+    }
+}
+
+test "QUIC 包头保护：ChaCha20 掩码（RFC 9001 A.5）" {
+    u8 hp[32] = {
+        0x25, 0xa2, 0x82, 0xb9, 0xe8, 0x2f, 0x06, 0xf2,
+        0x1f, 0x48, 0x89, 0x17, 0xa4, 0xfc, 0x8f, 0x1b,
+        0x73, 0x57, 0x36, 0x85, 0x60, 0x85, 0x97, 0xd0,
+        0xef, 0xcb, 0x07, 0x6b, 0x0a, 0xb7, 0xa7, 0xa4
+    };
+    u8 sample[16] = {
+        0x5e, 0x5c, 0xd5, 0x5c, 0x41, 0xf6, 0x90, 0x80,
+        0x57, 0x5d, 0x79, 0x99, 0xc2, 0x5a, 0x5b, 0xfb
+    };
+    HpKey k = { 0 };
+    u8 m[5] = { 0 };
+
+    k.init(QUIC_HP_CHACHA20, hp, 32);
+    if (!k.ok() || strcmp(hp_kind_name(k.kind_of()), "chacha20") != 0)
+        return err(1, "ChaCha20 掩码 key 初始化失败");
+    if (k.mask(sample, m) != 0 || !hex_eq(m, 5, "aefefe7d03"))
+        return err(2, "A.5 的掩码应是 aefefe7d03");
+    /* A.5 的完整首部：未保护 4200bff4 → 保护后 4cfe4189 */
+    {
+        u8 hdr[4] = { 0x42, 0x00, 0xbf, 0xf4 };
+
+        if (k.apply(sample, &hdr[0], 0, hdr + 1, 3) != 0)
+            return err(3, "短首部施加掩码失败");
+        if (!hex_eq(hdr, 4, "4cfe4189"))
+            return err(4, "A.5 的保护后首部应是 4cfe4189");
+        if (k.apply(sample, &hdr[0], 0, hdr + 1, 3) != 0)
+            return err(5, "还原失败");
+        if (!hex_eq(hdr, 4, "4200bff4"))
+            return err(6, "还原后应是 4200bff4");
+    }
+    /* AES-256 的掩码也要能跑（32 字节 key） */
+    {
+        u8 k32[32] = { 0 };
+        HpKey a = { 0 };
+
+        a.init(QUIC_HP_AES, k32, 32);
+        if (!a.ok() || a.kind_of() != QUIC_HP_AES)
+            return err(7, "AES-256 掩码 key 初始化失败");
+        if (a.mask(sample, m) != 0)
+            return err(8, "AES-256 掩码计算失败");
+    }
+}
+
+test "QUIC 包头保护：一步到位的 protect_at" {
+    /* 造一个短首部包：首字节 + 8 字节 DCID + 1 字节包号 + 16 字节负载 */
+    u8 pkt[32] = { 0 };
+    u8 hp[16] = {
+        0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10,
+        0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2
+    };
+    HpKey k = { 0 };
+    u8 copy[32] = { 0 };
+    int i = 0;
+
+    pkt[0] = 0x42;              /* 短首部、包号长度 1 */
+    for (i = 1; i < 9; i++)
+        pkt[i] = (u8)(0xa0 + i);
+    pkt[9] = 0x23;              /* 包号 */
+    for (i = 10; i < 32; i++)
+        pkt[i] = (u8)i;         /* 负载（采样落在这里） */
+    memcpy(copy, pkt, sizeof pkt);
+    k.init(QUIC_HP_AES, hp, 16);
+    if (k.protect_at(pkt, (int)sizeof pkt, 9, 1, 0) != 0)
+        return err(1, "protect_at 失败");
+    if (pkt[0] == 0x42 || pkt[9] == 0x23)
+        return err(2, "首字节与包号都应被改写");
+    for (i = 1; i < 9; i++)
+        if (pkt[i] != copy[i])
+            return err(3, "DCID 不应被改动");
+    for (i = 10; i < 32; i++)
+        if (pkt[i] != copy[i])
+            return err(4, "负载不应被改动");
+    if (k.protect_at(pkt, (int)sizeof pkt, 9, 1, 0) != 0)
+        return err(5, "再施加一次失败");
+    if (memcmp(pkt, copy, sizeof pkt) != 0)
+        return err(6, "施加两次应还原");
+    /* 包太短（采样不齐）要拒 */
+    if (k.protect_at(pkt, 20, 9, 1, 0) != -1)
+        return err(7, "采样不齐应判错");
+    /* 长首部：低 4 位掩码 */
+    {
+        u8 lp[32] = { 0 };
+
+        memcpy(lp, copy, sizeof lp);
+        lp[0] = 0xc3;
+        if (k.protect_at(lp, (int)sizeof lp, 9, 2, 1) != 0)
+            return err(8, "长首部 protect_at 失败");
+        if ((lp[0] ^ 0xc3) & 0xf0)
+            return err(9, "长首部只应改低 4 位");
+    }
+}

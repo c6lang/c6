@@ -1,0 +1,916 @@
+/* std/net/h3：HTTP/3 帧层与消息层（RFC 9114）——帧的解析/构造、SETTINGS、
+ * 单向流类型、请求/响应的伪头部处理。
+ *
+ *     import std.net.h3;
+ *
+ *     H3Frames r = { 0 };
+ *     r.init(buf, len);
+ *     H3Frame f = { 0 };
+ *     while (r.next(&f) == 1) {
+ *         if (f.type == H3_FRAME_HEADERS) { ... }
+ *     }
+ *
+ *     H3Settings st = { 0 };
+ *     h3_settings_parse(payload, payload_len, &st);
+ *
+ *     u8 block[256] = { 0 };
+ *     int n = h3_request_encode(block, sizeof block, &qpack_table,
+ *                               "GET", "https", "example.com", "/");
+ *
+ * 这一层只管「字节 → 结构」。连接管理（控制流、QPACK 流、请求流的状态机、
+ * GOAWAY/阻塞处理）在 std.net.h3conn，客户端在 std.net.h3c/server 在
+ * std.net.h3d；这里刻意不带任何 socket 概念，方便在测试里直接拿 RFC 的例子
+ * 跑。
+ *
+ * 帧格式（RFC 9114 §7.2）：`Type(varint) Length(varint) Payload`。Type 和
+ * Length 都是 QUIC 变长整数，所以两个字节就够描述大多数帧头。
+ *
+ * - 未知帧类型必须**忽略**（长度正确就跳过），这是向前兼容的全部秘密；
+ * - DATA/HEADERS 之外的控制帧出现在请求流上、或者 HEADERS 出现在控制流上，
+ *   都是 H3_FRAME_UNEXPECTED；
+ * - 帧长度与实际可用字节不符时不能猜：不够就返回 0（再等等），超了就 -1。
+ *
+ * SETTINGS（§7.2.4）的负载是 varint 键值对序列，同一个键出现两次是
+ * H3_SETTINGS_ERROR，不认识的键必须忽略。我们记住三个用得上的：
+ * QPACK_MAX_TABLE_CAPACITY(0x1)、MAX_FIELD_SECTION_SIZE(0x6)、
+ * QPACK_BLOCKED_STREAMS(0x7)，其余只计数。
+ *
+ * 消息层（§4）：请求的伪头部是 `:method :scheme :authority :path`（CONNECT
+ * 例外），响应是 `:status`。伪头部必须排在普通头部之前，且不能重复——这两条
+ * 由 decode 顺手检查，违反就是 H3_MESSAGE_ERROR。
+ */
+#include <string.h>
+
+module std.net.h3;
+import std.core.types;
+import std.net.quic;
+import std.net.hpack;
+import std.net.qpack;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3, FRAME = 4, SETTINGS = 5,
+             MESSAGE = 6, BLOCKED = 7 };
+
+/* 帧类型（RFC 9114 §7.2.1 起的注册表） */
+#define H3_FRAME_DATA            0x00
+#define H3_FRAME_HEADERS         0x01
+#define H3_FRAME_CANCEL_PUSH     0x03
+#define H3_FRAME_SETTINGS        0x04
+#define H3_FRAME_PUSH_PROMISE    0x05
+#define H3_FRAME_GOAWAY          0x07
+#define H3_FRAME_MAX_PUSH_ID     0x0d
+#define H3_FRAME_DUPLICATE_PUSH  0x0e
+
+/* 单向流类型（§6.2） */
+#define H3_STREAM_CONTROL        0x00
+#define H3_STREAM_PUSH           0x01
+#define H3_STREAM_QPACK_ENCODER  0x02
+#define H3_STREAM_QPACK_DECODER  0x03
+
+/* SETTINGS 标识（§7.2.4.1） */
+#define H3_SETTING_QPACK_MAX_TABLE_CAPACITY  0x01
+#define H3_SETTING_MAX_FIELD_SECTION_SIZE    0x06
+#define H3_SETTING_QPACK_BLOCKED_STREAMS     0x07
+
+/* 错误码（§8.1） */
+#define H3_NO_ERROR                 0x0100
+#define H3_GENERAL_PROTOCOL_ERROR   0x0101
+#define H3_INTERNAL_ERROR           0x0102
+#define H3_STREAM_CREATION_ERROR    0x0103
+#define H3_CLOSED_CRITICAL_STREAM   0x0104
+#define H3_FRAME_UNEXPECTED         0x0105
+#define H3_FRAME_ERROR              0x0106
+#define H3_EXCESSIVE_LOAD           0x0107
+#define H3_ID_ERROR                 0x0108
+#define H3_SETTINGS_ERROR           0x0109
+#define H3_MISSING_SETTINGS         0x010a
+#define H3_REQUEST_REJECTED         0x010b
+#define H3_REQUEST_CANCELLED        0x010c
+#define H3_REQUEST_INCOMPLETE       0x010d
+#define H3_MESSAGE_ERROR            0x010e
+#define H3_CONNECT_ERROR            0x010f
+#define H3_VERSION_FALLBACK         0x0110
+#define QPACK_DECOMPRESSION_FAILED  0x0200
+#define QPACK_ENCODER_STREAM_ERROR  0x0201
+#define QPACK_DECODER_STREAM_ERROR  0x0202
+
+/* ---- 帧 ---- */
+
+struct H3Frame {
+    u64 type;
+    u64 len;                    /* 负载长度 */
+    int hdr_len;                /* 帧头字节数 */
+    int total;                  /* 帧头 + 负载 */
+    int complete;               /* 负载是否已经全部到手 */
+};
+
+/* 解帧头：1 完整 / 0 还不够（帧头或负载没到齐）/ -1 格式错。
+ *
+ * 负载没到齐时 f->len 已经给出期望值，调用方可以据此攒字节；f->complete 为
+ * 0 时不要去看负载。 */
+int h3_frame_parse(const u8 *in, int n, H3Frame *f)
+{
+    u64 type = 0;
+    u64 len = 0;
+    int a = 0;
+    int b = 0;
+
+    if (!in || !f || n < 0)
+        return -1;
+    memset(f, 0, sizeof *f);
+    a = quic_varint_get(in, n, &type);
+    if (a < 0)
+        return 0;               /* 帧头还没到齐 */
+    if (a >= n)
+        return 0;
+    b = quic_varint_get(in + a, n - a, &len);
+    if (b < 0)
+        return 0;
+    f->type = type;
+    f->len = len;
+    f->hdr_len = a + b;
+    if (len > (u64)0x7fffffffu)
+        return -1;              /* 负载长度超出我们的地址空间，直接判错 */
+    f->total = f->hdr_len + (int)len;
+    if (n < f->total) {
+        f->complete = 0;
+        return 0;
+    }
+    f->complete = 1;
+    return 1;
+}
+
+/* 帧构造：帧头 + 负载（负载由调用方随后填进 out + hdr）。 */
+int h3_put_frame(u8 *out, int cap, u64 type, u64 len)
+{
+    int a = 0;
+    int b = 0;
+
+    if (!out || cap <= 0)
+        return -1;
+    a = quic_varint_put(out, cap, type);
+    if (a < 0)
+        return -1;
+    b = quic_varint_put(out + a, cap - a, len);
+    if (b < 0)
+        return -1;
+    return a + b;
+}
+
+/* 空负载帧（GOAWAY/MAX_PUSH_ID/CANCEL_PUSH 之类要先算头部再写值）：返回帧头
+ * 长度，负载用 h3_put_frame_payload 回填。 */
+int h3_put_frame_payload(u8 *out, int cap, u64 type, const void *payload,
+                         int plen)
+{
+    int n = 0;
+
+    if (plen < 0 || (plen > 0 && !payload))
+        return -1;
+    n = h3_put_frame(out, cap, type, (u64)plen);
+    if (n < 0)
+        return -1;
+    if (n + plen > cap)
+        return -1;
+    if (plen > 0)
+        memcpy(out + n, payload, (size_t)plen);
+    return n + plen;
+}
+
+/* ---- 帧扫描器：按顺序取出完整帧 ---- */
+
+struct H3Frames {
+    const u8 *buf;
+    int len;
+    int pos;
+};
+
+void init(H3Frames *r, const void *buf, int len)
+{
+    if (!r)
+        return;
+    r->buf = (const u8 *)buf;
+    r->len = len;
+    r->pos = 0;
+}
+
+/* 1 取到一帧 / 0 没有完整帧了 / -1 格式错。
+ *
+ * 不做「忽略未知帧」的判断——那要看这条流是请求流还是控制流，属于调用方的
+ * 事；这里只保证 f->type/len 可信。 */
+int next(H3Frames *r, H3Frame *f)
+{
+    int rc = 0;
+
+    if (!r || !f || r->pos >= r->len)
+        return 0;
+    rc = h3_frame_parse(r->buf + r->pos, r->len - r->pos, f);
+    if (rc != 1)
+        return rc < 0 ? -1 : 0;
+    r->pos += f->total;
+    return 1;
+}
+
+int remaining(H3Frames *r)
+{
+    if (!r || r->len < r->pos)
+        return 0;
+    return r->len - r->pos;
+}
+
+/* ---- SETTINGS ---- */
+
+struct H3Settings {
+    u64 max_table_capacity;     /* QPACK_MAX_TABLE_CAPACITY */
+    u64 blocked_streams;        /* QPACK_BLOCKED_STREAMS */
+    u64 max_field_section_size; /* MAX_FIELD_SECTION_SIZE，0 表示不限 */
+    int count;                  /* 收到的键值对个数（含不认识的） */
+    int unknown;                /* 不认识的键个数 */
+    int present;                /* 位掩码：1=表容量 2=阻塞流 4=字段块上限 */
+};
+
+/* 1 成功 / -1 格式错（键值对不完整、同一个键出现两次）。不认识的键忽略。 */
+int h3_settings_parse(const void *buf, int n, H3Settings *s)
+{
+    const u8 *p = (const u8 *)buf;
+    int pos = 0;
+
+    if (!s || n < 0 || (n > 0 && !buf))
+        return -1;
+    memset(s, 0, sizeof *s);
+    while (pos < n) {
+        u64 id = 0;
+        u64 val = 0;
+        int a = quic_varint_get(p + pos, n - pos, &id);
+        int b = 0;
+
+        if (a < 0)
+            return -1;
+        pos += a;
+        b = quic_varint_get(p + pos, n - pos, &val);
+        if (b < 0)
+            return -1;
+        pos += b;
+        s->count++;
+        switch (id) {
+        case H3_SETTING_QPACK_MAX_TABLE_CAPACITY:
+            if (s->present & 1)
+                return -1;
+            s->present |= 1;
+            s->max_table_capacity = val;
+            break;
+        case H3_SETTING_QPACK_BLOCKED_STREAMS:
+            if (s->present & 2)
+                return -1;
+            s->present |= 2;
+            s->blocked_streams = val;
+            break;
+        case H3_SETTING_MAX_FIELD_SECTION_SIZE:
+            if (s->present & 4)
+                return -1;
+            s->present |= 4;
+            s->max_field_section_size = val;
+            break;
+        default:
+            s->unknown++;
+            break;
+        }
+    }
+    return 1;
+}
+
+static int h3_settings_put(u8 *out, int cap, u64 id, u64 val)
+{
+    int a = quic_varint_put(out, cap, id);
+    int b = 0;
+
+    if (a < 0)
+        return -1;
+    b = quic_varint_put(out + a, cap - a, val);
+    if (b < 0)
+        return -1;
+    return a + b;
+}
+
+/* 只写三个我们关心的键（按需），返回字节数。 */
+int h3_settings_encode(const H3Settings *s, u8 *out, int cap)
+{
+    int n = 0;
+    int m = 0;
+
+    if (!s || !out)
+        return -1;
+    if (s->present & 1) {
+        m = h3_settings_put(out + n, cap - n,
+                            H3_SETTING_QPACK_MAX_TABLE_CAPACITY,
+                            s->max_table_capacity);
+        if (m < 0)
+            return -1;
+        n += m;
+    }
+    if (s->present & 2) {
+        m = h3_settings_put(out + n, cap - n, H3_SETTING_QPACK_BLOCKED_STREAMS,
+                            s->blocked_streams);
+        if (m < 0)
+            return -1;
+        n += m;
+    }
+    if (s->present & 4) {
+        m = h3_settings_put(out + n, cap - n, H3_SETTING_MAX_FIELD_SECTION_SIZE,
+                            s->max_field_section_size);
+        if (m < 0)
+            return -1;
+        n += m;
+    }
+    return n;
+}
+
+/* ---- 单向流类型 ---- */
+
+/* 读单向流开头的类型 varint：>=0 类型值 / -1 不够或非法。 */
+int h3_stream_type(const void *buf, int n, int *used)
+{
+    u64 t = 0;
+    int a = 0;
+
+    if (!buf || !used || n <= 0)
+        return -1;
+    a = quic_varint_get((const u8 *)buf, n, &t);
+    if (a < 0 || t > 0xffffffffu)
+        return -1;
+    if (used)
+        *used = a;
+    return (int)t;
+}
+
+const char *h3_stream_type_name(int t)
+{
+    switch (t) {
+    case H3_STREAM_CONTROL: return "control";
+    case H3_STREAM_PUSH: return "push";
+    case H3_STREAM_QPACK_ENCODER: return "qpack-encoder";
+    case H3_STREAM_QPACK_DECODER: return "qpack-decoder";
+    default: return "unknown";
+    }
+}
+
+/* ---- 错误码名字（打印/日志用） ---- */
+
+const char *h3_error_name(u64 code)
+{
+    switch (code) {
+    case H3_NO_ERROR: return "H3_NO_ERROR";
+    case H3_GENERAL_PROTOCOL_ERROR: return "H3_GENERAL_PROTOCOL_ERROR";
+    case H3_INTERNAL_ERROR: return "H3_INTERNAL_ERROR";
+    case H3_STREAM_CREATION_ERROR: return "H3_STREAM_CREATION_ERROR";
+    case H3_CLOSED_CRITICAL_STREAM: return "H3_CLOSED_CRITICAL_STREAM";
+    case H3_FRAME_UNEXPECTED: return "H3_FRAME_UNEXPECTED";
+    case H3_FRAME_ERROR: return "H3_FRAME_ERROR";
+    case H3_EXCESSIVE_LOAD: return "H3_EXCESSIVE_LOAD";
+    case H3_ID_ERROR: return "H3_ID_ERROR";
+    case H3_SETTINGS_ERROR: return "H3_SETTINGS_ERROR";
+    case H3_MISSING_SETTINGS: return "H3_MISSING_SETTINGS";
+    case H3_REQUEST_REJECTED: return "H3_REQUEST_REJECTED";
+    case H3_REQUEST_CANCELLED: return "H3_REQUEST_CANCELLED";
+    case H3_REQUEST_INCOMPLETE: return "H3_REQUEST_INCOMPLETE";
+    case H3_MESSAGE_ERROR: return "H3_MESSAGE_ERROR";
+    case H3_CONNECT_ERROR: return "H3_CONNECT_ERROR";
+    case H3_VERSION_FALLBACK: return "H3_VERSION_FALLBACK";
+    case QPACK_DECOMPRESSION_FAILED: return "QPACK_DECOMPRESSION_FAILED";
+    case QPACK_ENCODER_STREAM_ERROR: return "QPACK_ENCODER_STREAM_ERROR";
+    case QPACK_DECODER_STREAM_ERROR: return "QPACK_DECODER_STREAM_ERROR";
+    default: return "unknown";
+    }
+}
+
+/* ---- 消息层：请求/响应的伪头部 ---- */
+
+struct H3Request {
+    char method[32];
+    char scheme[16];
+    char authority[256];
+    char path[1024];
+    int has_method;
+    int has_scheme;
+    int has_authority;
+    int has_path;
+    int regular;                /* 普通头部个数 */
+    int err;
+};
+
+struct H3Response {
+    char status[8];
+    int has_status;
+    int regular;
+    int err;
+};
+
+/* 取一条字段行：静态/动态/字面量都能出名字和值。 */
+static int h3_field_fetch(QpackTable *t, const QpackPrefix *p, const u8 *in,
+                          int n, char *name, int ncap, char *value, int vcap,
+                          int *consumed)
+{
+    QpackField f = { 0 };
+
+    return t->qpack_field_decode(p, in, n, &f, name, ncap, value, vcap,
+                                 consumed);
+}
+
+/* 解一个请求字段块（含前缀）：1 成功 / -1 格式错 / -2 被阻塞。
+ *
+ * 伪头部的检查按 §4.1：伪头部必须全部排在普通头部之前、不能重复、不能出现
+ * 不认识的伪头部；`has_*` 由调用方决定哪个是必需（GET 要 :path，CONNECT 不
+ * 要）。 */
+int h3_request_decode(QpackTable *t, const u8 *block, int n, H3Request *req)
+{
+    QpackPrefix p = { 0 };
+    int rc = 0;
+    int pos = 0;
+    char name[512] = { 0 };
+    char value[4096] = { 0 };
+    int used = 0;
+    int seen_regular = 0;
+
+    if (!t || !block || !req || n < 0)
+        return -1;
+    memset(req, 0, sizeof *req);
+    rc = t->qpack_prefix_decode(block, n, &p);
+    if (rc < 0)
+        return rc;              /* -1 格式错 / -2 阻塞 */
+    pos = p.used;
+    while (pos < n) {
+        int r = h3_field_fetch(t, &p, block + pos, n - pos, name,
+                               (int)sizeof name, value, (int)sizeof value,
+                               &used);
+
+        if (r < 0)
+            return r;
+        if (used <= 0)
+            return -1;
+        pos += used;
+        if (name[0] == ':') {
+            if (seen_regular || req->err)
+                return -1;      /* 伪头部之后又出现伪头部 */
+            if (strcmp(name, ":method") == 0) {
+                if (req->has_method)
+                    return -1;
+                snprintf(req->method, sizeof req->method, "%s", value);
+                req->has_method = 1;
+            } else if (strcmp(name, ":scheme") == 0) {
+                if (req->has_scheme)
+                    return -1;
+                snprintf(req->scheme, sizeof req->scheme, "%s", value);
+                req->has_scheme = 1;
+            } else if (strcmp(name, ":authority") == 0) {
+                if (req->has_authority)
+                    return -1;
+                snprintf(req->authority, sizeof req->authority, "%s", value);
+                req->has_authority = 1;
+            } else if (strcmp(name, ":path") == 0) {
+                if (req->has_path)
+                    return -1;
+                snprintf(req->path, sizeof req->path, "%s", value);
+                req->has_path = 1;
+            } else {
+                return -1;      /* 请求里不认识这个伪头部 */
+            }
+        } else {
+            seen_regular = 1;
+            req->regular++;
+        }
+    }
+    return 1;
+}
+
+/* 解一个响应字段块，只挑 :status；1 / -1 / -2。 */
+int h3_response_decode(QpackTable *t, const u8 *block, int n,
+                       H3Response *res)
+{
+    QpackPrefix p = { 0 };
+    int rc = 0;
+    int pos = 0;
+    char name[512] = { 0 };
+    char value[4096] = { 0 };
+    int used = 0;
+    int seen_regular = 0;
+
+    if (!t || !block || !res || n < 0)
+        return -1;
+    memset(res, 0, sizeof *res);
+    rc = t->qpack_prefix_decode(block, n, &p);
+    if (rc < 0)
+        return rc;
+    pos = p.used;
+    while (pos < n) {
+        int r = h3_field_fetch(t, &p, block + pos, n - pos, name,
+                               (int)sizeof name, value, (int)sizeof value,
+                               &used);
+
+        if (r < 0)
+            return r;
+        if (used <= 0)
+            return -1;
+        pos += used;
+        if (name[0] == ':') {
+            if (seen_regular)
+                return -1;
+            if (strcmp(name, ":status") != 0)
+                return -1;      /* 响应里只允许 :status */
+            if (res->has_status)
+                return -1;
+            snprintf(res->status, sizeof res->status, "%s", value);
+            res->has_status = 1;
+        } else {
+            seen_regular = 1;
+            res->regular++;
+        }
+    }
+    return 1;
+}
+
+/* 把一条字段写进块尾：静态表能匹配就一个字节，否则字面量。 */
+static int h3_put_field(u8 *out, int cap, QpackTable *t, const char *name,
+                        const char *value, int huffman)
+{
+    return qpack_field_encode(out, cap, t, name, (int)strlen(name), value,
+                              (int)strlen(value), huffman);
+}
+
+/* 编码一个请求字段块（前缀 req=0、base=0 + 四个伪头部）。
+ *
+ * 因为没有用到动态表，Required Insert Count 恒为 0；`:method`/`:scheme`/
+ * `:path` 命中静态表时各占一个字节。返回总字节数。 */
+int h3_request_encode(u8 *out, int cap, QpackTable *t, const char *method,
+                      const char *scheme, const char *authority,
+                      const char *path, int huffman)
+{
+    int n = 0;
+    int m = 0;
+
+    if (!out || !t || !method || !scheme || !path)
+        return -1;
+    n = t->qpack_prefix_encode(0, 0, out, cap);
+    if (n < 0)
+        return -1;
+    m = h3_put_field(out + n, cap - n, t, ":method", method, huffman);
+    if (m < 0)
+        return -1;
+    n += m;
+    m = h3_put_field(out + n, cap - n, t, ":scheme", scheme, huffman);
+    if (m < 0)
+        return -1;
+    n += m;
+    if (authority && authority[0]) {
+        m = h3_put_field(out + n, cap - n, t, ":authority", authority,
+                         huffman);
+        if (m < 0)
+            return -1;
+        n += m;
+    }
+    m = h3_put_field(out + n, cap - n, t, ":path", path, huffman);
+    if (m < 0)
+        return -1;
+    n += m;
+    return n;
+}
+
+/* 编码一个响应字段块（前缀 + :status）。 */
+int h3_status_encode(u8 *out, int cap, QpackTable *t, int status,
+                     int huffman)
+{
+    char buf[8] = { 0 };
+    int n = 0;
+    int m = 0;
+
+    if (!out || !t)
+        return -1;
+    snprintf(buf, sizeof buf, "%d", status);
+    n = t->qpack_prefix_encode(0, 0, out, cap);
+    if (n < 0)
+        return -1;
+    m = h3_put_field(out + n, cap - n, t, ":status", buf, huffman);
+    if (m < 0)
+        return -1;
+    return n + m;
+}
+
+/* ---- 常用帧的便捷构造函数 ---- */
+
+int h3_put_data(u8 *out, int cap, const void *data, int len)
+{
+    return h3_put_frame_payload(out, cap, H3_FRAME_DATA, data, len);
+}
+
+int h3_put_headers(u8 *out, int cap, const void *block, int len)
+{
+    return h3_put_frame_payload(out, cap, H3_FRAME_HEADERS, block, len);
+}
+
+int h3_put_settings(u8 *out, int cap, const H3Settings *s)
+{
+    u8 payload[64] = { 0 };
+    int n = h3_settings_encode(s, payload, (int)sizeof payload);
+
+    if (n < 0)
+        return -1;
+    return h3_put_frame_payload(out, cap, H3_FRAME_SETTINGS, payload, n);
+}
+
+int h3_put_goaway(u8 *out, int cap, u64 stream_id)
+{
+    u8 payload[8] = { 0 };
+    int n = quic_varint_put(payload, (int)sizeof payload, stream_id);
+
+    if (n < 0)
+        return -1;
+    return h3_put_frame_payload(out, cap, H3_FRAME_GOAWAY, payload, n);
+}
+
+int h3_put_max_push_id(u8 *out, int cap, u64 push_id)
+{
+    u8 payload[8] = { 0 };
+    int n = quic_varint_put(payload, (int)sizeof payload, push_id);
+
+    if (n < 0)
+        return -1;
+    return h3_put_frame_payload(out, cap, H3_FRAME_MAX_PUSH_ID, payload, n);
+}
+
+int h3_put_cancel_push(u8 *out, int cap, u64 push_id)
+{
+    u8 payload[8] = { 0 };
+    int n = quic_varint_put(payload, (int)sizeof payload, push_id);
+
+    if (n < 0)
+        return -1;
+    return h3_put_frame_payload(out, cap, H3_FRAME_CANCEL_PUSH, payload, n);
+}
+
+/* 读一个「负载只有一个 varint」的帧的值（GOAWAY/MAX_PUSH_ID/CANCEL_PUSH）。 */
+int h3_frame_varint(const u8 *payload, int plen, u64 *value)
+{
+    if (!payload || !value || plen <= 0)
+        return -1;
+    if (quic_varint_get(payload, plen, value) != plen)
+        return -1;              /* 负载必须正好是一个 varint（§7.2.x） */
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "HTTP/3：帧的解析与构造" {
+    u8 buf[256] = { 0 };
+    H3Frame f = { 0 };
+    H3Frames r = { 0 };
+    int n = 0;
+
+    /* DATA：类型 0x00、长度 5 */
+    n = h3_put_data(buf, (int)sizeof buf, "hello", 5);
+    if (n != 7 || buf[0] != 0x00 || buf[1] != 0x05)
+        return err(1, "DATA 帧头应是 00 05");
+    if (h3_frame_parse(buf, n, &f) != 1 || f.type != H3_FRAME_DATA
+        || f.len != 5 || f.hdr_len != 2 || f.total != 7)
+        return err(2, "DATA 帧解析不对");
+    if (memcmp(buf + f.hdr_len, "hello", 5) != 0)
+        return err(3, "DATA 负载不对");
+    /* 长度还没到齐：0 表示再等等，且 len 给出期望值 */
+    if (h3_frame_parse(buf, 5, &f) != 0 || f.len != 5 || f.complete)
+        return err(4, "负载不齐时应返回 0 并给出长度");
+    /* 帧头不齐也是 0 */
+    if (h3_frame_parse(buf, 1, &f) != 0)
+        return err(5, "帧头不齐应返回 0");
+    /* 两个字节的 varint：长度 300 */
+    {
+        u8 big[8] = { 0 };
+        int m = h3_put_frame(big, (int)sizeof big, H3_FRAME_HEADERS, 300);
+
+        if (m != 3 || big[0] != 0x01 || big[1] != 0x41 || big[2] != 0x2c)
+            return err(6, "长帧头应是 01 41 2c");
+        if (h3_frame_parse(big, m + 300, &f) != 1 || f.len != 300
+            || f.total != 303)
+            return err(7, "300 字节帧的长度解错");
+        if (h3_frame_parse(big, m + 299, &f) != 0)
+            return err(8, "少一个字节时应返回 0");
+    }
+    /* 扫描器：DATA + 未知帧 + GOAWAY，未知帧要能跳过 */
+    {
+        u8 s[128] = { 0 };
+        int pos = 0;
+        int seen = 0;
+        int go = 0;
+
+        pos = h3_put_data(s, (int)sizeof s, "abc", 3);
+        pos += h3_put_frame_payload(s + pos, (int)sizeof s - pos, 0x21,
+                                    "xyz", 3);
+        go = pos;
+        pos += h3_put_goaway(s + pos, (int)sizeof s - pos, 4);
+        r.init(s, pos);
+        while (r.next(&f) == 1) {
+            seen++;
+            if (f.type == 0x21 && (f.len != 3 || f.total != 5))
+                return err(9, "未知帧的长度不对");
+        }
+        if (seen != 3 || r.remaining() != 0)
+            return err(10, "应扫出 3 个完整帧");
+        /* GOAWAY 的负载是一个 varint */
+        r.init(s + go, pos - go);
+        if (r.next(&f) != 1 || f.type != H3_FRAME_GOAWAY)
+            return err(11, "GOAWAY 帧应能取出");
+        {
+            u64 id = 0;
+
+            if (h3_frame_varint(s + go + f.hdr_len, (int)f.len, &id) != 1
+                || id != 4)
+                return err(12, "GOAWAY 的流号应是 4");
+        }
+    }
+    /* 只带一个 varint 的帧多写了字节要判错 */
+    {
+        u8 s[8] = { 0x01, 0x02 };
+        u64 v = 0;
+
+        if (h3_frame_varint(s, 2, &v) != -1)
+            return err(13, "负载多余字节应判错");
+    }
+}
+
+test "HTTP/3：SETTINGS 与单向流类型" {
+    H3Settings s = { 0 };
+    u8 buf[64] = { 0 };
+    int n = 0;
+
+    /* 手写三个键：0x1=4096、0x6=16384、0x7=16 */
+    n = h3_settings_put(buf, (int)sizeof buf, H3_SETTING_QPACK_MAX_TABLE_CAPACITY,
+                        4096);
+    n += h3_settings_put(buf + n, (int)sizeof buf - n,
+                         H3_SETTING_QPACK_BLOCKED_STREAMS, 16);
+    n += h3_settings_put(buf + n, (int)sizeof buf - n,
+                         H3_SETTING_MAX_FIELD_SECTION_SIZE, 16384);
+    if (h3_settings_parse(buf, n, &s) != 1)
+        return err(1, "SETTINGS 解析失败");
+    if (s.max_table_capacity != 4096 || s.max_field_section_size != 16384
+        || s.blocked_streams != 16)
+        return err(2, "SETTINGS 三个值不对");
+    if (s.count != 3 || s.unknown != 0 || s.present != 7)
+        return err(3, "SETTINGS 计数不对");
+    /* 同样的内容用编码器再写一遍，应该一字不差 */
+    {
+        u8 out[64] = { 0 };
+        int m = h3_settings_encode(&s, out, (int)sizeof out);
+
+        if (m != n || memcmp(out, buf, (size_t)n) != 0)
+            return err(4, "SETTINGS 往返不一致");
+    }
+    /* 不认识的键必须忽略 */
+    {
+        u8 b2[8] = { 0 };
+        int m = h3_settings_put(b2, (int)sizeof b2, 0x99, 1);
+
+        if (h3_settings_parse(b2, m, &s) != 1 || s.unknown != 1
+            || s.count != 1)
+            return err(5, "未知键应被忽略");
+    }
+    /* 同一个键两次 = 格式错 */
+    {
+        u8 b3[16] = { 0 };
+        int m = h3_settings_put(b3, (int)sizeof b3, 0x1, 1);
+
+        m += h3_settings_put(b3 + m, (int)sizeof b3 - m, 0x1, 2);
+        if (h3_settings_parse(b3, m, &s) != -1)
+            return err(6, "重复的键应判错");
+    }
+    /* 键值对不完整 */
+    {
+        u8 b4[2] = { 0x01, 0x01 };
+        u8 b5[1] = { 0x01 };
+
+        if (h3_settings_parse(b4, 1, &s) != -1)
+            return err(7, "缺值应判错");
+        if (h3_settings_parse(b5, 1, &s) != -1)
+            return err(8, "缺键又缺值应判错");
+    }
+    /* 单向流类型 */
+    {
+        u8 t[2] = { 0x02, 0x00 };
+        int used = 0;
+
+        if (h3_stream_type(t, 2, &used) != H3_STREAM_QPACK_ENCODER || used != 1)
+            return err(9, "QPACK 编码器流类型应是 0x02");
+        if (strcmp(h3_stream_type_name(H3_STREAM_CONTROL), "control") != 0)
+            return err(10, "流类型名字不对");
+        if (h3_stream_type(t, 0, &used) != -1)
+            return err(11, "空缓冲应判错");
+    }
+    /* 错误码名字 */
+    if (strcmp(h3_error_name(H3_NO_ERROR), "H3_NO_ERROR") != 0
+        || strcmp(h3_error_name(QPACK_DECOMPRESSION_FAILED),
+                  "QPACK_DECOMPRESSION_FAILED") != 0
+        || strcmp(h3_error_name(0x1234), "unknown") != 0)
+        return err(12, "错误码名字不对");
+}
+
+test "HTTP/3：请求与响应字段块" {
+    QpackTable t = { 0 };
+    H3Request req = { 0 };
+    H3Response res = { 0 };
+    u8 block[512] = { 0 };
+    int n = 0;
+
+    t.init(0);                  /* 不用动态表 */
+    n = h3_request_encode(block, (int)sizeof block, &t, "GET", "https",
+                          "example.com", "/", 0);
+    if (n <= 0)
+        return err(1, "请求字段块编码失败");
+    /* 00 00 d1 d7 50 0f example.com c1 */
+    if (block[0] != 0x00 || block[1] != 0x00)
+        return err(2, "前缀应是 00 00");
+    if (block[2] != 0xd1)
+        return err(3, ":method: GET 应命中静态表（d1）");
+    if (block[3] != 0xd7)
+        return err(4, ":scheme: https 应命中静态表（d7）");
+    if (block[4] != 0x50 || block[5] != 0x0b)
+        return err(5, ":authority 应是名字引用 + 长度 11");
+    if (block[n - 1] != 0xc1)
+        return err(6, ":path: / 应是 c1");
+    if (h3_request_decode(&t, block, n, &req) != 1)
+        return err(7, "请求字段块解码失败");
+    if (strcmp(req.method, "GET") != 0 || strcmp(req.scheme, "https") != 0
+        || strcmp(req.authority, "example.com") != 0
+        || strcmp(req.path, "/") != 0)
+        return err(8, "四个伪头部的值不对");
+    if (!req.has_method || !req.has_scheme || !req.has_authority
+        || !req.has_path || req.regular != 0)
+        return err(9, "伪头部的存在标记不对");
+    /* POST + 查询串 + Huffman */
+    n = h3_request_encode(block, (int)sizeof block, &t, "POST", "https",
+                          "example.com", "/submit?x=1", 1);
+    if (n <= 0)
+        return err(10, "POST 编码失败");
+    if (block[2] != 0xd4)
+        return err(11, ":method: POST 应是 d4");
+    if (h3_request_decode(&t, block, n, &req) != 1
+        || strcmp(req.method, "POST") != 0
+        || strcmp(req.path, "/submit?x=1") != 0)
+        return err(12, "POST + Huffman 的往返不对");
+    /* 响应 :status */
+    n = h3_status_encode(block, (int)sizeof block, &t, 404, 0);
+    if (n != 3 || block[2] != 0xdb)
+        return err(13, ":status: 404 应是 db");
+    if (h3_response_decode(&t, block, n, &res) != 1
+        || strcmp(res.status, "404") != 0 || !res.has_status)
+        return err(14, "响应字段块解码不对");
+    /* 响应块里出现 :method 是消息错 */
+    {
+        int m = h3_request_encode(block, (int)sizeof block, &t, "GET",
+                                  "https", "", "/", 0);
+
+        res.err = 0;
+        if (h3_response_decode(&t, block, m, &res) != -1)
+            return err(15, "响应里的 :method 应判错");
+    }
+    /* 伪头部重复 */
+    {
+        int m = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":method", 7, "GET", 3, 0);
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":method", 7, "PUT", 3, 0);
+        if (h3_request_decode(&t, block, m, &req) != -1)
+            return err(16, "重复的伪头部应判错");
+    }
+    /* 普通头部之后又出现伪头部 */
+    {
+        int m = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":method", 7, "GET", 3, 0);
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                "user-agent", 10, "c6", 2, 0);
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":path", 5, "/", 1, 0);
+        if (h3_request_decode(&t, block, m, &req) != -1)
+            return err(17, "普通头部之后的伪头部应判错");
+    }
+    /* 不认识的伪头部 */
+    {
+        int m = t.qpack_prefix_encode(0, 0, block, (int)sizeof block);
+
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":method", 7, "GET", 3, 0);
+        m += qpack_field_encode(block + m, (int)sizeof block - m, &t,
+                                ":x-bogus", 8, "1", 1, 0);
+        if (h3_request_decode(&t, block, m, &req) != -1)
+            return err(18, "不认识的伪头部应判错");
+    }
+    /* 引用还没到的动态表条目 → 被阻塞（-2） */
+    {
+        QpackTable t2 = { 0 };
+        int m = 0;
+
+        t2.init(4096);
+        t2.set_capacity(220);
+        m = t2.qpack_prefix_encode(1, 1, block, (int)sizeof block);
+        block[m++] = 0x10;      /* 后基索引 0 → 绝对索引 1（还没插入） */
+        if (h3_request_decode(&t2, block, m, &req) != -2)
+            return err(19, "引用未来条目应返回阻塞");
+    }
+}
