@@ -30,10 +30,19 @@ struct wk {
 #define __WORK_INITIALIZER(n) { .entry = { &(n).entry, &(n).entry }, .dummy = 7 }
 #define ASSERT_STATIC_STORAGE(name) \
 	static typeof(name) * const name##_storage_check = &(name)
+/* 括号和成员**交错嵌套**：workqueue.h:249 的 __DELAYED_WORK_INITIALIZER
+ * 把 n 换成 `(n).work` 再交给 __WORK_INITIALIZER，展开就是
+ * `&((n).work).entry`——关一层 `)`、走一格 `.work`、再关一层 `)`。 */
+#define __DELAYED_WORK_INITIALIZER(n) { .work = __WORK_INITIALIZER((n).work) }
+
+struct dw {
+	struct wk work;
+};
 
 static struct lh myhead = LIST_HEAD_INIT(myhead);
 static struct wk mywork = __WORK_INITIALIZER(mywork);
 ASSERT_STATIC_STORAGE(mywork);
+static struct dw mydwork = __DELAYED_WORK_INITIALIZER(mydwork);
 
 int main(void)
 {
@@ -52,5 +61,12 @@ int main(void)
 	/* ASSERT_STATIC_STORAGE：`&(name)` 就是它自己的地址 */
 	if (mywork_storage_check != &mywork)
 		return 6;
+	/* 交错嵌套：`&((n).work).entry` */
+	if (mydwork.work.entry.next != &mydwork.work.entry)
+		return 7;
+	if (mydwork.work.entry.prev != &mydwork.work.entry)
+		return 8;
+	if (mydwork.work.dummy != 7)
+		return 9;
 	return 42;
 }
