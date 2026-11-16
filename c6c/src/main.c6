@@ -624,6 +624,13 @@ static int parse_args(int argc, char **argv)
             /* 位置无关代码：native 后端一直是位置无关的（见上面 shared 那条
              * 注释），所以这里收下就够——别让 `-fPIC` 落进未知选项把构建打死。 */
             continue;
+        } else if (strncmp(a, "-l", 2) == 0 && a[2] != 0) {
+            /* `-l<name>`（`-lm` 最常见）：c6c 的产物是静态的，没有动态库可依赖，
+             * 所以这一项**收下但不生效**——libc/libm 的常用面由 c6c/lib/rt.c6
+             * 自带（数学函数那一节从 sqrt 到 hypot 都有，std 的用例就是按
+             * "静态链接也有 libm"这个前提写的）。真的少了某个符号，链接期会
+             * 如实报「未定义的符号」，不会因为收下 `-lm` 而变成运行时炸。 */
+            continue;
         } else if (strncmp(a, "-Wl,", 4) == 0) {
             /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
              * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母

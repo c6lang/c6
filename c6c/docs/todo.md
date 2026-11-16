@@ -4220,3 +4220,38 @@ syscall，能把 std-fsx/std-ub/std-sys/std-term 一起点亮），再看跨 TU 
 **还差的 47 个**，分类没变（libc 面 / `-lm` / 跨 TU 符号 / 行为差异），但每一类
 都薄了一层。下一轮的顺序：`getgrgid`+`getgrouplist` 补完口令那半边、`-lm` 走
 动态依赖（`DT_NEEDED` 加一条 libm）、再看跨 TU 的模板成员函数与 `$2` 符号。
+
+## 第 211 轮：`-lm` 那一族解锁（回归 45 → 47）
+
+`std-*` 里有一整批用例（10 个）挂在 `c6c: error: 未知选项 '-lm'` 上——命令行是
+照 tcc 的口径写的，而 c6c 不认 `-l`。这一轮把这件事弄清楚并落地。
+
+**做了什么**：
+
+* `c6c/src/main.c6`：`-l<name>`（`-lm` 最常见）**收下不报错**。理由不是"懒得实现"，
+  而是 c6c 的产物是静态的、没有动态库可依赖：libc/libm 的常用面本来就在
+  `c6c/lib/rt.c6` 里（`sqrt`/`pow`/`sin`/`cos`/`log`/`exp`/`hypot`/`atan`…… 一大堆，
+  见那节的注释）。真少了某个符号，链接期照旧如实报「未定义的符号」——不会因为
+  收下 `-lm` 就变成运行时炸。
+* `c6c/lib/rt.c6`：补齐这条路上真缺的几个数学函数 `atan2`（std/geo 就是卡在它）、
+  `exp2`、`fdim`、`nextafter`（`log2`/`copysign` 早就有）。`atan2` 用 `atan` 加象限
+  修正，不查表。
+* `c6c/lib/rt.c6` 顺手补的符号：`getgrgid`（`/etc/group` 的解析，`struct group`
+  按 glibc 的 ABI 摆，成员列表就地切开）、`sem_trywait`/`sem_timedwait`/
+  `sem_getvalue`、`pthread_rwlock_tryrdlock`/`trywrlock`、`pthread_barrier_*`、
+  `pthread_spin_*`。
+
+**实测**（`./c6c/tests/regression-c6c.sh --all`）：
+
+```
+45 → 47 / 92     新增全绿：std-linalg（31 条自检）/ std-math3（25 条）
+                 没有一条从绿变红
+从"链不上"变成"跑起来但自检有差"：std-sys（13 条里差 2，pty 那两条）、
+         std-thread（29 条里差 7，线程池语义）、std-geo（30 条里差 19）
+```
+
+**还差的 45 个**，四类的排序变了：跨 TU 的模板/`static` 符号现在是最扎眼的一堆
+（`std-demo`/`std-kit`/`std-tour`/`std-box`/`std-more`/`std-mw`/`std-docs`/
+`std-async3`/`std-ub`/`std-mesh` 十个，缺的都是 `Iter_int_has`、`p_atom$2`、
+`take_n`、`next_set` 这种"某个 TU 里生成了、别的 TU 看不见"的名字）。下一轮先
+把这一类的成因弄清楚（是不是模板实例化按 TU 局部生成了）。
