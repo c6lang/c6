@@ -48,29 +48,14 @@ if(C6_INSTALL_C6C OR NOT C6_ENABLE_TCC)
 endif()
 
 if(_c6c_installed AND C6_INSTALL_CMAKE_PACKAGE)
-  set(C6C_PACKAGE_DIR "${C6_LIBDIR_REL}/cmake/c6c")
   set(C6C_BINDIR "${CMAKE_INSTALL_FULL_BINDIR}")
   set(C6C_LIBDIR "${CMAKE_INSTALL_FULL_LIBDIR}")
   set(C6C_INCLUDEDIR "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
-
-  configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6cConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6cConfig.cmake"
-    INSTALL_DESTINATION "${C6C_PACKAGE_DIR}"
-    PATH_VARS C6C_BINDIR C6C_LIBDIR C6C_INCLUDEDIR
-  )
-  write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/c6cConfigVersion.cmake"
-    VERSION "${C6_VERSION_NUMERIC}"
-    COMPATIBILITY SameMajorVersion
-  )
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6cTargets.cmake.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/c6cTargets.cmake" @ONLY)
-  install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/c6cConfig.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6cConfigVersion.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/c6cTargets.cmake"
-    DESTINATION "${C6C_PACKAGE_DIR}")
+  # C6CheckInstall.cmake 的 check-install 脚本要按这个落点核对安装树
+  set(C6C_PACKAGE_DIR "${C6_LIBDIR_REL}/cmake/c6c")
+  c6_install_cmake_package(c6c "${C6C_PACKAGE_DIR}"
+    c6cConfig.cmake.in c6cTargets.cmake.in
+    C6C_BINDIR C6C_LIBDIR C6C_INCLUDEDIR)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -80,13 +65,10 @@ endif()
 # 在 <libdir>/c6/include，不能进 Cflags，否则会盖掉宿主程序的系统头。
 # ---------------------------------------------------------------------------
 if(_c6c_installed AND C6_INSTALL_PKGCONF)
-  c6_pcfile_prefix(C6C_PC_PREFIX "${C6_PKGCONFIG_DIR}")
-  set(C6C_PC_NAME "c6c")
-  set(C6C_PC_DESCRIPTION
-      "c6c - self-hosted compiler written in c6 (embeddable libc6c)")
-  set(C6C_PC_LIBS "-lc6c")
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6c.pc.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/c6c.pc" @ONLY)
-  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/c6c.pc"
-          DESTINATION "${C6_PKGCONFIG_DIR_REL}")
+  # 与 c6.pc / c6lib.pc / libtcc.pc 同一套模板与安装机制（cmake/C6Metadata.cmake）
+  c6_install_pc(c6c "c6c"
+    "c6c - self-hosted compiler written in c6 (embeddable libc6c)"
+    "-lc6c" "c6c=\${bindir}/c6c${C6_TCC_EXESUF}"
+    NO_TCCDIR
+    VARS_COMMENT "pkgconf --variable=c6c c6c")
 endif()

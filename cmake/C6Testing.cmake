@@ -111,11 +111,8 @@ set(_c6_test_env
   "C6_NODE=${C6_NODE}"
   "C6_WASM_TRIPLE=${C6_WASM_TRIPLE}"
 )
-if(NOT C6_TCC_STATIC)
-  set(_c6_ld_path "${C6_TCC_DIR}:$ENV{LD_LIBRARY_PATH}")
-  string(REGEX REPLACE ":+$" "" _c6_ld_path "${_c6_ld_path}")
-  list(APPEND _c6_test_env "LD_LIBRARY_PATH=${_c6_ld_path}")
-endif()
+# shared 形态下构建树的 c6 要补 LD_LIBRARY_PATH（见 C6Metadata.cmake）
+c6_ld_env(_c6_test_env)
 
 # regression.sh 里部分 $C6_OUT/... 引用没有加引号，含空格的构建目录会让
 # 这些用例以难以诊断的方式失败，这里提前给出明确提示。
