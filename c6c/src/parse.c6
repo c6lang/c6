@@ -15754,9 +15754,17 @@ static int glob_addr_start(int amp)
      *     ASSERT_STATIC_STORAGE(name) → static typeof(name) * const … = &(name)
      *     __WORK_INITIALIZER(n, f)    → { .entry = { &(n).entry, &(n).entry }, … }
      * 不认就报"全局地址初始化器只支持 &全局/函数"（15 个文件）。 */
-    if (amp && t && t->kind == TK_PUNCT && TOK_EQ(t, "(") && pa_peek(1)
-        && pa_peek(1)->kind == TK_IDENT)
-        return 1;
+    if (amp && t && t->kind == TK_PUNCT && TOK_EQ(t, "(")) {
+        u32 q = 1;
+
+        /* 括号可以连着套：`&((n).work).entry`（workqueue.h 的
+         * __DELAYED_WORK_INITIALIZER 把 n 换成 `(n).work` 就是这个形状），
+         * 所以把开头这一串 `(` 全数过去，看后面是不是名字。 */
+        while (pa_peek(q) && pa_peek(q)->kind == TK_PUNCT && TOK_EQ(pa_peek(q), "("))
+            q++;
+        if (pa_peek(q) && pa_peek(q)->kind == TK_IDENT)
+            return 1;
+    }
     if (!(t && t->kind == TK_IDENT))
         return 0;
     s = sym_find(tok_data(t), t->len);
@@ -15905,6 +15913,18 @@ static void glob_addr_parse(u32 data_off, int amp, int num_first, int pclose)
                 pa_error("'->' 要先读出运行期的指针值，不是地址常量；静态初始化里"
                          "请写成 '&对象.成员'");
                 goto bad;
+            } else if (pa_is_ch(')') && (grp > 0 || pclose > 0)) {
+                /* 成组括号的右半边，且**还没关完**：括号和成员是交错嵌套的。
+                 * 内核 include/linux/workqueue.h:249 的
+                 *     __DELAYED_WORK_INITIALIZER(n, f, t) → .work = __WORK_INITIALIZER((n).work, (f))
+                 * 展开出来就是 `&((n).work).entry`：关一层 `)`、走一格
+                 * `.work`、再关一层 `)`、再走 `.entry`。以前这里是 break，
+                 * 剩下的 `)` 留在流里，后面一路"这里要 ')' / '}'"。 */
+                pa_advance();
+                if (grp > 0)
+                    grp--;
+                else
+                    pclose--;
             } else {
                 break;
             }
