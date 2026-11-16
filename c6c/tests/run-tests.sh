@@ -54,6 +54,18 @@ one_file() {
     out="$TMP/v.$i"
 
     : >"$out"
+    # tests/protobuf/ 的 roundtrip.c6 include 的是 protoc6 **生成**的头
+    # （`demo/addressbook.c6` …），不是能单独编的语义用例，连前端都不该过一遍
+    # ——所以这条判断要在下面的 -fsyntax-only **之前**。生成 + 编译 + 运行由
+    # c6 那条 `std-protobuf` 用例负责（tests/regression.sh 里先跑
+    # tools/protoc6，再用 -I <out>/pb 编），这一层没有生成步骤。
+    case "$f" in
+    */tests/protobuf/*)
+        echo "FOK" >>"$out"
+        echo "SKIP" >>"$out"
+        return
+        ;;
+    esac
     # 编译器调用一律有上限：c6c 在某个用例上卡死时，这里 timeout 出手，
     # 把这个用例判成失败，而不是让整个 check-all 挂住。
     if ! timeout -k 5 "$C6C_TMO" "$C6C" -fsyntax-only \

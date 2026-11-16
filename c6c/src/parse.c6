@@ -6314,9 +6314,29 @@ static u32 parse_typespec(void)
     if (!base) {
         /* C TU 里不带类型说明符的声明按隐式 int 处理，但要发 tcc 口径的
          * warning（tests2/102_alignas.expect 与 60_errors_and_warnings.expect
-         * 的第一段都逐字要它）；c6 源码总是显式类型，不要打噪声。 */
-        if (!in_c6_tu())
-            pa_warn_tcc("type defaults to int");
+         * 都要它）；c6 源码总是显式类型，不要打噪声。
+         *
+         * 判据一：`!base` 不等于"没写说明符"。`int`、`unsigned long`、
+         * `signed short` 这些只由修饰符组成的写法，base 也是走到下面这串 if
+         * 才补出来的，得靠 saw_int（见过 int/long/short/unsigned/signed 之一）
+         * 分辨。只看 `!base` 的话每个 `int f(...)`、每个 `unsigned long x;`
+         * 都算"隐式 int"——一条 C TU 上固定刷 218 条（bundled 头里的声明），
+         * tests2 的输出比对整片判"不符"，stderr 也不再干净。
+         *
+         * 判据二：只有**对象声明**才告警，而且必须真的站在声明符上。tcc 的
+         * 告警只挂在 decl() 的对象分支上：函数声明/定义、旧式（K&R）形参表、
+         * 强制转换里的类型名都不发——60_errors_and_warnings.c 的
+         * test_default_int_type 就把 `n;`（warn）和 `f();`（don't warn）并排
+         * 摆着。用"名字后面跟 `;` `=` `,` `[`"来认对象声明符，顺带把变参
+         * 原型里那个会问一次类型的 `...`（`int printf(const char *fmt, ...)`）
+         * 和 `(int(ATTR *)(void))` 这类转换类型名挡在外面。 */
+        if (!in_c6_tu() && !saw_int && pa_cur()->kind == TK_IDENT) {
+            Tok *nx = pa_peek(1);
+            if (nx->kind == TK_PUNCT
+                && (tok_eq(nx, ";") || tok_eq(nx, "=") || tok_eq(nx, ",")
+                    || tok_eq(nx, "[")))
+                pa_warn_tcc("type defaults to int");
+        }
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
         else if (nlong == 1)
