@@ -744,6 +744,14 @@ static int parse_args(int argc, char **argv)
 
 static char C6C_SELF_DIR[512];
 
+/* c6c **自带**的 include 目录（stddef.h / string.h … 所在的那几个）。
+ * 数组本体声明在 parse.c6（它比本文件先被 #include，那边要用），这里只负责填。 */
+static void c6_self_incdir_add(const char *dir)
+{
+    if (dir && N_C6_SELF_INCDIR < C6_SELF_INCDIRS_MAX)
+        C6_SELF_INCDIR[N_C6_SELF_INCDIR++] = dir;
+}
+
 /* -c 没给 -o 时的默认输出名：`src/foo.c6` → `foo.o`（和 gcc 同一个习惯：
  * 只留下文件名、去掉 .c6 / .c 后缀）。 */
 static const char *obj_default_out(const char *src, char *buf, size_t n)
@@ -792,20 +800,28 @@ static void setup_incdirs(void)
      * 优先按 -B 给的目录，其次按 argv[0] 所在目录，最后按源码树相对路径。 */
     if (C6C_SELF_DIR[0]) {
         snprintf(bd, sizeof(bd), "%s/include", C6C_SELF_DIR);
-        if (NINCDIR < MAX_INCDIRS)
-            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        if (NINCDIR < MAX_INCDIRS) {
+            INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
+            c6_self_incdir_add(INCDIR[NINCDIR++]);
+        }
         snprintf(bd, sizeof(bd), "%s/../include", C6C_SELF_DIR);
-        if (NINCDIR < MAX_INCDIRS)
-            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        if (NINCDIR < MAX_INCDIRS) {
+            INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
+            c6_self_incdir_add(INCDIR[NINCDIR++]);
+        }
         /* 装出来的布局：<prefix>/bin/c6 + <prefix>/lib/c6/include（和 tcc 的
          * <prefix>/lib/tcc 一个意思——自带头文件不跟 C 库的 include 抢地方）。 */
         snprintf(bd, sizeof(bd), "%s/../lib/c6/include", C6C_SELF_DIR);
-        if (NINCDIR < MAX_INCDIRS)
-            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        if (NINCDIR < MAX_INCDIRS) {
+            INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
+            c6_self_incdir_add(INCDIR[NINCDIR++]);
+        }
     }
     snprintf(bd, sizeof(bd), "%s/include", O.bdir);
-    if (NINCDIR < MAX_INCDIRS)
-        INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+    if (NINCDIR < MAX_INCDIRS) {
+        INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
+        c6_self_incdir_add(INCDIR[NINCDIR++]);
+    }
     if (NINCDIR < MAX_INCDIRS)
         INCDIR[NINCDIR++] = "/usr/local/include";
     if (NINCDIR < MAX_INCDIRS)
