@@ -19,6 +19,16 @@ enum {
     TY_CHAR, TY_SCHAR, TY_UCHAR,
     TY_SHORT, TY_USHORT, TY_INT, TY_UINT,
     TY_LONG, TY_ULONG, TY_LLONG, TY_ULLONG,
+    /* `__int128` / `unsigned __int128`（GCC 扩展）。内核 include/uapi/
+     * linux/types.h 有一句**无条件**的
+     *     typedef unsigned __int128 __u128 __attribute__((aligned(16)));
+     * 缺少它整棵头链在 include/linux/types.h:14 的 `typedef __u128 u128;` 就断，
+     * 而 u128 之后在 cmpxchg_64.h 的 `union __u128_halves { u128 full; … };`
+     * 里被当成员用。
+     *
+     * 排在 TY_ULLONG **后面**是有意的：ty_is_int() 用的是范围判断
+     * （TY_CHAR … TY_ULLONG），放进去就自动算整数类型。 */
+    TY_I128, TY_U128,
     TY_FLOAT, TY_DOUBLE, TY_LDOUBLE,
     TY_PTR, TY_ARRAY, TY_FUNC, TY_STRUCT, TY_UNION, TY_ENUM,
     TY_CLOSURE,          /* closure RET(params)：单字，指向 {fn, 捕获…} 的堆对象 */
@@ -242,6 +252,11 @@ static u32 ty_long(void)    { return ty_leaf(TY_LONG, 0, 8, 8); }
 static u32 ty_ulong(void)   { return ty_leaf(TY_ULONG, 0, 8, 8); }
 static u32 ty_llong(void)   { return ty_leaf(TY_LLONG, 0, 8, 8); }
 static u32 ty_ullong(void)  { return ty_leaf(TY_ULLONG, 0, 8, 8); }
+/* `__int128` / `unsigned __int128`：16 字节。见 TY_I128 那里的注释。
+ * 目前只在类型层成立（声明、成员、sizeof、取地址都按 16 字节走）；真正的
+ * 128 位算术没有实现——内核头链里它只出现在声明位置。 */
+static u32 ty_i128(void)    { return ty_leaf(TY_I128, 0, 16, 16); }
+static u32 ty_u128(void)    { return ty_leaf(TY_U128, 0, 16, 16); }
 static u32 ty_float(void)   { return ty_leaf(TY_FLOAT, 0, 4, 4); }
 static u32 ty_double(void)  { return ty_leaf(TY_DOUBLE, 0, 8, 8); }
 static u32 ty_ldouble(void) { return ty_leaf(TY_LDOUBLE, 0, 16, 16); }
@@ -543,7 +558,7 @@ static int ty_is_int(u32 id)
 {
     u8 k = TY_AT(id)->kind;
 
-    return k >= TY_CHAR && k <= TY_ULLONG;
+    return k >= TY_CHAR && k <= TY_U128;
 }
 static int ty_is_float(u32 id)
 {
