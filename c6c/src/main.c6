@@ -739,6 +739,11 @@ static int parse_args(int argc, char **argv)
              * 注释）。默认不开——开了会让 glibc 头走 GNU 分支，偏离与 tcc
              * 的 -E 对齐口径。 */
             O.kernel_mode = 1;
+            /* 编内核时自带运行时（lib/rt.c6）一个字节都不能进来：它 include
+             * 的是用户态那套头（stdio.h/stdlib.h/string.h…），而 -ffreestanding-
+             * kernel 下只从内核树找头，于是立刻报一串"找不到头文件"。
+             * 内核自己就是运行时，用不上 c6c 的。 */
+            O.nostdlib = 1;
             continue;
         } else if (strcmp(a, "-fPIC") == 0 || strcmp(a, "-fpic") == 0) {
             /* 位置无关代码：native 后端一直是位置无关的（见上面 shared 那条
