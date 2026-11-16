@@ -7,6 +7,22 @@
 
 ## 未发布
 
+### 无符号左值的 `>>=` 改成逻辑右移：回归 71 → 73 / 92
+
+复合赋值里的 `>>=` 一律记成 `IR_SAR`（算术右移），于是**无符号**左值也是带着符号
+位右移：`unsigned long long v = ~0ull; v >>= 7;` 移完还是全 `1`，`v >>= 1` 从
+`8000…` 变成 `c000…`。普通的 `v = v >> 7` 走的是另一条路（按 `ty_is_signed` 选
+`IR_SHR`/`IR_SAR`），一直是对的。
+
+`std.encoding.varint` 的 `uvarint_encoded_len` 就是 `while (v >= 0x80) v >>= 7;`，
+碰上 `0xffffffffffffffff` 直接死循环——`std-next` 打完标题就卡住（`std-more` 同理，
+它是回归里唯一"跑不完"而不是"跑不对"的两个用例）。
+
+按左值类型的符号性选 op 后：
+
+- `std-more` / `std-next` 全绿
+- 71 → 73 / 92，无回退
+
 ### 拼接字符串字面量的 sizeof：回归 66 → 71 / 92
 
 `sizeof("a" "bc")` 一直算成 **8**（指针大小）——`sizeof` 里"括号中是一个字符串

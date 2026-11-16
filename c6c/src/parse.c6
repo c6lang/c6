@@ -13548,6 +13548,11 @@ static u32 gen_assign(void)
                          "Allocate it with 'new' and hold it in '@%s'", dnm, dnm);
             }
             r = value_of(r);
+            /* `>>=` 在无符号左值上要逻辑右移。这里图省事一律记成 IR_SAR，
+             * 于是 `u64 v = ~0ull; v >>= 7;` 移完还是全 1（std 的
+             * `uvarint_encoded_len` 因此死循环，std-next 整个卡住）。 */
+            if (op == IR_SAR && !ty_is_signed(ty))
+                op = IR_SHR;
             if (op == 0) {
                 /* 托管引用赋值：先给新值加计数，再存，最后放掉旧值。
                  * 这个顺序让 `p = p` 净变化为 0（先 +1 后 -1）。 */
