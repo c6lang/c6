@@ -2770,11 +2770,18 @@ static int hex_val(int c)
 }
 
 /* 解码一个转义序列：*pp 指向反斜杠之后，返回字节值并推进 *pp。 */
+/* 上一次 esc_decode 解出来的是不是**码点**（`\uXXXX` / `\UXXXXXXXX`）。
+ * `\x41` / `\101` 是**字节**转义，值 >= 0x80 也只能写进一个字节——把它们
+ * 当码点再 UTF-8 编码会把 `"\xde"` 变成两个字节（踩过：std/encoding/hexdump
+ * 的用例就是拿它拼二进制数据，结果 0xde 变成了 0xc3 0x9e）。 */
+static int ESC_IS_UCN;
+
 static u32 esc_decode(const char **pp, const char *end)
 {
     const char *p = *pp;
     u32 v = 0;
 
+    ESC_IS_UCN = 0;
     if (p >= end)
         return 0;
     switch (*p) {
@@ -2791,6 +2798,8 @@ static u32 esc_decode(const char **pp, const char *end)
         /* 通用字符名：\uXXXX（4 位）/ \UXXXXXXXX（8 位）→ 码点 */
         int want = (*p == 'u') ? 4 : 8;
         int k = 0;
+
+        ESC_IS_UCN = 1;
 
         p++;
         for (k = 0; k < want && p < end && hex_val((u8)*p) >= 0; k++) {
@@ -8008,14 +8017,15 @@ static u32 str_lit_data(void)
         nk->ncp = 0;
         while (i + 1 < t->len) {
             u32 ch = 0;
-            int from_esc = 0;
+            int esc_ucn = 0;        /* \u / \U：码点，窄字面量要重新编码 */
+            int src_utf8 = 0;       /* 源码里直接写的 UTF-8：解成码点后再编码回去 */
 
             if (s[i] == '\\') {
                 const char *p = s + i + 1;
 
                 ch = esc_decode(&p, s + t->len);
+                esc_ucn = ESC_IS_UCN;
                 i = (u32)(p - s);
-                from_esc = 1;
             } else {
                 ch = (u32)(u8)s[i];
                 i++;
@@ -8031,10 +8041,10 @@ static u32 str_lit_data(void)
                         i++;
                     }
                     ch = acc;
-                    from_esc = 1;
+                    src_utf8 = 1;
                 }
             }
-            if (kind == 0 && from_esc && ch >= 0x80) {
+            if (kind == 0 && (esc_ucn || src_utf8) && ch >= 0x80) {
                 /* 窄字面量里的非 ASCII 码点按 UTF-8 编码（\uXXXX 和源码里的
                  * UTF-8 字节都走这里） */
                 if (ch < 0x800) {
@@ -8050,6 +8060,8 @@ static u32 str_lit_data(void)
                     buf[n++] = (u8)(0x80 | ((ch >> 6) & 0x3F));
                     buf[n++] = (u8)(0x80 | (ch & 0x3F));
                 }
+                ((u32 *)nk->cps)[nk->ncp] = ch;
+                nk->ncp++;
             } else {
                 buf[n++] = (u8)(ch & 0xFF);
                 ((u32 *)nk->cps)[nk->ncp] = ch;
