@@ -12691,14 +12691,13 @@ static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty)
          * 整数那边**不动**：c6c 自己有个约定，通用 `task` 句柄的 `t->val`
          * 是按 long 读出来的裸位模式，和浮点字面量比时正好按位对上；改成
          * 整数转浮点会把它算成 4.6e18（tests/async.c6 会挂）。 */
-        if (ty_is_float(aty))
-            a = gen_convert(a, aty, cty);
-        else
-            a = gen_cast_to(a, cty);
-        if (ty_is_float(bty))
-            b = gen_convert(b, bty, cty);
-        else
-            b = gen_cast_to(b, cty);
+        /* 整数那侧以前走 gen_cast_to（只砍整数高位），是给"通用 task 句柄的
+         * `t->val` 按位和浮点字面量比"留的偏门；副作用是 `double h; h > 1`
+         * 把 h 的**位模式**当整数和 1 比，恒为真——std-geo 的距离、包围盒判断
+         * 全错（`if (h > 1) h = 1` 把 haversine 结果夹成 1，距离恒为 20015 km）。
+         * 按标准语义把整数转成浮点再比。 */
+        a = gen_convert(a, aty, cty);
+        b = gen_convert(b, bty, cty);
     } else {
         a = gen_cast_to(a, cty);
         b = gen_cast_to(b, cty);

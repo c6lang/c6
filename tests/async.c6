@@ -486,15 +486,19 @@ test "task 句柄在 err / return 路径上都会被回收（超过池容量）"
 
 test "async 的 double!error 失败路径写回 +0.0" {
     int i = 0;
+    /* 用**具体**的任务结构（`struct <函数>_task *`）拿 val：通用 `task` 句柄上的
+     * `t->val` 两个编译器给的语义不一样（c6c 给位模式、tcc 给转好的 double），
+     * 具体结构上 `val` 就是真字段，两边一致。 */
     for (i = 0; i < 20; i++) {
-        task t = fail_double_task(i * 2);
+        struct fail_double_task_task *t = fail_double_task(i * 2);
+
         if (__c6_co_wait(t) != 0)
             return err(1, "成功的 double task 不该失败");
         if (t->val != i * 2 + 0.5)
             return err(2, "double task 的成功值不对");
     }
     for (i = 1; i < 20; i += 2) {
-        task t = fail_double_task(i);
+        struct fail_double_task_task *t = fail_double_task(i);
         if (__c6_co_wait(t) != -1)
             return err(3, "失败的 double task 没有以失败结束");
         if (t->val != 0.0)
