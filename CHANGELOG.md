@@ -7,6 +7,33 @@
 
 ## 未发布
 
+### 安装：c6c 有了自己的 `find_package(c6c)` 与 `c6c.pc`；`C6C.cmake` 拆成五个模块
+
+- **c6c 的包元数据**：此前无论哪种 flavour，安装树里只有 `c6.pc` / `c6lib.pc` /
+  `libtcc.pc` 与 `find_package(c6)`（c6c 包下还得写 `pkgconf --libs c6`），c6c
+  自己没有名字。现在装 c6c 就同时给：
+  - `find_package(c6c COMPONENTS compiler libc6c)` → `c6c::compiler`（`bin/c6c`）、
+    `c6c::libc6c`（静态，默认）/ `c6c::libc6c_shared`；变量 `c6c_EXECUTABLE`、
+    `c6c_LIBC6C_STATIC` / `_SHARED`、`c6c_INCLUDE_DIR`、`c6c_VERSION`；
+  - `c6c.pc`（`pkgconf --cflags --libs c6c` → `-lc6c`，`--variable=c6c` 给编译器路径）。
+  c6 那套名字照旧安装、不冲突：`c6.pc` 在两种 flavour 下内容不同，`c6c.pc` 只
+  描述自举编译器本身（`cmake/C6CInstall.cmake` 里有取舍说明）。
+- **`cmake/C6C.cmake` 417 行拆成五个模块**（顶层 include 不变，target 名与行为
+  逐个保持）：`C6C.cmake`（总控：路径/工具/`_c6c_ld_env`/源码 GLOB/llc 发现）、
+  `C6CBuild.cmake`（c6c / c6c-opt / libc6c 与 stage0 两条路）、
+  `C6CCheck.cmake`（`c6c_target()` + 全部验收 target）、`C6CGate.cmake`（fast /
+  check-all-c6c / check-all-perf / CTest / check-c6c）、`C6CInstall.cmake`（库与头
+  文件安装 + 上面那套包元数据）。
+- 顺带抽出 `c6_pcfile_prefix()`（`cmake/C6Options.cmake`）：`.pc` 的 `prefix` 用
+  `${pcfiledir}` 反推，`c6.pc` / `c6c.pc` 共用一条算法，不再各写一遍。
+- 契约测试同步：`pkgcheck` 从 7/7 扩到 **10/10**（安装树含 `c6c.pc` 与
+  `lib/cmake/c6c/*`、`find_package(c6c COMPONENTS compiler libc6c)` 的消费方真编
+  真跑、`pkgconf c6c` 的旗子 `-Wall -Werror` 编得过）；`check-install` 在默认
+  flavour 下也验 `c6c.pc` 的 `prefix` 重定位与 `find_package(c6c)` 消费方。
+- 验证：`pkgcheck` 10/10、`check-install` 通过、`tests2-check` 117/0 意外失败、
+  `testflag` 19/0、`regression-c6c` 52/0、`diagtest` 316/0；ON（tcc）与 OFF（宿主
+  CC 引导）两种 flavour 都能 configure + build。
+
 ### 修复：隐式 int 告警只在"非函数声明"发；宏体里的 `__LINE__`/`__FILE__` 报调用点
 
 - `parse_typespec` 的隐式 int 告警收缩到 tcc 的真实口径：形参表里不发

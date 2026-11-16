@@ -3414,7 +3414,7 @@ int main(void) { struct S t = mk(3.0); return t.a == 3.0 ? 0 : 1; }
 | --- | --- | --- |
 | 引导器可选 | `c6c/Makefile` 的 `BOOTSTRAP=tcc\|host` | `BOOTSTRAP=host` 走 `$(HOSTCC) -x c -O2 -o build/c6c src/c6c.c6`；`tcc` 仍是默认 |
 | 构建开关 | `C6_ENABLE_TCC`（默认 ON） | OFF 时 `add_subdirectory(tcc)` 不执行，c6c 的 stage0 换成 `CMAKE_C_COMPILER`，`c6c` 不再依赖 `tcc-build` |
-| 依赖关系 | `cmake/C6C.cmake` | OFF 时反过来 `c6` / `build` 依赖 `c6c`（ALL 上只有 c6c） |
+| 依赖关系 | `cmake/C6CBuild.cmake` | OFF 时反过来 `c6` / `build` 依赖 `c6c`（ALL 上只有 c6c） |
 | 侧翼 | 安装 / `find_package(c6)` / pkgconf / CPack / wasm / `check-install` / `test-plain` / `c6-clean` | OFF 时逐个退化成打印说明，不生成指向不存在产物的清单 |
 | tcc 侧用例 | `cmake/C6Testing.cmake` | OFF 时 115 个 tcc 回归用例**不注册**（它们描述 tcc 产品面），`check-all` / `test-all` 等聚合入口改为打印"用 `ctest -L c6c`"；汇总行明确写"CTest 用例 0 个（tcc 侧 114 个未注册）" |
 | 机器证据 | `.github/workflows/ci.yml` 的 `no-tcc` 作业 | 只用 cmake+gcc 配置构建，**断言 `tcc/c6`、`tcc/libtcc.a` 不存在**，再跑 `ctest -L c6c -LE perf` + `make -C c6c selfhost BOOTSTRAP=host` |

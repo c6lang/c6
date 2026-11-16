@@ -50,14 +50,9 @@ endif()
 # ---------------------------------------------------------------------------
 
 if(C6_INSTALL_PKGCONF)
-  # prefix 用 ${pcfiledir} 反推，安装到别的前缀/DESTDIR 里也能直接用。
-  file(RELATIVE_PATH C6_PC_PREFIX_REL "${C6_PKGCONFIG_DIR}" "${CMAKE_INSTALL_PREFIX}")
-  string(REGEX REPLACE "/+$" "" C6_PC_PREFIX_REL "${C6_PC_PREFIX_REL}")
-  if(C6_PC_PREFIX_REL STREQUAL "" OR C6_PC_PREFIX_REL STREQUAL ".")
-    set(C6_PC_PREFIX "\${pcfiledir}")
-  else()
-    set(C6_PC_PREFIX "\${pcfiledir}/${C6_PC_PREFIX_REL}")
-  endif()
+  # prefix 用 ${pcfiledir} 反推，安装到别的前缀/DESTDIR 里也能直接用
+  # （同一套算法见 cmake/C6Options.cmake 的 c6_pcfile_prefix）。
+  c6_pcfile_prefix(C6_PC_PREFIX "${C6_PKGCONFIG_DIR}")
 
   set(C6_PC_NAME "c6")
   if(C6_ENABLE_TCC)
