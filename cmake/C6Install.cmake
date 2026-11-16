@@ -1,16 +1,33 @@
 # 安装：复刻 tcc/Makefile 的 install-unx 清单，支持 DESTDIR 与 --prefix 落点。
 
-# C6_ENABLE_TCC=OFF：没有 tcc 的 install-unx 清单可抄，这份清单按 c6c 自己的
-# 搜索规则来定落点——
-#   * c6c 用 argv[0] 推自己的目录，找 <bin>/../include 和 <bin>/../lib/rt.c6
-#     （见 src/main.c6 的 setup_incdirs / src/parse.c6 的 find_runtime）；
-#   * 所以 bin/c6 + include/ + lib/rt.c6 三件套装进去，二进制搬家也能自己找到
-#     自带头文件和运行时；
-#   * 嵌入库 libc6c.a/.so 与它的头文件在 C6C.cmake 里装。
+# ---------------------------------------------------------------------------
+# c6c（c6 写的自举编译器）与它自己的数据文件。
+#
+# c6c 不认 tcc 的 <prefix>/lib/tcc，它按 argv[0] 推自己的目录找东西：
+#   * 自带头文件：<bin>/../lib/c6/include（见 src/main.c6 的 setup_incdirs）；
+#   * 运行时源码：<bin>/../lib/rt.c6 或 <bin>/../lib/c6/rt.c6
+#     （见 src/parse.c6 的 find_runtime）。
+# 所以「二进制 + 自带头文件 + rt.c6」必须成套出现：只装二进制的话它连 hello
+# 都编不出来，只会报「找不到自带运行时 lib/rt.c6」。二进制搬家也能自己找到，
+# 不依赖构建期的绝对路径。
+#
+# 三种配置共用这份清单：
+#   * C6_ENABLE_TCC=OFF：没有 tcc，c6c 就是 c6 —— 装成 bin/c6，再加一个同内容
+#     的 bin/c6c，让两种配置的落点一致；
+#   * 默认（tcc 在）+ C6_INSTALL_C6C=ON：c6c 当第二个编译器装成 bin/c6c，
+#     和 tcc 版 c6 并存（包里既能用 tcc 版 c6，也能用 c6c 自举）；
+#   * C6_INSTALL_C6C=OFF：不装 c6c，只装 tcc 版 c6。
+# 嵌入库 libc6c.a/.so 与它的头文件在 C6C.cmake 里装。
+# ---------------------------------------------------------------------------
 if(NOT C6_ENABLE_TCC)
   install(PROGRAMS "${C6C_DIR}/build/c6c"
           DESTINATION "${C6_BINDIR_REL}"
           RENAME "c6${C6_TCC_EXESUF}")
+endif()
+if(C6_INSTALL_C6C OR NOT C6_ENABLE_TCC)
+  install(PROGRAMS "${C6C_DIR}/build/c6c"
+          DESTINATION "${C6_BINDIR_REL}"
+          RENAME "c6c${C6_TCC_EXESUF}")
 
   # 自带头文件（stddef.h / stdarg.h / stdint.h …）装到 <prefix>/lib/c6/include，
   # 不装进 <prefix>/include：那一层是给**宿主 C 程序**用的（c6lib.h / libtcc.h），
@@ -22,6 +39,11 @@ if(NOT C6_ENABLE_TCC)
 
   # 自带运行时源码：编译时被拼进 TU，装在 <prefix>/lib/c6/rt.c6 才找得到。
   install(FILES "${C6C_DIR}/lib/rt.c6" DESTINATION "${C6_LIBDIR_REL}/c6")
+endif()
+
+# C6_ENABLE_TCC=OFF：没有 tcc 的 install-unx 清单可抄，装到这里为止；剩下的
+# 是 tcc 的库、头文件与文档。
+if(NOT C6_ENABLE_TCC)
   return()
 endif()
 

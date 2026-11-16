@@ -2,7 +2,8 @@
 #
 # 把 install() 结果装进 DESTDIR 暂存树，然后：
 #   1. 按 install() 清单核对编译器 / libtcc / 公共头 / libtcc1.a / 内置
-#      include / tcc 兼容软链；
+#      include / tcc 兼容软链，以及自举编译器 c6c 与它自己的自带头文件、
+#      运行时（C6_INSTALL_C6C=ON 时）；
 #   2. 用装出去的 c6 加 -B 真的编译并运行一个程序；
 #   3. 用暂存树里的 c6Config.cmake 配置、编译并运行一个 find_package(c6)
 #      消费方（真的链接 c6::libtcc），再验证不存在的版本会被拒绝；
@@ -25,6 +26,7 @@ set(_c6_symlink "@C6_INSTALL_TCC_SYMLINK@")
 set(_c6_tccdir "@C6_TCCDIR_REL@")
 set(_c6_c6docdir "@C6_C6_DOCDIR_REL@")
 set(_c6_have_docs "@C6_INSTALL_DOCS@")
+set(_c6_have_c6c "@C6_INSTALL_C6C@")
 set(_c6_src "@CMAKE_CURRENT_SOURCE_DIR@")
 set(_c6_exe_suf "@C6_TCC_EXESUF@")
 set(_c6_lib "@C6_LIBTCC_FILENAME@")
@@ -125,6 +127,48 @@ if(NOT _r EQUAL 0 OR NOT _out MATCHES "c6 -B ok")
     "check-install: -B 编译产物运行失败 (${_r})\n${_out}\n${_err}")
 endif()
 message(STATUS "check-install: c6 -B 编译运行 -> ${_out}")
+
+# c6c：默认（tcc 在）也装一份 bin/c6c，包里就有第二个编译器可用。它的自带头
+# 文件与 rt.c6 全靠 argv[0] 推出来的 <bin>/../lib/c6 找，所以只查文件存在不够，
+# 还要真的用暂存树里的 c6c 编一个程序并运行；装漏了 rt.c6 或 include/ 的时候，
+# 这一步会以「找不到自带运行时 lib/rt.c6」失败。
+if(_c6_have_c6c STREQUAL "ON")
+  foreach(_f IN ITEMS
+      "${_c6_root}/${_c6_bindir}/c6c${_c6_exe_suf}"
+      "${_c6_root}/${_c6_libdir}/c6/rt.c6"
+      "${_c6_root}/${_c6_libdir}/c6/include/stddef.h"
+      "${_c6_root}/${_c6_libdir}/c6/include/sys/stat.h")
+    if(NOT EXISTS "${_f}")
+      message(FATAL_ERROR "check-install: 安装树里缺 c6c 的 ${_f}")
+    endif()
+  endforeach()
+  # 退出码 91 是自检结论：既用到自带的 <stddef.h>，也用到自带的 rt.c6。
+  file(WRITE "${_c6_consumer}/pk.c6"
+"#include <stddef.h>
+int main(void)
+{
+    size_t n = 7;
+
+    return (int)n + 84;
+}
+")
+  execute_process(
+    COMMAND "${_c6_root}/${_c6_bindir}/c6c${_c6_exe_suf}"
+            -o "${_c6_consumer}/pk" "${_c6_consumer}/pk.c6"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR
+      "check-install: 装出去的 c6c 编译失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  execute_process(
+    COMMAND "${_c6_consumer}/pk"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 91)
+    message(FATAL_ERROR
+      "check-install: c6c 编出的程序退出码 ${_r}（应为 91）\n${_out}\n${_err}")
+  endif()
+  message(STATUS "check-install: c6c 编译运行 -> 退出码 91")
+endif()
 
 if(_c6_have_pc)
   set(_c6_pc_dir "${_c6_root}/${_c6_pkgconfig}")
