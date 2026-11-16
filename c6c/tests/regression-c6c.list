@@ -89,7 +89,6 @@ std-subs
 std-sys
 std-text
 std-textan
-std-thread
 std-time
 std-tour
 std-transcode
