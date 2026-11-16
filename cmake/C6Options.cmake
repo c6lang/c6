@@ -30,6 +30,18 @@ option(C6_INSTALL_C6C
   "安装自举编译器 c6c（默认与 tcc 版 c6 并存；C6_ENABLE_TCC=OFF 时它就是 c6）" ON)
 option(C6_INSTALL_TCC_SYMLINK "安装 bindir/tcc -> c6 兼容软链" ON)
 option(C6_INSTALL_DOCS "安装 c6 的 docs/、README、CHANGELOG 与 license" ON)
+# 包名跟着 flavour 走：默认（tcc 在）出 c6 包，C6_ENABLE_TCC=OFF 出 c6c 包。
+# 两者装的是同一批路径（/usr/bin/c6、<libdir>/c6/…），所以只能二选一装上，
+# 见 cmake/C6Packaging.cmake 的 Provides/Conflicts。
+set(C6_PACKAGE_NAME "" CACHE STRING
+    "包名（TGZ/DEB/RPM 与 <datarootdir>/doc/<名>）；留空 = 有 tcc 时 c6、C6_ENABLE_TCC=OFF 时 c6c")
+if(NOT C6_PACKAGE_NAME)
+  if(C6_ENABLE_TCC)
+    set(C6_PACKAGE_NAME "c6")
+  else()
+    set(C6_PACKAGE_NAME "c6c")
+  endif()
+endif()
 set(C6_INSTALL_TCCDIR "" CACHE STRING
     "运行时库目录；留空 = <CMAKE_INSTALL_FULL_LIBDIR>/tcc；相对值按安装前缀解析")
 set(C6_INSTALL_DOCDIR "" CACHE STRING
@@ -87,7 +99,7 @@ set(_c6_tccdir_doc
 set(_c6_docdir_doc
     "上游 tcc 文档目录（tcc-doc.html）；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/tcc；相对值按安装前缀解析")
 set(_c6_c6docdir_doc
-    "c6 自己的文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/c6；相对值按安装前缀解析")
+    "c6 自己的文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/<包名>（c6 或 c6c）；相对值按安装前缀解析")
 if(NOT C6_INSTALL_TCCDIR)
   set(C6_INSTALL_TCCDIR "${CMAKE_INSTALL_FULL_LIBDIR}/tcc"
       CACHE STRING "${_c6_tccdir_doc}" FORCE)
@@ -103,7 +115,7 @@ elseif(NOT IS_ABSOLUTE "${C6_INSTALL_DOCDIR}")
       CACHE STRING "${_c6_docdir_doc}" FORCE)
 endif()
 if(NOT C6_INSTALL_C6_DOCDIR)
-  set(C6_INSTALL_C6_DOCDIR "${CMAKE_INSTALL_FULL_DATAROOTDIR}/doc/c6"
+  set(C6_INSTALL_C6_DOCDIR "${CMAKE_INSTALL_FULL_DATAROOTDIR}/doc/${C6_PACKAGE_NAME}"
       CACHE STRING "${_c6_c6docdir_doc}" FORCE)
 elseif(NOT IS_ABSOLUTE "${C6_INSTALL_C6_DOCDIR}")
   set(C6_INSTALL_C6_DOCDIR "${CMAKE_INSTALL_PREFIX}/${C6_INSTALL_C6_DOCDIR}"

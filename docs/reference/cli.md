@@ -115,6 +115,12 @@ c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DO
 去找这两样，所以二进制与它们必须成套出现——只装二进制的话它连一个 hello 都编不
 出来，只会报「找不到自带运行时 lib/rt.c6」。
 
+安装包也分两种 flavour：`C6_ENABLE_TCC=ON` 出 `c6` 包（tcc 版编译器 + `libtcc`），
+`C6_ENABLE_TCC=OFF` 出 `c6c` 包（自举编译器 + `libc6c`，没有一行 tcc）。包名与
+文档落点由 `C6_PACKAGE_NAME` 决定，留空时按 flavour 取 `c6` / `c6c`（所以 c6c 包的
+文档在 `share/doc/c6c/`，许可证是 c6c 的 MIT）。两种包装的是同一批路径，
+`Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。
+
 `tcc/` 里的目标文件全部依赖一份标志记录 `tcc/.c6-flags`（内容是本轮编译用的
 `CC` / `CFLAGS` / `DEFINES` / `LDFLAGS` / `LIBS`）。标志一变（切换 `build` /
 `build-plain`、换一份 `CFLAGS`），下一次 `cmake --build build` 就把所有目标文件

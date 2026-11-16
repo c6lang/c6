@@ -17,12 +17,13 @@
 # Release，这样 deb 的排序（0.2.0~rc1 < 0.2.0）才是正确的。
 # ---------------------------------------------------------------------------
 
-# 没有 tcc 就没有可打的包：CPack 复用 install() 清单，而 C6_ENABLE_TCC=OFF
-# 时光那条清单本身是空的（见 cmake/C6Install.cmake）。
-if(NOT C6_ENABLE_TCC)
-  message(STATUS "c6: C6_ENABLE_TCC=OFF —— 不生成打包配置（没有 tcc 安装清单）")
-  return()
-endif()
+# ---------------------------------------------------------------------------
+# flavour：有 tcc 时出 c6 包（tcc 版编译器 + libtcc + libtcc1.a + 上游文档），
+# C6_ENABLE_TCC=OFF 时出 c6c 包（自举编译器 + libc6c + lib/c6）。两者复用同一
+# 份 install() 清单，差别只在包名、描述、许可证与 Provides/Conflicts：它们装的
+# 是同一批路径（/usr/bin/c6、<libdir>/c6/…），所以互相 Conflicts，同一个系统
+# 上只能装一个。
+# ---------------------------------------------------------------------------
 
 set(C6_PACKAGE_RELEASE "1" CACHE STRING
     "DEB/RPM 的 Release 字段；CI 可注入构建号，例如 42.1a2b3c4")
@@ -46,20 +47,41 @@ set(CPACK_PACKAGE_VERSION_MAJOR "${CMAKE_MATCH_1}")
 set(CPACK_PACKAGE_VERSION_MINOR "${CMAKE_MATCH_2}")
 set(CPACK_PACKAGE_VERSION_PATCH "${CMAKE_MATCH_3}")
 
-set(CPACK_PACKAGE_NAME "c6")
+set(CPACK_PACKAGE_NAME "${C6_PACKAGE_NAME}")
 set(CPACK_PACKAGE_VERSION "${C6_VERSION_NUMERIC}")
 set(CPACK_PACKAGE_VENDOR "c6lang")
 set(CPACK_PACKAGE_CONTACT "taotieren <admin@taotieren.com>")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/c6lang/c6")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-    "c6 - TinyCC with language extensions")
-string(CONCAT CPACK_PACKAGE_DESCRIPTION
-  "c6 is a small, fast C compiler derived from TinyCC, extended with\n"
-  "modules, generics, slices, closures, async and a C99 output backend.\n"
-  "This package ships the c6 compiler, the embeddable libtcc library,\n"
-  "the runtime library (libtcc1.a), headers, CMake package config,\n"
-  "pkgconf metadata and the c6 documentation under share/doc/c6.\n")
-set(CPACK_RESOURCE_FILE_LICENSE "${C6_TCC_DIR}/COPYING")
+if(C6_ENABLE_TCC)
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "c6 - TinyCC with language extensions")
+  string(CONCAT CPACK_PACKAGE_DESCRIPTION
+    "c6 is a small, fast C compiler derived from TinyCC, extended with\n"
+    "modules, generics, slices, closures, async and a C99 output backend.\n"
+    "This package ships the c6 compiler, the embeddable libtcc library,\n"
+    "the runtime library (libtcc1.a), headers, CMake package config,\n"
+    "pkgconf metadata and the c6 documentation under share/doc/c6.\n")
+  set(CPACK_RESOURCE_FILE_LICENSE "${C6_TCC_DIR}/COPYING")
+  set(_c6_rpm_license "LGPL-2.1-or-later")
+  set(_c6_deb_provides "tcc")
+  set(_c6_deb_conflicts "tcc, c6c")
+  set(_c6_rpm_provides "tcc")
+  set(_c6_rpm_conflicts "tcc c6c")
+else()
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "c6c - the c6 compiler written in c6")
+  string(CONCAT CPACK_PACKAGE_DESCRIPTION
+    "c6c is the c6 language compiler written in c6 itself: self-hosting, no\n"
+    "tcc involved, with native x86-64, C99 and LLVM IR backends.\n"
+    "This package ships the compiler (installed as both c6 and c6c), the\n"
+    "embeddable libc6c library, its bundled headers and runtime source\n"
+    "(lib/c6/rt.c6), the CMake package config, pkgconf metadata and the c6\n"
+    "documentation under share/doc/c6c.\n")
+  set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/c6c/LICENSE")
+  set(_c6_rpm_license "MIT")
+  set(_c6_deb_provides "c6")
+  set(_c6_deb_conflicts "c6, tcc")
+  set(_c6_rpm_provides "c6")
+  set(_c6_rpm_conflicts "c6 tcc")
+endif()
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 
 # install() 用的是相对 prefix 的路径，包内根必须与配置时一致，否则
@@ -111,8 +133,8 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "${CPACK_PACKAGE_HOMEPAGE_URL}")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6 (>= 2.17)")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "tcc")
-set(CPACK_DEBIAN_PACKAGE_CONFLICTS "tcc")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "${_c6_deb_provides}")
+set(CPACK_DEBIAN_PACKAGE_CONFLICTS "${_c6_deb_conflicts}")
 # 不探测本机的 dpkg：没有 dpkg 时 CPack 会悄悄默认成 i386。直接从
 # CMake 的目标架构映射，保证在任何打包机上架构都是对的。
 set(_c6_deb_arch "${CMAKE_SYSTEM_PROCESSOR}")
@@ -142,14 +164,14 @@ endif()
 set(CPACK_RPM_PACKAGE_RELEASE "${_c6_rpm_release}")
 # 同样交给 CPack 生成 <name>-<version>-<release>.<arch>.rpm。
 set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
-set(CPACK_RPM_PACKAGE_LICENSE "LGPL-2.1-or-later")
+set(CPACK_RPM_PACKAGE_LICENSE "${_c6_rpm_license}")
 set(CPACK_RPM_PACKAGE_GROUP "Development/Tools")
 set(CPACK_RPM_PACKAGE_URL "${CPACK_PACKAGE_HOMEPAGE_URL}")
 set(CPACK_RPM_PACKAGE_SUMMARY "${CPACK_PACKAGE_DESCRIPTION_SUMMARY}")
 set(CPACK_RPM_PACKAGE_DESCRIPTION "${CPACK_PACKAGE_DESCRIPTION}")
 set(CPACK_RPM_PACKAGE_REQUIRES "glibc")
-set(CPACK_RPM_PACKAGE_PROVIDES "tcc")
-set(CPACK_RPM_PACKAGE_CONFLICTS "tcc")
+set(CPACK_RPM_PACKAGE_PROVIDES "${_c6_rpm_provides}")
+set(CPACK_RPM_PACKAGE_CONFLICTS "${_c6_rpm_conflicts}")
 set(CPACK_RPM_PACKAGE_AUTOREQ OFF)
 set(CPACK_RPM_PACKAGE_AUTOPROV OFF)
 set(CPACK_RPM_PACKAGE_RELOCATABLE OFF)

@@ -189,6 +189,7 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
 | `C6_INSTALL_C6C` | `ON` | 安装自举编译器 `bin/c6c`（与 tcc 版 `c6` 并存；`C6_ENABLE_TCC=OFF` 时它同时是 `bin/c6`） |
+| `C6_PACKAGE_NAME` | 按 flavour | 包名（`c6` / `c6c`），同时决定 `<datarootdir>/doc/<名>` |
 | `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
 | `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
 | `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
@@ -246,6 +247,13 @@ CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除 tc
 `README.md` / `CHANGELOG.md` / `copyright` 装在 `/usr/share/doc/c6/`，上游
 tcc 的 `tcc-doc.html` 仍装在 `<datarootdir>/doc/tcc/`。用
 `-DC6_INSTALL_DOCS=OFF` 可关闭，`-DC6_INSTALL_C6_DOCDIR=...` 可改位置。
+
+同一份清单出两种 flavour：默认（`C6_ENABLE_TCC=ON`）出 **c6** 包；`-DC6_ENABLE_TCC=OFF`
+出 **c6c** 包——里面没有一行 tcc，编译器是 `bin/c6`（c6c，另加一个 `bin/c6c`），库是
+`libc6c`，文档落在 `/usr/share/doc/c6c/`，许可证是 c6c 的 MIT。包名由
+`C6_PACKAGE_NAME` 决定（留空时按 flavour 取 `c6` / `c6c`）；两种包装的是同一批路径，
+所以 `Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。c6c 包目前只作 CI
+artifact（`c6c-packages-*`）产出并验收，Release 里发的仍是 c6 包。
 
 ```sh
 cpack --config build/CPackConfig.cmake -G TGZ -B packages
