@@ -2302,6 +2302,8 @@ static void gen_decl_from_spec(u32 base);
 static u32 gen_unary(void);
 static void skip_attributes(void);
 static void skip_paren_group(void);
+/* 结构体成员里的 `_Static_assert(...)` 要用（定义在后面）。 */
+static void parse_static_assert_rest(void);
 static u32 GEN_TY;
 static int PEND_LVAL;
 static u32 PEND_ADDR;
@@ -3690,6 +3692,20 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
         int base_mgd_kind = 0;
 
         PA_SAW_ENUM = 0;
+        /* 结构体/联合体里的 `_Static_assert(expr, "msg");`（C11 6.7.2.1p2，
+         * 不需要是完整声明）。内核 include/linux/compiler.h 的
+         * __BUILD_BUG_ON_ZERO_MSG 正是这么写的：
+         *     #define __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) \
+         *             ((int)sizeof(struct { _Static_assert(!(e), msg); }))
+         * 少了这一支，它会被当成"没有返回类型的成员函数"，
+         * 报 a member function needs a body —— 而 __must_be_array()
+         * 在头文件里到处都是。 */
+        if (PA_IS_IDENT("_Static_assert") || PA_IS_IDENT("static_assert")) {
+            pa_advance();
+            parse_static_assert_rest();
+            (void)pa_accept_ch(';');
+            continue;
+        }
         base = parse_typespec();
         memb_is_enum = PA_SAW_ENUM;
         /* 成员上的 `__attribute__((aligned(N)))` 写在**类型说明符之前**
@@ -5478,8 +5494,19 @@ static u32 parse_enum_spec(void)
     }
     if (has_tag && etaglen == 5 && memcmp(etag, "Error", 5) == 0 && CUR_FILE)
         ebase = mod_err_base(mod_of_file((u32)CUR_FILE->id));
-    if (!pa_accept_ch('{'))
+    if (!pa_accept_ch('{')) {
+        /* `enum t` 这种**引用**（没有体）：查标签表拿真类型，不要无脑给
+         * ty_int()——packed 枚举在标签表里存的是窄类型，
+         * `sizeof(enum _tlb_table_type)` 得是 1 而不是 4
+         * （内核 arch/x86/include/asm/cpuid/types.h:105 的静态断言）。 */
+        if (has_tag) {
+            Sym *tg = sym_find_tag(etag, etaglen);
+
+            if (tg)
+                return (u32)tg->val;
+        }
         return ty_int();
+    }
     while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
         Tok *t = pa_cur();
         char nm[256] = {0};
@@ -5577,6 +5604,79 @@ static u32 parse_enum_spec(void)
     pa_expect_ch('}');
     if (has_tag)
         HAS_ENUM_TAG = 1;
+    /* `} __packed;` / `} __attribute__((packed));`：GCC 的 packed enum 取
+     * **刚好装得下所有枚举值**的最小宽度（1/2/4 字节）。
+     *
+     * 内核 arch/x86/include/asm/cpuid/types.h 就有
+     *     enum _tlb_table_type { … } __packed;
+     *     static_assert(sizeof(enum _tlb_table_type) == 1);
+     * 不给它以 1 字节，内联在 struct leaf_0x2_table 里的那个 union 会整体
+     * 撑大，那条静态断言当场失败（实测：kernel/sched/core.c 报
+     * cpuid/types.h:84 与 :112 两条 _Static_assert 失败）。
+     *
+     * 这里的属性是**枚举自己**的，parse_typespec 的 skip_attributes 在
+     * 返回之后才跑，所以得在这一层吃掉并记账。 */
+    {
+        int packed = 0;
+
+        if (PA_IS_IDENT("__packed") || PA_IS_IDENT("packed")) {
+            pa_advance();
+            packed = 1;
+        } else if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
+            /* `__attribute__((packed))`：前瞻扫一遍属性体，只找 packed。
+             * 不用 skip_attributes()——它会真吃掉，而这里之后
+             * parse_typespec 还会再跑一遍（属性可能不止 packed）。 */
+            u32 k = 2;      /* 跳过 `__attribute__` `(` */
+
+            while (pa_peek(k)->kind != TK_EOF) {
+                Tok *c = pa_peek(k);
+
+                /* `packed` 和它的别名拼法都要认：内核的 __packed 展开出来
+                 * 是 `__attribute__((__packed__))`（**带尾双下划线**），
+                 * 只匹配 "packed" 会漏（实测：拆开写的
+                 * `__attribute__((packed))` 能过，内核里却过不去）。 */
+                if (c->kind == TK_IDENT
+                    && (TOK_EQ(c, "packed") || TOK_EQ(c, "__packed")
+                        || TOK_EQ(c, "__packed__")))
+                    packed = 1;
+                if (c->kind == TK_PUNCT && TOK_EQ(c, ")")) {
+                    /* 两个 `)` 关掉 ((…))。见到第二个就停。 */
+                    if (pa_peek(k + 1)->kind == TK_PUNCT
+                        && TOK_EQ(pa_peek(k + 1), ")") && k > 2)
+                        k += 2;
+                    else
+                        k++;
+                    break;
+                }
+                k++;
+            }
+            /* 真吃掉，免得 parse_typespec 那里再扫一遍时又不认识 */
+            skip_attributes();
+        }
+        if (packed) {
+            /* 值域 → 最小宽度。maxval 是最后那个 val - 1（val 已经自增过）。 */
+            u32 last = val ? val - 1 : 0;
+            int hi = (int)last;
+            u32 et = ty_int();
+
+            if (hi >= 0 && hi <= 0xFF)
+                et = ty_uchar();
+            else if (hi >= 0 && hi <= 0xFFFF)
+                et = ty_ushort();
+            /* 超过 16 位就保持 int：GCC 也不会为此给 8 字节。
+             *
+             * 标签表里那一条也要跟着改：`sizeof(enum t)` / `enum t x;` 走的是
+             * 标签表里的类型，而不是 parse_enum_spec 的返回值——开头登记时
+             * 还不知道末尾有没有 packed（实测：只改返回值，sizeof 照样是 4）。 */
+            if (has_tag) {
+                Sym *tg = sym_find_tag(etag, etaglen);
+
+                if (tg)
+                    tg->val = (i64)et;
+            }
+            return et;
+        }
+    }
     return ty_int();
 }
 
@@ -7314,7 +7414,13 @@ static void parse_static_assert_rest(void)
     pa_expect_ch('(');
     v = const_expr();
     if (pa_accept_ch(',')) {
-        if (pa_cur()->kind == TK_STR)
+        /* 消息可以是**相邻字符串字面量的拼接**（C99 6.4.5），要连着吃。
+         * 内核 include/linux/build_bug.h:17 的
+         *     __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) (… #e " is true")
+         * 展开出来就是 `"BUILD_BUG_ON failed" " is true"` 两个相邻的串——
+         * 只吃第一个的话，那个 " is true" 会被当成 `)` 之后的多余 token，
+         * 报"这里要 ')'（当前是 '" is true"'）"。 */
+        while (pa_cur()->kind == TK_STR)
             pa_advance();
     }
     pa_expect_ch(')');
