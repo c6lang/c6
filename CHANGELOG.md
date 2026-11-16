@@ -7,6 +7,14 @@
 
 ## 未发布
 
+### 许可：仓库根新增 `LICENSE`（LGPL-2.1，逐字继承 tcc）
+
+- `tcc/COPYING`（LGPL-2.1 全文）逐字复制为根 `LICENSE`：c6 是 TinyCC 的分支，
+  主编译器（`tcc/`）及其修改按 tcc 原许可继承；GitHub 许可识别与 README 的
+  License 徽章从此有据可依。`c6c/` 是自举重写、不复制 tcc 源码，仍按自己的
+  MIT（`c6c/LICENSE`）；打包侧许可随 flavour 分发（`cmake/C6Install.cmake`），
+  README「上游与许可」一节同步双许可作用域。
+
 ### 修复：tests2 全线飘红（隐式 int 告警误伤 `unsigned` 组合）与记分板死因点名
 
 - `parse_typespec` 的隐式 int warning（tcc 口径 `type defaults to int`，为
