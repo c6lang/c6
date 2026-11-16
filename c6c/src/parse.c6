@@ -15543,7 +15543,13 @@ static int pa_is_compound_lit(void)
     /* 元组/单类型都能这么认：`(int, int){…}`、`(struct S){…}`、`(int){…}`
      * ——括号里是类型、闭括号后面紧跟 `{`。 */
     if (is_typename_tok(pa_peek(1))) {
-        int depth = 0;
+        /* depth 从 1 起：下标 0 的那个 `(` 已经站在里面了。以前从 0 起，
+         * 闭括号一到就把 depth 数成 -1，于是 `(struct s){ ((0)) }` 里
+         * 花括号体中的括号对把 depth 拉回 0、提前 return 一个 false——
+         * 复合字面量认不出来，值被当成标量送进 const_expr，在 `{` 上
+         * 报"这里要一个常量表达式"（内核 mm/backing-dev.c 等 10 个文件
+         * 的 RB_ROOT：(struct rb_root){ ((void *)0) , }）。 */
+        int depth = 1;
         int q = 0;
 
         for (q = 1; q < PA_LOOK; q++) {
