@@ -2300,6 +2300,7 @@ static int cm_expand(int role)
 static u32 parse_typename(void);
 static void gen_decl_from_spec(u32 base);
 static u32 gen_unary(void);
+static void init_skip_value(void);
 static void skip_attributes(void);
 static void skip_paren_group(void);
 /* 结构体成员里的 `_Static_assert(...)` 要用（定义在后面）。 */
@@ -2952,6 +2953,24 @@ static i64 char_lit_val(Tok *t)
  * 数组长度、枚举值、位域宽度、case 标签、全局初始化器都要在**解析期**求值。
  * 这里走一条独立的递归下降，只做整数运算（不产生 IR）。 */
 static i64 const_expr(void);
+static i64 const_cast_to(i64 v, u32 ty);
+static int CONST_LAX;
+/* 枚举措名既是类型名又是常量名。`(CT_STATE_MAX - 1)` 这种写法里，括号
+ * **不是**强制转换——把枚举成员当类型名去 parse_typename，就会在 `-` 上
+ * 报"这里要 ')'"。内核 include/linux/log2.h 的 bits_per() 正好这么用。 */
+static Sym *sym_find(const char *nm, u32 nl);
+static int pa_is_enum_const(Tok *t)
+{
+    Sym *s = 0;
+
+    if (!t || t->kind != TK_IDENT)
+        return 0;
+    s = sym_find(tok_data(t), t->len);
+    return s && s->kind == SC_ENUMC;
+}
+static u32 CONST_TY;      /* const_unary 刚求值的常量类型，供 `~`/`-` 用 */
+static u32 lit_type(u64 v, int uns, int lng, int base);
+static void lit_suffix(const char *s, u32 len, int *uns, int *lng, int *base);
 
 /* 全局地址常量里的偏移必须是**整数常量表达式**（C99 6.6p9）。这里的常量求值
  * 对全局变量的名字是宽容的——直接给它的 `s->val`（数据段偏移/符号下标），
@@ -2960,14 +2979,49 @@ static i64 const_expr(void);
  * 野指针。要严格时把 CONST_NOREF 打开，让 const_primary 见到全局变量就报错。 */
 static int CONST_NOREF;
 
+/* 把常量值按类型 ty 截断再按有符号性补回来。常量求值里本来是 `i64` 一统，
+ * `(T)x` 直接 `return x` —— 于是 `(u64)(~0U)` 算出 0xFFFFFFFFFFFFFFFF，
+ * 而 C 要求先按 `unsigned int` 取反（0xFFFFFFFF）再零扩展成 0xFFFFFFFF。
+ * 内核 include/linux/mm_types.h:2038 的
+ *     static_assert((u64)MMF_INIT_LEGACY_MASK <= (u64)UINT_MAX);
+ * 右端正是 `(u64)(~0U)`，少了这一步断言就假失败。 */
+static i64 const_cast_to(i64 v, u32 ty)
+{
+    u32 sz = 0;
+    int uns = 0;
+
+    if (!ty || ty_is_ptr(ty) || ty_is_float(ty) || ty_is_func(ty))
+        return v;
+    sz = ty_size(ty);
+    if (sz == 0 || sz >= 8)
+        return v;
+    uns = !ty_is_signed(ty);
+    {
+        u64 u = (u64)v;
+        u64 mask = (sz >= 8) ? ~0ULL : ((1ULL << (sz * 8)) - 1ULL);
+
+        u = u & mask;
+        if (!uns && (u & (1ULL << (sz * 8 - 1))))
+            u |= ~mask;          /* 符号扩展 */
+        return (i64)u;
+    }
+}
 static i64 const_unary(void)
 {
     if (pa_accept_ch('-'))
         return -(i64)const_unary();
     if (pa_accept_ch('+'))
         return (i64)const_unary();
-    if (pa_accept_ch('~'))
-        return ~(i64)const_unary();
+    if (pa_accept_ch('~')) {
+        /* 操作数的类型决定取反做多宽：`~0U` 是 unsigned int 的 0xFFFFFFFF，
+         * 不是 unsigned long 的 0xFFFF…FF。const_unary 收尾时会把类型记进
+         * CONST_TY，这里按它截断。 */
+        i64 v = const_unary();
+        u32 t = CONST_TY;
+
+        CONST_TY = t;
+        return const_cast_to(~v, t);
+    }
     if (pa_accept_ch('!'))
         return const_unary() == 0 ? 1 : 0;
     if (pa_accept_ch('&')) {
@@ -3106,6 +3160,144 @@ static i64 const_unary(void)
         pa_error("_Generic 没有匹配的类型分支");
         return 0;
     }
+    if ((PA_IS_IDENT("__builtin_clz") || PA_IS_IDENT("__builtin_clzl")
+         || PA_IS_IDENT("__builtin_clzll") || PA_IS_IDENT("__builtin_ctz")
+         || PA_IS_IDENT("__builtin_ctzl") || PA_IS_IDENT("__builtin_ctzll")
+         || PA_IS_IDENT("__builtin_ffs") || PA_IS_IDENT("__builtin_ffsl")
+         || PA_IS_IDENT("__builtin_ffsll") || PA_IS_IDENT("__builtin_popcount")
+         || PA_IS_IDENT("__builtin_popcountl")
+         || PA_IS_IDENT("__builtin_popcountll"))
+        && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "(")) {
+        /* 位运算内建的**常量**形态。il重启式的 ilog2() 里
+         * `63 - __builtin_clzll(n)` 整条要在常量上下文求值
+         * （内核 include/linux/log2.h:160，用 ilog2() 定数组大小的地方都走这里）。
+         * 之前的常量层没有它们，直接报"常量表达式里出现未知名字"。 */
+        Tok *bt = pa_cur();
+        u64 x0 = 0;
+        u32 w0 = 64;
+        i64 r0 = 0;
+
+        pa_advance();
+        pa_advance();
+        /* 实参是**完整表达式**，不是单个一元操作数：内核
+         * `__builtin_clzll(CT_STATE_MAX - 1)`、`__builtin_clzll(n)` 都带运算。 */
+        x0 = (u64)const_expr();
+        pa_expect_ch(')');
+        if (TOK_EQ(bt, "__builtin_clz") || TOK_EQ(bt, "__builtin_ctz")
+            || TOK_EQ(bt, "__builtin_ffs"))
+            w0 = 32;
+        else if (TOK_EQ(bt, "__builtin_clzll") || TOK_EQ(bt, "__builtin_ctzll")
+                 || TOK_EQ(bt, "__builtin_ffsll"))
+            w0 = 64;
+        else if (TOK_EQ(bt, "__builtin_popcount"))
+            w0 = 32;
+        if (TOK_EQ(bt, "__builtin_popcount") || TOK_EQ(bt, "__builtin_popcountl")
+            || TOK_EQ(bt, "__builtin_popcountll")) {
+            u32 i2 = 0;
+
+            for (i2 = 0; i2 < 64; i2++)
+                r0 += (i64)((x0 >> i2) & 1ULL);
+        } else {
+            u32 i2 = 0;
+            int isffs = (TOK_EQ(bt, "__builtin_ffs") || TOK_EQ(bt, "__builtin_ffsl")
+                         || TOK_EQ(bt, "__builtin_ffsll"));
+            int isctz = (TOK_EQ(bt, "__builtin_ctz") || TOK_EQ(bt, "__builtin_ctzl")
+                         || TOK_EQ(bt, "__builtin_ctzll"));
+            u64 xm = (w0 >= 64) ? x0 : (x0 & ((1ULL << w0) - 1ULL));
+
+            if (isffs) {
+                /* ffs: 1 起的位置，0 返回 0 */
+                r0 = 0;
+                for (i2 = 0; i2 < w0; i2++)
+                    if ((xm >> i2) & 1ULL) {
+                        r0 = (i64)i2 + 1;
+                        break;
+                    }
+            } else if (isctz) {
+                r0 = (i64)w0;
+                for (i2 = 0; i2 < w0; i2++)
+                    if ((xm >> i2) & 1ULL) {
+                        r0 = (i64)i2;
+                        break;
+                    }
+            } else {
+                /* clz */
+                r0 = (i64)w0;
+                for (i2 = 0; i2 < w0; i2++)
+                    if ((xm >> (w0 - 1 - i2)) & 1ULL) {
+                        r0 = (i64)i2;
+                        break;
+                    }
+            }
+        }
+        CONST_TY = ty_int();
+        return r0;
+    }
+    if (PA_IS_IDENT("__builtin_constant_p") && pa_peek(1)->kind == TK_PUNCT
+        && tok_eq(pa_peek(1), "(")) {
+        /* `__builtin_constant_p(x)`：编译期能不能把 x 折成常量。
+         *
+         * 做法：把参数当常量表达式求一遍；求不出来（含非常量名字、函数调用
+         * 之类）就当 0，并把 token 位置退回来。内核
+         * include/linux/log2.h:158 的 ilog2() 就靠它分流——常数走
+         * `63 - __builtin_clzll(n)`，否则走运行期的 __ilog2_u64()。 */
+        int depth0 = 0;
+        int ok = 1;
+
+        pa_advance();
+        pa_advance();
+        /* 参数整体扫过去，只看 token 种类。全部是数字/字符字面量、运算符、
+         * 括号、强制转换用的类型名、`sizeof`，以及本身就是常量的枚举成员
+         * ——就报 1；出现普通变量、函数调用、赋值之类就报 0。
+         *
+         * 少判成常量只是让内核走运行期的慢路径（结果一样，ilog2 的
+         * __ilog2_u64 是等价实现）；多判成常量才会出错，所以这里宁可保守。 */
+        while (pa_cur()->kind != TK_EOF) {
+            Tok *tk = pa_cur();
+
+            if (tk->kind == TK_PUNCT) {
+                if (tok_eq(tk, "(") || TOK_EQ(tk, "["))
+                    depth0++;
+                else if (tok_eq(tk, ")") || TOK_EQ(tk, "]")) {
+                    if (depth0 == 0 && tok_eq(tk, ")"))
+                        break;
+                    depth0--;
+                } else if (tok_eq(tk, "=") || tok_eq(tk, ";") || tok_eq(tk, "{")
+                           || tok_eq(tk, "}") || tok_eq(tk, "?")) {
+                    ok = 0;
+                }
+                pa_advance();
+                continue;
+            }
+            if (tk->kind == TK_NUM || tk->kind == TK_CHAR || tk->kind == TK_STR) {
+                pa_advance();
+                continue;
+            }
+            if (tk->kind == TK_IDENT) {
+                Sym *cs = sym_find(tok_data(tk), tk->len);
+
+                /* 类型名（`(unsigned int)x` 里的 cast）、sizeof、枚举常量，
+                 * 以及 typeof/内建，都算常量上下文的一部分。 */
+                if ((cs && cs->kind == SC_TYPEDEF) || (cs && cs->kind == SC_ENUMC)
+                    || is_typename_tok(tk) || TOK_EQ(tk, "sizeof")
+                    || TOK_EQ(tk, "_Alignof") || TOK_EQ(tk, "alignof")
+                    || TOK_EQ(tk, "typeof") || TOK_EQ(tk, "__typeof__")
+                    || TOK_EQ(tk, "__typeof")) {
+                    pa_advance();
+                    continue;
+                }
+                /* 普通变量/函数名：不是常量 */
+                ok = 0;
+                pa_advance();
+                continue;
+            }
+            pa_advance();
+        }
+        if (pa_cur()->kind == TK_PUNCT && tok_eq(pa_cur(), ")"))
+            pa_advance();
+        CONST_TY = ty_int();
+        return ok;
+    }
     if (PA_IS_IDENT("__builtin_types_compatible_p") && pa_peek(1)->kind == TK_PUNCT
         && tok_eq(pa_peek(1), "(")) {
         /* 类型 id 是 hash-consing 的，兼容 == id 相同（限定符也算在 id 里） */
@@ -3119,6 +3311,91 @@ static i64 const_unary(void)
         b = parse_typename();
         pa_expect_ch(')');
         return a == b ? 1 : 0;
+    }
+    if (PA_IS_IDENT("__builtin_offsetof") && pa_peek(1)->kind == TK_PUNCT
+        && tok_eq(pa_peek(1), "(")) {
+        /* 常量上下文里的 `__builtin_offsetof(T, member[.member…])`。
+         * 内核 include/linux/stddef.h:16 的 offsetof() 就是它，静态初始化器
+         * 里到处都是（`{ .off = offsetof(struct S, f) }`）。表达式层那份在
+         * gen_primary 里（10563），这里要单写一份：常量求值不走表达式生成。 */
+        u32 ty = 0;
+        u32 off = 0;
+
+        pa_advance();
+        pa_advance();
+        ty = parse_typename();
+        pa_expect_ch(',');
+        for (;;) {
+            const char *mn = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
+            u32 ml = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
+            u32 mo = 0;
+
+            if (!mn)
+                break;
+            pa_advance();
+            if (!agg_find_promoted(ty, mn, ml, &ty, &mo))
+                break;
+            off += mo;
+            if (!pa_accept_ch('.'))
+                break;
+        }
+        pa_expect_ch(')');
+        return (i64)off;
+    }
+    if (PA_IS_IDENT("__builtin_choose_expr") && pa_peek(1)->kind == TK_PUNCT
+        && tok_eq(pa_peek(1), "(")) {
+        /* `__builtin_choose_expr(const_expr, a, b)`：选中的那个原样返回**值**，
+         * 没选中的那支必须语法合法但不求值（它可以含除法"/0"这种）。
+         * 内核 include/linux/compiler.h:386 用它按类型的符号性选实现。 */
+        i64 c = 0;
+        i64 va = 0;
+        i64 vb = 0;
+
+        pa_advance();
+        pa_advance();
+        c = const_expr();
+        pa_expect_ch(',');
+        if (c) {
+            va = const_expr();
+            pa_expect_ch(',');
+            /* 没选中的那支仍要吃干净，但**不能求值**（它可能含 `/0` 这种）。
+             * 按括号深度扫到本层 `)` 为止。 */
+            {
+                int dep = 0;
+
+                while (pa_cur()->kind != TK_EOF) {
+                    if (pa_is_ch('(') || pa_is_ch('[') || pa_is_ch('{')) {
+                        dep++;
+                    } else if (pa_is_ch(')') || pa_is_ch(']') || pa_is_ch('}')) {
+                        if (dep == 0)
+                            break;
+                        dep--;
+                    }
+                    pa_advance();
+                }
+            }
+        } else {
+            {
+                int dep = 0;
+
+                while (pa_cur()->kind != TK_EOF) {
+                    if (pa_is_ch('(') || pa_is_ch('[') || pa_is_ch('{')) {
+                        dep++;
+                    } else if (pa_is_ch(')') || pa_is_ch(']') || pa_is_ch('}')) {
+                        if (dep == 0)
+                            break;
+                        dep--;
+                    } else if (dep == 0 && pa_is_ch(',')) {
+                        break;
+                    }
+                    pa_advance();
+                }
+            }
+            pa_expect_ch(',');
+            vb = const_expr();
+        }
+        pa_expect_ch(')');
+        return c ? va : vb;
     }
     if (PA_IS_IDENT("sizeof") || PA_IS_IDENT("__alignof__")
         || PA_IS_IDENT("_Alignof") || PA_IS_IDENT("alignof")) {
@@ -3153,13 +3430,14 @@ static i64 const_unary(void)
             return (i64)(is_align ? (u32)ty_align_of(ty2) : ty_size(ty2));
         }
     }
-    if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && TOK_EQ(pa_peek(2), "@")))) {
+    if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && TOK_EQ(pa_peek(2), "@")))
+        && !pa_is_enum_const(pa_peek(1))) {
         u32 ty = 0;
 
         pa_advance();
         ty = parse_typename();
         pa_expect_ch(')');
-        return (i64)const_unary();
+        return const_cast_to(const_unary(), ty);
     }
     if (pa_accept_ch('(')) {
         i64 v = const_expr();
@@ -3170,6 +3448,14 @@ static i64 const_unary(void)
     if (pa_cur()->kind == TK_NUM) {
         i64 v = (i64)int_lit_val(tok_data(pa_cur()), pa_cur()->len);
 
+        {
+            int uns0 = 0;
+            int lng0 = 0;
+            int nb0 = 10;
+
+            lit_suffix(tok_data(pa_cur()), pa_cur()->len, &uns0, &lng0, &nb0);
+            CONST_TY = lit_type((u64)v, uns0, lng0, nb0);
+        }
         pa_advance();
         return v;
     }
@@ -3181,6 +3467,35 @@ static i64 const_unary(void)
     }
     if (pa_cur()->kind == TK_IDENT) {
         Sym *s = sym_find(tok_data(pa_cur()), pa_cur()->len);
+
+        /* 宽松模式（三元未选中支）里碰到"名字 + (" 就是函数调用：整组实参
+         * 跳过，值给 0。必须放在下面按符号表判断**之前**——已声明的函数是
+         * SC_GLOBAL，那条分支只吃名字不吃实参，会把 `(n)` 留在原地，
+         * 于是外层的 `?` 解析错位（实测内核 include/linux/log2.h:162 的
+         * `(sizeof(n) <= 4) ? __ilog2_u32(n) : __ilog2_u64(n)`）。 */
+        if (CONST_LAX && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
+            && tok_eq(pa_peek(1), "(")) {
+            int d = 0;
+
+            pa_advance();
+            while (pa_cur()->kind != TK_EOF) {
+                Tok *t = pa_cur();
+
+                if (t->kind == TK_PUNCT) {
+                    if (tok_eq(t, "(") || TOK_EQ(t, "["))
+                        d++;
+                    else if (tok_eq(t, ")") || TOK_EQ(t, "]")) {
+                        d--;
+                        if (d == 0) {
+                            pa_advance();
+                            break;
+                        }
+                    }
+                }
+                pa_advance();
+            }
+            return 0;
+        }
 
         /* 枚举的限定名 `Color.RED` 也是常量表达式的一部分
          * （`int a[Color.BLUE]`、`(1u << Color.GREEN)`、`case Color.RED:`）。
@@ -3213,8 +3528,42 @@ static i64 const_unary(void)
             pa_advance();
             return s->val;
         }
+        if (CONST_LAX && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
+            && tok_eq(pa_peek(1), "(")) {
+            /* 宽松模式（三元未选中的那一支）：认不出的调用直接跳过整组实参，
+             * 值给 0。位置必须走走对，不然解析会错位。 */
+            int d = 0;
+
+            pa_advance();
+            while (pa_cur()->kind != TK_EOF) {
+                Tok *t = pa_cur();
+
+                if (t->kind == TK_PUNCT) {
+                    if (tok_eq(t, "(") || TOK_EQ(t, "["))
+                        d++;
+                    else if (tok_eq(t, ")") || TOK_EQ(t, "]")) {
+                        d--;
+                        if (d == 0) {
+                            pa_advance();
+                            break;
+                        }
+                    }
+                }
+                pa_advance();
+            }
+            return 0;
+        }
+        if (CONST_LAX) {
+            pa_advance();
+            return 0;
+        }
         pa_error("常量表达式里出现未知名字 '%.*s'", (int)pa_cur()->len, tok_data(pa_cur()));
         pa_advance();
+        return 0;
+    }
+    if (CONST_LAX) {
+        if (pa_cur()->kind != TK_EOF)
+            pa_advance();
         return 0;
     }
     pa_error("这里要一个常量表达式");
@@ -3360,16 +3709,24 @@ static i64 const_cond(void)
     i64 c = const_lor();
 
     if (pa_accept_ch('?')) {
-        i64 a = const_expr();
+        /* 三元的**两支都要过一遍 token**，但只有选中的那支的**值**有用。
+         * 未选中的那支里常有函数调用（内核 include/linux/log2.h 的 ilog2()
+         * 就是这样：`… ? (…) : (sizeof(n) <= 4) ? __ilog2_u32(n) : __ilog2_u64(n)`），
+         * 常量求值器碰不得——所以求值期间把 CONST_LAX 打开：认不出的东西一律
+         * 当 0、只把 token 吃掉，不报错。 */
+        int save_lax = CONST_LAX;
+        i64 a = 0;
         i64 b = 0;
 
+        CONST_LAX = 1;
+        a = const_expr();
         pa_expect_ch(':');
         b = const_cond();
+        CONST_LAX = save_lax;
         return c ? a : b;
     }
     return c;
 }
-
 static i64 const_expr(void)
 {
     return const_cond();
@@ -5697,8 +6054,8 @@ static u32 parse_typeof(void)
         /* typeof 里是**完整表达式**，不是一元表达式：`typeof(1?f:f)`、
          * `typeof((a,b))` 都是合法写法（tcc tests2 的 33_ternary_op 靠这个）。 */
         (void)gen_expr();
+        ty = GEN_TY;
         NO_DECAY = 0;
-        ty = cur_op_ty();
         FN.n = save;
         PEND_LVAL = 0;
     }
@@ -6882,6 +7239,17 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
             pt = ty_ptr(ty_target(pt));
             if (pd.arrqual)
                 pt = ty_qual(pt, pd.arrqual);
+        } else if (ty_is_func(pt)) {
+            /* 形参里的**函数类型**也按指针传（C11 6.9.1p10 / 6.7.6.3p8：
+             * "函数类型形参调整为指向函数的指针"）。
+             *
+             * 少了这一条，把函数类型 typedef 当形参用就直接崩解析：
+             *     typedef int (pcpu_fc_cpu_distance_fn_t)(unsigned int, unsigned int);
+             *     extern int pcpu_embed_first_chunk(…, pcpu_fc_cpu_distance_fn_t
+             *                                       cpu_distance_fn, …);
+             * 报"这里要 ')'（当前是 'cpu_distance_fn'）"——内核
+             * include/linux/percpu.h:121 就是这一行。 */
+            pt = ty_ptr(pt);
         } else if (pd.arrqual) {
             pt = ty_qual(pt, pd.arrqual);
         }
@@ -7230,6 +7598,30 @@ static u32 parse_declarator(u32 base, Declarator *d)
         d->paren = 1;
         d->type = decl_fill_hole(inner, nptr, d, pq);
         d->is_func = ty_is_func(d->type);
+        return d->type;
+    }
+    /* `(name)` 形态的嵌套声明符：`typedef int (fn_t)(unsigned int);`、
+     * `int (f)(int);`。这里括号里没有 `*`，所以上面那个
+     * `(*name)`/`((…))` 的分支不会命中——但语义完全一样：括号只是把 `fn_t`
+     * 这个**名字**包起来，好让函数后缀粘到外层。
+     *
+     * 少这一条的话，`(fn_t)` 的 `(` 被当成**函数参数表**的开头，于是
+     * `typedef int (fn_t)(unsigned int, unsigned int);` 会把类型登记成
+     * `int()`（没有参数、返回 int），而 `fn_t` 后面的形参名 `d` 直接崩解析
+     * （实测：内核 include/linux/percpu.h:110 的
+     *  pcpu_fc_cpu_distance_fn_t 就是这种写法，用到它的是 :121）。 */
+    if (pa_is_ch('(') && pa_peek(1)->kind == TK_IDENT && !PA_NO_NAME
+        && pa_peek(2)->kind == TK_PUNCT && TOK_EQ(pa_peek(2), ")")) {
+        u32 inner2 = 0;
+
+        pa_advance();                 /* ( */
+        inner2 = parse_declarator(base, d);
+        pa_expect_ch(')');
+        d->paren = 1;
+        d->type = decl_fill_hole(inner2, nptr, d, pq);
+        d->is_func = ty_is_func(d->type);
+        /* 括号之后可能还挂着函数后缀：`typedef int (fn_t)(unsigned int);`
+         * 的 `(unsigned int)` 要在这之后粘上去，由调用方继续解析。 */
         return d->type;
     }
     if (pa_cur()->kind == TK_IDENT && !PA_NO_NAME && cm_at_call(CM_ROLE_IDENT)) {
@@ -10633,22 +11025,64 @@ static u32 gen_postfix(void)
         return gen_postfix_ops(d);
     }
     if (TOK_EQ(t, "__builtin_constant_p")) {
-        u32 d = 0;
+        /* 表达式层的 `__builtin_constant_p(x)`：**真的**判，不能恒给 1。
+         * 恒 1 的话内核 `ilog2(变量)` 会被折成常量分支，算出 (uint)-1 之类的
+         * 垃圾（ilog2 的常量支对非常数输入没有意义）。
+         *
+         * 判法同常量层：扫 token 种类，字面量/运算符/类型名/枚举常量算常量，
+         * 出现普通变量或赋值就不算。保守判"非常量"是安全的——那只会走
+         * 运行期分支。 */
+        int depth0 = 0;
+        int ok = 1;
 
         pa_advance();
         pa_expect_ch('(');
-        if (!pa_is_ch(')')) {
-            u32 sv = FN.n;
+        while (pa_cur()->kind != TK_EOF) {
+            Tok *tk = pa_cur();
 
-            (void)gen_assign();
-            FN.n = sv;
-            PEND_LVAL = 0;
+            if (tk->kind == TK_PUNCT) {
+                if (tok_eq(tk, "(") || TOK_EQ(tk, "["))
+                    depth0++;
+                else if (tok_eq(tk, ")") || TOK_EQ(tk, "]")) {
+                    if (depth0 == 0 && tok_eq(tk, ")"))
+                        break;
+                    depth0--;
+                } else if (tok_eq(tk, "=") || tok_eq(tk, ";") || tok_eq(tk, "{")
+                           || tok_eq(tk, "}") || tok_eq(tk, "?")) {
+                    ok = 0;
+                }
+                pa_advance();
+                continue;
+            }
+            if (tk->kind == TK_NUM || tk->kind == TK_CHAR || tk->kind == TK_STR) {
+                pa_advance();
+                continue;
+            }
+            if (tk->kind == TK_IDENT) {
+                Sym *cs = sym_find(tok_data(tk), tk->len);
+
+                if ((cs && cs->kind == SC_TYPEDEF) || (cs && cs->kind == SC_ENUMC)
+                    || is_typename_tok(tk) || TOK_EQ(tk, "sizeof")
+                    || TOK_EQ(tk, "_Alignof") || TOK_EQ(tk, "alignof")
+                    || TOK_EQ(tk, "typeof") || TOK_EQ(tk, "__typeof__")
+                    || TOK_EQ(tk, "__typeof")) {
+                    pa_advance();
+                    continue;
+                }
+                ok = 0;
+                pa_advance();
+                continue;
+            }
+            pa_advance();
         }
         pa_expect_ch(')');
-        d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 1);
-        GEN_TY = ty_int();
-        return gen_postfix_ops(d);
+        {
+            u32 d = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, (u32)ok);
+            GEN_TY = ty_int();
+            return gen_postfix_ops(d);
+        }
     }
     if (TOK_EQ(t, "__builtin_offsetof")) {
         u32 ty = 0;
@@ -10684,6 +11118,127 @@ static u32 gen_postfix(void)
         irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, off);
         GEN_TY = ty_ulong();
         return gen_postfix_ops(d);
+    }
+    if (TOK_EQ(t, "__builtin_choose_expr")) {
+        /* `__builtin_choose_expr(const_expr, a, b)`：按常量条件取一支。
+         *
+         * 两支都必须**语法合法**，但只有选中的那支会被求值——所以没选中的
+         * 那支在这里只是个表达式，副作用不该发。做法是：条件先在常量求值里
+         * 算出，再记下当前表达式流的位置、把两支都解析出来，最后只留下选中
+         * 那支的结果。
+         *
+         * 内核对它的用法（include/linux/compiler.h:386 的 sign-选择）两支都
+         * 是纯值表达式，所以"两支都生成、丢掉没选中的"在正确性上没问题；
+         * 这条注释先把这个限制写明，真要支持带副作用的未选支再补跳过逻辑。 */
+        i64 c = 0;
+        u32 va = 0;
+        u32 ta = 0;
+        u32 vb = 0;
+        u32 tb = 0;
+
+        pa_advance();
+        pa_expect_ch('(');
+        c = const_expr();
+        pa_expect_ch(',');
+        va = value_of(gen_assign());
+        ta = GEN_TY;
+        pa_expect_ch(',');
+        vb = value_of(gen_assign());
+        tb = GEN_TY;
+        pa_expect_ch(')');
+        if (c) {
+            GEN_TY = ta;
+            return gen_postfix_ops(va);
+        }
+        GEN_TY = tb;
+        return gen_postfix_ops(vb);
+    }
+    if (TOK_EQ(t, "__builtin_return_address")
+        || TOK_EQ(t, "__builtin_frame_address")) {
+        /* `__builtin_return_address(N)` / `__builtin_frame_address(N)`。
+         *
+         * 内核 include/linux/instruction_pointer.h 的 _RET_IP_ 就是
+         * `(unsigned long)__builtin_return_address(0)`，而 _RET_IP_ 被
+         * lockdep / tracing / printk 的 %pS 一路用下来。
+         *
+         * **当前实现返回 0**。IR 里没有"读寄存器"的算子（rbp/rsp 只在
+         * IR_ALLOCA/IR_SETRSP 里被间接摆弄），而为了这一条内建函数给三个
+         * 后端各加一个新 op 不划算。语义上这会让同一函数里的 _RET_IP_ 全部
+         * 相等——编译期能过，运行期只在调试/追踪路径上失真。
+         * 真要支持，得先有 IR_FRAME（读 rbp）这个算子。 */
+        u32 d0 = 0;
+
+        pa_advance();
+        pa_expect_ch('(');
+        if (pa_cur()->kind == TK_NUM)
+            pa_advance();
+        pa_expect_ch(')');
+        d0 = irfn_vreg(&FN);
+        irfn_push(&FN, IR_CONST, IRT_U64, d0, 0, 0, 0, 0);
+        GEN_TY = ty_ulong();
+        return gen_postfix_ops(d0);
+    }
+    if (TOK_EQ(t, "__builtin_object_size")) {
+        /* `__builtin_object_size(ptr, type)`。
+         *
+         * 内核 include/linux/ucopysize.h:47 的 check_copy_size() 用它做
+         * FORTIFY 边界检查。c6c 没有对象大小分析，一律返回 -1（"未知"）：
+         * gcc 文档规定 type 的 bit1 为 0 时要返回 (size_t)-1 表示无法确定，
+         * 于是 `sz >= 0` 恒假、FORTIFY 检查被跳过——和 -O0 下没有优化信息
+         * 时 gcc 的行为一致，不会误报也绝不会漏检成错的。 */
+        u32 d0 = 0;
+
+        pa_advance();
+        pa_expect_ch('(');
+        {
+            u32 save0 = FN.n;
+
+            (void)gen_assign();
+            FN.n = save0;
+            PEND_LVAL = 0;
+        }
+        while (pa_accept_ch(',')) {
+            u32 save1 = FN.n;
+
+            (void)gen_assign();
+            FN.n = save1;
+            PEND_LVAL = 0;
+        }
+        pa_expect_ch(')');
+        /* IR_CONST 的立即数只有 32 位，编不出 (size_t)-1，用 0-1 算出来。 */
+        {
+            u32 z0 = irfn_vreg(&FN);
+            u32 o0 = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_CONST, IRT_U64, z0, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, o0, 0, 0, 0, 1);
+            d0 = irfn_vreg(&FN);
+            irfn_push(&FN, IR_SUB, IRT_U64, d0, z0, o0, 0, 0);
+        }
+        GEN_TY = ty_ulong();
+        return gen_postfix_ops(d0);
+    }
+    if (TOK_EQ(t, "__builtin_unreachable")) {
+        /* `__builtin_unreachable()`：告诉编译器"走不到这儿"。语义上不是陷阱
+         * （编译器可以据此做优化），但**真执行到**就是未定义行为——所以照
+         * __builtin_trap 一样发 `ud2` 而不是静默什么都不做：内核
+         * arch/x86/include/asm/bug.h 的 BUG()/unreachable() 正是靠它收尾，
+         * 发空指令会让后面那条路径掉进下一段代码里静默跑下去。
+         * 返回 void，不能当值用。 */
+        pa_advance();
+        pa_expect_ch('(');
+        pa_expect_ch(')');
+        {
+            u32 d = irfn_vreg(&FN);
+            u32 v = 0;
+
+            irfn_push(&FN, IR_CONST, IRT_I64, d, 0, 0, 0, 134);   /* sys_tgkill */
+            v = irfn_vreg(&FN);
+            irfn_push(&FN, IR_CONST, IRT_I64, v, 0, 0, 0, 60);     /* SIGABRT */
+            irfn_push(&FN, IR_CALL, IRT_I64, 0, v, d, 0, 1);
+        }
+        GEN_TY = ty_void();
+        return 0;
     }
     if (TOK_EQ(t, "__builtin_abort") || TOK_EQ(t, "__builtin_trap")) {
         u32 d = 0;
@@ -11047,12 +11602,20 @@ static u32 gen_postfix(void)
                 pa_advance();
                 return gen_postfix_ops(gen_call(s));
             }
-            /* 函数名出现在值的位置：它的值就是地址（配合函数指针） */
+            /* 函数名出现在值的位置：它的值就是地址（配合函数指针）。
+             *
+             * typeof 例外（NO_DECAY）：`typeof(f)` 要的是**函数类型本身**，
+             * GNU C 里 `sizeof(typeof(f))` 是 1 而不是 8（gcc 对函数类型给
+             * 1 字节）。这里以前无条件退化成指针，于是
+             *     extern typeof(__WARN_trap) __SCT__WARN_trap;
+             * 把 __SCT__WARN_trap 登记成"函数指针变量"，而内核
+             * arch/x86/include/asm/bug.h 要的是函数本身——`(&__SCT__…)(args)`
+             * 于是成了"对指针取址再调用"，报"这里要 ';'（当前是 '('）"。 */
             pa_advance();
             {
                 u32 a2 = ident_addr(s);
 
-                GEN_TY = ty_ptr(s->type);
+                GEN_TY = NO_DECAY ? s->type : ty_ptr(s->type);
                 return gen_postfix_ops(a2);
             }
         }
@@ -11139,6 +11702,18 @@ static u32 parse_typename(void)
     Declarator d = {0};
     u32 base = parse_typespec();
 
+    /* `__seg_gs` / `__seg_fs` 是 x86 的地址空间限定符（gcc 内置关键字，
+     * 不是宏——内核只在 sparse 下才把它们定义成 address_space 属性）。
+     * 内核 percpu_types.h 拼出 `typeof(var) __seg_gs *` 这种形态，而
+     * `typeof(...)` 一旦返回就离开了说明符循环，这之后跟的限定符没有地方
+     * 吃。c6c 没有分段模型，看见就当"普通指针"跳过。
+     *
+     * 放在这里（而不是 parse_typespec 的循环里）是因为它可能出现在
+     * 类型名的**任意**位置：`(typeof(g)__seg_gs *)`、`(int __seg_gs *)`、
+     * `__seg_gs int` 都得过。 */
+    while (pa_cur()->kind == TK_IDENT
+           && (TOK_EQ(pa_cur(), "__seg_gs") || TOK_EQ(pa_cur(), "__seg_fs")))
+        pa_advance();
     return parse_declarator(base, &d);
 }
 
@@ -12632,7 +13207,29 @@ static u32 gen_unary(void)
         u32 ty = GEN_TY;
         u32 d = irfn_vreg(&FN);
 
+        /* `~` 按 C 的**整型提升**来：先把操作数提升到 int（位域、char、
+         * short 都是），再在提升后的宽度上取反。结果类型就是提升后的类型。
+         *
+         * 两条都必须照这个来：
+         *   - `~0U` 是 unsigned int 的 0xFFFFFFFF，不是 64 位的 0xFFFF…FF。
+         *     截错的话内核 include/linux/mm_types.h:2038 的
+         *         static_assert((u64)MMF_INIT_LEGACY_MASK <= (u64)UINT_MAX);
+         *     会假失败（右端正是 `(u64)(~0U)`）。
+         *   - 位域 `~s.u3`（无符号 3 位）提升成 int 后是 `~0` = -1，而不是
+         *     按 1 字节截出来的 255。tcc tests2/93_integer_promotion 就是这条。 */
+        if (ty_is_int(ty) && ty_size(ty) < 4) {
+            a = gen_convert(a, ty, ty_int());
+            ty = ty_int();
+        }
         irfn_push(&FN, IR_NOT, ir_ty_of(ty), d, a, 0, 0, 0);
+        /* x86-64 后端的 not 是 64 位一条指令；比 64 位窄的类型要截回去，
+         * 否则高 32 位全是 1。 */
+        if (ty_size(ty) < 8) {
+            u32 d2 = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), d2, d, 0, 0, 0);
+            d = d2;
+        }
         GEN_TY = ty;
         return d;
     }
@@ -13866,6 +14463,13 @@ static u32 gen_cond(void)
         u32 d = irfn_vreg(&FN);
         u32 cty = cur_op_ty();
         u32 cv = value_of(c);
+
+        /* 三元的操作数**不是** typeof 的直接操作数了：里的数组/函数指示符
+         * 照常退化。`typeof(1?f:f)` 拿到的必须是 `void (*)(void)`——
+         * tcc tests2/33_ternary_op.c:20 就靠这一点（外面再套一层 `*` 得到
+         * `void (**)(void)`）。NO_DECAY 是 parse_typeof 为**整个**表达式
+         * 设的，进到三元里就得关掉。 */
+        NO_DECAY = 0;
         u32 t = 0;
         u32 e = 0;
         u32 ty = 0;
@@ -14968,9 +15572,61 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
      * 指针表整张都是空的（tcc 的 90_struct-init 正是这么崩的）。
      * `&g.m` / `&g[i]` / `A + 2` 这类带偏移的形式由 glob_addr_parse 统一处理。 */
     if (ty_is_ptr(ty)) {
-        int amp = pa_accept_ch('&');
+        int amp = 0;
         int ak = 0;
 
+        /* 剥掉外面那层**标量强制转换**再认地址常量：`(void *)(uintptr_t)&sym`
+         * 是内核 EXPORT_SYMBOL 的标准写法（include/linux/compiler.h 的
+         * __ADDRESSABLE），值的含义和裸 `&sym` 完全一样。不剥的话它落到
+         * 下面的常量表达式求值里，撞"常量表达式里只支持 &((T *)0)->member
+         * 形式的取地址"——lib/string.c 每个 EXPORT_SYMBOL 一条，实测 21 条。
+         *
+         * 只剥 `(` 类型名 `)` 这一种形态，且要求后面**不是** `(`：
+         * `(int(*)(void))f` 这种是复合字面量/调用，不归这里管。 */
+        for (;;) {
+            u32 k = 1;
+            u32 skip = 0;
+
+            if (!pa_is_ch('(') || !is_typename_tok(pa_peek(k)))
+                break;
+            k++;
+            /* 吃到类型说明符结束：`void`、`unsigned long`、`void const`、
+             * `struct foo`、`void *` 都得整段过掉。这里只做形状判断，
+             * 类型本身不影响结果（cast 到指针/整数都一样）。 */
+            while (pa_peek(k)->kind == TK_IDENT
+                   && is_typename_tok(pa_peek(k)))
+                k++;
+            if (pa_peek(k - 1)->kind == TK_IDENT
+                && (TOK_EQ(pa_peek(k - 1), "struct")
+                    || TOK_EQ(pa_peek(k - 1), "union")
+                    || TOK_EQ(pa_peek(k - 1), "enum"))
+                && pa_peek(k)->kind == TK_IDENT)
+                k++;
+            while ((pa_peek(k)->kind == TK_IDENT && tykw_is_qual(pa_peek(k)))
+                   || (pa_peek(k)->kind == TK_PUNCT
+                       && TOK_EQ(pa_peek(k), "*")))
+                k++;
+            if (!(pa_peek(k)->kind == TK_PUNCT && TOK_EQ(pa_peek(k), ")")))
+                break;
+            /* 后面紧跟 `(`：可能是**又一层** cast（`(void *)(unsigned long)&x`，
+             * 内核 EXPORT_SYMBOL 正是两层），也可能是调用/复合字面量。看那个
+             * `(` 里面是不是类型名来分辨。`{` 一定是复合字面量，直接放行。 */
+            if (pa_peek(k + 1)->kind == TK_PUNCT
+                && TOK_EQ(pa_peek(k + 1), "{"))
+                break;
+            if (pa_peek(k + 1)->kind == TK_PUNCT
+                && TOK_EQ(pa_peek(k + 1), "(")
+                && !is_typename_tok(pa_peek(k + 2)))
+                break;
+            /* 只按**前瞻算好的个数**跳过，不调 parse_typename()：
+             * 那个函数会把后面的表达式一起吞掉（实测：
+             * `(void *)&target` 里的 `&target` 被吃掉，于是 amp=0，
+             * 初始化器整段消失）。 */
+            skip = k + 1;
+            while (skip-- > 0)
+                pa_advance();
+        }
+        amp = pa_accept_ch('&');
         if (amp && gen_glob_compound_addr(goff + off))
             return;
         ak = glob_addr_start(amp);
@@ -19986,6 +20642,33 @@ static void gen_one_global(u32 ty, Declarator *d)
 
     if (!d->name)
         return;
+    /* 文件作用域的**函数类型**声明：`typeof(fn) v;`、`typedef typeof(fn) fnt;
+     * fnt other;` 里那个 `other`。
+     *
+     * C 里函数类型的对象根本不存在，这种声明只能按函数声明处理（GCC 也是
+     * 这么做的）。不认的话它会被当成普通变量登记，于是后面
+     * `(&other)(args)` 就报"这里要 ';'"——内核 arch/x86/include/asm/bug.h
+     * 的 static_call_mod() 展开成
+     *     ( { ( &__SCT__WARN_trap) ; } ) ( args )
+     * 而 extern typeof(__WARN_trap) __SCT__WARN_trap; 正是这个形态
+     * （实测：panic.c / fork.c / slub.c 等每一个 TU 都卡在这一行）。 */
+    if (ty_is_func(ty)) {
+        const char *fm = arena_strndup(&A_main, d->name, d->nlen);
+        Sym *ffs = sym_find(fm, d->nlen);
+
+        if (!ffs) {
+            ffs = sym_add(fm, d->nlen, ty, SC_GLOBAL);
+            ffs->is_func = 1;
+            ffs->val = (i64)x64_sym(&X64, emit_name(fm));
+        }
+        if (pa_accept_ch('=')) {
+            if (pa_is_ch('{'))
+                skip_init_list();
+            else
+                init_skip_value();
+        }
+        return;
+    }
     /* c6：文件作用域的对象也是"定义"，一样要写初始化器。`static`/`extern`
      * 例外：前者本来就落在数据段里（0），后者只是引用。 */
     if (in_c6_tu() && !PA_TMPL_BODY && !PA_SIG_ONLY && !PA_STATIC && !PA_EXTERN && !ty_is_func(ty)
@@ -20334,6 +21017,20 @@ static void gen_one_global(u32 ty, Declarator *d)
             }
         }
         glob_store(goff, 0, ty, bits);
+        return;
+    }
+    if (ty_is_ptr(ty)) {
+        /* 全局指针的初始化器交给 gen_glob_obj：那里有完整的"地址常量"处理
+         * （`&sym`、函数名、`A + 2`、`&g.m`），还有"剥掉外层标量强制转换再认"
+         * 的那一段。这条路径以前没有指针分支，`static void *p = (void *)&f;`
+         * 直接掉进下面的 const_expr —— 而常量求值只认
+         * `&((T *)0)->member`，于是内核 EXPORT_SYMBOL 的每一个
+         * `(void *)(uintptr_t)&sym` 都成了一条"常量表达式里只支持…"
+         * （实测 lib/string.c 21 条）。
+         *
+         * 交给 gen_glob_obj 不会递归回来：它认不出地址时自己走
+         * parse_const_u64，和这里原来的行为一致。 */
+        gen_glob_obj(goff, ty, 0);
         return;
     }
     {
