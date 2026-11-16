@@ -4884,3 +4884,15 @@ lock(m);
 Mutex 保护队列，但 signal 发生在 unlock 之后的那一侧）。下一版要先把
 `Chan` 的 push/pop 与 signal 的顺序打出来（或换成"signal 在锁内"）再看。
 改动依旧没进主干（`git checkout` 回去了），回归 86 / 92、CI 绿。
+
+### 第 243 轮：chan 的 signal 本来就在锁内，交互协议没问题
+
+看了 `std/container/chan.c6`：`send`/`try_send`/`send_ms`/`recv` 都是
+`m.lock(); …; not_empty.signal(); m.unlock();`——signal **在**互斥锁内，和我实现
+的条件变量是配套的安全写法（consumer 读序号、放锁、FUTEX_WAIT 之间不可能有
+silgnal 插进来）。所以第 242 轮"谓词与信号不一致"的猜测也排除了。
+
+剩下的嫌疑就落在**互斥锁本身**（`__c6_tsl` + FUTEX_WAIT(2) 那套）或者
+`wait_ms`（`pthread_cond_timedwait` 在 rt.c6 里仍是桩，`sync.c6` 的 `wait_ms`
+会立刻返回 0）上。下一版建议：先把 `pthread_cond_timedwait` 也实装（返回 ETIMEDOUT
+要走序号 + futex 的相对超时），再看还有没有挂。
