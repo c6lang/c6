@@ -5,7 +5,8 @@
 #   3. 源码里不出现 LGPL 头（tcc/ 是 LGPL-2.1，c6c 是 MIT，边界必须机器可查）
 #   4. 必需文件都在
 #
-# 扫描范围：c6c 自己的 C 源码 + c6c/Makefile 的非注释行。
+# 扫描范围：c6c 自己的 C 源码 + 定义 c6c 构建的那两份 CMake 文件
+# （cmake/C6C.cmake、根 CMakeLists.txt）——c6c 已经没有自己的 Makefile 了。
 # 文档（*.md）与 bench/ 允许提到 tcc：前者讲边界，后者的语料就是 tcc.c。
 #
 # 两个坑（都踩过）：
@@ -34,13 +35,15 @@ scan "c6c 不得链接 libtcc：" -nE 'libtcc([^1]|$)|-ltcc'
 scan "c6c 不得引用 tcc 的 .c：" -nE '(^|[^a-zA-Z0-9_/])tcc/[a-z0-9_]+\.c'
 scan "c6c 源码里不得出现 LGPL 头：" -lniE 'gnu (lesser|library) general public license|LGPL'
 
-if [ -f Makefile ]; then
-    # 去掉整行注释和行尾注释再查：BDIR 那行的注释里提到 libtcc1.a（tcc 的运行时
-    # 静态库，不是 libtcc），不剥掉行尾注释会误报。
-    hits=$(sed -E 's/#.*$//' Makefile | grep -nE 'libtcc([^1]|$)|-ltcc' || true)
-    [ -z "$hits" ] || die "c6c/Makefile 不得链接 libtcc：
+# 构建定义在 CMake 里：去掉 `#` 注释再查（注释里讲边界是允许的）。
+# 这里只查"链接"形态（-ltcc / libtcc.so / libtcc.a）：`RENAME "libtcc.h"` 是
+# 把 tcc 兼容头装成 tcc 的标准头名，跟链接别家库不是一回事。
+for f in ../cmake/C6C.cmake ../CMakeLists.txt; do
+    [ -f "$f" ] || continue
+    hits=$(sed -E 's/#.*$//' "$f" | grep -nE -- '-ltcc|libtcc\.(so|a)($|[^0-9a-zA-Z_])' || true)
+    [ -z "$hits" ] || die "$f 不得链接 libtcc：
 $hits"
-fi
+done
 
 for f in README.md LICENSE docs/plan.md docs/design.md docs/todo.md \
          bench/bench.py bench/baseline.json bench/thresholds.json; do

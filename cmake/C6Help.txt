@@ -36,7 +36,7 @@ source-tree（stdtest / std-kit / std-client / std-serve / std-fsx 会写
 check-all 的 -j 由 -DC6_CHECK_JOBS=N 控制。
 
 c6c 当被测编译器（替换 c6）的两条门禁：fast（≈40 s）与 check-all-c6c
-（≈4 min）。它们直调 c6c/Makefile，不走 ctest，用来验 c6c 自己；第三方
+（≈4 min）。它们是 CMake target，不走 ctest，用来验 c6c 自己；第三方
 语料是它们的一部分：c-testsuite（c99suite，150 条）、tcc 上游 tests1/tests2、
 c6c 编出的 tcc 再跑上游 tests2（build-tcc）。ctest 视角的同一套验收是
 check-c6c（-R '^c6c-' -LE perf）。
