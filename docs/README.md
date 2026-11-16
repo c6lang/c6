@@ -71,3 +71,6 @@
 5. **状态行**：每篇顶部写 `状态 / 索引 / 关联文档`，历史文档标「历史记录」而不是删掉。
 6. **新增特性**：manual 一篇 + grammar 一节 + diagnostics 编号 + 用例 + README 特性表一行 +
    CHANGELOG 一条，六件事一起提交。
+7. **发版**：根 `VERSION` + CHANGELOG 该版本一段 + 一条主题为 `c6 <版本>` 的提交
+   （**正文就是 Release 说明**，CI 不再另写摘要）+ `v<版本>` tag。tag 与 `VERSION`
+   不一致、CHANGELOG 缺段落、版本提交缺失或正文为空，CI 都会挡住。

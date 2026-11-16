@@ -16,8 +16,11 @@
 
 - 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的
   `Version` 是 `0.2.0~rc1`、rpm 的 `Release` 是 `0.<release>.rc1`，排序才是对的。
-- 发布：push 一个 `v*` tag（如 `v0.1.0`），CI 的 release job 会跑完整回归、打
-  DEB/RPM/TGZ 三个包并附到 GitHub Release。tag 名应与根 `VERSION` 一致。
+- 发布：改根 `VERSION`、在 `CHANGELOG.md` 里补该版本一段，再提交一条**主题为
+  `c6 <版本>`** 的提交——它的正文就是 GitHub Release 的说明（CI 只做取用与排版；
+  package job 会挡住缺这条提交、或正文为空的版本）；最后 push 一个 `v*` tag
+  （如 `v0.1.0`），release job 会跑完整回归、打 DEB/RPM/TGZ 三个包并附到 Release。
+  tag 名应与根 `VERSION` 一致。
 
 ## 编译器选项
 
