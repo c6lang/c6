@@ -2504,6 +2504,9 @@ static int PA_UNEVAL;
 static int PA_AWAIT_IO;      /* 正在编 await 的操作数：c6_io 只在这里合法 */
 static int PA_INLINE_SEEN;
 static u8 PA_TASK_KW;
+/* `__builtin_va_list` 的类型 id：SysV x86-64 的 4 字段结构，懒构造一次
+ * （见 parse_typespec 里那条分支）。0 = 还没构造。 */
+static u32 VA_LIST_TY;
 /* `!error` 返回类型：PA_FALLIBLE 是"刚看到标记，等挂到声明上"，
  * CUR_FALLIBLE 是"当前这个函数带 `!error`"（try 要查它）。 */
 /* 刚解析完的表达式是一次函数调用吗？（返回值可能是新引用，比如
@@ -6018,6 +6021,30 @@ static u32 parse_typespec(void)
         return it;
     }
     for (;;) {
+        /* `__builtin_va_list`：GCC 口径的"编译器内建的 va_list 类型"。
+         * 内核的 include/linux/stdarg.h 就一句 `typedef __builtin_va_list
+         * va_list;`——不带内建类型名，整棵内核头链在第一个文件就断。
+         * 形状与自带 include/stdarg.h 的 __c6c_va_elem 一致（SysV x86-64 的
+         * 4 字段结构：gp_offset / fp_offset / overflow_arg_area /
+         * reg_save_area），IR_VASTART 的 ABI 就是按这个形状写的；但内建写法
+         * 是**结构体本身**，不带那个 [1]（GCC 的 __builtin_va_list 是数组
+         * 类型，只是几乎所有代码都用它取地址/当形参退化成指针，这里按结构体
+         * 给，`va_list ap;` + `va_start(ap,x)` 的用法照样成立）。 */
+        if (PA_IS_IDENT("__builtin_va_list")) {
+            if (!VA_LIST_TY) {
+                u32 m[4] = {0};
+
+                m[0] = ty_uint();
+                m[1] = ty_uint();
+                m[2] = ty_ptr(ty_void());
+                m[3] = ty_ptr(ty_void());
+                VA_LIST_TY = ty_agg(m, NULL, 4, 0, 0u);
+            }
+            pa_advance();
+            base = VA_LIST_TY;
+            saw_int = 1;        /* 已经是完整类型，别再按隐式 int 补 */
+            continue;
+        }
         if (PA_ACCEPT_IDENT("unsigned")) { uns = 1; saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("signed")) { nsigned = 1; saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("long")) { nlong++; saw_int = 1; continue; }
@@ -6553,9 +6580,15 @@ static void skip_attributes(void)
                     /* `__attribute__((packed))`：布局按 pack(1) 走 */
                     if (c->kind == TK_IDENT && TOK_EQ(c, "packed"))
                         SAW_PACKED = 1;
-                    /* `__attribute__((aligned(N)))` / `__declspec(align(N))` */
+                    /* `__attribute__((aligned(N)))` / `__declspec(align(N))`，
+                     * 以及 GCC 的保留拼写 `__aligned(N)` / `__aligned__(N)`
+                     * ——内核 include/linux/compiler_attributes.h 里
+                     * `#define __aligned(x) __attribute__((__aligned__(x)))`，
+                     * `atomic_t` 的第一句就是 `int __aligned(sizeof(int))
+                     * counter;`，不认这个拼写整条内核头链从这里断。 */
                     if (c->kind == TK_IDENT
-                        && (TOK_EQ(c, "aligned") || TOK_EQ(c, "align"))) {
+                        && (TOK_EQ(c, "aligned") || TOK_EQ(c, "align")
+                            || TOK_EQ(c, "__aligned") || TOK_EQ(c, "__aligned__"))) {
                         Tok *nx2 = pa_peek(1);
                         Tok *ny2 = pa_peek(2);
 
@@ -9787,6 +9820,14 @@ static u32 gen_postfix(void)
         pa_expect_ch('(');
         ap = value_of(gen_assign());
         if (kind == 0) {
+            /* `__builtin_va_start(ap)` 是 c6c 自带头文件的写法，GCC 与内核
+             * 的头文件是 `__builtin_va_start(ap, last)`——第二个实参（最后
+             * 一个具名参数）在 SysV ABI 下不用：具名参数个数出码时从
+             * FN.nparams 取（见 x64.c6 的 IR_VASTART）。所以收下、丢掉。 */
+            if (pa_is_ch(',')) {
+                pa_advance();
+                value_of(gen_assign());
+            }
             pa_expect_ch(')');
             irfn_push(&FN, IR_VASTART, IRT_VOID, 0, ap, 0, 0, FN.nparams * 8);
             d = irfn_vreg(&FN);
