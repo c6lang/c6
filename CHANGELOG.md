@@ -7,6 +7,21 @@
 
 ## 未发布
 
+### 修复：tests2 全线飘红（隐式 int 告警误伤 `unsigned` 组合）与记分板死因点名
+
+- `parse_typespec` 的隐式 int warning（tcc 口径 `type defaults to int`，为
+  tests2/102_alignas 补的）原先挂在 `if (!base)` 分支上——该分支同时也是
+  `unsigned` / `long` / `unsigned long` 这类**只选宽度**的组合的必经之路，
+  于是 `stddef.h` 的 `typedef unsigned long size_t;` 也被当隐式 int 告警：
+  每个 TU 的每个头文件 `unsigned` 族声明都多一条 warning（00_assignment 多
+  220 行、101_cleanup 多 65797 行），tests2 118 条全红，`testflag` 的
+  "stderr 干净 / 过滤空 / 没有 test 块"三条也被同一噪声打挂。改为只在
+  `!saw_int`（完全不带类型说明符的真隐式 int）且非 c6 TU 时告警。
+- `c6c/tests/tcc-tests2.sh` 完善错误提示：运行期超时/被信号杀死的用例不再
+  只留 shell 一句 "Segmentation fault"，退出码被接住后在汇总里逐条点名
+  （`运行期被信号 11 杀死（139=SIGSEGV…）`）；判定口径不变（上游只比输出），
+  FAIL 结论的 diff 预览从 2 行加到 3 行。
+
 ### 回归换编译器跑：`C6_CC` + c6c 侧 42 个用例
 
 - `tests/regression.sh` 的被测编译器从写死的 `$C6_TCC_DIR/c6` 改成 `$C6_CC`

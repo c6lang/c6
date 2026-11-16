@@ -91,7 +91,15 @@ one_case() {
     fi
     # 上游 T3 是 `2>&1 | sed 's,$(SRC)/,,g'`：程序 stdout/stderr 都要进输出，
     # 且都要做路径归一化（129_scopes 的 __FILE__ 是绝对路径，expect 只要 basename）。
+    # 运行期的死因（超时/信号）也要接住：只留 shell 一句 "Segmentation fault"
+    # 没法动手，记下来汇总时点名（判定口径不变：上游只比输出）。
     ( cd "$TMP" && timeout -k 2 10 "./$base" "$@" >"$TMP/$base.run" 2>&1 )
+    rrc=$?
+    if [ "$rrc" -eq 124 ] || [ "$rrc" -eq 137 ]; then
+        echo "运行超时（>10s，被 timeout 杀死，输出可能不完整）" >"$TMP/sig.$base"
+    elif [ "$rrc" -ge 128 ]; then
+        echo "运行期被信号 $((rrc - 128)) 杀死（139=SIGSEGV，输出可能不完整）" >"$TMP/sig.$base"
+    fi
     sed "s|$TCCDIR/||g" "$TMP/$base.run" >>"$TMP/$base.out" 2>/dev/null
     if diff -q "$exp" "$TMP/$base.out" >/dev/null 2>&1; then
         echo "PASS" >"$vf"
@@ -110,7 +118,7 @@ one_case() {
         if [ "$stale" = 1 ]; then
             echo "STALE" >"$vf"
         else
-            echo "FAIL $(diff "$exp" "$TMP/$base.out" 2>&1 | head -2 | tr '\n' ' ')" >"$vf"
+            echo "FAIL $(diff "$exp" "$TMP/$base.out" 2>&1 | head -3 | tr '\n' ' ')" >"$vf"
         fi
     fi
 }
@@ -201,6 +209,15 @@ if [ -s "$TMP/faillist" ]; then
         printf '  %-22s %s\n' "$_n" "$_v"
     done <"$TMP/faillist"
 fi
+nsig=0
+for sigf in "$TMP"/sig.*; do
+    [ -e "$sigf" ] || continue
+    if [ "$nsig" -eq 0 ]; then
+        echo "运行期异常（输出仍参与比对，不计入失败，但死因要点名）："
+    fi
+    nsig=$((nsig + 1))
+    printf '  %-22s %s\n' "${sigf##*/sig.}" "$(cat "$sigf")"
+done
 if [ -s "$TMP/missing.txt" ]; then
     echo "最缺的外部符号（前 12 个）：$(sort "$TMP/missing.txt" | uniq -c | sort -rn | head -12 | awk '{printf "%s(%s) ", $2, $1}')"
 fi
