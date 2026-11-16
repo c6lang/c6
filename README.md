@@ -1,5 +1,10 @@
 # c6 —— 带语言扩展的 TinyCC
 
+[![CI](https://github.com/c6lang/c6/actions/workflows/ci.yml/badge.svg)](https://github.com/c6lang/c6/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/c6lang/c6)](https://github.com/c6lang/c6/releases)
+[![License](https://img.shields.io/github/license/c6lang/c6)](https://github.com/c6lang/c6)
+[![AUR package](https://repology.org/badge/version-for-repo/aur/c6.svg)](https://repology.org/project/c6/versions)
+
 ## 先看一眼：`defer` / `errdefer` 管资源
 
 C 里最容易写错的不是功能，而是**每条出口都得把已拿到的资源还回去**。c6 让你在拿到资源的
@@ -856,5 +861,12 @@ cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++
 
 ## 上游与许可
 
-TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`）。
+仓库根的 [`LICENSE`](LICENSE) 就是许可全文（与 `tcc/COPYING` 逐字一致）：
+**LGPL-2.1**——c6 是 TinyCC 的分支，主编译器（`tcc/`，含 `tcc/c6` 与 `libtcc`）
+及其全部修改按 tcc 的原许可继承分发。例外是 [`c6c/`](c6c/)：它是用 c6 语言
+**自举重写**的编译器，不 `#include` `tcc/*.h`、不链接 `libtcc`、不复制 `tcc/`
+源码（`cmake --build build --target lint` 机器可查），按自己的
+[`c6c/LICENSE`](c6c/LICENSE)（**MIT**）分发。打包时许可证也随 flavour 走
+（c6 包带 LGPL、c6c 包带 MIT，见 `cmake/C6Install.cmake`）。
+
 上游基线固定在 `2d3eea2`（`origin/mob`）。

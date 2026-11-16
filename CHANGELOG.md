@@ -7,6 +7,30 @@
 
 ## 未发布
 
+### 许可：仓库根新增 `LICENSE`（LGPL-2.1，逐字继承 tcc）
+
+- `tcc/COPYING`（LGPL-2.1 全文）逐字复制为根 `LICENSE`：c6 是 TinyCC 的分支，
+  主编译器（`tcc/`）及其修改按 tcc 原许可继承；GitHub 许可识别与 README 的
+  License 徽章从此有据可依。`c6c/` 是自举重写、不复制 tcc 源码，仍按自己的
+  MIT（`c6c/LICENSE`）；打包侧许可随 flavour 分发（`cmake/C6Install.cmake`），
+  仓库根 `LICENSE` 也作为总许可声明随两种包安装；README「上游与许可」一节
+  同步双许可作用域。
+
+### 修复：tests2 全线飘红（隐式 int 告警误伤 `unsigned` 组合）与记分板死因点名
+
+- `parse_typespec` 的隐式 int warning（tcc 口径 `type defaults to int`，为
+  tests2/102_alignas 补的）原先挂在 `if (!base)` 分支上——该分支同时也是
+  `unsigned` / `long` / `unsigned long` 这类**只选宽度**的组合的必经之路，
+  于是 `stddef.h` 的 `typedef unsigned long size_t;` 也被当隐式 int 告警：
+  每个 TU 的每个头文件 `unsigned` 族声明都多一条 warning（00_assignment 多
+  220 行、101_cleanup 多 65797 行），tests2 118 条全红，`testflag` 的
+  "stderr 干净 / 过滤空 / 没有 test 块"三条也被同一噪声打挂。改为只在
+  `!saw_int`（完全不带类型说明符的真隐式 int）且非 c6 TU 时告警。
+- `c6c/tests/tcc-tests2.sh` 完善错误提示：运行期超时/被信号杀死的用例不再
+  只留 shell 一句 "Segmentation fault"，退出码被接住后在汇总里逐条点名
+  （`运行期被信号 11 杀死（139=SIGSEGV…）`）；判定口径不变（上游只比输出），
+  FAIL 结论的 diff 预览从 2 行加到 3 行。
+
 ### `-l<name>` 收下 + 数学/组库/线程同步的边角：回归 45 → 47 / 92
 
 - `c6c/src/main.c6` 接受 `-l<name>`（`-lm` 最常见）并**不生效**：c6c 的产物是
