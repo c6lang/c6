@@ -23,6 +23,11 @@ cmake --build build --target check-all-perf    # 上面 + 验收 (4)
 cmake --build build --target tests2-check      # 只跑 tcc 上游 tests2 闸门
 ```
 
+> 跑分相关目标（`bench` / `bench-c6c` / `check-all-c6c`）需要 `python3`：
+> CMake 配置时用 `find_package(Python3 COMPONENTS Interpreter REQUIRED)` 查找解释器，
+> 再显式调用 `c6c/bench/bench.py`（它负责合成语料、跑分和阈值断言）。
+> 不依赖 `bench.py` 的可执行位；打包 `check()` 环境里也必须有 `python3`。
+
 ## (0) 不用 tcc 的验收：`C6_ENABLE_TCC=OFF` / `BOOTSTRAP=host`
 
 stage0 是可换的：c6c 的源码是 C99 兼容的单 TU，宿主 C 编译器直接编就能出
