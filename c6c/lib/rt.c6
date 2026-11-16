@@ -238,14 +238,33 @@ static void *c6c_mem_zero(void *p, long n)
     return p;
 }
 
+/* 大块走 `rep movsb`（src/asmblob.c6 里的 __c6_memcpy_rep）：c6c 没有优化器，
+ * 下面那种逐字节的 C 循环实测只有 0.083 GB/s、8 字节块 0.62 GB/s；rep 这条
+ * 能跑满内存带宽（本机 6.8 GB/s，同口径 glibc 7.96 GB/s）。
+ * 小拷贝反过来：rep 有约 14 ns 的启动开销，16 字节以内 C 的 8 字节块循环更快，
+ * 所以按 C6C_MEMCPY_REP_MIN 分叉。阈值是实测的交叉点（1 GiB 吞吐 + 8..262144
+ * 字节的逐档延迟，方法与数字见 c6c/docs/jit/todo.md 的 J-16）。 */
+#define C6C_MEMCPY_REP_MIN 16
+
+void *__c6_memcpy_rep(void *dst, const void *src, long n);
+
 static void c6c_mem_copy(void *dst, const void *src, long n)
 {
     char *d = (char *)dst;
     const char *s = (const char *)src;
-    long i = 0;
 
-    for (i = 0; i < n; i++)
-        d[i] = s[i];
+    if (n >= C6C_MEMCPY_REP_MIN) {
+        __c6_memcpy_rep(dst, src, n);
+        return;
+    }
+    while (n >= 8) {
+        *(long *)d = *(const long *)s;
+        d += 8;
+        s += 8;
+        n -= 8;
+    }
+    while (n-- > 0)
+        *d++ = *s++;
 }
 
 /* 最近一次 err(id, msg) 的消息指针。`catch e { e.msg }` 从这里取。 */

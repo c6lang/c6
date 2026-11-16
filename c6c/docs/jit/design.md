@@ -13,13 +13,13 @@
   ↓
 收尾（pa_finish）── 和现在完全一样地打补丁、补跳板，只是把 ELF_BASE_VA 换成 PA_BASE
   ↓
-不落盘、也不拷贝：[数据段][代码段] 直接长在那块窗里（固定窗 Image，见 §5）
+不落盘：把 [数据段][代码段] 拷进那块窗（一次 `rep movsb`，443 KB 只要 0.065 ms，见 §5）
   ↓
 mprotect 拆成"数据 RW / 代码 RX / 中间的洞 PROT_NONE" → 调镜像里的入口桩
 ```
 
 三件事一句话说完：**基址变成解析前定下来的变量**、**镜像直接长在进程内的窗里
-（一次字节拷贝都没有，理由见 §5.1）**、**入口桩替代 `_start`
+（只拷一次，理由见 §5.1）**、**入口桩替代 `_start`
 （唯一的语义差别是"返回"而不是 `exit_group`）**。
 
 ## 1. 现在的流水线：镜像怎么长出来的
@@ -85,10 +85,9 @@ v1 的选择是承认这条约束（见 §4），把 u64 化留给后续（[todo
 ## 3. 架构：`src/jit.c6` 的五个动作
 
 ```
-jit_begin()     解析前：mmap 预留窗（RW|NORESERVE|MAP_32BIT，64 MB）→ PA_BASE = 窗首；
-                把 DATA_IMG 挂到"窗首+120"、CODE_IMG 挂到"窗首+cap/2"（固定窗模式）
-jit_code_off()  解析期就返回 cap/2（默认 32 MB；不再是"120 + 数据段长度"）
-jit_protect()   收尾时：数据段 RW / 代码段 RX / 中间的洞 PROT_NONE —— 一个字节都不搬
+jit_begin()     解析前：mmap 预留窗（PROT_NONE|NORESERVE|MAP_32BIT，64 MB）→ PA_BASE = 窗首
+jit_fill()      收尾时：mprotect 前段 RW → 两次 __c6_memcpy_rep 装 [数据段][代码段]
+                → 数据段 RW / 代码段 RX → 记入口
 jit_sym()       按名字取镜像里的符号地址（数据/代码符号的 va 都已定好）
 jit_run()       调入口：fflush(宿主) → 装私有堆 → call → 返回退出码（不 unmap）
 jit_abort()     编译失败/装不下：munmap 整块窗
@@ -100,7 +99,7 @@ jit_abort()     编译失败/装不下：munmap 整块窗
 typedef struct JitState {
     u8 *base;        /* 预留窗首；PA_BASE = (u32)(u64)base */
     u32 cap;         /* 预留字节数（默认 64 MB，C6C_JIT_CAP 可改） */
-    u32 code_off;    /* 代码段在窗里的固定偏移（= cap/2，解析前就定死） */
+    u32 code_off;    /* 代码段在镜像里的偏移（= 120 + 数据段长度，收尾时才有） */
     u32 entry_off;   /* 入口桩在窗里的偏移（= code_off + 代码镜像里的偏移） */
     int on;
 } JitState;
@@ -125,7 +124,7 @@ s->mapped = mmap((void *)ELF_BASE_VA, s->image_size, R|W|X,
 | 要点 | 取值 | 理由 |
 |---|---|---|
 | flags | `MAP_PRIVATE\|MAP_ANONYMOUS\|MAP_32BIT\|MAP_NORESERVE` | `MAP_32BIT` 保证落在 < 2 GiB（`u32 va` 的上限），且不用 `MAP_FIXED`，不会撞上已经占了的区间；`NORESERVE` 让未触碰的页不占 commit |
-| prot | 一开始就 `PROT_READ\|PROT_WRITE` | 编译器要**直接往里长**（§5）；代码页在调用前才换成 RX，全程没有一页同时可写可执行 |
+| prot | 先 `PROT_NONE` | 解析期间谁都不写它；装填时才开 RW，代码页在调用前换成 RX（§5） |
 | 容量 | **64 MB**（`C6C_JIT_CAP` 可调） | 已知最大镜像是 c6c 自编译的 13,684,120 B（4.7×）；普通程序是几百 KB |
 | 超限 | 明确报错，不静默截断 | 报"需要 N 字节 / 预留 M 字节"并提示 `C6C_JIT_CAP` 与 `C6C_RUN=exec` |
 | 上界断言 | `base + used < 2^32` | 防 `u32 va` 悄悄截断（`MAP_32BIT` 已经保证，断言是保险） |
@@ -137,87 +136,82 @@ s->mapped = mmap((void *)ELF_BASE_VA, s->image_size, R|W|X,
 | 沿用 `0x400000` 固定基址 | c6c 自己是那儿的 ET_EXEC（§4 开头） |
 | 按 `0x400000` 编完，装载时整体 +delta 搬迁 | 要一份完整的绝对地址表，而 §2.2 那 5 处没登记 |
 | 每段独立 `mmap`、各自定基址（tcc 那样） | c6c 的代码用 `lea rip+rel32` 与 imm64 两种绝对引用，段间距离必须 < 2 GB 且互相可见；单块窗最接近现有 ELF 布局，补丁代码一行都不用改。**注意**：单块窗内部仍分"数据在低处、代码在 +32 MB"，那是为了 `code_off` 能在解析前定死（§5.1），不是两段 mmap |
-| 编完拷贝进窗（最初的设计） | 拷贝比要省的还贵：`rt.c6` 的 `memcpy` 是字节循环，443 KB 要 5.3 ms、13.7 MB 要 165 ms（§5.1 实测） |
+| 编完拷贝进窗 | **就是本设计**（J-16 之后一次 `rep movsb` 只要 0.065 ms，见 §5.1） |
+| 镜像直接长在窗里（固定窗 Image） | 能省掉那 0.065 ms，但要改 `Image`、`code_off` 得写成 `cap/2`、数据段还受限 —— 不划算，留作备选（§5.4） |
 | 编完之后再 `mmap`（不预留） | 基址必须在解析期已知（§2.2） |
 | 编两遍（先量尺寸再定基址重编） | 单趟流式设计，等于把编译时间翻倍 |
 
-## 5. 镜像长在窗里（不拷贝）
+## 5. 装填：编完拷进窗
 
-### 5.1 为什么不能用 memcpy 搬（实测把设计改掉了）
+### 5.1 拷一次只要 0.065 ms（J-16 落地后的重测）
 
-最初的设计是"收尾时把 `DATA_IMG` / `CODE_IMG` 拷进窗"。量了一下，拷贝速度就是成败
-（详见 [plan.md](plan.md) §9.2）：
+最早的设计是"收尾时 `memcpy` 两个 Image 进窗"，一量发现拷贝比要省的还贵 ——
+那时的 `rt.c6` 的 `memcpy` 是逐字节循环，0.083 GB/s。**J-16 把它换成了 `rep movsb`
+（6.80 GB/s）**，现在同一件事的代价是：
 
-| 拷贝手段 | 443 KB（hello） | 13.7 MB（自编译） |
+| 镜像 | 拷贝耗时 | 占一次 `-run` |
 |---|---|---|
-| `rt.c6` 的 `memcpy`（自举版编译器用的） | **5.3 ms** | **165 ms** |
-| c6c 写的 8 字节块循环 | 0.71 ms | 22 ms |
-| c6c 写的 32 字节块循环 | 0.64 ms | 20 ms |
-| glibc `memcpy`（stage0 用的） | 0.06 ms | 1.7 ms |
+| hello 443 KB（数据 155 KB + 代码 288 KB） | **0.065 ms** | 0.12% |
+| c6c 自编译 13.7 MB | **2.0 ms** | 0.34% |
 
-要省下的只有 0.8 ms，所以"用 `rt.c6` 的 `memcpy` 拷"是净亏 4.5 ms（+8%），
-手写块循环也只是打平。c6c 的 codegen 是槽式的，循环体每次过栈，靠手写救不回来。
+对比"能省下的 0.8 ms"：拷一次仍然净赚 0.7 ms。所以**回到最简单的那条路**：
+编译照旧长在堆里的 `DATA_IMG` / `CODE_IMG`，收尾把它们拷进窗、改权限、调入口。
+不需要碰 `Image`、不需要把 `code_off` 提前定死。
 
-**结论：不拷贝，让镜像直接长在窗里。** 代价是 `code_off` 得在解析前就能算出来 ——
-那就别让它依赖数据段长度：**代码段固定从窗首 `+cap/2` 起**（默认 `+32 MB`），
-数据段仍从 `+120` 起往上长。两者都在同一块窗里、相距 `cap/2`，
-`lea rip+rel32` 与 rel32 调用照样够得着（< 2 GB）。`code_off` 取 `cap/2` 而不是写死 32 MB，
-是为了让 `C6C_JIT_CAP` 一调，数据段和代码段的余量一起变大（两边各占一半）。
+（备选方案"镜像直接长在窗里"见 §5.4：它能省掉这 0.065 ms 和一份 13.7 MB 的内存，
+代价是 `Image` 加固定窗模式、`code_off = cap/2`、数据段被限制在半块窗内。
+现在的收益撑不起这个改动量。）
 
 ### 5.2 布局
 
 ```
-base        ─► ┌────────────────────────────┐
-                │ 120 B：ELF 头占位（不用）   │  RW（和数据段同一页）
-                ├────────────────────────────┤
-                │ 数据段 DATA_IMG            │  RW  ← 从 +120 往上长
-                │   （含字符串字面量）        │
-                ├────────────────────────────┤  ← 洞：PROT_NONE（抓野指针）
-                │            洞              │
-base + 32 MB ─► ├────────────────────────────┤
-                │ 代码段 CODE_IMG            │  RX  ← 含 asmblob 跳板、入口桩
-base + 64 MB ─► └────────────────────────────┘
+base ─► ┌──────────────────────────┐
+        │ 120 B  ELF 头（原样照抄）│  RW（和数据段同页）
+        ├──────────────────────────┤
+        │ 数据段 DATA_IMG          │  RW  ← 含字符串字面量
+        ├──────────────────────────┤
+        │ 代码段 CODE_IMG          │  RX  ← 含 asmblob 跳板、入口桩
+        └──────────────────────────┘
+base + used ─► 窗外（后面的页没映射，越界立刻 SIGSEGV）
 ```
 
-### 5.3 固定窗 Image（`img_attach`）
+`used = ELF_HDR + DATA_IMG.n + CODE_IMG.n`，窗按"先 64 MB 预留、用到多少算多少"，
+所以未触碰的页既不占 commit（`MAP_NORESERVE`）也不占 RSS。
 
-`src/elf.c6` 的 `Image` 加一个"固定窗"模式：`p` / `cap` 由装载器给（数据段 `cap = code_off - 120`，
-代码段 `cap = 总 cap - code_off`），
-`img_grow` 只做边界检查、**不 `realloc`、不 `memset`**（匿名页本来就是零）。
-
-```c
-/* elf.c6：把 Image 挂到一块外来的固定缓冲上（JIT 的窗）。 */
-static void img_attach(Image *im, u8 *p, u32 cap)
-{
-    im->p = p; im->n = 0; im->cap = cap; im->fixed = 1;
-}
-
-static void img_grow(Image *im, u32 need)
-{
-    if (im->fixed) {                     /* 窗里就地长：不搬、不清零 */
-        if (need > im->cap) { /* 报错：JIT 窗不够（数据段/代码段已用 N MB） */ }
-        return;
-    }
-    ... 原来的 realloc 路径（`-o`/`-c`/库形态一字不改）...
-}
-```
-
-好处不止"省一次拷贝"：`img_grow` 顺带不再产生"1.5 倍增长 + 全量 memcpy"那串中间拷贝
-（自举版编译器里那串走的是 `rt.c6` 的 `realloc` = 字节循环 + 两次拷贝，见 §8 末尾）。
-
-### 5.4 W^X 顺序
+### 5.3 装填顺序（W^X）
 
 ```
-jit_begin()   mmap 64 MB PROT_READ|WRITE + MAP_NORESERVE（未触碰的页不占 commit）
-解析期        编译器直接写进窗（数据段 / 代码段各长各的）
-jit_protect() ① 数据段 [base, 页对齐(120 + 数据段长度))   → PROT_READ|PROT_WRITE
-              ② 洞（数据段尾 → base + cap/2）             → PROT_NONE
-              ③ 代码段 [base + cap/2, 页对齐(代码段长度))  → PROT_READ|PROT_EXEC
+jit_begin()   mmap 64 MB PROT_NONE + MAP_NORESERVE + MAP_32BIT
+解析期        编译器照旧写堆里的两个 Image（一行不改）
+jit_fill()    ① used = 120 + 数据段 + 代码段；used > cap → 报错（§12）
+              ② mprotect(base, 页对齐(120 + 数据段), RW)
+              ③ __c6_memcpy_rep(base + 120, DATA_IMG.p, DATA_IMG.n)
+                 __c6_memcpy_rep(base + code_off, CODE_IMG.p, CODE_IMG.n)
+              ④ mprotect(base + code_off, 页对齐(代码段), RX)
+                 （数据段保持 RW；代码段从 RW 收窄成 RX）
 jit_run()     调入口
 ```
 
-**任何一个页都不同时是 W 和 X**：代码页在解析期是 W，调用前被换成 X。
+**任何一个页都不同时是 W 和 X**：代码段先 RW 写完，再 `mprotect` 成 RX。
 （`-o` 那条路的单段 RWX 这一轮不动，见 §11.7。）
+
+`③` 直接调 `memcpy` 即可：J-16 之后它已经对 ≥16 字节的块走 `rep movsb`
+（`src/asmblob.c6` 的 `__c6_memcpy_rep`）。**不要**在这里再手写 C 的逐字节/8 字节块
+循环：c6c 没有优化器，那样 443 KB 要 5.3 ms、13.7 MB 要 165 ms。
+
+### 5.4 备选（不做，留档）：镜像直接长在窗里
+
+如果哪天镜像再大一个数量级，或者要省掉"堆里一份 + 窗里一份"的双份内存：
+
+- `elf.c6` 的 `Image` 加 `fixed` 标志 + `img_attach(im, p, cap)`；
+- `img_grow` 在 `fixed` 时只查边界，不 `realloc`、不清零（匿名页本来就是零）；
+- `DATA_IMG` 挂到 `窗首 + 120`、`CODE_IMG` 挂到 `窗首 + cap/2`，
+  `code_off` 因此能解析前定死（满足 §2.2），数据段被限制在 `cap/2 - 120` 以内；
+- 收尾只 `mprotect`，一个字节都不搬。
+
+收益：省掉 `jit_fill` 的那次拷贝（0.065 ms / 2.0 ms）、省一份内存、
+顺带干掉 `img_grow` 里 `realloc` 的中间拷贝。成本：改 `Image`、多一条"数据段超了
+`cap/2` 就报错"的约束。**J-16 之后这笔账不划算**，需要时再上。
 
 ## 6. 入口桩：`x64_emit_start_jit`
 
@@ -319,9 +313,6 @@ long  c6c_brk_left = 0;
 
 arena 用尽（>64 MB）时会回落到 brk —— 这条残余风险写进 §10，不假装不存在。
 
-固定窗模式还有个副作用值得记：`img_grow` 不再 `realloc`，于是"1.5 倍增长 + 全量拷贝"
-那串中间拷贝也没有了 —— 自举版编译器里它走的是 `rt.c6` 的 `realloc`（字节循环 + 两次拷贝），
-13.7 MB 的镜像长大到 3.8 MB 代码段时要搬几十 MB。这一轮不指望它，但它是白送的。
 
 ## 9. 退出、信号、线程、栈
 
@@ -354,7 +345,7 @@ arena 用尽（>64 MB）时会回落到 brk —— 这条残余风险写进 §10
 
 ## 11. 代码改动清单
 
-### 11.1 新增 `src/jit.c6`（约 220 行）
+### 11.1 新增 `src/jit.c6`（约 200 行）
 
 见 §3 的动作表 + §4/§5 的 mmap/mprotect/窗口布局 + `jit_sym`（按名字取符号地址，
 和 `embed.c6` 的 `c6_get_symbol` 同一套查法；因为 include 顺序在 `embed.c6` 之前，
@@ -387,10 +378,6 @@ static u32 PA_BASE = ELF_BASE_VA;
 | `src/parse.c6:20920`（CLBL 回填） | `ELF_BASE_VA + code_off + …` | `PA_BASE + code_off + …` |
 | `src/parse.c6:20931`（符号 va 重算） | `ELF_BASE_VA + off` | `PA_BASE + off` |
 
-在 `elf.c6` 里另加 `img_attach` + `img_grow` 的固定窗分支（§5.3），
-`sym.c6:89`（`img_init(&DATA_IMG, 4096)`）与 `pa_setup` 里的
-`img_init(&CODE_IMG, 8192)` 改成"JIT 时挂窗、否则照旧"。
-
 `elf.c6:166/185/186`（写 ELF 头）**不改**。
 
 ### 11.3 `x64_emit_start_jit`（`src/x64.c6`，约 40 行）
@@ -406,11 +393,9 @@ if (JIT_ON)
     x64_emit_start_jit(&X64, main_sym, CTORS, NCTOR, DTORS, NDTOR, NTLS > 0);
 else
     x64_emit_start(&X64, main_sym, CTORS, NCTOR, DTORS, NDTOR);
-/* ③ 的 code_off 要分叉：JIT 用固定值（解析前就定死），文件路径照旧 */
-code_off = JIT_ON ? jit_code_off() : (ELF_HDR + DATA_IMG.n);
-/* ①..⑨ 其余全部不变（只把基址换成 PA_BASE） */
+/* ①..⑨ 全部不变（只把基址换成 PA_BASE） */
 if (JIT_ON) {
-    if (jit_protect(code_off + entry_off) < 0)   /* 只拆权限，不搬字节 */
+    if (jit_fill(entry_off + code_off) < 0)      /* 拷进窗 + 拆权限，不再是 elf_write_parts */
         return 1;
 } else {
     elf_write_parts(out, hdr, &DATA_IMG, &CODE_IMG, entry_off + code_off);

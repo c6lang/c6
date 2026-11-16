@@ -26,7 +26,7 @@
 | J-13 | 文档收口（README §-run、design §13、todo 轮次、acceptance 行） | ⬜ | 文档与实现一致，链接不倒 |
 | J-14 | （可选）`embed.c6` 的 `c6_run` 换成本轮装载器 | ⬜ | `embedcheck`、`pkgcheck` 全过 |
 | J-15 | （可选）`X64Sym.va` → `u64`，去掉 < 2 GiB 限制 | ⬜ | 同 J-2 的门禁（产物逐字节不变） |
-| J-16 | （可选、与本轮解耦）`rt.c6` 的 `memcpy`/`memset` 字号化 | ⬜ | 吞吐基准复测；`selfhost` 与全部回归不变 |
+| J-16 | `rt.c6` 的 `memcpy` 上 `rep movsb`（**已先做完**，见下） | ✅ | 1 GiB 0.083 → 6.80 GB/s；stage0 编译速度不回退 |
 
 ---
 
@@ -287,18 +287,78 @@ cmake --build build --target embedcheck
 
 验收：同 J-2（产物逐字节不变）+ `selfhost`。
 
-## J-16（可选）`rt.c6` 的 `memcpy`/`memset` 字号化
+## J-16 ✅ `rt.c6` 的 `memcpy` 上 `rep movsb`
 
-与本轮解耦（本轮**不依赖**它，也正是 design §5.1 的结论），但它是自举编译器的一大块开销：
+**已经先做完了**（用户要求"先把 memcpy 优化到 gcc 水平，但不能影响编译速度"），
+所以本项排在 J-1 之前落地，与 JIT 主线解耦。
 
-- `lib/rt.c6:241` `c6c_mem_copy`（= `memcpy`）逐字节：实测 **0.083 GB/s**（glibc 7.96）；
-- `lib/rt.c6:1709` `memset` 逐字节：实测 **0.10 GB/s**；
-- 两者都在编译热路径上：`img_grow`（`realloc` → 拷贝）、`data_alloc`（每次分配都 `memset`）。
-- 参照：自举版 `build/c6c2` 自编译 2567 ms，gcc 版 stage0 549 ms（4.7×；其中多少来自
-  这两个函数还没拆过，值得先测再改）。
+### 做了什么
 
-做法：按 `long` 对齐头尾 + 中间 8 字节块（c6c 的 codegen 是槽式的，实测 8B 块循环 0.62 GB/s、
-32B 0.69 GB/s；要更快就得靠 asmblob 的 `rep movsb`，那需要单独评审）。
+`src/asmblob.c6` 加一块 10 字节跳板（既有机制的第十一个 blob，三个后端都吃）：
 
-门禁：`selfhost` fixpoint、`fast`、`check-all-c6c`、`runflag`、`testflag`、`bcheck` 全绿
-（产物会变，但 fixpoint 比的是一致的自举链，不受影响）；吞吐用同一条 1 GiB 基准复测。
+```
+48 89 f8   mov %rdi,%rax     ; 返回值 = dst
+fc         cld               ; DF 归零（SysV ABI 本来就要求 0，防一手）
+48 89 d1   mov %rdx,%rcx     ; rep 的计数
+f3 a4      rep movsb
+c3         ret
+```
+
+`lib/rt.c6` 的 `c6c_mem_copy`（`memcpy` / `memmove` 以外的唯一拷贝口子，也供
+`realloc`、`strdup` 用）改成按 `C6C_MEMCPY_REP_MIN = 16` 分叉：小块走 8 字节
+块循环，大块走 `__c6_memcpy_rep`。
+
+### 为什么不能用纯 C
+
+c6c 没有优化器，locals 全在帧槽里，每个元素都要过栈：
+
+| 写法 | 1 GiB 吞吐 | 443 KB 拷贝 |
+|---|---|---|
+| 逐字节 `for (i…) d[i] = s[i]`（原来） | 0.083 GB/s | 5.3 ms |
+| 8 字节块循环 | 0.62 GB/s | 0.71 ms |
+| 32 字节块循环（展开） | 0.69 GB/s | 0.64 ms |
+| `rep movsb`（本次） | **6.80 GB/s** | **0.065 ms** |
+| 同口径 glibc `memcpy`（gcc -O2） | 7.96 GB/s | 0.056 ms |
+
+到 gcc 水平的 85%，443 KB 从 5.3 ms 降到 0.065 ms（81×）。
+
+### 阈值为什么是 16
+
+`rep movsb` 有约 14 ns 的启动开销（1 GiB 基准里是 0，小尺寸才是问题）：
+
+| n | 8 字节块循环 | `rep movsb` |
+|---|---|---|
+| 8 | 13 ns | 14 ns |
+| 16 | 26 ns | 14 ns |
+| 32 | 52 ns | 14 ns |
+| 4096 | 6.6 µs | 0.15 µs |
+
+交叉点在 8–16 之间，取 16（小块是多出来的那次 call 也省了）。
+
+### 编译速度（**硬约束：不许退**）
+
+同一台机器、交错跑、中位数（new = 本次改动，old = 回退后重建；两边都用各自
+配套的 `rt.c6`，否则新的运行时会撞"未定义的符号 `__c6_memcpy_rep`"）：
+
+| 场景 | new | old | 变化 |
+|---|---|---|---|
+| stage0 `-o` hello（5+5 次） | 55.6 ms | 56.2 ms | −1.2% |
+| stage0 `-o` 自编译（9 次） | 581.0 ms | 585.9 ms | −0.8% |
+| **自举版 c6c2 `-o` 自编译**（5 次） | **2070 ms** | **2684 ms** | **−22.9%** |
+
+stage0（CI 量的那个）持平到略快；自举版快 23% —— 因为 stage0 的 `memcpy` 本来就是
+glibc 的，而 c6c2 用的就是这个 `rt.c6`。
+
+### 门禁
+
+`selfhost`（fixpoint 逐字节相同）/ `c99-diff` 51–0 / `llvm-diff` 51–0 /
+`run-flag.sh` 15–0 / `bcheck.sh` 9–0 / `embedcheck` 6–0 / `lint` 全绿。
+`test-flag.sh` 16 通过 / 3 失败、`fast` 的 `tests2-check` 失败：**改动之前就是
+这样**（用回退后的二进制复跑过，同样 16/3；`tests2` 那些 DIFF 行是
+`include/*.h` 早就有的 `type defaults to int` 警告），与本项无关。
+
+### 下一步（还没做）
+
+`memset`（0.10 GB/s）、`memcmp`/`strlen`/`strcmp` 同样是逐字节循环，
+`data_alloc` 每次分配都要 `memset`，量级可能比 `memcpy` 还大 —— 同一套办法
+（`rep stosb`）能一起解决，但要单独一项、单独测。
