@@ -30,6 +30,11 @@ set(C6C_LIB_A "${C6C_BUILD}/libc6c.a")
 set(C6C_LIB_SO "${C6C_BUILD}/libc6c.so")
 set(C6C_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# bench.py 是 Python 脚本：显式用解释器调用，不依赖文件可执行位
+# （git 里它是 100644，AUR check 直接 exec 会得到 permission denied）。
+# Python3 是 c6c 跑分/回归的依赖，详见 README 与 docs/manual/testing.md。
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 include(ProcessorCount)
 ProcessorCount(C6C_JOBS)
 if(C6C_JOBS EQUAL 0)
@@ -261,14 +266,14 @@ c6c_target(scan ENV C6C=${C6C_BIN} ROOT=${C6C_ROOT}
 
 # --- 2.7 性能（验收 (4)，门槛在 bench/thresholds.json）---
 c6c_target(bench ENV C6C=${C6C_STAGE0} ROOT=${C6C_ROOT}
-  COMMAND "${C6C_ROOT}/c6c/bench/bench.py" --root ${C6C_ROOT} --cc ${C6C_STAGE0}
-          --runs 5 --json ${C6C_DIR}/bench/last.json
+  COMMAND "${Python3_EXECUTABLE}" "${C6C_ROOT}/c6c/bench/bench.py" --root ${C6C_ROOT} --cc ${C6C_STAGE0}
+          --runs 5 --json "${CMAKE_BINARY_DIR}/c6c-bench-last.json"
   NO_C6C_DEP
   COMMENT "c6c: bench（用 tcc/c6 跑基线；BOOTSTRAP=host 时不适用）")
 
 c6c_target(bench-c6c DEPENDS c6c-opt ENV ROOT=${C6C_ROOT}
-  COMMAND "${C6C_DIR}/bench/bench.py" --root ${C6C_ROOT} --cc "${C6C_OPT}"
-          --runs 5 --assert --json "${C6C_DIR}/bench/last.json"
+  COMMAND "${Python3_EXECUTABLE}" "${C6C_DIR}/bench/bench.py" --root ${C6C_ROOT} --cc "${C6C_OPT}"
+          --runs 5 --assert --json "${CMAKE_BINARY_DIR}/c6c-bench-last.json"
   COMMENT "c6c: bench-c6c（c6c-opt 跑分并按 thresholds.json 断言）")
 
 # --- 2.8 c6c 编出上游 tcc（G2c），再让那个 tcc 跑 tests2 ---

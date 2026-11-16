@@ -5,6 +5,41 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 未发布
+
+### 打包：默认包里带上自举编译器 `c6c`
+
+- `cmake/C6Install.cmake` 把 c6c 的数据文件从 `C6_ENABLE_TCC=OFF` 分支里挪出来，
+  默认配置（tcc 在）也把自举编译器装成 `bin/c6c`，与 tcc 版 `c6` 并存；没有 tcc
+  时它仍是 `bin/c6`，另外多一个同内容的 `bin/c6c`，两种配置的落点因此一致。
+  以前 DEB / RPM / TGZ 三种包里根本没有 c6c，只有 `-DC6_ENABLE_TCC=OFF` 才装得出来。
+- 新开关 `C6_INSTALL_C6C`（默认 `ON`，只在 tcc 在时起作用）：关掉就只装 tcc 版 `c6`。
+- 二进制必须跟它自己的数据成套：c6c 按 `argv[0]` 找 `<bin>/../lib/c6/include`
+  （自带头文件）与 `<bin>/../lib/c6/rt.c6`（自带运行时），所以 `lib/c6/` 跟着
+  `bin/c6c` 一起装——只装二进制的话它连 hello 都编不出来，只会报「找不到自带
+  运行时 lib/rt.c6」。
+- `cmake/c6-check-install.cmake.in` 除了核对落点，还用暂存树里的 `bin/c6c` 真编一个
+  程序并运行（退出码 91，同时用到自带头文件与 rt.c6）；`c6c/tests/pkgcheck.sh` 的
+  安装清单加上 `bin/c6c` 并单独验一遍它的自找路径；CI 的打包步骤对 DEB / RPM / TGZ
+  逐个断言 `usr/bin/c6c` 与 `usr/lib/c6/rt.c6` 在包里。
+
+### 打包：没有 tcc 也能出包（`c6c` flavour）
+
+- `cmake/C6Packaging.cmake` 以前在 `C6_ENABLE_TCC=OFF` 下直接 `return()`——「没有
+  tcc 就没有可打的包」。现在两种 flavour 都能打：默认出 `c6` 包（tcc 版编译器 +
+  `libtcc`），`-DC6_ENABLE_TCC=OFF` 出 `c6c` 包（自举编译器 + `libc6c` + `lib/c6/`，
+  没有一行 tcc）。包名、描述、许可证（LGPL-2.1 vs MIT）、`/usr/share/doc/<名>` 与
+  `Provides` / `Conflicts` 都跟着 flavour 走；新开关 `C6_PACKAGE_NAME` 可覆盖包名。
+- 文档安装从 tcc 分支里挪出来：`C6_ENABLE_TCC=OFF` 以前一份文档都不装，现在 c6c 包
+  也带 `share/doc/c6c/`（`docs/` 的 33 篇 + `README.md` / `CHANGELOG.md` /
+  `copyright`，其中 copyright 是 c6c 自己的 MIT，不是 tcc 的 `COPYING`）。
+- CI 新增 `package c6c-only (DEB|RPM|TGZ)` 作业：构建 c6c、打包、逐项断言「有
+  `usr/bin/c6`、`usr/bin/c6c`、`lib/c6/rt.c6`、`libc6c.a`、`libc6c.so`、
+  `share/doc/c6c/docs/README.md`」与「没有 `usr/lib/tcc`、`libtcc.a`、`libtcc1.a`、
+  `usr/bin/tcc`、`tcc-doc`、`tcc.1`」，产物作 `c6c-packages-*` artifact 上传。
+  Release 里发的仍是 `c6` 包：等 c6c 的能力缺口（`-shared`/`-fPIC`、libtcc 兼容面、
+  `tests/regression.sh` 的 91 个用例迁移）补齐再换默认。
+
 ## 0.6.2 — 2026-11-16
 
 ### CI：发版说明直接取自版本提交的正文
@@ -408,7 +443,7 @@ v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口�
   完整握手、SNMP v3、LDAP/RADIUS/SIP、Office/Parquet/7z、GPX/KML/GeoJSON、
   base36/62 变体、词典级断词/排序），以及「什么时候到头」的三条判定标准与结论。
 
-### 标准库第九十二批：QUIC 与 HTTP/3
+### 标准库第九十三批：QUIC 与 HTTP/3
 
 - **`std/net/quic.c6`**：QUIC 报文层。变长整数、长/短包头解析、头构造器
   `HeaderBuilder`、全部帧型（`Frame.parse` + `frame_put_*`）、ACK 区间游标 `AckIt`、
@@ -433,8 +468,42 @@ v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口�
   与服务端路由表（命中 / 404，一条请求只回一次）。
 - **`std/net/quicd.c6`**：一个端口上按连接 ID 分流（短包头按前缀匹配、长包头读自带
   DCID 长度），`flush_all` 轮流刷所有连接。
+- 与第九十二批的关系：上一批的 `std/net/hpack` 是 HTTP/2 的；这一批的
+  `std/net/hpack` 是同一套思路的 QUIC 版（模块名不冲突，路径不同）
 - 集成示例 `examples/stdquic.c6`（`ctest --test-dir build -R '^std-quic$'`，72 条检查）；
-  err 号段 0x6179…0x6186；`std/` 到 **391** 个模块。
+  err 号段 0x6179…0x6186；`std/` 到 **395** 个模块。
+### 标准库第九十二批：HTTP/2（HPACK / 帧层 / h2c 客户端 / h2c 服务端）
+
+- **`std/encoding/hpack.c6`**：HPACK 头压缩（RFC 7541）。61 项静态表 + 动态表（尺寸更新、
+  淘汰、按尺寸清空）、1..8 位前缀整数、字符串与 Huffman（按码长分桶的扁平偏移表，解码
+  不建树，EOS 出现在数据里直接判错）、整块 `put_block`/`decode_block`；编码端一律不插
+  动态表（同一份头块永远编成同一串字节），解码端按对端指令插；`authorization`/`cookie`/
+  `set-cookie`/`proxy-authorization` 强制 never-indexed，头名自动转小写。RFC 7541 的
+  C.2/C.3/C.4 向量（含 Huffman 与动态表尺寸计算）都在 test 块里。
+- **`std/net/http2.c6`**：帧层（RFC 9113）。帧头读写（半包给 0）、`PADDED`/`PRIORITY`
+  前缀剥离、preface 校验、SETTINGS / WINDOW_UPDATE / RST_STREAM / PING / GOAWAY 编解码；
+  `H2Pipe` 把「读满一帧 / 写满一帧 / 读负载 / 丢负载」收成一套同步原语，客户端与服务端
+  共用，拿 `socketpair` 就能互测。
+- **`std/net/http2c.c6`**：h2c（明文）客户端。连上先发 preface + SETTINGS、等对端 SETTINGS
+  落地再发请求；SETTINGS/PING 自动应答、DATA 自动还 WINDOW_UPDATE、GOAWAY 与 RST_STREAM
+  让本次请求失败（原因在 `why()`）；一条连接串行发请求、流号 1/3/5…，CONTINUATION 与填充
+  都拼装，请求体超首窗在本地拒绝而不是挂着等 WINDOW_UPDATE。
+- **`std/net/http2d.c6`**：h2c 服务端骨架。`next_request` 返回 1（请求收全，头已解、body
+  已在调用方缓冲）/0（对端收工）/−1（协议错），`respond`/`respond_text` 写响应；连接第一
+  件事必须是 preface（HTTP/1 报文判协议错），一次一个流，并发的流回
+  `RST_STREAM(REFUSED_STREAM)`。
+- 有意的边界（写在模块注释里）：只做 h2c + prior knowledge，**不做** ALPN、不把 TLS 记录层
+  塞进来（那是 `std.net.https`/`std.net.tlsrec` 的活）、不做服务端推送与并发流、请求/响应体
+  不跨窗口排队。协议本身完整：CONTINUATION 拼装、填充、优先前缀、SETTINGS 协商、
+  WINDOW_UPDATE、RST_STREAM、PING、GOAWAY 都处理。
+- 集成示例 `examples/stdh2.c6`（`cmake --build build --target std-h2`，49 条检查）+
+  `tests/regression.sh` 的 `std-h2` 用例（同时进 `C6_STD_TARGETS` / `C6_TEST_ALL`）+ `stdtest`
+  的 `deps` 映射；真机互通方向用 `curl --http2-prior-knowledge`（nghttp2）打过 `http2d` 的
+  服务端：200/404、响应头、60000 字节响应体、POST 回显，curl 收工时的 GOAWAY 也正常收尾。
+  `std/` 到 **381** 个模块（`encoding` 54 / `net` 56）。
+- 顺手改定位：[docs/stdlib-coverage.md](docs/stdlib-coverage.md) 第 4 节原来的「只收
+  判断型/编解码型、新模块只能是变体」删掉，换成「开发者常用就收 / 代价可控 / 零分配风格一致」
+  三条；QUIC 与 HTTP/3 仍然不做，但理由从「类型学不符」改成「等于随包一个传输栈」的代价判断。
 
 ### 标准库第九十一批：网段、字节序、排序键、断词
 

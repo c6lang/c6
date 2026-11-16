@@ -10,6 +10,8 @@
 
 # 自举产物（cmake --build build --target selfhost / c99selfhost）
 /build/
+# 其它构建目录（CI 的 build-pkg、本地试 flavour 的 build-notcc）
+/build-*/
 # CPack 打包产物（cpack -B packages）
 /packages/
 # tokio 基准的 cargo 产物

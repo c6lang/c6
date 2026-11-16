@@ -106,6 +106,21 @@ c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DO
 `<datarootdir>/doc/tcc`）。文档里指向 `examples/` / `tests/` 源码的链接只在
 仓库内有效，安装包里不携带源码。
 
+自举编译器 c6c 默认也随安装走：`C6_INSTALL_C6C`（默认 `ON`，只在
+`C6_ENABLE_TCC=ON` 时有意义）把它装成 `bin/c6c`，与 tcc 版 `c6` 并存；
+`C6_ENABLE_TCC=OFF` 时它本身就是 `bin/c6`，另外留一个同内容的 `bin/c6c`。
+两种配置都装 `<libdir>/c6/include/`（c6c 的自带头文件 `stddef.h` / `stdarg.h` /
+`stdint.h` …，**不进** `<prefix>/include`，免得盖掉宿主程序的系统头文件）与
+`<libdir>/c6/rt.c6`（编译时拼进 TU 的运行时源码）。c6c 按 `argv[0]` 推自己的目录
+去找这两样，所以二进制与它们必须成套出现——只装二进制的话它连一个 hello 都编不
+出来，只会报「找不到自带运行时 lib/rt.c6」。
+
+安装包也分两种 flavour：`C6_ENABLE_TCC=ON` 出 `c6` 包（tcc 版编译器 + `libtcc`），
+`C6_ENABLE_TCC=OFF` 出 `c6c` 包（自举编译器 + `libc6c`，没有一行 tcc）。包名与
+文档落点由 `C6_PACKAGE_NAME` 决定，留空时按 flavour 取 `c6` / `c6c`（所以 c6c 包的
+文档在 `share/doc/c6c/`，许可证是 c6c 的 MIT）。两种包装的是同一批路径，
+`Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。
+
 `tcc/` 里的目标文件全部依赖一份标志记录 `tcc/.c6-flags`（内容是本轮编译用的
 `CC` / `CFLAGS` / `DEFINES` / `LDFLAGS` / `LIBS`）。标志一变（切换 `build` /
 `build-plain`、换一份 `CFLAGS`），下一次 `cmake --build build` 就把所有目标文件

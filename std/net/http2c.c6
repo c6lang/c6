@@ -1,0 +1,1221 @@
+/* std/net/http2c：h2c（明文 HTTP/2）客户端——一条连接上串行发请求、收完整响应。
+ *
+ *     import std.net.http2c;
+ *
+ *     H2Client c = { 0 };
+ *     char hb[16384] = { 0 }, tb[4096] = { 0 }, ar[4096] = { 0 };
+ *     char body[8192] = { 0 };
+ *     HpackField hdrs[32] = { 0 };
+ *     H2Response r = { 0 };
+ *
+ *     c = h2c_connect("127.0.0.1", 8080, 3000, hb, (int)sizeof hb,
+ *                     tb, (int)sizeof tb, ar, (int)sizeof ar);
+ *     if (h2c_get(&c, SS("localhost:8080"), SS("/hi"), &r, hdrs, 32,
+ *                 body, (int)sizeof body) < 0)
+ *         ... c.error() ...
+ *     r.status;              // 200
+ *     r.body;                // "hello"
+ *     h2c_header(&r, SS("content-type"));
+ *
+ * 这是「客户端」那一半：连接建立后先发 preface + SETTINGS，等对端的 SETTINGS
+ * 落地再发请求，然后一直读到本流 END_STREAM 为止。帧层在 `std.net.http2`，
+ * 头压缩在 `std.encoding.hpack`，这里只做状态机（流号、窗口、SETTINGS/PING 应答、
+ * 头块拼装、响应字段提取）。
+ *
+ * 约定：
+ *
+ * - **只做 h2c（明文，prior knowledge）**：不链 TLS，所以不做 ALPN；`https://`
+ *   请先自己建好 TLS 记录层，再用 `h2c_attach` 把 fd 交进来（加密/解密在
+ *   fd 之外做，和 `std.net.https` 的分工一样）；
+ * - **一条连接串行发请求**：`h2c_request` 返回时本流已经收完，不排队、不并发。
+ *   流号从 1 开始按 2 递增；要并发就在应用层开多条连接；
+ * - 请求体必须放得进**首窗**（默认 65535 字节，且不超过对端
+ *   `SETTINGS_INITIAL_WINDOW_SIZE`）：超了直接返回 -1，不会卡在等
+ *   WINDOW_UPDATE 上；响应体受调用方缓冲限制，超了返回 -1；
+ * - `hblock` 同时用来拼请求头块和响应头块/数据帧，**至少要有 16384 字节**
+ *   （对端 MAX_FRAME_SIZE 允许更大时按那个来）；
+ * - 解码出来的头字段视图指向 `hblock` 或 `hpack` 的 arena，下一次请求会覆盖；
+ *   要留着就自己拷走；
+ * - 收到 SETTINGS 自动 ACK，收到 PING 自动回同数据的 ACK，收到数据自动还
+ *   WINDOW_UPDATE；GOAWAY / RST_STREAM / 帧尺寸越界都让本次请求失败，原因在
+ *   `why()`。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <stdio.h>
+
+module std.net.http2c;
+import std.core.types;
+import std.text.str;
+import std.encoding.hpack;
+import std.net.http2;
+import std.net.tcp;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+#define H2C_HDR_MAX 64
+#define H2C_CTL 256
+
+enum Error {
+    OK = 0,
+    INVAL = 1,      /* 参数不合法 */
+    IO = 2,         /* 连接/读写失败 */
+    PROTO = 3,      /* 对端违反协议 */
+    SPACE = 4,      /* 调用方缓冲不够 */
+    UNSUPP = 5,     /* 这一层不做的特性（大 body、推送等） */
+};
+
+struct H2Client {
+    Tcp sock;               /* h2c_connect 建的连接；attach 时 fd = -1 */
+    H2Pipe pipe;
+    Hpack hp;
+    char *hblock;
+    int hbcap;
+    u8 ctl[H2C_CTL];
+    int started;
+    int timeout_ms;
+    u32 next_stream;
+    i64 conn_window;        /* 连接级发送窗口 */
+    i64 stream_window;      /* 下一个流的初始发送窗口 */
+    u32 peer_initial;
+    u32 peer_max_frame;
+    int nreq;
+    int goaway;
+    int err;
+    const char *why;
+};
+
+struct H2Response {
+    int status;
+    HpackField *hdrs;
+    int nhdrs;
+    Str body;               /* 视图：指向调用方 body 缓冲 */
+    int body_len;
+    int ok;
+    const char *why;
+};
+
+static void h2c_fail(H2Client *self, int e, const char *why)
+{
+    if (!self)
+        return;
+    self->err = e;
+    self->why = why;
+}
+
+int h2c_err(H2Client *self) { return self ? self->err : INVAL; }
+
+const char *h2c_why(H2Client *self)
+{
+    return self ? self->why : (const char *)"no handle";
+}
+
+int h2c_ok(H2Client *self) { return self && h2_ok(&self->pipe); }
+
+int h2c_requests(H2Client *self) { return self ? self->nreq : 0; }
+
+u32 h2c_next_stream(H2Client *self) { return self ? self->next_stream : 0; }
+
+/* 把 fd 对交进来（rfd 读、wfd 写；同一个 fd 也行） */
+int h2c_attach(H2Client *self, int rfd, int wfd, char *hblock, int hbcap,
+               char *tbuf, int tcap, char *arena, int acap)
+{
+    if (!self)
+        return -1;
+    memset(self, 0, sizeof *self);
+    self->sock.fd = -1;
+    self->pipe.rfd = -1;
+    self->pipe.wfd = -1;
+    self->why = (const char *)"ok";
+    if (rfd < 0 || wfd < 0 || !hblock || hbcap < H2_DEFAULT_FRAME
+        || !tbuf || tcap < 0 || acap < 0) {
+        h2c_fail(self, INVAL, "attach 参数不合法");
+        return -1;
+    }
+    if (h2_pipe_attach(&self->pipe, rfd, wfd) != 1)
+        return -1;
+    if (hpack_init(&self->hp, tbuf, tcap, tcap > 4096 ? 4096 : tcap, arena,
+                   acap) != 1)
+        return -1;
+    self->hblock = hblock;
+    self->hbcap = hbcap;
+    self->next_stream = 1;
+    self->peer_initial = H2_DEFAULT_WINDOW;
+    self->peer_max_frame = H2_DEFAULT_FRAME;
+    self->conn_window = H2_DEFAULT_WINDOW;
+    self->stream_window = H2_DEFAULT_WINDOW;
+    self->why = (const char *)"ok";
+    return 1;
+}
+
+/* 建连接（TCP + attach）；失败返回 err() != OK 的句柄 */
+H2Client h2c_connect(const char *host, int port, int timeout_ms, char *hblock,
+                     int hbcap, char *tbuf, int tcap, char *arena, int acap)
+{
+    H2Client c = { 0 };
+
+    c.sock = tcp_connect(host, port, timeout_ms);
+    if (c.sock.fd < 0) {
+        h2c_fail(&c, IO, "TCP 连不上");
+        return c;
+    }
+    if (timeout_ms > 0)
+        c.sock.set_timeout(timeout_ms);
+    if (h2c_attach(&c, c.sock.fd, c.sock.fd, hblock, hbcap, tbuf, tcap,
+                   arena, acap) != 1) {
+        c.sock.close_socket();
+        c.sock.fd = -1;
+        h2c_fail(&c, INVAL, "attach 参数不合法");
+        return c;
+    }
+    c.timeout_ms = timeout_ms;
+    return c;
+}
+
+void h2c_close(H2Client *self)
+{
+    if (!self)
+        return;
+    if (self->pipe.rfd >= 0)
+        close(self->pipe.rfd);
+    else if (self->sock.fd >= 0)
+        close(self->sock.fd);
+    self->pipe.rfd = -1;
+    self->pipe.wfd = -1;
+    self->sock.fd = -1;
+}
+
+/* 控制帧负载读进 ctl；太大就丢掉（返回 0） */
+static int h2c_read_ctl(H2Client *self, H2Frame *f)
+{
+    if (f->len > (int)sizeof self->ctl) {
+        if (h2_pipe_discard(&self->pipe, f->len) != 1)
+            return -1;
+        return 0;
+    }
+    return h2_pipe_payload(&self->pipe, self->ctl, f->len);
+}
+
+/* 应用对端 SETTINGS；返回 1 / -1 */
+static int h2c_settings(H2Client *self, const u8 *p, int len)
+{
+    H2Setting st[16] = { 0 };
+    int cnt = 0;
+    int i = 0;
+
+    if (len % 6 != 0) {
+        h2c_fail(self, PROTO, "SETTINGS 长度不是 6 的倍数");
+        return -1;
+    }
+    if (len / 6 > 16) {
+        h2c_fail(self, UNSUPP, "SETTINGS 项太多");
+        return -1;
+    }
+    if (h2_settings_parse(p, len, st, 16, &cnt) != 1) {
+        h2c_fail(self, PROTO, "SETTINGS 解析失败");
+        return -1;
+    }
+    for (i = 0; i < cnt; i++) {
+        if (st[i].id == H2_SET_INITIAL_WINDOW) {
+            i64 diff = (i64)st[i].value - (i64)self->peer_initial;
+
+            if (st[i].value > H2_MAX_WINDOW) {
+                h2c_fail(self, PROTO, "INITIAL_WINDOW 超上限");
+                return -1;
+            }
+            self->stream_window += diff;
+            self->peer_initial = st[i].value;
+        } else if (st[i].id == H2_SET_MAX_FRAME) {
+            if (st[i].value < 16384 || st[i].value > H2_MAX_FRAME_LIMIT) {
+                h2c_fail(self, PROTO, "MAX_FRAME 不在合法范围");
+                return -1;
+            }
+            self->peer_max_frame = st[i].value;
+        }
+    }
+    return 1;
+}
+
+/* preface + SETTINGS，然后等对端的 SETTINGS 并 ACK；返回 1 / -1 */
+static int h2c_start(H2Client *self)
+{
+    H2Setting st[4] = { 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+    int got_peer = 0;
+
+    if (self->started)
+        return 1;
+    if (h2_pipe_write(&self->pipe, H2_PREFACE, H2_PREFACE_LEN) != 1) {
+        h2c_fail(self, IO, "preface 发不出去");
+        return -1;
+    }
+    st[0].id = H2_SET_HEADER_TABLE;
+    st[0].value = 4096;
+    st[1].id = H2_SET_ENABLE_PUSH;
+    st[1].value = 0;
+    st[2].id = H2_SET_MAX_CONCURRENT;
+    st[2].value = 1;
+    st[3].id = H2_SET_MAX_FRAME;
+    st[3].value = H2_DEFAULT_FRAME;
+    n = h2_settings_write(buf, (int)sizeof buf, st, 4);
+    if (h2_pipe_send(&self->pipe, H2_SETTINGS, 0, 0, buf, n) < 0) {
+        h2c_fail(self, IO, "SETTINGS 发不出去");
+        return -1;
+    }
+    while (!got_peer) {
+        H2Frame f = { 0 };
+        int rc = h2_pipe_recv(&self->pipe, &f);
+
+        if (rc <= 0) {
+            h2c_fail(self, IO, "等对端 SETTINGS 时连接断了");
+            return -1;
+        }
+        if (f.type == H2_SETTINGS) {
+            if (h2c_read_ctl(self, &f) <= 0) {
+                h2c_fail(self, IO, "SETTINGS 负载读不出来");
+                return -1;
+            }
+            if (f.flags & H2_ACK) {
+                if (f.len != 0) {
+                    h2c_fail(self, PROTO, "SETTINGS ACK 不该带负载");
+                    return -1;
+                }
+                continue;
+            }
+            if (h2c_settings(self, self->ctl, f.len) != 1)
+                return -1;
+            if (h2_pipe_send(&self->pipe, H2_SETTINGS, H2_ACK, 0, 0, 0) < 0) {
+                h2c_fail(self, IO, "SETTINGS ACK 发不出去");
+                return -1;
+            }
+            got_peer = 1;
+            continue;
+        }
+        if (f.type == H2_PING) {
+            if (f.len != 8 || h2c_read_ctl(self, &f) <= 0) {
+                h2c_fail(self, PROTO, "PING 长度不是 8");
+                return -1;
+            }
+            if (!(f.flags & H2_ACK)
+                && h2_pipe_send(&self->pipe, H2_PING, H2_ACK, 0, self->ctl,
+                                8) < 0) {
+                h2c_fail(self, IO, "PING ACK 发不出去");
+                return -1;
+            }
+            continue;
+        }
+        if (f.type == H2_WINDOW_UPDATE) {
+            u32 inc = 0;
+
+            if (h2c_read_ctl(self, &f) <= 0
+                || h2_window_parse(self->ctl, f.len, &inc) != 1) {
+                h2c_fail(self, PROTO, "WINDOW_UPDATE 格式错");
+                return -1;
+            }
+            if (f.stream == 0)
+                self->conn_window += (i64)inc;
+            else
+                self->stream_window += (i64)inc;
+            continue;
+        }
+        if (f.type == H2_GOAWAY) {
+            self->goaway = 1;
+            h2c_fail(self, IO, "对端发了 GOAWAY");
+            return -1;
+        }
+        if (h2_pipe_discard(&self->pipe, f.len) != 1) {
+            h2c_fail(self, IO, "握手期间丢帧失败");
+            return -1;
+        }
+    }
+    self->started = 1;
+    return 1;
+}
+
+/* 请求头块：伪头 + 额外头 + 自动 content-length */
+static int h2c_build_headers(H2Client *self, Str method, Str authority, Str path,
+                             HpackField *extra, int nextra, Str body, int *out_len)
+{
+    HpackField f[H2C_HDR_MAX + 1] = { 0 };
+    int n = 0;
+    int i = 0;
+    int has_cl = 0;
+    char cl[24] = { 0 };
+    int cln = 0;
+    i64 v = (i64)body.s.len;
+
+    if (nextra < 0 || nextra > H2C_HDR_MAX || (nextra > 0 && !extra)) {
+        h2c_fail(self, INVAL, "额外头太多或指针为空");
+        return -1;
+    }
+    f[n].name = SS(":method");
+    f[n].value = method;
+    n++;
+    f[n].name = SS(":scheme");
+    f[n].value = SS("http");
+    n++;
+    f[n].name = SS(":authority");
+    f[n].value = authority;
+    n++;
+    f[n].name = SS(":path");
+    f[n].value = path;
+    n++;
+    for (i = 0; i < nextra; i++) {
+        Str nm = extra[i].name;
+
+        if (nm.s.len == 10 && memcmp(nm.s.data, "content-length", 10) == 0)
+            has_cl = 1;
+        f[n] = extra[i];
+        n++;
+    }
+    if (body.s.len > 0 && !has_cl) {
+        /* 十进制数字 */
+        if (v == 0) {
+            cl[0] = '0';
+            cln = 1;
+        } else {
+            while (v > 0 && cln < (int)sizeof cl) {
+                cl[cln++] = (char)('0' + (int)(v % 10));
+                v /= 10;
+            }
+        }
+        /* 反转 */
+        for (i = 0; i < cln / 2; i++) {
+            char t = cl[i];
+
+            cl[i] = cl[cln - 1 - i];
+            cl[cln - 1 - i] = t;
+        }
+        f[n].name = SS("content-length");
+        f[n].value = (Str){ (char[:]){ cl, cln } };
+        n++;
+    }
+    {
+        int k = hpack_put_block(&self->hp, f, n, self->hblock, self->hbcap);
+
+        if (k < 0) {
+            h2c_fail(self, SPACE, "请求头块压不进缓冲");
+            return -1;
+        }
+        *out_len = k;
+    }
+    return 1;
+}
+
+/* 把一个头块按 MAX_FRAME 拆成 HEADERS + CONTINUATION 发出去 */
+static int h2c_emit_block(H2Client *self, u32 sid, const char *blk, int blen,
+                          int end_stream)
+{
+    int off = 0;
+    int first = 1;
+
+    while (off < blen || first) {
+        int take = blen - off;
+        int flags = 0;
+        int type = first ? H2_HEADERS : H2_CONTINUATION;
+
+        if (take > (int)self->peer_max_frame)
+            take = (int)self->peer_max_frame;
+        if (off + take >= blen)
+            flags |= H2_END_HEADERS;
+        if (first && end_stream)
+            flags |= H2_END_STREAM;
+        if (h2_pipe_send(&self->pipe, type, flags, sid, blk + off, take) < 0) {
+            h2c_fail(self, IO, "头块发不出去");
+            return -1;
+        }
+        off += take;
+        first = 0;
+        if (blen == 0)
+            break;
+    }
+    return 1;
+}
+
+/* 发请求体（受首窗限制，按 MAX_FRAME 切） */
+static int h2c_send_body(H2Client *self, u32 sid, Str body)
+{
+    int off = 0;
+
+    if (body.s.len <= 0)
+        return 1;
+    if ((i64)body.s.len > self->conn_window
+        || (i64)body.s.len > self->stream_window) {
+        h2c_fail(self, UNSUPP, "请求体超出首窗（这一层不排队等 WINDOW_UPDATE）");
+        return -1;
+    }
+    while (off < body.s.len) {
+        int take = body.s.len - off;
+        int flags = 0;
+
+        if (take > (int)self->peer_max_frame)
+            take = (int)self->peer_max_frame;
+        if (off + take >= body.s.len)
+            flags |= H2_END_STREAM;
+        if (h2_pipe_send(&self->pipe, H2_DATA, flags, sid, body.s.data + off,
+                         take) < 0) {
+            h2c_fail(self, IO, "请求体发不出去");
+            return -1;
+        }
+        off += take;
+    }
+    self->conn_window -= (i64)body.s.len;
+    self->stream_window -= (i64)body.s.len;
+    return 1;
+}
+
+/* 从头字段数组里找 :status；返回状态码，找不到返回 -1 */
+static int h2c_status_of(HpackField *f, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        Str nm = f[i].name;
+
+        if (nm.s.len == 7 && memcmp(nm.s.data, ":status", 7) == 0) {
+            int v = 0;
+            int k = 0;
+
+            if (f[i].value.s.len != 3)
+                return -1;
+            for (k = 0; k < 3; k++) {
+                char c = f[i].value.s.data[k];
+
+                if (c < '0' || c > '9')
+                    return -1;
+                v = v * 10 + (c - '0');
+            }
+            return v;
+        }
+    }
+    return -1;
+}
+
+Str h2c_header(H2Response *self, Str name)
+{
+    int i = 0;
+
+    if (!self || !self->hdrs)
+        return (Str){ (char[:]){ (char *)0, 0 } };
+    for (i = 0; i < self->nhdrs; i++) {
+        Str nm = self->hdrs[i].name;
+
+        if (nm.s.len != name.s.len)
+            continue;
+        if (nm.s.len == 0 || memcmp(nm.s.data, name.s.data,
+                                   (size_t)nm.s.len) == 0)
+            return self->hdrs[i].value;
+    }
+    return (Str){ (char[:]){ (char *)0, 0 } };
+}
+
+/* 读响应：一直读到 sid 的 END_STREAM；返回 body 长度或 -1 */
+static int h2c_recv_response(H2Client *self, u32 sid, H2Response *out,
+                             HpackField *hdrs, int hdrcap, char *body_buf,
+                             int body_cap)
+{
+    int got_status = 0;
+    int got_end = 0;
+    int blen = -1;              /* 头块拼装状态：-1 = 不在拼 */
+    int body_len = 0;
+
+    while (!got_end) {
+        H2Frame f = { 0 };
+        int rc = h2_pipe_recv(&self->pipe, &f);
+
+        if (rc <= 0) {
+            h2c_fail(self, IO, "等响应时连接断了");
+            return -1;
+        }
+        if (f.type == H2_SETTINGS) {
+            if (h2c_read_ctl(self, &f) <= 0)
+                return -1;
+            if (!(f.flags & H2_ACK)) {
+                if (h2c_settings(self, self->ctl, f.len) != 1)
+                    return -1;
+                if (h2_pipe_send(&self->pipe, H2_SETTINGS, H2_ACK, 0, 0, 0) < 0) {
+                    h2c_fail(self, IO, "SETTINGS ACK 发不出去");
+                    return -1;
+                }
+            }
+            continue;
+        }
+        if (f.type == H2_PING) {
+            if (f.len != 8 || h2c_read_ctl(self, &f) <= 0) {
+                h2c_fail(self, PROTO, "PING 长度不是 8");
+                return -1;
+            }
+            if (!(f.flags & H2_ACK)
+                && h2_pipe_send(&self->pipe, H2_PING, H2_ACK, 0, self->ctl,
+                                8) < 0) {
+                h2c_fail(self, IO, "PING ACK 发不出去");
+                return -1;
+            }
+            continue;
+        }
+        if (f.type == H2_WINDOW_UPDATE) {
+            u32 inc = 0;
+
+            if (h2c_read_ctl(self, &f) <= 0
+                || h2_window_parse(self->ctl, f.len, &inc) != 1) {
+                h2c_fail(self, PROTO, "WINDOW_UPDATE 格式错");
+                return -1;
+            }
+            if (f.stream == 0)
+                self->conn_window += (i64)inc;
+            else
+                self->stream_window += (i64)inc;
+            continue;
+        }
+        if (f.type == H2_GOAWAY) {
+            self->goaway = 1;
+            h2c_fail(self, IO, "对端发了 GOAWAY");
+            return -1;
+        }
+        if (f.type == H2_RST_STREAM) {
+            int code = 0;
+
+            if (h2c_read_ctl(self, &f) <= 0 || h2_rst_parse(self->ctl, f.len,
+                                                            &code) != 1) {
+                h2c_fail(self, PROTO, "RST_STREAM 格式错");
+                return -1;
+            }
+            if (f.stream == sid) {
+                h2c_fail(self, IO, "本流被 RST_STREAM");
+                return -1;
+            }
+            continue;
+        }
+        if (f.type == H2_PUSH_PROMISE) {
+            h2c_fail(self, PROTO, "我们关了推送，对端还发 PUSH_PROMISE");
+            return -1;
+        }
+        if (f.type == H2_PRIORITY) {
+            if (h2_pipe_discard(&self->pipe, f.len) != 1)
+                return -1;
+            continue;
+        }
+        if (f.type == H2_HEADERS && f.stream == sid) {
+            int off = 0;
+            int vn = 0;
+            int cnt = 0;
+
+            if (f.len > self->hbcap) {
+                h2c_fail(self, SPACE, "头块比 hblock 大");
+                return -1;
+            }
+            if (h2_pipe_payload(&self->pipe, self->hblock, f.len) != 1)
+                return -1;
+            vn = h2_payload_off(self->hblock, f.len, f.flags,
+                                (f.flags & H2_PRIORITY_FLAG) != 0, &off);
+            if (vn < 0) {
+                h2c_fail(self, PROTO, "HEADERS 前缀非法");
+                return -1;
+            }
+            if (off > 0 && vn > 0)
+                memmove(self->hblock, self->hblock + off, (size_t)vn);
+            blen = vn;
+            if (f.flags & H2_END_HEADERS) {
+                if (hpack_decode_block(&self->hp, self->hblock, blen, hdrs,
+                                       hdrcap, &cnt) != 1) {
+                    h2c_fail(self, PROTO, hpack_why(&self->hp));
+                    return -1;
+                }
+                out->hdrs = hdrs;
+                out->nhdrs = cnt;
+                out->status = h2c_status_of(hdrs, cnt);
+                if (out->status < 0) {
+                    h2c_fail(self, PROTO, "响应没有 :status");
+                    return -1;
+                }
+                got_status = 1;
+                blen = -1;
+            }
+            if (f.flags & H2_END_STREAM)
+                got_end = 1;
+            continue;
+        }
+        if (f.type == H2_CONTINUATION && f.stream == sid && blen >= 0) {
+            if (blen + f.len > self->hbcap) {
+                h2c_fail(self, SPACE, "CONTINUATION 拼进 hblock 装不下");
+                return -1;
+            }
+            if (h2_pipe_payload(&self->pipe, self->hblock + blen, f.len) != 1)
+                return -1;
+            blen += f.len;
+            if (f.flags & H2_END_HEADERS) {
+                int cnt = 0;
+
+                if (hpack_decode_block(&self->hp, self->hblock, blen, hdrs,
+                                       hdrcap, &cnt) != 1) {
+                    h2c_fail(self, PROTO, hpack_why(&self->hp));
+                    return -1;
+                }
+                out->hdrs = hdrs;
+                out->nhdrs = cnt;
+                out->status = h2c_status_of(hdrs, cnt);
+                if (out->status < 0) {
+                    h2c_fail(self, PROTO, "响应没有 :status");
+                    return -1;
+                }
+                got_status = 1;
+                blen = -1;
+            }
+            continue;
+        }
+        if (f.type == H2_DATA && f.stream == sid) {
+            int off = 0;
+            int vn = 0;
+
+            if (f.len > self->hbcap) {
+                h2c_fail(self, SPACE, "DATA 帧比 hblock 大");
+                return -1;
+            }
+            if (h2_pipe_payload(&self->pipe, self->hblock, f.len) != 1)
+                return -1;
+            vn = h2_payload_off(self->hblock, f.len, f.flags, 0, &off);
+            if (vn < 0) {
+                h2c_fail(self, PROTO, "DATA 填充非法");
+                return -1;
+            }
+            if (body_len + vn > body_cap) {
+                h2c_fail(self, SPACE, "响应体比调用方缓冲大");
+                return -1;
+            }
+            if (vn > 0)
+                memcpy(body_buf + body_len, self->hblock + off, (size_t)vn);
+            body_len += vn;
+            /* 收到的数据立刻还额度：连接级 + 流级各一个 WINDOW_UPDATE */
+            if (f.len > 0) {
+                u32 inc = (u32)f.len;
+
+                if (h2_window_write((char *)self->ctl, 4, 0, inc) != 4
+                    || h2_pipe_send(&self->pipe, H2_WINDOW_UPDATE, 0, 0,
+                                    self->ctl, 4) < 0) {
+                    h2c_fail(self, IO, "连接级 WINDOW_UPDATE 发不出去");
+                    return -1;
+                }
+                if (h2_window_write((char *)self->ctl, 4, sid, inc) != 4
+                    || h2_pipe_send(&self->pipe, H2_WINDOW_UPDATE, 0, sid,
+                                    self->ctl, 4) < 0) {
+                    h2c_fail(self, IO, "流级 WINDOW_UPDATE 发不出去");
+                    return -1;
+                }
+            }
+            if (f.flags & H2_END_STREAM)
+                got_end = 1;
+            continue;
+        }
+        /* 其它帧（未知类型、别的流）一律丢掉 */
+        if (h2_pipe_discard(&self->pipe, f.len) != 1) {
+            h2c_fail(self, IO, "丢帧失败");
+            return -1;
+        }
+    }
+    if (!got_status || blen >= 0) {
+        h2c_fail(self, PROTO, "响应结束但没有完整的头块");
+        return -1;
+    }
+    out->body = (Str){ (char[:]){ body_buf, body_len } };
+    out->body_len = body_len;
+    out->ok = 1;
+    out->why = (const char *)"ok";
+    return body_len;
+}
+
+/* 发一个请求并读到响应完整；返回 body 长度或 -1 */
+int h2c_request(H2Client *self, Str method, Str authority, Str path,
+                HpackField *extra, int nextra, Str body, H2Response *out,
+                HpackField *hdrs, int hdrcap, char *body_buf, int body_cap)
+{
+    u32 sid = 0;
+    int blen = 0;
+
+    if (!self || !out || !hdrs || hdrcap < 1 || (!body_buf && body_cap > 0))
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (!h2c_ok(self)) {
+        h2c_fail(self, INVAL, "句柄没有可用连接");
+        return -1;
+    }
+    if (self->goaway) {
+        h2c_fail(self, IO, "连接已经 GOAWAY");
+        return -1;
+    }
+    if (method.s.len <= 0 || path.s.len <= 0 || authority.s.len <= 0) {
+        h2c_fail(self, INVAL, "method/path/authority 不能为空");
+        return -1;
+    }
+    if (body.s.len < 0 || (body.s.len > 0 && !body.s.data)) {
+        h2c_fail(self, INVAL, "body 指针为空");
+        return -1;
+    }
+    if (h2c_start(self) != 1)
+        return -1;
+    /* 流号用完（2^31-1）就没法再开流 */
+    if (self->next_stream > H2_MAX_STREAM - 2) {
+        h2c_fail(self, UNSUPP, "流号用完");
+        return -1;
+    }
+    sid = self->next_stream;
+    self->next_stream += 2;
+    self->stream_window = (i64)self->peer_initial;
+    if (h2c_build_headers(self, method, authority, path, extra, nextra, body,
+                          &blen) != 1)
+        return -1;
+    /* 先头后体：HEADERS 的 END_STREAM 只在没有 body 时置 */
+    if (h2c_emit_block(self, sid, self->hblock, blen, body.s.len == 0) != 1)
+        return -1;
+    if (h2c_send_body(self, sid, body) != 1)
+        return -1;
+    {
+        int n = h2c_recv_response(self, sid, out, hdrs, hdrcap, body_buf,
+                                  body_cap);
+
+        if (n < 0)
+            return -1;
+        self->nreq++;
+        self->err = OK;
+        self->why = (const char *)"ok";
+        return n;
+    }
+}
+
+/* GET 快捷入口 */
+int h2c_get(H2Client *self, Str authority, Str path, H2Response *out,
+            HpackField *hdrs, int hdrcap, char *body_buf, int body_cap)
+{
+    return h2c_request(self, SS("GET"), authority, path, (HpackField *)0, 0,
+                       (Str){ (char[:]){ (char *)0, 0 } }, out, hdrs, hdrcap,
+                       body_buf, body_cap);
+}
+
+
+/* ---- 自测 ---- */
+
+/* 读对端 fd 上所有可读字节（先设 200ms 超时，读到超时为止） */
+static int h2c_drain(int fd, char *dst, int cap)
+{
+    int n = 0;
+
+    for (;;) {
+        ssize_t k = 0;
+
+        if (n >= cap - 1)
+            break;
+        k = read(fd, dst + n, (size_t)(cap - 1 - n));
+        if (k <= 0)
+            break;
+        n += (int)k;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+static void h2c_timeout(int fd, int ms)
+{
+    struct timeval tv = { 0 };
+
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, (socklen_t)sizeof tv);
+}
+
+/* 往脚本化的「服务端」写一帧 */
+static int h2c_put_frame(int fd, int type, int flags, u32 stream,
+                         const void *p, int n)
+{
+    char buf[4096] = { 0 };
+    int total = 0;
+
+    if (n > (int)sizeof buf - H2_HEAD_LEN)
+        return -1;
+    total = h2_frame_write(buf, (int)sizeof buf, type, flags, stream, p, n);
+    if (total < 0)
+        return -1;
+    return write(fd, buf, (size_t)total) == total ? total : -1;
+}
+
+/* 拼一个响应头块：:status + content-type + content-length */
+static int h2c_resp_block(Hpack *h, int status, int blen, char *dst, int cap)
+{
+    HpackField f[3] = { 0 };
+    char st[4] = { 0 };
+    char cl[16] = { 0 };
+    int v = status;
+    int c = blen;
+    int cln = 0;
+    int i = 0;
+
+    st[0] = (char)('0' + (v / 100) % 10);
+    st[1] = (char)('0' + (v / 10) % 10);
+    st[2] = (char)('0' + v % 10);
+    if (c == 0) {
+        cl[0] = '0';
+        cln = 1;
+    } else {
+        while (c > 0) {
+            cl[cln++] = (char)('0' + c % 10);
+            c /= 10;
+        }
+        for (i = 0; i < cln / 2; i++) {
+            char t = cl[i];
+
+            cl[i] = cl[cln - 1 - i];
+            cl[cln - 1 - i] = t;
+        }
+    }
+    f[0].name = SS(":status");
+    f[0].value = (Str){ (char[:]){ st, 3 } };
+    f[1].name = SS("content-type");
+    f[1].value = SS("text/plain");
+    f[2].name = SS("content-length");
+    f[2].value = (Str){ (char[:]){ cl, cln } };
+    return hpack_put_block(h, f, 3, dst, cap);
+}
+
+test "请求、响应与第二条流" {
+    int fds[2] = { -1, -1 };
+    H2Client c = { 0 };
+    char hb[16384] = { 0 };
+    char tb[4096] = { 0 }, ar[4096] = { 0 };
+    char body[64] = { 0 };
+    char hdrs_buf[2048] = { 0 };
+    HpackField hdrs[16] = { 0 };
+    H2Response r = { 0 };
+    Hpack srv = { 0 };
+    char stb[4096] = { 0 }, sarena[512] = { 0 };
+    char blk[256] = { 0 };
+    char out[8192] = { 0 };
+    int blen = 0, n = 0, pos = 0;
+    H2Frame f = { 0 };
+    char *payload = 0;
+    Hpack dec = { 0 };
+    char dtb[4096] = { 0 }, darena[1024] = { 0 };
+    HpackField reqf[16] = { 0 };
+    int rcnt = 0;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+        return err(1, "socketpair 建不起来");
+    h2c_timeout(fds[1], 200);
+    hpack_init(&srv, stb, (int)sizeof stb, 4096, sarena, (int)sizeof sarena);
+    /* 服务端先摆好：SETTINGS(空) + 响应1 + 响应2 */
+    if (h2c_put_frame(fds[1], H2_SETTINGS, 0, 0, 0, 0) != 9)
+        return err(2, "SETTINGS 写不进去");
+    blen = h2c_resp_block(&srv, 200, 5, blk, (int)sizeof blk);
+    if (blen <= 0 || h2c_put_frame(fds[1], H2_HEADERS, H2_END_HEADERS, 1, blk,
+                                   blen) < 0)
+        return err(3, "响应头 1 写不进去");
+    if (h2c_put_frame(fds[1], H2_DATA, H2_END_STREAM, 1, "hello", 5) < 0)
+        return err(4, "响应体 1 写不进去");
+    blen = h2c_resp_block(&srv, 404, 4, blk, (int)sizeof blk);
+    if (blen <= 0 || h2c_put_frame(fds[1], H2_HEADERS, H2_END_HEADERS, 3, blk,
+                                   blen) < 0)
+        return err(5, "响应头 2 写不进去");
+    if (h2c_put_frame(fds[1], H2_DATA, H2_END_STREAM, 3, "nope", 4) < 0)
+        return err(6, "响应体 2 写不进去");
+
+    if (h2c_attach(&c, fds[0], fds[0], hb, (int)sizeof hb, tb, (int)sizeof tb,
+                   ar, (int)sizeof ar) != 1)
+        return err(7, "attach 失败");
+    n = h2c_get(&c, SS("example.com"), SS("/hi"), &r, hdrs, 16, body,
+                (int)sizeof body);
+    if (n != 5 || r.status != 200 || r.body_len != 5
+        || memcmp(r.body.s.data, "hello", 5) != 0)
+        return err(8, "第一个响应不对");
+    {
+        Str ct = h2c_header(&r, SS("content-type"));
+        Str cl = h2c_header(&r, SS("content-length"));
+
+        if (ct.s.len != 10 || memcmp(ct.s.data, "text/plain", 10) != 0)
+            return err(9, "content-type 不对");
+        if (cl.s.len != 1 || cl.s.data[0] != '5')
+            return err(10, "content-length 不对");
+    }
+    /* 第二条流：流号应该是 3，响应 404 */
+    n = h2c_get(&c, SS("example.com"), SS("/missing"), &r, hdrs, 16, body,
+                (int)sizeof body);
+    if (n != 4 || r.status != 404 || memcmp(r.body.s.data, "nope", 4) != 0)
+        return err(11, "第二个响应不对");
+    if (h2c_requests(&c) != 2 || h2c_next_stream(&c) != 5)
+        return err(12, "请求计数或下一个流号不对");
+
+    /* 检查客户端发出去的字节 */
+    n = h2c_drain(fds[1], out, (int)sizeof out);
+    if (n < H2_PREFACE_LEN
+        || memcmp(out, H2_PREFACE, (size_t)H2_PREFACE_LEN) != 0)
+        return err(13, "没先发 preface");
+    pos = H2_PREFACE_LEN;
+    /* 1: 我们的 SETTINGS */
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_SETTINGS
+        || (f.flags & H2_ACK))
+        return err(14, "第一帧应该是 SETTINGS");
+    payload = out + pos + H2_HEAD_LEN;
+    pos += H2_HEAD_LEN + f.len;
+    /* 2: 对端 SETTINGS 的 ACK */
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_SETTINGS
+        || !(f.flags & H2_ACK) || f.len != 0)
+        return err(15, "第二帧应该是 SETTINGS ACK");
+    pos += H2_HEAD_LEN;
+    /* 3: 请求 1 的 HEADERS */
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_HEADERS
+        || f.stream != 1
+        || f.flags != (H2_END_HEADERS | H2_END_STREAM))
+        return err(16, "请求 1 的 HEADERS 不对");
+    hpack_init(&dec, dtb, (int)sizeof dtb, 4096, darena, (int)sizeof darena);
+    if (hpack_decode_block(&dec, out + pos + H2_HEAD_LEN, f.len, reqf, 16,
+                           &rcnt) != 1)
+        return err(17, "请求 1 的头块解不出来");
+    {
+        int i = 0, got_m = 0, got_p = 0, got_a = 0;
+
+        for (i = 0; i < rcnt; i++) {
+            if (reqf[i].name.s.len == 7
+                && memcmp(reqf[i].name.s.data, ":method", 7) == 0
+                && reqf[i].value.s.len == 3
+                && memcmp(reqf[i].value.s.data, "GET", 3) == 0)
+                got_m = 1;
+            if (reqf[i].name.s.len == 5
+                && memcmp(reqf[i].name.s.data, ":path", 5) == 0
+                && reqf[i].value.s.len == 3
+                && memcmp(reqf[i].value.s.data, "/hi", 3) == 0)
+                got_p = 1;
+            if (reqf[i].name.s.len == 10
+                && memcmp(reqf[i].name.s.data, ":authority", 10) == 0
+                && reqf[i].value.s.len == 11
+                && memcmp(reqf[i].value.s.data, "example.com", 11) == 0)
+                got_a = 1;
+        }
+        if (!got_m || !got_p || !got_a)
+            return err(18, "请求 1 的伪头不全");
+    }
+    pos += H2_HEAD_LEN + f.len;
+    /* 4: 数据帧回来之后会有两个 WINDOW_UPDATE，然后是请求 2 的 HEADERS */
+    while (pos < n) {
+        if (!h2_frame_head(out + pos, n - pos, &f))
+            return err(19, "多出来的字节不是完整帧");
+        if (f.type == H2_HEADERS && f.stream == 3) {
+            if (f.flags != (H2_END_HEADERS | H2_END_STREAM))
+                return err(20, "请求 2 的 HEADERS 标志不对");
+            break;
+        }
+        if (f.type == H2_WINDOW_UPDATE) {
+            u32 inc = 0;
+
+            if (h2_window_parse(out + pos + H2_HEAD_LEN, f.len, &inc) != 1
+                || inc != 5)
+                return err(21, "还的额度不对");
+        } else if (f.type != H2_DATA) {
+            return err(22, "请求之间出现了不该有的帧");
+        }
+        pos += H2_HEAD_LEN + f.len;
+    }
+    if (pos >= n)
+        return err(23, "没看到请求 2 的 HEADERS");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "请求体、CONTINUATION 与填充" {
+    int fds[2] = { -1, -1 };
+    H2Client c = { 0 };
+    char hb[16384] = { 0 };
+    char tb[4096] = { 0 }, ar[4096] = { 0 };
+    char body[16] = { 0 };
+    HpackField hdrs[16] = { 0 };
+    H2Response r = { 0 };
+    Hpack srv = { 0 };
+    char stb[4096] = { 0 }, sarena[512] = { 0 };
+    char blk[256] = { 0 };
+    char out[8192] = { 0 };
+    int blen = 0, n = 0, pos = 0, half = 0;
+    H2Frame f = { 0 };
+    HpackField extra[1] = { 0 };
+    Hpack dec = { 0 };
+    char dtb[4096] = { 0 }, darena[1024] = { 0 };
+    HpackField reqf[16] = { 0 };
+    int rcnt = 0;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+        return err(24, "socketpair 建不起来");
+    h2c_timeout(fds[1], 200);
+    hpack_init(&srv, stb, (int)sizeof stb, 4096, sarena, (int)sizeof sarena);
+    if (h2c_put_frame(fds[1], H2_SETTINGS, 0, 0, 0, 0) != 9)
+        return err(25, "SETTINGS 写不进去");
+    /* 响应头拆成 HEADERS + CONTINUATION，body 走带填充的 DATA */
+    blen = h2c_resp_block(&srv, 200, 3, blk, (int)sizeof blk);
+    if (blen < 4)
+        return err(26, "响应头块太短");
+    half = blen / 2;
+    if (h2c_put_frame(fds[1], H2_HEADERS, 0, 1, blk, half) < 0
+        || h2c_put_frame(fds[1], H2_CONTINUATION,
+                         H2_END_HEADERS, 1, blk + half,
+                         blen - half) < 0)
+        return err(27, "CONTINUATION 写不进去");
+    {
+        char pad[6] = { 2, 'a', 'b', 'c', 0, 0 };
+
+        if (h2c_put_frame(fds[1], H2_DATA, H2_END_STREAM | H2_PADDED, 1, pad,
+                          6) < 0)
+            return err(28, "带填充的 DATA 写不进去");
+    }
+    if (h2c_attach(&c, fds[0], fds[0], hb, (int)sizeof hb, tb, (int)sizeof tb,
+                   ar, (int)sizeof ar) != 1)
+        return err(29, "attach 失败");
+    extra[0].name = SS("content-type");
+    extra[0].value = SS("text/plain");
+    n = h2c_request(&c, SS("POST"), SS("example.com"), SS("/submit"), extra, 1,
+                    (Str){ (char[:]){ (char *)"hello world", 11 } }, &r, hdrs,
+                    16, body, (int)sizeof body);
+    if (n != 3 || r.status != 200 || memcmp(r.body.s.data, "abc", 3) != 0)
+        return err(30, "带 CONTINUATION / 填充的响应解不对");
+    /* 客户端应该发了 HEADERS + DATA（带 body 时 HEADERS 不置 END_STREAM） */
+    n = h2c_drain(fds[1], out, (int)sizeof out);
+    pos = H2_PREFACE_LEN;
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_SETTINGS)
+        return err(31, "第一帧应该是 SETTINGS");
+    pos += H2_HEAD_LEN + f.len;
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_SETTINGS
+        || !(f.flags & H2_ACK))
+        return err(32, "第二帧应该是 SETTINGS ACK");
+    pos += H2_HEAD_LEN;
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_HEADERS
+        || f.flags != H2_END_HEADERS || f.stream != 1)
+        return err(33, "带 body 的 HEADERS 标志不对");
+    hpack_init(&dec, dtb, (int)sizeof dtb, 4096, darena, (int)sizeof darena);
+    if (hpack_decode_block(&dec, out + pos + H2_HEAD_LEN, f.len, reqf, 16,
+                           &rcnt) != 1)
+        return err(34, "请求头块解不出来");
+    {
+        int i = 0, got_cl = 0, got_ct = 0;
+
+        for (i = 0; i < rcnt; i++) {
+            if (reqf[i].name.s.len == 14
+                && memcmp(reqf[i].name.s.data, "content-length", 14) == 0
+                && reqf[i].value.s.len == 2
+                && memcmp(reqf[i].value.s.data, "11", 2) == 0)
+                got_cl = 1;
+            if (reqf[i].name.s.len == 12
+                && memcmp(reqf[i].name.s.data, "content-type", 12) == 0)
+                got_ct = 1;
+        }
+        if (!got_cl || !got_ct)
+            return err(35, "自动 content-length 或调用方的额外头丢了");
+    }
+    pos += H2_HEAD_LEN + f.len;
+    if (!h2_frame_head(out + pos, n - pos, &f) || f.type != H2_DATA
+        || !(f.flags & H2_END_STREAM) || f.len != 11
+        || memcmp(out + pos + H2_HEAD_LEN, "hello world", 11) != 0)
+        return err(36, "请求体帧不对");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "错误路径：RST / GOAWAY / 首窗限制" {
+    /* RST_STREAM：请求返回 -1，原因里带 RST */
+    {
+        int fds[2] = { -1, -1 };
+        H2Client c = { 0 };
+        char hb[16384] = { 0 };
+        char tb[4096] = { 0 }, ar[4096] = { 0 };
+        char body[16] = { 0 };
+        char rst[4] = { 0, 0, 0, 8 };
+        HpackField hdrs[16] = { 0 };
+        H2Response r = { 0 };
+
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+            return err(37, "socketpair 建不起来");
+        if (h2c_put_frame(fds[1], H2_SETTINGS, 0, 0, 0, 0) != 9
+            || h2c_put_frame(fds[1], H2_RST_STREAM, 0, 1, rst, 4) < 0)
+            return err(38, "RST 场景摆不出来");
+        if (h2c_attach(&c, fds[0], fds[0], hb, (int)sizeof hb, tb,
+                       (int)sizeof tb, ar, (int)sizeof ar) != 1)
+            return err(39, "attach 失败");
+        if (h2c_get(&c, SS("h"), SS("/x"), &r, hdrs, 16, body,
+                    (int)sizeof body) != -1)
+            return err(40, "RST_STREAM 之后不该成功");
+        if (h2c_err(&c) != IO || strstr(h2c_why(&c), "RST") == 0)
+            return err(41, "RST_STREAM 的失败原因不对");
+        close(fds[0]);
+        close(fds[1]);
+    }
+    /* GOAWAY：请求返回 -1 */
+    {
+        int fds[2] = { -1, -1 };
+        H2Client c = { 0 };
+        char hb[16384] = { 0 };
+        char tb[4096] = { 0 }, ar[4096] = { 0 };
+        char body[16] = { 0 };
+        char go[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        HpackField hdrs[16] = { 0 };
+        H2Response r = { 0 };
+
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+            return err(42, "socketpair 建不起来");
+        if (h2c_put_frame(fds[1], H2_SETTINGS, 0, 0, 0, 0) != 9
+            || h2c_put_frame(fds[1], H2_GOAWAY, 0, 0, go, 8) < 0)
+            return err(43, "GOAWAY 场景摆不出来");
+        if (h2c_attach(&c, fds[0], fds[0], hb, (int)sizeof hb, tb,
+                       (int)sizeof tb, ar, (int)sizeof ar) != 1)
+            return err(44, "attach 失败");
+        if (h2c_get(&c, SS("h"), SS("/x"), &r, hdrs, 16, body,
+                    (int)sizeof body) != -1)
+            return err(45, "GOAWAY 之后不该成功");
+        if (strstr(h2c_why(&c), "GOAWAY") == 0)
+            return err(46, "GOAWAY 的失败原因不对");
+        close(fds[0]);
+        close(fds[1]);
+    }
+    /* 请求体超出首窗：直接拒绝，别卡在等 WINDOW_UPDATE 上 */
+    {
+        int fds[2] = { -1, -1 };
+        H2Client c = { 0 };
+        static char hb[16384] = { 0 };
+        char tb[4096] = { 0 }, ar[4096] = { 0 };
+        static char big[70000] = { 0 };
+        char body[16] = { 0 };
+        HpackField hdrs[16] = { 0 };
+        H2Response r = { 0 };
+
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+            return err(47, "socketpair 建不起来");
+        if (h2c_put_frame(fds[1], H2_SETTINGS, 0, 0, 0, 0) != 9)
+            return err(48, "SETTINGS 写不进去");
+        if (h2c_attach(&c, fds[0], fds[0], hb, (int)sizeof hb, tb,
+                       (int)sizeof tb, ar, (int)sizeof ar) != 1)
+            return err(49, "attach 失败");
+        if (h2c_request(&c, SS("POST"), SS("h"), SS("/x"), (HpackField *)0, 0,
+                        (Str){ (char[:]){ big, (int)sizeof big } }, &r, hdrs, 16,
+                        body, (int)sizeof body) != -1)
+            return err(50, "超出首窗的 body 应该拒绝");
+        if (strstr(h2c_why(&c), "首窗") == 0)
+            return err(51, "首窗限制的失败原因不对");
+        close(fds[0]);
+        close(fds[1]);
+    }
+}
+
+test "参数检查" {
+    H2Client c = { 0 };
+    H2Response r = { 0 };
+    HpackField hdrs[4] = { 0 };
+    char body[8] = { 0 };
+    char hb[16384] = { 0 };
+    char tb[64] = { 0 }, ar[64] = { 0 };
+
+    if (h2c_attach(0, 0, 0, hb, (int)sizeof hb, tb, 64, ar, 64) != -1)
+        return err(52, "空句柄应该拒绝");
+    if (h2c_attach(&c, -1, -1, hb, (int)sizeof hb, tb, 64, ar, 64) != -1)
+        return err(53, "坏 fd 应该拒绝");
+    /* hblock 小于一个默认帧：拒绝（帧负载要读进来） */
+    if (h2c_attach(&c, 0, 0, hb, 1024, tb, 64, ar, 64) != -1)
+        return err(54, "太小的 hblock 应该拒绝");
+    if (h2c_get(&c, SS("h"), SS("/"), &r, hdrs, 4, body, 8) != -1)
+        return err(55, "没 attach 的句柄不该能发请求");
+    if (h2c_err(&c) != INVAL)
+        return err(56, "错误码不对");
+}
