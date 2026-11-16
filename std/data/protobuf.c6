@@ -1,0 +1,1220 @@
+/* std/data/protobuf：Protocol Buffers 的**线格式**（零分配，调用方给缓冲）。
+ *
+ *     import std.data.protobuf;
+ *
+ *     char buf[64] = { 0 };
+ *     PbWriter w = pb_writer(buf, (int)sizeof buf);
+ *     w.write_tag_uint(1, 150);            // 08 96 01
+ *     w.write_tag_str(2, (Str){ S("hi") }); // 12 02 68 69
+ *     if (!w.ok()) return 1;
+ *
+ *     PbReader r = pb_reader(buf, w.len());
+ *     PbField f = { 0 };
+ *     while (r.next(&f) == 1) {
+ *         if (f.field == 1 && f.wire == PB_VARINT) { u64 v; f.as_uint(&v); }
+ *         else r.skip(&f);                 // 认不出的字段：跳过去
+ *     }
+ *
+ * 这一层只管「字段号 + 线类型 + 值」，不认识 .proto：schema 由调用方按顺序
+ * 读写字段（或者交给 `tools/protoc6` 生成代码）。和 msgpack/cbor 一样**不建
+ * 树、不分配**：读到的字符串/子消息是输入缓冲上的视图，写的结果进调用方缓冲。
+ *
+ * 线格式（protobuf 编码规范，全部覆盖）：
+ *
+ * | 线类型 | 名字       | 负载                          | 本模块的表示        |
+ * |-------:|------------|-------------------------------|---------------------|
+ * | 0      | VARINT     | 1..10 字节变长整数            | `f.u`               |
+ * | 1      | FIXED64    | 8 字节小端                    | `f.u`               |
+ * | 2      | BYTES      | 变长长度 + 负载               | `f.s` / `f.len`     |
+ * | 3      | GROUP_START| 已废弃的 proto2 group 开始    | 由 `skip` 整段跳过  |
+ * | 4      | GROUP_END  | group 结束                    | `skip` 配对检查     |
+ * | 5      | FIXED32    | 4 字节小端                    | `f.u`               |
+ *
+ * 约定：
+ *
+ * - 键 = `(字段号 << 3) | 线类型`；字段号 0、线类型 6/7 一律算坏数据；
+ * - 写：缓冲满了置 `bad = 1` 并忽略后续写入，`ok()` 转 0，`error_code()` 给
+ *   `PB_CAP`（读端与 `PbIter` 也各有一个 `ok()`，含义都是「到目前为止没踩到
+ *   坏数据」）；`write_int` 对负数写 64 位补码（10 字节，和主流实现一致），
+ *   `write_sint` 走 zigzag；`mark`/`mark_end` 用来回填长度（嵌套消息或 packed
+ *   段的「先写体、再补长度」）；
+ * - 读：`next` 返回 1 取到一个字段 / 0 输入读完 / -1 坏数据（截断的 varint、
+ *   越界的长度、字段号 0、线类型 6/7、未知 group 不闭合）；`next` 会把
+ *   定长与长度前缀负载都走完，所以 `skip` 对 0/1/2/5 是空操作，只有 group
+ *   需要它继续消费；
+ * - `as_*` 访问器检查线类型，不符返回 -1；`as_int32` 按 int32 截断（protobuf
+ *   的 int32 在线上是 64 位补码，超宽位要丢掉）；`as_str` 对 string/bytes 都给
+ *   字节视图，**不校验 UTF-8**；
+ * - `packed` 把线类型 2 的负载变成 `PbIter`，逐个取定长/变长元素（proto3 的
+ *   数值 repeated 默认打包；解码侧要同时接受打包与逐个两种写法，生成代码
+ *   负责这件事）；
+ * - 不认识的字段用 `skip` 跳过，这是 protobuf 前向兼容的基础。
+ *
+ * 完整的 .proto → C6 代码生成在 `tools/protoc6`（把 .proto 编成结构体 +
+ * `*_size` / `*_encode` / `*_decode`），本模块是它的运行时。
+ */
+#include <string.h>
+
+module std.data.protobuf;
+import std.core.types;
+import std.text.str;
+
+enum PbWire {
+    PB_VARINT = 0,
+    PB_FIXED64 = 1,
+    PB_BYTES = 2,
+    PB_GROUP_START = 3,
+    PB_GROUP_END = 4,
+    PB_FIXED32 = 5,
+};
+
+enum PbError {
+    PB_OK = 0,
+    PB_TRUNC = 1,       /* 输入在中间断了 */
+    PB_BADWIRE = 2,     /* 线类型 6/7 */
+    PB_BADFIELD = 3,    /* 字段号 0 或越界 */
+    PB_OVERFLOW = 4,    /* varint 超过 10 字节 / 第 10 字节越界 */
+    PB_CAP = 5,         /* 输出缓冲不够 */
+    PB_DEPTH = 6,       /* group / 子消息嵌套超过上限 */
+    PB_TYPE = 7,        /* 访问器与线类型不符 */
+};
+
+/* 写端：结果进调用方缓冲，`used` 只记成功写入的部分。 */
+struct PbWriter {
+    char *p;
+    int cap;
+    int used;
+    int bad;
+    int err;
+};
+
+/* 读端：`pos` 指向下一个字段的键，`depth` 是 group 递归深度。 */
+struct PbReader {
+    const char *p;
+    int n;
+    int pos;
+    int bad;
+    int err;
+    int depth;
+};
+
+/* 一个字段：`u` 是 VARINT/FIXED32/FIXED64 的原始值，`s` 是 BYTES 的负载视图。 */
+struct PbField {
+    int field;
+    int wire;
+    int at;         /* 负载在输入里的偏移 */
+    int len;        /* BYTES 的负载长度；其它线类型为 0 */
+    u64 u;
+    Str s;
+};
+
+/* `mark` 记下当前位置，`mark_end` 回填「体长度」变长整数并把它前面的体后移。 */
+struct PbMark {
+    int at;
+};
+
+/* packed 段的迭代器：在 BYTES 负载上逐个取元素。 */
+struct PbIter {
+    const char *p;
+    int n;
+    int pos;
+    int bad;
+};
+
+/* ---- 尺寸与 zigzag ---- */
+
+int pb_varint_size(u64 v)
+{
+    int n = 1;
+
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+
+/* 键的字节数：字段号合法时只跟 `field << 3` 有关，线类型不会跨 7 位边界。 */
+int pb_tag_size(int field)
+{
+    if (field <= 0 || field > 0x1fffffff)
+        return 0;
+    return pb_varint_size((u64)field << 3);
+}
+
+u64 pb_zigzag(i64 v)
+{
+    return ((u64)v << 1) ^ (u64)(v >> 63);
+}
+
+i64 pb_unzigzag(u64 v)
+{
+    return (i64)((v >> 1) ^ (u64)-(i64)(v & 1));
+}
+
+/* ---- 写端 ---- */
+
+PbWriter pb_writer(void *buf, int cap)
+{
+    PbWriter w = { (char *)buf, cap, 0, 0, PB_OK };
+
+    if (!buf || cap <= 0)
+        w.bad = 1;
+    return w;
+}
+
+int ok(PbWriter *self) { return self && !self->bad; }
+
+int len(PbWriter *self) { return self ? self->used : 0; }
+
+int error_code(PbWriter *self) { return self ? self->err : PB_CAP; }
+
+static void pw_fail(PbWriter *w, int code)
+{
+    if (!w || w->bad)
+        return;
+    w->bad = 1;
+    w->err = code;
+}
+
+static void pw_byte(PbWriter *w, int b)
+{
+    if (!w || w->bad)
+        return;
+    if (w->used >= w->cap) {
+        pw_fail(w, PB_CAP);
+        return;
+    }
+    w->p[w->used++] = (char)(u8)b;
+}
+
+static void pw_raw(PbWriter *w, const void *src, int n)
+{
+    if (!w || w->bad)
+        return;
+    if (n < 0 || !src) {
+        pw_fail(w, PB_CAP);
+        return;
+    }
+    if (w->used + n > w->cap) {
+        pw_fail(w, PB_CAP);
+        return;
+    }
+    if (n > 0)
+        memcpy(w->p + w->used, src, (usize)n);
+    w->used += n;
+}
+
+void write_key(PbWriter *self, int field, int wire)
+{
+    u64 key = 0;
+
+    if (!self || self->bad)
+        return;
+    if (field <= 0 || field > 0x1fffffff || wire < 0 || wire > 5) {
+        pw_fail(self, PB_BADFIELD);
+        return;
+    }
+    key = ((u64)field << 3) | (u64)wire;
+    while (key >= 0x80) {
+        pw_byte(self, (int)((key & 0x7f) | 0x80));
+        key >>= 7;
+    }
+    pw_byte(self, (int)key);
+}
+
+void write_uint(PbWriter *self, u64 v)
+{
+    if (!self || self->bad)
+        return;
+    while (v >= 0x80) {
+        pw_byte(self, (int)((v & 0x7f) | 0x80));
+        v >>= 7;
+    }
+    pw_byte(self, (int)v);
+}
+
+/* 负数按 64 位补码写 10 字节（protobuf 的 int32/int64 就这样）。 */
+void write_int(PbWriter *self, i64 v)
+{
+    write_uint(self, (u64)v);
+}
+
+/* zigzag：小负数也只占 1 字节（sint32/sint64）。 */
+void write_sint(PbWriter *self, i64 v)
+{
+    write_uint(self, pb_zigzag(v));
+}
+
+void write_bool(PbWriter *self, int v)
+{
+    write_uint(self, v ? 1u : 0u);
+}
+
+void write_fixed32(PbWriter *self, u32 v)
+{
+    pw_byte(self, (int)(v & 0xff));
+    pw_byte(self, (int)((v >> 8) & 0xff));
+    pw_byte(self, (int)((v >> 16) & 0xff));
+    pw_byte(self, (int)((v >> 24) & 0xff));
+}
+
+void write_fixed64(PbWriter *self, u64 v)
+{
+    int i = 0;
+
+    for (i = 0; i < 8; i++)
+        pw_byte(self, (int)((v >> (i * 8)) & 0xff));
+}
+
+void write_float(PbWriter *self, f32 v)
+{
+    u32 bits = 0;
+
+    memcpy(&bits, &v, sizeof bits);
+    write_fixed32(self, bits);
+}
+
+void write_double(PbWriter *self, f64 v)
+{
+    u64 bits = 0;
+
+    memcpy(&bits, &v, sizeof bits);
+    write_fixed64(self, bits);
+}
+
+/* 裸负载：长度前缀由调用方自己写（生成代码算好尺寸后调它）。 */
+void write_bytes(PbWriter *self, const void *src, int n)
+{
+    pw_raw(self, src, n);
+}
+
+void write_str(PbWriter *self, Str s)
+{
+    if (!self || self->bad)
+        return;
+    pw_raw(self, s.s.data, s.s.len);
+}
+
+void write_tag_uint(PbWriter *self, int field, u64 v)
+{
+    write_key(self, field, PB_VARINT);
+    write_uint(self, v);
+}
+
+void write_tag_int(PbWriter *self, int field, i64 v)
+{
+    write_key(self, field, PB_VARINT);
+    write_int(self, v);
+}
+
+void write_tag_sint(PbWriter *self, int field, i64 v)
+{
+    write_key(self, field, PB_VARINT);
+    write_sint(self, v);
+}
+
+void write_tag_bool(PbWriter *self, int field, int v)
+{
+    write_key(self, field, PB_VARINT);
+    write_bool(self, v);
+}
+
+void write_tag_fixed32(PbWriter *self, int field, u32 v)
+{
+    write_key(self, field, PB_FIXED32);
+    write_fixed32(self, v);
+}
+
+void write_tag_fixed64(PbWriter *self, int field, u64 v)
+{
+    write_key(self, field, PB_FIXED64);
+    write_fixed64(self, v);
+}
+
+void write_tag_float(PbWriter *self, int field, f32 v)
+{
+    write_key(self, field, PB_FIXED32);
+    write_float(self, v);
+}
+
+void write_tag_double(PbWriter *self, int field, f64 v)
+{
+    write_key(self, field, PB_FIXED64);
+    write_double(self, v);
+}
+
+void write_tag_str(PbWriter *self, int field, Str s)
+{
+    if (!self || self->bad)
+        return;
+    write_key(self, field, PB_BYTES);
+    write_uint(self, (u64)s.s.len);
+    write_str(self, s);
+}
+
+void write_tag_bytes(PbWriter *self, int field, const void *src, int n)
+{
+    if (!self || self->bad || n < 0)
+        return;
+    write_key(self, field, PB_BYTES);
+    write_uint(self, (u64)n);
+    write_bytes(self, src, n);
+}
+
+/* 把 callee 直接写进 writer 的剩余空间：返回可写指针，成功时 used += n。
+   嵌套消息可以用它做到「只编码一遍、不做二次拷贝」。 */
+int put(PbWriter *self, int n, char **at)
+{
+    if (!self || !at || self->bad || n < 0)
+        return -1;
+    if (self->used + n > self->cap) {
+        pw_fail(self, PB_CAP);
+        return -1;
+    }
+    *at = self->p + self->used;
+    self->used += n;
+    return 1;
+}
+
+/* 记下「体」的起点，等体写完再回填长度前缀（嵌套消息 / packed 段）。 */
+void mark(PbWriter *self, PbMark *out)
+{
+    if (!out)
+        return;
+    out->at = (self && !self->bad) ? self->used : -1;
+}
+
+void mark_end(PbWriter *self, PbMark m)
+{
+    int body = 0;
+    int need = 0;
+    u64 v = 0;
+
+    if (!self || self->bad)
+        return;
+    if (m.at < 0 || m.at > self->used) {
+        pw_fail(self, PB_CAP);
+        return;
+    }
+    body = self->used - m.at;
+    need = pb_varint_size((u64)body);
+    if (self->used + need > self->cap) {
+        pw_fail(self, PB_CAP);
+        return;
+    }
+    if (body > 0)
+        memmove(self->p + m.at + need, self->p + m.at, (usize)body);
+    v = (u64)body;
+    {
+        int i = 0;
+
+        while (v >= 0x80) {
+            self->p[m.at + i++] = (char)(u8)((v & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        self->p[m.at + i++] = (char)(u8)v;
+    }
+    self->used += need;
+}
+
+/* ---- 读端 ---- */
+
+PbReader pb_reader(const void *p, int n)
+{
+    PbReader r = { (const char *)p, n, 0, 0, PB_OK, 0 };
+
+    if (!p || n < 0)
+        r.bad = 1;
+    return r;
+}
+
+int ok(PbReader *self) { return self && !self->bad; }
+
+int error_code(PbReader *self) { return self ? self->err : PB_TRUNC; }
+
+int error_at(PbReader *self) { return self ? self->pos : -1; }
+
+/* 解一个 varint：1 成功 / 0 截断 / -1 超 10 字节或第 10 字节越界。
+   只解出来才更新 `*used`，失败时调用方的游标不动。 */
+static int pr_varint(const char *p, int n, int *used, u64 *out)
+{
+    u64 v = 0;
+    int i = 0;
+    int shift = 0;
+
+    if (!p || n < 0 || !used || !out)
+        return -1;
+    while (i < n && i < 10) {
+        int b = (int)(u8)p[i];
+
+        if (i == 9 && (b & 0xfe) != 0)
+            return -1;              /* 第 10 字节只允许 0x00 / 0x01 */
+        v |= ((u64)(b & 0x7f)) << shift;
+        i++;
+        if (!(b & 0x80)) {
+            *used = i;
+            *out = v;
+            return 1;
+        }
+        shift += 7;
+    }
+    return i >= 10 ? -1 : 0;
+}
+
+static u64 pr_le(const char *p, int n)
+{
+    u64 v = 0;
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        v |= ((u64)(u8)p[i]) << (i * 8);
+    return v;
+}
+
+static void pr_fail(PbReader *r, int code)
+{
+    if (!r || r->bad)
+        return;
+    r->bad = 1;
+    r->err = code;
+}
+
+/* 取下一个字段：1 有 / 0 读完 / -1 坏数据。负载已经越过（group 除外）。 */
+int next(PbReader *self, PbField *out)
+{
+    u64 key = 0;
+    u64 v = 0;
+    int used = 0;
+    int r = 0;
+    int field = 0;
+    int wire = 0;
+
+    if (!self || !out)
+        return -1;
+    if (self->bad)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (self->pos >= self->n)
+        return 0;
+    r = pr_varint(self->p + self->pos, self->n - self->pos, &used, &key);
+    if (r != 1) {
+        pr_fail(self, r == 0 ? PB_TRUNC : PB_OVERFLOW);
+        return -1;
+    }
+    self->pos += used;
+    field = (int)(key >> 3);
+    wire = (int)(key & 7);
+    if (field <= 0) {
+        pr_fail(self, PB_BADFIELD);
+        return -1;
+    }
+    if (wire == 6 || wire == 7) {
+        pr_fail(self, PB_BADWIRE);
+        return -1;
+    }
+    out->field = field;
+    out->wire = wire;
+    out->at = self->pos;
+    switch (wire) {
+    case PB_VARINT:
+        r = pr_varint(self->p + self->pos, self->n - self->pos, &used, &v);
+        if (r != 1) {
+            pr_fail(self, r == 0 ? PB_TRUNC : PB_OVERFLOW);
+            return -1;
+        }
+        self->pos += used;
+        out->u = v;
+        break;
+    case PB_FIXED64:
+        if (self->n - self->pos < 8) {
+            pr_fail(self, PB_TRUNC);
+            return -1;
+        }
+        out->u = pr_le(self->p + self->pos, 8);
+        self->pos += 8;
+        break;
+    case PB_FIXED32:
+        if (self->n - self->pos < 4) {
+            pr_fail(self, PB_TRUNC);
+            return -1;
+        }
+        out->u = pr_le(self->p + self->pos, 4);
+        self->pos += 4;
+        break;
+    case PB_BYTES:
+        r = pr_varint(self->p + self->pos, self->n - self->pos, &used, &v);
+        if (r != 1) {
+            pr_fail(self, r == 0 ? PB_TRUNC : PB_OVERFLOW);
+            return -1;
+        }
+        self->pos += used;
+        if (v > (u64)(self->n - self->pos)) {
+            pr_fail(self, PB_TRUNC);
+            return -1;
+        }
+        out->len = (int)v;
+        out->s = (Str){ (char[:]){ (char *)(self->p + self->pos), (int)v } };
+        self->pos += (int)v;
+        break;
+    case PB_GROUP_START:
+    case PB_GROUP_END:
+        break;
+    }
+    return 1;
+}
+
+/* 跳过认不出的字段。0/1/2/5 的负载 `next` 已经走完，group 在这里递归配对。 */
+int skip(PbReader *self, PbField *f)
+{
+    if (!self || !f)
+        return -1;
+    if (f->wire == PB_GROUP_END)
+        return -1;
+    if (f->wire != PB_GROUP_START)
+        return 1;
+    if (self->depth >= 32) {
+        pr_fail(self, PB_DEPTH);
+        return -1;
+    }
+    self->depth++;
+    for (;;) {
+        PbField g = { 0 };
+        int r = next(self, &g);
+
+        if (r != 1) {
+            self->depth--;
+            return -1;
+        }
+        if (g.wire == PB_GROUP_END) {
+            self->depth--;
+            return g.field == f->field ? 1 : -1;
+        }
+        if (g.wire == PB_GROUP_START && skip(self, &g) != 1) {
+            self->depth--;
+            return -1;
+        }
+    }
+}
+
+/* ---- 字段访问器（线类型不符返回 -1） ---- */
+
+int as_uint(PbField *self, u64 *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = self->u;
+    return 1;
+}
+
+int as_int(PbField *self, i64 *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = (i64)self->u;
+    return 1;
+}
+
+/* int32：线上是 64 位补码，按低 32 位截断（负数会先符号扩展再截）。 */
+int as_int32(PbField *self, int *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = (int)(i32)(u32)self->u;
+    return 1;
+}
+
+int as_sint(PbField *self, i64 *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = pb_unzigzag(self->u);
+    return 1;
+}
+
+int as_sint32(PbField *self, int *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = (int)pb_unzigzag(self->u);
+    return 1;
+}
+
+int as_bool(PbField *self, int *out)
+{
+    if (!self || !out || self->wire != PB_VARINT)
+        return -1;
+    *out = self->u != 0;
+    return 1;
+}
+
+int as_fixed32(PbField *self, u32 *out)
+{
+    if (!self || !out || self->wire != PB_FIXED32)
+        return -1;
+    *out = (u32)self->u;
+    return 1;
+}
+
+int as_fixed64(PbField *self, u64 *out)
+{
+    if (!self || !out || self->wire != PB_FIXED64)
+        return -1;
+    *out = self->u;
+    return 1;
+}
+
+int as_float(PbField *self, f32 *out)
+{
+    u32 bits = 0;
+
+    if (!self || !out || self->wire != PB_FIXED32)
+        return -1;
+    bits = (u32)self->u;
+    memcpy(out, &bits, sizeof bits);
+    return 1;
+}
+
+int as_double(PbField *self, f64 *out)
+{
+    u64 bits = 0;
+
+    if (!self || !out || self->wire != PB_FIXED64)
+        return -1;
+    bits = self->u;
+    memcpy(out, &bits, sizeof bits);
+    return 1;
+}
+
+/* string / bytes 都是字节视图，不校验 UTF-8、不复制。 */
+int as_str(PbField *self, Str *out)
+{
+    if (!self || !out || self->wire != PB_BYTES)
+        return -1;
+    *out = self->s;
+    return 1;
+}
+
+/* 进入嵌套消息：返回一个只在父输入范围内活动的 reader。 */
+int as_message(PbField *self, PbReader *out)
+{
+    if (!self || !out || self->wire != PB_BYTES)
+        return -1;
+    *out = pb_reader(self->s.s.data, self->s.s.len);
+    return 1;
+}
+
+/* ---- packed 段 ---- */
+
+int packed(PbField *self, PbIter *out)
+{
+    if (!self || !out || self->wire != PB_BYTES)
+        return -1;
+    out->p = self->s.s.data;
+    out->n = self->s.s.len;
+    out->pos = 0;
+    out->bad = 0;
+    return 1;
+}
+
+int ok(PbIter *self) { return self && !self->bad; }
+
+int error_code(PbIter *self) { return self && self->bad ? PB_TYPE : PB_OK; }
+
+static int pi_varint(PbIter *it, u64 *out)
+{
+    int used = 0;
+    int r = 0;
+
+    if (!it || !out)
+        return -1;
+    if (it->bad)
+        return -1;
+    if (it->pos >= it->n)
+        return 0;
+    r = pr_varint(it->p + it->pos, it->n - it->pos, &used, out);
+    if (r != 1) {
+        it->bad = 1;
+        return -1;
+    }
+    it->pos += used;
+    return 1;
+}
+
+int next_uint(PbIter *self, u64 *out) { return pi_varint(self, out); }
+
+int next_int(PbIter *self, i64 *out)
+{
+    u64 v = 0;
+    int r = 0;
+
+    if (!out)
+        return -1;
+    r = pi_varint(self, &v);
+    if (r == 1)
+        *out = (i64)v;
+    return r;
+}
+
+int next_sint(PbIter *self, i64 *out)
+{
+    u64 v = 0;
+    int r = 0;
+
+    if (!out)
+        return -1;
+    r = pi_varint(self, &v);
+    if (r == 1)
+        *out = pb_unzigzag(v);
+    return r;
+}
+
+int next_bool(PbIter *self, int *out)
+{
+    u64 v = 0;
+    int r = 0;
+
+    if (!out)
+        return -1;
+    r = pi_varint(self, &v);
+    if (r == 1)
+        *out = v != 0;
+    return r;
+}
+
+int next_fixed32(PbIter *self, u32 *out)
+{
+    if (!self || !out || self->bad)
+        return -1;
+    if (self->pos >= self->n)
+        return 0;
+    if (self->n - self->pos < 4) {
+        self->bad = 1;
+        return -1;
+    }
+    *out = (u32)pr_le(self->p + self->pos, 4);
+    self->pos += 4;
+    return 1;
+}
+
+int next_fixed64(PbIter *self, u64 *out)
+{
+    if (!self || !out || self->bad)
+        return -1;
+    if (self->pos >= self->n)
+        return 0;
+    if (self->n - self->pos < 8) {
+        self->bad = 1;
+        return -1;
+    }
+    *out = pr_le(self->p + self->pos, 8);
+    self->pos += 8;
+    return 1;
+}
+
+int next_float(PbIter *self, f32 *out)
+{
+    u32 bits = 0;
+    int r = 0;
+
+    if (!out)
+        return -1;
+    r = next_fixed32(self, &bits);
+    if (r == 1)
+        memcpy(out, &bits, sizeof bits);
+    return r;
+}
+
+int next_double(PbIter *self, f64 *out)
+{
+    u64 bits = 0;
+    int r = 0;
+
+    if (!out)
+        return -1;
+    r = next_fixed64(self, &bits);
+    if (r == 1)
+        memcpy(out, &bits, sizeof bits);
+    return r;
+}
+
+/* ---- 用例 ---- */
+
+static int t_eq(const void *got, int n, const void *want, int wn)
+{
+    const u8 *a = (const u8 *)got;
+    const u8 *b = (const u8 *)want;
+    int i = 0;
+
+    if (n != wn)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+test "protobuf：规范向量（varint / string / 嵌套 / fixed / packed）" {
+    u8 buf[64] = { 0 };
+    PbWriter w = pb_writer(buf, (int)sizeof buf);
+    PbReader r = { 0 };
+    PbField f = { 0 };
+    PbField tag = { 0 };
+    PbMark m = { 0 };
+    Str s = { 0 };
+    PbReader sub = { 0 };
+    u64 u = 0;
+    u32 f32v = 0;
+    u64 f64v = 0;
+    f32 fl = 0;
+    f64 db = 0;
+    static const u8 want1[] = { 0x08, 0x96, 0x01 };
+    static const u8 want2[] = { 0x12, 0x07, 't', 'e', 's', 't', 'i', 'n', 'g' };
+    static const u8 want3[] = { 0x1a, 0x03, 0x08, 0x96, 0x01 };
+    static const u8 want4[] = { 0x0a, 0x03, 0x01, 0x02, 0x03 };
+
+    /* 1. 字段 1 = 150 */
+    w.write_tag_uint(1, 150);
+    if (!w.ok() || w.len() != 3 || !t_eq(buf, w.len(), want1, 3))
+        return err(1, "varint 150 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.field != 1 || f.wire != PB_VARINT)
+        return err(2, "varint 150 解不出字段");
+    if (f.as_uint(&u) != 1 || u != 150)
+        return err(3, "varint 150 值不对");
+    if (r.next(&f) != 0)
+        return err(4, "varint 150 之后应该读完");
+
+    /* 2. 字段 2 = "testing"（规范里的第二个例子） */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_tag_str(2, (Str){ S("testing") });
+    if (!w.ok() || !t_eq(buf, w.len(), want2, 9))
+        return err(5, "string 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.field != 2 || f.wire != PB_BYTES || f.len != 7)
+        return err(6, "string 字段头不对");
+    if (f.as_str(&s) != 1 || s.s.len != 7 || s.s.data[0] != 't'
+        || s.s.data != (char *)buf + 2)
+        return err(7, "string 视图不对（必须是输入上的视图）");
+    if (f.as_uint(&u) != -1)
+        return err(8, "线类型不符时 as_uint 应该 -1");
+
+    /* 3. 嵌套消息：字段 3 { 字段 1 = 150 }，用 mark 回填长度 */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_key(3, PB_BYTES);
+    w.mark(&m);
+    w.write_tag_uint(1, 150);
+    w.mark_end(m);
+    if (!w.ok() || !t_eq(buf, w.len(), want3, 5))
+        return err(9, "嵌套消息编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.as_message(&sub) != 1)
+        return err(10, "嵌套消息取不出来");
+    if (sub.next(&tag) != 1 || tag.field != 1 || tag.as_uint(&u) != 1 || u != 150)
+        return err(11, "嵌套消息里的字段不对");
+
+    /* 4. fixed32 / fixed64 / float / double */
+    {
+        static const u8 w32[] = { 0x0d, 0x78, 0x56, 0x34, 0x12 };
+        static const u8 w64[] = { 0x09, 1, 2, 3, 4, 5, 6, 7, 8 };
+        static const u8 wf[] = { 0x0d, 0x00, 0x00, 0x80, 0x3f };
+        static const u8 wd[] = { 0x09, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f };
+
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_tag_fixed32(1, 0x12345678u);
+        if (!w.ok() || !t_eq(buf, w.len(), w32, 5))
+            return err(12, "fixed32 编得不对");
+        r = pb_reader(buf, w.len());
+        if (r.next(&f) != 1 || f.as_fixed32(&f32v) != 1 || f32v != 0x12345678u)
+            return err(13, "fixed32 解得不对");
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_tag_fixed64(1, 0x0807060504030201ull);
+        if (!w.ok() || !t_eq(buf, w.len(), w64, 9))
+            return err(14, "fixed64 编得不对");
+        r = pb_reader(buf, w.len());
+        if (r.next(&f) != 1 || f.as_fixed64(&f64v) != 1
+            || f64v != 0x0807060504030201ull)
+            return err(15, "fixed64 解得不对");
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_tag_float(1, 1.0f);
+        if (!w.ok() || !t_eq(buf, w.len(), wf, 5))
+            return err(16, "float 1.0 编得不对");
+        r = pb_reader(buf, w.len());
+        if (r.next(&f) != 1 || f.as_float(&fl) != 1 || fl != 1.0f)
+            return err(17, "float 1.0 解得不对");
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_tag_double(1, 1.0);
+        if (!w.ok() || !t_eq(buf, w.len(), wd, 9))
+            return err(18, "double 1.0 编得不对");
+        r = pb_reader(buf, w.len());
+        if (r.next(&f) != 1 || f.as_double(&db) != 1 || db != 1.0)
+            return err(19, "double 1.0 解得不对");
+    }
+
+    /* 5. packed：字段 1 = [1,2,3] */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_key(1, PB_BYTES);
+    w.mark(&m);
+    w.write_uint(1);
+    w.write_uint(2);
+    w.write_uint(3);
+    w.mark_end(m);
+    if (!w.ok() || !t_eq(buf, w.len(), want4, 5))
+        return err(20, "packed 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.wire != PB_BYTES)
+        return err(21, "packed 字段头不对");
+    {
+        PbIter it = { 0 };
+
+        if (f.packed(&it) != 1)
+            return err(22, "packed 迭代器建不起来");
+        if (it.next_uint(&u) != 1 || u != 1)
+            return err(23, "packed 第 1 个元素不对");
+        if (it.next_uint(&u) != 1 || u != 2)
+            return err(24, "packed 第 2 个元素不对");
+        if (it.next_uint(&u) != 1 || u != 3)
+            return err(25, "packed 第 3 个元素不对");
+        if (it.next_uint(&u) != 0)
+            return err(26, "packed 读完之后应该返回 0");
+    }
+
+    /* 6. 空字符串、bool */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_tag_str(2, (Str){ S("") });
+    w.write_tag_bool(3, 1);
+    if (!w.ok() || w.len() != 4 || buf[0] != 0x12 || buf[1] != 0
+        || buf[2] != 0x18 || buf[3] != 0x01)
+        return err(27, "空串/bool 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.as_str(&s) != 1 || s.s.len != 0)
+        return err(28, "空串解得不对");
+    if (r.next(&f) != 1) {
+        return err(29, "bool 字段没解出来");
+    }
+    {
+        int b = 0;
+
+        if (f.as_bool(&b) != 1 || b != 1)
+            return err(30, "bool 解得不对");
+    }
+}
+
+test "protobuf：zigzag、负数与 int32 截断" {
+    u8 buf[32] = { 0 };
+    PbWriter w = { 0 };
+    PbReader r = { 0 };
+    PbField f = { 0 };
+    i64 v = 0;
+    int i32v = 0;
+    static const u8 sz[] = { 0x08, 0x01 };
+    static const u8 sm[] = { 0x08, 0xfe, 0xff, 0xff, 0xff, 0xff,
+                             0xff, 0xff, 0xff, 0xff, 0x01 };
+    static const u8 big[] = { 0x08, 0x81, 0x80, 0x80, 0x80, 0x10 };
+
+    /* zigzag 的定义值 */
+    if (pb_zigzag(0) != 0 || pb_zigzag(-1) != 1 || pb_zigzag(1) != 2
+        || pb_zigzag(-2) != 3)
+        return err(1, "zigzag 映射不对");
+    if (pb_unzigzag(0) != 0 || pb_unzigzag(1) != -1 || pb_unzigzag(2) != 1
+        || pb_unzigzag(3) != -2)
+        return err(2, "unzigzag 映射不对");
+    if (pb_zigzag(-9223372036854775807ll - 1) != 0xffffffffffffffffull)
+        return err(3, "zigzag 对 i64 最小值不对");
+    if (pb_unzigzag(0xffffffffffffffffull) != -9223372036854775807ll - 1)
+        return err(4, "unzigzag 对 i64 最小值不对");
+
+    /* sint32 = -1 -> 08 01 */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_tag_sint(1, -1);
+    if (!w.ok() || !t_eq(buf, w.len(), sz, 2))
+        return err(5, "sint -1 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.as_sint(&v) != 1 || v != -1)
+        return err(6, "sint -1 解得不对");
+
+    /* int32 = -2 -> 10 字节补码 */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_tag_int(1, -2);
+    if (!w.ok() || !t_eq(buf, w.len(), sm, 11))
+        return err(7, "int -2 编得不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.as_int(&v) != 1 || v != -2)
+        return err(8, "int -2 解得不对");
+    if (f.as_int32(&i32v) != 1 || i32v != -2)
+        return err(9, "int -2 按 int32 截断不对");
+
+    /* 超宽 varint 按 int32 截断：0x1_0000_0001 -> 1 */
+    r = pb_reader(big, (int)sizeof big);
+    if (r.next(&f) != 1 || f.as_int(&v) != 1 || v != 4294967297ll)
+        return err(10, "超宽 varint 的 64 位值不对");
+    if (f.as_int32(&i32v) != 1 || i32v != 1)
+        return err(11, "int32 截断不对");
+    {
+        u32 wrong = 0;
+
+        if (f.as_fixed32(&wrong) != -1)
+            return err(12, "线类型不符时 as_fixed32 应该 -1");
+    }
+}
+
+test "protobuf：未知字段跳过、group、坏数据与写端容量" {
+    u8 buf[32] = { 0 };
+    PbReader r = { 0 };
+    PbField f = { 0 };
+    PbWriter w = { 0 };
+    u64 u = 0;
+    static const u8 two[] = { 0x08, 0x01, 0x10, 0x02 };
+    static const u8 grp[] = { 0x0b, 0x10, 0x01, 0x0c, 0x08, 0x05 };
+    static const u8 endgrp[] = { 0x0c };
+    static const u8 trunc[] = { 0x08 };
+    static const u8 field0[] = { 0x00 };
+    static const u8 wire6[] = { 0x0e };
+    static const u8 wire7[] = { 0x0f };
+    static const u8 lenover[] = { 0x0a, 0x05, 0x01 };
+    static const u8 over[] = { 0x08, 0xff, 0xff, 0xff, 0xff, 0xff,
+                               0xff, 0xff, 0xff, 0xff, 0xff, 0x02 };
+
+    /* 未知字段：字段 1 认识、字段 2 跳过 */
+    r = pb_reader(two, (int)sizeof two);
+    if (r.next(&f) != 1 || f.field != 1 || f.as_uint(&u) != 1 || u != 1)
+        return err(1, "字段 1 不对");
+    if (r.skip(&f) != 1)
+        return err(2, "跳过已知字段应该成功（空操作）");
+    if (r.next(&f) != 1 || f.field != 2 || f.as_uint(&u) != 1 || u != 2)
+        return err(3, "字段 2 不对");
+    if (r.next(&f) != 0)
+        return err(4, "两个字段之后应该读完");
+
+    /* group：整段跳过，后面还有字段 1 = 5 */
+    r = pb_reader(grp, (int)sizeof grp);
+    if (r.next(&f) != 1 || f.field != 1 || f.wire != PB_GROUP_START)
+        return err(5, "group 起始标记不对");
+    if (r.skip(&f) != 1)
+        return err(6, "group 没跳过");
+    if (r.next(&f) != 1 || f.field != 1 || f.as_uint(&u) != 1 || u != 5)
+        return err(7, "group 之后的字段不对");
+
+    /* 未配对的 group 结束、截断、字段号 0、线类型 6/7、超长 varint、长度越界 */
+    r = pb_reader(endgrp, (int)sizeof endgrp);
+    if (r.next(&f) != 1 || r.skip(&f) != -1)
+        return err(8, "孤立的 group 结束标记应该报错");
+    r = pb_reader(trunc, (int)sizeof trunc);
+    if (r.next(&f) != -1 || r.error_code() != PB_TRUNC)
+        return err(9, "截断的 varint 应该 PB_TRUNC");
+    r = pb_reader(field0, (int)sizeof field0);
+    if (r.next(&f) != -1 || r.error_code() != PB_BADFIELD)
+        return err(10, "字段号 0 应该 PB_BADFIELD");
+    r = pb_reader(wire6, (int)sizeof wire6);
+    if (r.next(&f) != -1 || r.error_code() != PB_BADWIRE)
+        return err(11, "线类型 6 应该 PB_BADWIRE");
+    r = pb_reader(wire7, (int)sizeof wire7);
+    if (r.next(&f) != -1 || r.error_code() != PB_BADWIRE)
+        return err(12, "线类型 7 应该 PB_BADWIRE");
+    r = pb_reader(lenover, (int)sizeof lenover);
+    if (r.next(&f) != -1 || r.error_code() != PB_TRUNC)
+        return err(13, "长度越过输入应该 PB_TRUNC");
+    r = pb_reader(over, (int)sizeof over);
+    if (r.next(&f) != -1 || r.error_code() != PB_OVERFLOW)
+        return err(14, "11 字节 varint 应该 PB_OVERFLOW");
+
+    /* 写端：容量不够 -> ok() 0，error() PB_CAP；字段号非法 -> PB_BADFIELD */
+    {
+        char tiny[2] = { 0 };
+
+        w = pb_writer(tiny, 2);
+        w.write_tag_uint(1, 150);
+        if (w.ok() || w.error_code() != PB_CAP || w.len() != 2)
+            return err(15, "容量不足应该 PB_CAP 且只写 2 字节");
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_key(0, PB_VARINT);
+        if (w.ok() || w.error_code() != PB_BADFIELD)
+            return err(16, "字段号 0 写端应该 PB_BADFIELD");
+        w = pb_writer(buf, (int)sizeof buf);
+        w.write_key(1, 6);
+        if (w.ok() || w.error_code() != PB_BADFIELD)
+            return err(17, "线类型 6 写端应该 PB_BADFIELD");
+    }
+}
+
+test "protobuf：尺寸、tag 与 mark 回填" {
+    u8 buf[64] = { 0 };
+    PbWriter w = { 0 };
+    PbMark m = { 0 };
+    PbReader r = { 0 };
+    PbField f = { 0 };
+    u64 u = 0;
+
+    if (pb_varint_size(0) != 1 || pb_varint_size(127) != 1
+        || pb_varint_size(128) != 2 || pb_varint_size(16383) != 2
+        || pb_varint_size(16384) != 3 || pb_varint_size(0xffffffffull) != 5
+        || pb_varint_size(0xffffffffffffffffull) != 10)
+        return err(1, "varint 尺寸边界不对");
+    if (pb_tag_size(1) != 1 || pb_tag_size(15) != 1 || pb_tag_size(16) != 2
+        || pb_tag_size(2047) != 2 || pb_tag_size(2048) != 3
+        || pb_tag_size(0x1fffffff) != 5 || pb_tag_size(0) != 0)
+        return err(2, "tag 尺寸不对");
+
+    /* 体 = 8 × (tag + varint 200) = 8 × 3 = 24 字节，前缀 1 字节 */
+    w = pb_writer(buf, (int)sizeof buf);
+    w.write_key(1, PB_BYTES);
+    w.mark(&m);
+    {
+        int i = 0;
+
+        for (i = 0; i < 8; i++)
+            w.write_tag_uint(1, 200);
+    }
+    w.mark_end(m);
+    if (!w.ok() || w.len() != 2 + 24)
+        return err(3, "mark_end 回填长度不对");
+    if ((u8)buf[0] != 0x0a || (u8)buf[1] != 24)
+        return err(4, "体长 24 的长度前缀不对");
+    r = pb_reader(buf, w.len());
+    if (r.next(&f) != 1 || f.wire != PB_BYTES || f.len != 24)
+        return err(5, "回填之后的字段头不对");
+    {
+        PbReader sub = { 0 };
+        int i = 0;
+
+        if (f.as_message(&sub) != 1)
+            return err(6, "子消息取不出来");
+        for (i = 0; i < 8; i++)
+            if (sub.next(&f) != 1 || f.as_uint(&u) != 1 || u != 200)
+                return err(7, "子消息里的 200 不对");
+    }
+
+    /* put：直接把 callee 写进剩余空间 */
+    w = pb_writer(buf, (int)sizeof buf);
+    {
+        char *at = 0;
+
+        w.write_key(2, PB_BYTES);
+        w.write_uint(3);
+        if (w.put(3, &at) != 1 || at != (char *)buf + 2)
+            return err(9, "put 给的指针不对");
+        at[0] = 'a';
+        at[1] = 'b';
+        at[2] = 'c';
+    }
+    if (!w.ok() || w.len() != 5 || (u8)buf[0] != 0x12 || (u8)buf[1] != 3
+        || (u8)buf[2] != 'a' || (u8)buf[4] != 'c')
+        return err(10, "put 写进去的字节不对");
+    {
+        char *at = 0;
+
+        w = pb_writer(buf, 2);
+        if (w.put(3, &at) != -1 || w.error_code() != PB_CAP)
+            return err(11, "put 放不下应该 PB_CAP");
+    }
+
+    /* 缓冲刚好放不下长度前缀 -> PB_CAP，且不写脏数据 */
+    w = pb_writer(buf, 3);
+    w.write_key(1, PB_BYTES);
+    w.mark(&m);
+    w.write_uint(1);
+    w.write_uint(2);
+    w.mark_end(m);
+    if (w.ok() || w.error_code() != PB_CAP)
+        return err(8, "回填放不下应该 PB_CAP");
+}

@@ -2,14 +2,16 @@
 
 这份文档回答一个问题：**「继续扩 `std/`，什么时候才算到头？」**
 
-结论先给：到目前为止（381 个模块、九十二批、`cmake --build build --target stdtest`
-381/381 全绿），**按族覆盖没有空缺**。
+结论先给：到目前为止（382 个模块、九十三批、`cmake --build build --target stdtest`
+382/382 全绿），**按族覆盖没有空缺**。
 
 这份文档的第 4 节以前写的是「判定标准：只收判断型/编解码型、新模块只能是变体」。
 那条自我设限已经删掉：**只要开发者日常要用的能力，就进 `std/`**。标准库存在的意义
 是不让人为了「发一封邮件/读一个 HTTP/2 响应」去引第三方库，而不是维持一个「小而纯」
 的类型学。所以第九十二批补了 HTTP/2（`hpack` + `http2` + `http2c` + `http2d`）——
-它既不是变体，也不是纯编解码，但它显然是开发者日常要用的东西。
+它既不是变体，也不是纯编解码，但它显然是开发者日常要用的东西。第九十三批补的是
+protobuf：`std/data/protobuf.c6` 做线格式运行时，`tools/protoc6` 从 `.proto` 生成 C6 结构体
+与编解码——嵌入式项目里常见的那条链路，从字节一直到工具链。
 
 下面这份矩阵仍然有用：它记录**现在有什么、刻意不做什么、以及不做的代价判断**。
 
@@ -20,7 +22,7 @@
 | 目录 | 模块数 | 职责 |
 |---|---:|---|
 | `std/core/` | 53 | 类型、内存、位运算、数值与线性代数、单元与几何、运行时原语 |
-| `std/data/` | 85 | 文档/媒体/系统镜像/字幕/网络配置等格式的解析与生成 |
+| `std/data/` | 86 | 文档/媒体/系统镜像/字幕/网络配置等格式的解析与生成 |
 | `std/encoding/` | 54 | 文本编码（base 家族、转义）、校验和、哈希、压缩、KDF |
 | `std/net/` | 56 | 传输、应用协议、安全与策略、运维与可观测 |
 | `std/text/` | 52 | 字符串、搜索、分析、排版辅助 |
@@ -28,7 +30,7 @@
 | `std/os/` | 32 | 文件、进程、线程、时间、终端、系统信息 |
 | `std/async/` | 13 | 语言级 `async`/`await` 的运行时与横切面 |
 | `std/analysis/` | 3 | 用 c6 写的 c6 静态分析（lex/parse/ub） |
-| **合计** | **381** | |
+| **合计** | **382** | |
 
 ---
 
@@ -53,12 +55,12 @@
 | 结构化序列化 | asn1 / pem(在 data) / varint | ✅ |
 | base36 / base62 | — | — 变体，无新增能力 |
 
-### 2.2 `std/data`（85）
+### 2.2 `std/data`（86）
 
 | 族 | 代表模块 | 状态 |
 |---|---|---|
 | 结构化文本 | json / yaml / toml / xml / kdl / ini / props / dotenv / query / bencode | ✅ |
-| 二进制序列化 | cbor / msgpack / ubjson / bson / plist / protobuf(手写编解码) | ✅ |
+| 二进制序列化 | cbor / msgpack / ubjson / bson / plist / protobuf（线格式在 `std.data.protobuf`，代码生成在 `tools/protoc6`） | ✅ |
 | 表格与清单 | csv / vcf / ics / crontab / hosts / resolvconf / sshconfig / netrc / knownhosts | ✅ |
 | 文档与邮件 | html / markdown(在 text) / rtf / mbox / pem / x509 / keys / jwt / sqlite | ✅ |
 | 音频容器 | wav / aiff / au / voc / ircam / flac / ogg / mp3 / midi | ✅ |

@@ -279,6 +279,7 @@ yay -Syu c6
 ├── std/                标准库：一个文件一个 module（std/container/vec.c6 -> std.container.vec）
 ├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2；
 │                       regression.sh 是回归用例实现，调度交给 CTest
+├── tools/              开发工具：protoc6（.proto -> C6 结构体与编解码生成器）
 ├── examples/           可运行示例：每个特性一个 *_demo.c6，wordcount 是集成示例
 ├── CMakeLists.txt      构建入口：只按顺序 include cmake/ 下的模块
 ├── cmake/              C6Options / C6Tcc / C6Build / C6Install /
@@ -476,6 +477,7 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/props.c6         std.data.props         .properties/.env 零分配读取：props_open/next、e.decode(buf)、props_lookup/has/count（\n/\uXXXX/代理对/续行）
   std/data/bencode.c6       std.data.bencode      Bencode（BitTorrent）：benc_writer 的 write_int/write_str/write_list/write_dict/write_end、benc_reader + next 的标记流；拒绝前导零与溢出
   std/data/msgpack.c6       std.data.msgpack      MessagePack：mp_writer 的 nil/bool/uint/int/f64/str/bin/array/map、mp_reader + next 的 MpTag；不支持扩展类型
+  std/data/protobuf.c6      std.data.protobuf      protobuf 线格式：pb_writer/pb_reader 的 key/tag/varint/packed/mark/put，PbField 的 as_* 与 skip；配 tools/protoc6 从 .proto 生成结构体与编解码
   std/data/cbor.c6          std.data.cbor         CBOR（RFC 8949）：cbor_writer 的 uint/int/bytes/text/array/map/bool/null/f64、cbor_reader + next 的 CborTag；半/单/双精度都转 f64，不支持不定长与标签
   std/data/pem.c6           std.data.pem          PEM（RFC 7468）：pem_encode（64 列 Base64）、pem_reader + next 的多块迭代、PemBlock.decode_der；标签 1..48 个可打印 ASCII
   std/data/wav.c6           std.data.wav           RIFF/WAVE 头解析：wav_parse 给格式/声道/采样率/位宽/对齐/data 偏移，WavInfo.frames 算帧数，跳过 LIST/JUNK 等块

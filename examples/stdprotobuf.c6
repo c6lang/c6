@@ -1,0 +1,248 @@
+/* stdprotobuf：protobuf 这条线从线格式到工具链的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这条线分三层，示例按层走一遍：
+ *
+ *   1. 线格式（std/data/protobuf.c6）：直接拿 PbWriter / PbReader 手写 tag，
+ *      看 varint / 长度前缀 / packed 到底长成什么样；
+ *   2. 生成代码（tools/protoc6）：把 tests/protobuf/addressbook.proto 编成
+ *      C6 结构体 + init/size/encode/decode，再用它编解码一本通讯录；
+ *   3. 前向兼容：往合法字节里塞一个未知字段（含 group），解码侧靠 skip 跳过。
+ *
+ * 生成物不在仓库里，跑之前先生成（模块名就是路径，所以要加 `-I`）：
+ *
+ *     ./tcc/c6 -B tcc -I . -I tools -o build/protoc6 tools/protoc6/protoc6.c6 \
+ *         tools/protoc6/protofile.c6 std/core/types.c6 std/text/str.c6 \
+ *         std/data/protobuf.c6
+ *     build/protoc6 --out build/pb tests/protobuf/addressbook.proto
+ *     ./tcc/c6 -B tcc -I . -I build/pb -o build/stdprotobuf \
+ *         examples/stdprotobuf.c6 build/pb/demo/addressbook.c6 \
+ *         std/core/types.c6 std/text/str.c6 std/data/protobuf.c6
+ *     ./build/stdprotobuf
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.protobuf;
+import demo.addressbook;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static void hexdump(const char *tag, const u8 *p, int n)
+{
+    int i = 0;
+
+    printf("  %s (%d 字节):", tag, n);
+    for (i = 0; i < n; i++)
+        printf(" %02x", p[i]);
+    printf("\n");
+}
+
+/* ---- 1. 线格式：手写 tag ---- */
+
+static void tour_wire(void)
+{
+    u8 buf[64] = { 0 };
+    PbWriter w = pb_writer(buf, (int)sizeof buf);
+    PbReader r = { 0 };
+    PbField f = { 0 };
+    i64 id = 0;
+    Str name = { 0 };
+    u64 scores = 0;
+
+    printf("wire: 同一份数据在线上长什么样\n");
+    /* Person{name="testing", id=300, scores=[1,2,3]}，字段号来自 .proto */
+    w.write_key(1, PB_BYTES);
+    w.write_uint(7);
+    w.write_str((Str){ S("testing") });
+    w.write_tag_uint(2, 300);
+    w.write_key(6, PB_BYTES); /* repeated int32 在 proto3 里打包 */
+    w.write_uint(3);
+    w.write_uint(1);
+    w.write_uint(2);
+    w.write_uint(3);
+    check(w.ok(), "wire: 写入没溢出");
+    hexdump("Person", buf, w.len());
+
+    /* 和规范里的三个例子对齐：08 96 01 / 12 07 testing / 0a 03 01 02 03 */
+    check(w.len() == 17, "wire: 总长 17");
+    check(buf[0] == 0x0a && buf[1] == 0x07, "wire: name 的 tag+长度");
+    check(buf[9] == 0x10 && buf[10] == 0xac && buf[11] == 0x02,
+          "wire: id=300 的 varint 是 ac 02");
+    check(buf[12] == 0x32 && buf[13] == 0x03, "wire: scores 打包是 tag+字节数");
+
+    /* 读回来：字段可以不按顺序问，遇到不关心的就 skip */
+    r = pb_reader(buf, w.len());
+    while (r.next(&f) == 1) {
+        if (f.field == 1) {
+            check(f.as_str(&name) == 1 && name.s.len == 7, "wire: 解出 name");
+        } else if (f.field == 2) {
+            check(f.as_int(&id) == 1 && id == 300, "wire: 解出 id");
+        } else if (f.field == 6) {
+            PbIter it = { 0 };
+            int seen = 0;
+
+            check(f.packed(&it) == 1, "wire: scores 是打包的");
+            while (it.next_uint(&scores) == 1)
+                seen++;
+            check(seen == 3, "wire: scores 解出 3 个");
+        } else {
+            check(r.skip(&f) == 1, "wire: 未知字段能跳过");
+        }
+    }
+    check(r.ok(), "wire: 读到结尾没有坏数据");
+    printf("wire: 手写 tag 与规范向量一致\n");
+}
+
+/* ---- 2. 生成代码：编解码一本通讯录 ---- */
+
+static void tour_generated(void)
+{
+    struct demo_AddressBook book = { 0 };
+    struct demo_Person *p = 0;
+    struct demo_AddressBook back = { 0 };
+    u8 *buf = 0;
+    int need = 0;
+    int n = 0;
+
+    printf("gen: 用 protoc6 生成的 encode/decode 走通讯录\n");
+    demo_AddressBook_init(&book);
+
+    p = &book.people[0];
+    demo_Person_init(p);
+    p->name = (Str){ S("alice") };
+    p->id = 1;
+    p->email = (Str){ S("alice@example.com") };
+    p->kind = demo_Person_Kind_KIND_HUMAN;
+    p->phones[0].number = (Str){ S("+1-555-0100") };
+    p->phones[0].type = demo_PhoneType_PHONE_MOBILE;
+    p->phones_n = 1;
+    p->scores[0] = 7;
+    p->scores[1] = 9;
+    p->scores_n = 2;
+    p->tags[0].key = (Str){ S("team") };
+    p->tags[0].value = 42;
+    p->tags_n = 1;
+    p->handle = (Str){ S("@alice") };
+    p->contact_case = 11; /* oneof contact 选了 handle */
+    p->active_has = 1;    /* optional 显式写 false，线上也要出现 */
+    p->active = 0;
+    book.people_n++;
+
+    p = &book.people[1];
+    demo_Person_init(p);
+    p->name = (Str){ S("bob") };
+    p->id = 2;
+    p->deltas[0] = -1;
+    p->deltas[1] = 1;
+    p->deltas_n = 2;
+    p->icq = 123456;
+    p->contact_case = 12;
+    p->ok = 1;
+    book.people_n++;
+
+    /* 两遍：先量，再写；缓冲刚好够，写完长度必须等于量出来的数 */
+    need = demo_AddressBook_size(&book);
+    check(need > 0, "gen: size 量出正数");
+    buf = (u8 *)malloc((size_t)need);
+    check(buf != 0, "gen: 分配得出来");
+    if (!buf)
+        return;
+    n = demo_AddressBook_encode(&book, buf, need);
+    check(n == need, "gen: encode 长度与 size 一致");
+    hexdump("AddressBook", buf, n);
+
+    check(demo_AddressBook_decode(buf, n, &back) == 1, "gen: decode 成功");
+    check(back.people_n == 2, "gen: 两个人都在");
+    check(back.people[0].id == 1 && back.people[1].id == 2, "gen: id 往返");
+    check(back.people[0].name.s.len == 5
+              && memcmp(back.people[0].name.s.data, "alice", 5) == 0,
+          "gen: name 往返");
+    check(back.people[0].phones_n == 1
+              && back.people[0].phones[0].type == demo_PhoneType_PHONE_MOBILE,
+          "gen: 嵌套消息往返");
+    check(back.people[0].scores_n == 2 && back.people[0].scores[1] == 9,
+          "gen: 打包的 repeated 往返");
+    check(back.people[0].tags_n == 1 && back.people[0].tags[0].value == 42,
+          "gen: map 往返");
+    check(back.people[0].contact_case == 11 && back.people[0].handle.s.len == 6,
+          "gen: oneof 往返");
+    check(back.people[0].active_has && !back.people[0].active,
+          "gen: optional 的 presence 往返");
+    check(back.people[1].deltas_n == 2 && back.people[1].deltas[0] == -1,
+          "gen: sint64 的 zigzag 往返");
+    check(back.people[1].contact_case == 12 && back.people[1].icq == 123456,
+          "gen: oneof 换成员也往返");
+
+    /* 再编一次必须逐字节一致（否则 decode 有信息丢失） */
+    {
+        u8 *again = (u8 *)malloc((size_t)need);
+        int m = 0;
+
+        check(again != 0, "gen: 再分配得出来");
+        if (again) {
+            m = demo_AddressBook_encode(&back, again, need);
+            check(m == n && memcmp(again, buf, (size_t)n) == 0,
+                  "gen: 解码后再编码逐字节一致");
+            free(again);
+        }
+    }
+    free(buf);
+    printf("gen: 两层嵌套 + map + oneof + optional 全部往返\n");
+}
+
+/* ---- 3. 前向兼容：未知字段 ---- */
+
+static void tour_unknown(void)
+{
+    /* Person{id=7}，后面跟一个 100 号 varint 和一个 50 号 group */
+    static const u8 wire[] = {
+        0x10, 0x07,
+        0xa0, 0x06, 0x63,
+        0x93, 0x03, 0x08, 0x01, 0x94, 0x03,
+    };
+    struct demo_Person p = { 0 };
+
+    printf("compat: 老代码遇到新字段\n");
+    check(demo_Person_decode(wire, (int)sizeof wire, &p) == 1,
+          "compat: 未知字段（含 group）能跳过");
+    check(p.id == 7, "compat: 已知字段照常解出来");
+    check(p.name.s.len == 0, "compat: 未知字段没污染别的字段");
+
+    /* 截断：长度前缀说 7 字节，实际只给 3 字节 */
+    {
+        static const u8 cut[] = { 0x0a, 0x07, 'a', 'b', 'c' };
+
+        check(demo_Person_decode(cut, (int)sizeof cut, &p) == -1,
+              "compat: 截断的输入被拒");
+    }
+    printf("compat: 未知字段跳过、坏输入拒绝\n");
+}
+
+int main(void)
+{
+    printf("stdprotobuf: protobuf 线格式 + protoc6 工具链\n");
+    tour_wire();
+    tour_generated();
+    tour_unknown();
+    printf("stdprotobuf: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

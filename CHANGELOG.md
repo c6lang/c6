@@ -7,6 +7,25 @@
 
 ## 0.6.2 — 2026-11-16
 
+### protobuf：线格式运行时 + `protoc6` 生成器
+
+- 新增 `std/data/protobuf.c6`（`std.data.protobuf`，err 号段 `0x6179`）：零分配的线格式
+  读写——`pb_writer`/`pb_reader`、`PbWriter` 的 `write_key`/`write_tag_*`/`write_fixed*`/
+  `write_str`/`put`/`mark`/`mark_end`、`PbReader.next` + `PbField.as_*`、`skip`（未知字段
+  与 group 配对）、`packed` 迭代器 `PbIter`。4 个 `test` 块覆盖规范向量（`08 96 01` /
+  `12 07 testing` / 嵌套 / packed）、zigzag 与 10 字节负数、坏数据与写端容量、尺寸回填。
+- 新增 `tools/protoc6`：`protofile.c6` 做 `.proto` 的解析与校验（proto2/proto3、嵌套消息
+  与枚举、`map`、`oneof`、`packed`/`default`、19000-19999 保留号、重号/重名/未解析类型），
+  `protoc6.c6` 生成 C6 结构体与 `init`/`size`/`encode`/`decode`（proto3 隐式 presence、
+  proto2 required 位图与默认值、repeated/map 固定容量、未知字段与线型不符都跳过、解码
+  全有或全无、递归消息类型在生成阶段报错）。
+- 用例：`tests/protobuf/{addressbook,basic,packed,maponeof}.proto` + `roundtrip.c6`（黄金
+  字节、全类型往返、proto2 默认值与 required、map/oneof/未知字段、失败路径）；回归用例
+  `std-protobuf`（进 `C6_STD_TARGETS` / `C6_TEST_ALL`）先编 `protoc6`、生成、跑 `-test`，
+  再跑集成示例 `examples/stdprotobuf.c6`。
+- `std/data/protobuf.c6` 补上 `ok()`（读端与 `PbIter` 各一个），`errbase.def` 与
+  `docs/reference/grammar.md` §8.1 的号段表同步。
+
 ### CI：发版说明直接取自版本提交的正文
 
 - release job 的正文改成取**版本提交**（主题正好是 `c6 <VERSION>`）的正文：发版
