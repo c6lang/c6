@@ -34,9 +34,9 @@ mkdir -p "$C6_OUT" "$C6_SELFHOST" "$C6_BARE" "$C6_TMP"
 
 # 下面三行既是文档，也是 CTest 标签 / 互斥组的单一数据源，不要改名。
 
-C6_STD_TARGETS="stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2"
+C6_STD_TARGETS="stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2"
 C6_CHECK_PARALLEL="selftest errcheck c99test c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc test fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
-C6_TEST_ALL="selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
+C6_TEST_ALL="selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-protobuf std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
 
 case "${1:-}" in
 std-demo)
@@ -193,6 +193,25 @@ std-data)
   mkdir -p "$C6_OUT"
   "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -o $C6_OUT/stddata examples/stddata.c6 std/core/types.c6 std/text/str.c6 std/data/bencode.c6 std/data/msgpack.c6 std/data/cbor.c6 std/data/pem.c6 std/encoding/base64.c6
   $C6_OUT/stddata
+  ;;
+
+std-protobuf)
+  mkdir -p "$C6_OUT/pb"
+  "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -I tools -o $C6_OUT/protoc6 \
+    tools/protoc6/protoc6.c6 tools/protoc6/protofile.c6 \
+    std/core/types.c6 std/text/str.c6 std/data/protobuf.c6
+  $C6_OUT/protoc6 --out "$C6_OUT/pb" \
+    tests/protobuf/addressbook.proto tests/protobuf/basic.proto \
+    tests/protobuf/packed.proto tests/protobuf/maponeof.proto
+  "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -I "$C6_OUT/pb" -test \
+    tests/protobuf/roundtrip.c6 \
+    "$C6_OUT/pb/demo/addressbook.c6" "$C6_OUT/pb/demo/basic.c6" \
+    "$C6_OUT/pb/demo/packed.c6" "$C6_OUT/pb/demo/maponeof.c6" \
+    std/core/types.c6 std/text/str.c6 std/data/protobuf.c6
+  "$C6_TCC_DIR/c6" -B "$C6_TCC_DIR" -I . -I "$C6_OUT/pb" -o $C6_OUT/stdprotobuf \
+    examples/stdprotobuf.c6 "$C6_OUT/pb/demo/addressbook.c6" \
+    std/core/types.c6 std/text/str.c6 std/data/protobuf.c6
+  $C6_OUT/stdprotobuf
   ;;
 
 std-calc)
@@ -621,6 +640,7 @@ stdtest)
   std/container/bitset.c6) deps="std/core/bits.c6" ;;
   std/data/json.c6) deps="std/core/mem.c6 std/text/str.c6 std/text/num.c6 std/core/err.c6" ;;
   std/data/csv.c6) deps="std/text/str.c6" ;;
+  std/data/protobuf.c6) deps="std/text/str.c6" ;;
   std/os/env.c6) deps="std/text/str.c6 std/core/err.c6" ;;
   std/encoding/sha256.c6) deps="std/core/bits.c6" ;;
   std/net/url.c6) deps="std/text/str.c6" ;;

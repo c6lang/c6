@@ -13096,6 +13096,7 @@ static const struct C6ErrStdSlot {
     { "std.core.endian",        C6_ERR_SLOT_STD + 374 },
     { "std.text.collate",       C6_ERR_SLOT_STD + 375 },
     { "std.text.hyphen",        C6_ERR_SLOT_STD + 376 },
+    { "std.data.protobuf",      C6_ERR_SLOT_STD + 377 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

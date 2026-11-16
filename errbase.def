@@ -20,6 +20,7 @@
 
 math                     0x6100
 pick.m                   0x6101
+protoc6.protofile        0x6109
 tu.c6mod                 0x6102
 tu.err_code              0x6107
 tu.err_ids               0x6108

@@ -1,0 +1,344 @@
+/* protoc6 端到端用例：生成代码的黄金字节、往返、默认值、失败路径。
+ *
+ * 生成物不在仓库里：跑用例前先用 tools/protoc6 把 tests/protobuf/*.proto
+ * 编到 $C6_OUT/pb（见 tests/regression.sh 的 protoc6 分支），再把它加进 -I。
+ */
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.protobuf;
+import demo.addressbook;
+import demo.basic;
+import demo.packed;
+import demo.maponeof;
+
+static int bytes_eq(const u8 *a, int an, const u8 *b, int bn)
+{
+    int i = 0;
+
+    if (an != bn)
+        return 0;
+    for (i = 0; i < an; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+test "protoc6：Person 黄金字节与往返" {
+    struct demo_Person p = { 0 };
+    struct demo_Person q = { 0 };
+    u8 buf[512] = { 0 };
+    int n = 0;
+    static const u8 want[] = {
+        0x0a, 0x07, 't', 'e', 's', 't', 'i', 'n', 'g', /* name = "testing" */
+        0x10, 0xac, 0x02,                             /* id = 300 */
+        0x32, 0x03, 0x01, 0x02, 0x03,                 /* scores 打包 */
+        0x3a, 0x02, 0x01, 0x02,                       /* deltas 打包（zigzag） */
+        0x5a, 0x03, 'a', 'b', 'c',                    /* oneof handle */
+        0x6d, 0x78, 0x56, 0x34, 0x12,                 /* fixed32 crc */
+        0x90, 0x01, 0x01,                             /* bool ok */
+    };
+
+    demo_Person_init(&p);
+    p.name = (Str){ S("testing") };
+    p.id = 300;
+    p.scores[0] = 1;
+    p.scores[1] = 2;
+    p.scores[2] = 3;
+    p.scores_n = 3;
+    p.deltas[0] = -1;
+    p.deltas[1] = 1;
+    p.deltas_n = 2;
+    p.handle = (Str){ S("abc") };
+    p.contact_case = 11;
+    p.crc = 0x12345678u;
+    p.ok = 1;
+
+    if (demo_Person_size(&p) != (int)sizeof want)
+        return err(1, "size 跟黄金字节长度不一致");
+    n = demo_Person_encode(&p, buf, (int)sizeof buf);
+    if (n != (int)sizeof want || !bytes_eq(buf, n, want, (int)sizeof want))
+        return err(2, "编码字节跟黄金值不一致");
+
+    if (demo_Person_decode(want, (int)sizeof want, &q) != 1)
+        return err(3, "解码失败");
+    if (q.name.s.len != 7 || memcmp(q.name.s.data, "testing", 7) != 0)
+        return err(4, "name 没往返");
+    if (q.id != 300)
+        return err(5, "id 没往返");
+    if (q.scores_n != 3 || q.scores[0] != 1 || q.scores[2] != 3)
+        return err(6, "scores 没往返");
+    if (q.deltas_n != 2 || q.deltas[0] != -1 || q.deltas[1] != 1)
+        return err(7, "deltas（zigzag）没往返");
+    if (q.contact_case != 11 || q.handle.s.len != 3
+        || memcmp(q.handle.s.data, "abc", 3) != 0)
+        return err(8, "oneof handle 没往返");
+    if (q.crc != 0x12345678u || q.ok != 1)
+        return err(9, "fixed32/bool 没往返");
+    if (q.active_has)
+        return err(10, "没写的 optional 不该有 presence");
+
+    /* 再编一次，字节必须一致（幂等） */
+    memset(buf, 0, sizeof buf);
+    if (demo_Person_encode(&q, buf, (int)sizeof buf) != (int)sizeof want
+        || !bytes_eq(buf, n, want, (int)sizeof want))
+        return err(11, "解码后再编码不一致");
+    return 0;
+}
+
+test "protoc6：标量全类型往返（含负数 10 字节 varint）" {
+    struct demo_Scalars s = { 0 };
+    struct demo_Scalars t = { 0 };
+    u8 buf[512] = { 0 };
+    int n = 0;
+    int i = 0;
+    int hits = 0;
+
+    demo_Scalars_init(&s);
+    s.f_double = 1.5;
+    s.f_float = -2.5f;
+    s.f_int32 = -1;
+    s.f_int64 = -2;
+    s.f_uint32 = 4000000000u;
+    s.f_uint64 = 18446744073709551615ull;
+    s.f_sint32 = -5;
+    s.f_sint64 = -6;
+    s.f_fixed32 = 0xdeadbeefu;
+    s.f_fixed64 = 0x1122334455667788ull;
+    s.f_sfixed32 = -7;
+    s.f_sfixed64 = -8;
+    s.f_bool = 1;
+    s.f_string = (Str){ S("hi") };
+    s.f_bytes = (Str){ (char[:]){ "\x00\xff", 2 } };
+    s.f_color = demo_Color_COLOR_BLUE;
+    s.rep[0] = 1;
+    s.rep[1] = 300;
+    s.rep_n = 2;
+    s.names[0] = (Str){ S("a") };
+    s.names[1] = (Str){ S("bb") };
+    s.names_n = 2;
+    s.neg = -1;
+    s.opt_has = 1;
+    s.opt = 0;
+    s.zig[0] = -1;
+    s.zig[1] = 1;
+    s.zig_n = 2;
+
+    n = demo_Scalars_encode(&s, buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(1, "编码失败");
+
+    /* neg 是字段 19 的 int32，值 -1 按 10 字节补码写：0x98 0x01 后面 10 个字节 */
+    for (i = 0; i + 12 < n; i++) {
+        if (buf[i] == 0x98 && buf[i + 1] == 0x01 && buf[i + 2] == 0xff
+            && buf[i + 11] == 0x01)
+            hits = 1;
+    }
+    if (!hits)
+        return err(2, "int32 -1 不是 10 字节 varint");
+
+    if (demo_Scalars_decode(buf, n, &t) != 1)
+        return err(3, "解码失败");
+    if (t.f_double != 1.5 || t.f_float != -2.5f)
+        return err(4, "浮点没往返");
+    if (t.f_int32 != -1 || t.f_int64 != -2)
+        return err(5, "有符号 varint 没往返");
+    if (t.f_uint32 != 4000000000u || t.f_uint64 != 18446744073709551615ull)
+        return err(6, "无符号 varint 没往返");
+    if (t.f_sint32 != -5 || t.f_sint64 != -6)
+        return err(7, "zigzag 没往返");
+    if (t.f_fixed32 != 0xdeadbeefu || t.f_fixed64 != 0x1122334455667788ull)
+        return err(8, "fixed 没往返");
+    if (t.f_sfixed32 != -7 || t.f_sfixed64 != -8)
+        return err(9, "sfixed 没往返");
+    if (!t.f_bool || t.f_string.s.len != 2 || t.f_bytes.s.len != 2)
+        return err(10, "bool/string/bytes 没往返");
+    if ((u8)t.f_bytes.s.data[0] != 0x00 || (u8)t.f_bytes.s.data[1] != 0xff)
+        return err(11, "bytes 里的 0 字节没往返");
+    if (t.f_color != demo_Color_COLOR_BLUE)
+        return err(12, "枚举没往返");
+    if (t.rep_n != 2 || t.rep[1] != 300)
+        return err(13, "打包的 uint32 没往返");
+    if (t.names_n != 2 || t.names[1].s.len != 2)
+        return err(14, "repeated string 没往返");
+    if (t.neg != -1)
+        return err(15, "负 int32 没往返");
+    if (!t.opt_has || t.opt != 0)
+        return err(16, "optional 显式写 0 时 presence 丢了");
+    if (t.zig_n != 2 || t.zig[0] != -1 || t.zig[1] != 1)
+        return err(17, "打包的 sint32 没往返");
+    return 0;
+}
+
+test "protoc6：proto2 默认值 / required / packed 开关" {
+    struct demo_Old o = { 0 };
+    struct demo_Old p = { 0 };
+    u8 buf[256] = { 0 };
+    int n = 0;
+    static const u8 id_only[] = { 0x08, 0x2a };
+    static const u8 want[] = {
+        0x08, 0x07,                   /* id = 7 */
+        0x40, 0x01, 0x40, 0x02,       /* nums：proto2 默认逐个 */
+        0x4a, 0x03, 0x01, 0xac, 0x02, /* packed_nums：显式 packed */
+        0x50, 0x01, 0x50, 0x02,       /* zz：显式 [packed=false] */
+    };
+
+    demo_Old_init(&o);
+    if (o.count != 42 || o.flag != 1 || o.ratio != 1.5)
+        return err(1, "proto2 标量默认值没进 init");
+    if (o.mode != demo_Mode_MODE_B || o.delta != -3)
+        return err(2, "枚举/负数默认值没进 init");
+    if (o.name.s.len != 4 || memcmp(o.name.s.data, "anon", 4) != 0)
+        return err(3, "字符串默认值没进 init");
+    if (o.name_has || o.count_has)
+        return err(4, "默认值不该顺手把 presence 置上");
+
+    /* required 缺失：空输入必须解不出来 */
+    if (demo_Old_decode("", 0, &p) != -1)
+        return err(5, "缺 required 字段时解码应该失败");
+    if (demo_Old_decode(id_only, 2, &p) != 1 || p.id != 42)
+        return err(6, "只有 required 的解码失败");
+    if (p.count != 42)
+        return err(7, "解码后默认值没补上");
+
+    demo_Old_init(&o);
+    o.id = 7;
+    o.nums[0] = 1;
+    o.nums[1] = 2;
+    o.nums_n = 2;
+    o.packed_nums[0] = 1;
+    o.packed_nums[1] = 300;
+    o.packed_nums_n = 2;
+    o.zz[0] = -1;
+    o.zz[1] = 1;
+    o.zz_n = 2;
+    n = demo_Old_encode(&o, buf, (int)sizeof buf);
+    if (n != (int)sizeof want || !bytes_eq(buf, n, want, (int)sizeof want))
+        return err(8, "proto2 的 packed/unpacked 编码不对");
+
+    if (demo_Old_decode(want, (int)sizeof want, &p) != 1)
+        return err(9, "proto2 解码失败");
+    if (p.id != 7 || p.nums_n != 2 || p.nums[1] != 2)
+        return err(10, "逐个的 repeated 没往返");
+    if (p.packed_nums_n != 2 || p.packed_nums[1] != 300)
+        return err(11, "packed 的 repeated 没往返");
+    if (p.zz_n != 2 || p.zz[0] != -1)
+        return err(12, "packed=false 的 sint 没往返");
+    return 0;
+}
+
+test "protoc6：map / oneof / 未知字段跳过" {
+    struct demo_Order o = { 0 };
+    struct demo_Order p = { 0 };
+    u8 buf[512] = { 0 };
+    int n = 0;
+    /* 未知字段：100 号 varint，然后 50 号 group（里面一个 1 号 varint） */
+    static const u8 unknown[] = {
+        0xa0, 0x06, 0x05,
+        0x93, 0x03, 0x08, 0x01, 0x94, 0x03,
+        0x18, 0x2a,
+    };
+    struct demo_Scalars s = { 0 };
+
+    demo_Order_init(&o);
+    o.lines[0].key = (Str){ S("a") };
+    o.lines[0].value_has = 1;
+    o.lines[0].value.sku = (Str){ S("x") };
+    o.lines[0].value.qty = 2;
+    o.lines_n = 1;
+    o.labels[0].key = 3;
+    o.labels[0].value = (Str){ S("three") };
+    o.labels_n = 1;
+    o.card = (Str){ S("4111") };
+    o.pay_case = 3;
+    o.items[0].sku = (Str){ S("y") };
+    o.items[0].qty = 9;
+    o.items_n = 1;
+
+    n = demo_Order_encode(&o, buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(1, "编码失败");
+    if (demo_Order_decode(buf, n, &p) != 1)
+        return err(2, "解码失败");
+    if (p.lines_n != 1 || p.lines[0].key.s.len != 1
+        || !p.lines[0].value_has || p.lines[0].value.qty != 2)
+        return err(3, "map<string, Item> 没往返");
+    if (p.labels_n != 1 || p.labels[0].key != 3
+        || p.labels[0].value.s.len != 5)
+        return err(4, "map<int32, string> 没往返");
+    if (p.pay_case != 3 || p.card.s.len != 4)
+        return err(5, "oneof 没往返");
+    if (p.items_n != 1 || p.items[0].qty != 9)
+        return err(6, "repeated 消息没往返");
+
+    /* 未知字段（含 group）必须被跳过，后面的已知字段照常解 */
+    if (demo_Scalars_decode(unknown, (int)sizeof unknown, &s) != 1)
+        return err(7, "带未知字段的解码失败");
+    if (s.f_int32 != 42)
+        return err(8, "未知字段之后的已知字段没解出来");
+    if (s.f_double != 0 || s.rep_n != 0)
+        return err(9, "未知字段污染了别的字段");
+    return 0;
+}
+
+test "protoc6：失败路径（截断 / 线型不符 / 容量 / 越界 / 不写一半）" {
+    struct demo_Person p = { 0 };
+    struct demo_Person q = { 0 };
+    struct demo_Scalars s = { 0 };
+    u8 buf[512] = { 0 };
+    u8 big[64] = { 0 };
+    int n = 0;
+    /* 17 号字段（rep）打包 9 个 0x01，超过容量 8 */
+    static const u8 too_many[] = {
+        0x8a, 0x01, 0x09, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    };
+    static const u8 bad_wire[] = { 0x08, 0x01 };
+    static const u8 no_such_wire[] = { 0x0f, 0x01 };
+
+    demo_Person_init(&p);
+    p.name = (Str){ S("testing") };
+    p.id = 300;
+    n = demo_Person_encode(&p, buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(1, "编码失败");
+
+    if (demo_Person_decode(buf, n - 1, &q) != -1)
+        return err(2, "截断的输入应该失败");
+
+    /* 容量不足：失败，且不返回半个长度 */
+    if (demo_Person_encode(&p, big, 4) != -1)
+        return err(4, "容量不足时编码应该失败");
+    if (demo_Person_size(&p) <= 4)
+        return err(5, "size 和实际长度不一致");
+
+    /* 线型不符：Scalars 的 1 号是 fixed64，喂 varint 时按未知字段跳过（与 protoc 一致） */
+    if (demo_Scalars_decode(bad_wire, 2, &s) != 1 || s.f_double != 0)
+        return err(6, "线型不符的已知字段应该当未知字段跳过");
+    /* 线型 6/7 不是合法 wire type：必须失败 */
+    if (demo_Scalars_decode(no_such_wire, 2, &s) != -1)
+        return err(12, "非法 wire type 应该失败");
+    /* 超出 repeated 容量 */
+    if (demo_Scalars_decode(too_many, (int)sizeof too_many, &s) != -1)
+        return err(7, "超过 repeated 容量时应该失败");
+
+    /* 失败时 *out 不能被写坏 */
+    demo_Person_init(&q);
+    q.id = 999;
+    if (demo_Person_decode(buf, n - 1, &q) != -1)
+        return err(8, "截断的输入应该失败");
+    if (q.id != 999)
+        return err(9, "解码失败时不该动 *out");
+
+    /* 空消息编出 0 字节 */
+    {
+        struct demo_AddressBook ab = { 0 };
+
+        demo_AddressBook_init(&ab);
+        if (demo_AddressBook_size(&ab) != 0)
+            return err(10, "空消息的 size 应该是 0");
+        if (demo_AddressBook_encode(&ab, big, (int)sizeof big) != 0)
+            return err(11, "空消息应该编出 0 字节");
+    }
+    return 0;
+}
