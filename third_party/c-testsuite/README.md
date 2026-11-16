@@ -1,7 +1,7 @@
 # c-testsuite（vendored）
 
 c6c 语言层 C99 兼容性的**外部闸门**。这里只是数据，跑法是 `c6c/tests/c99-suite.sh`
-（或 `make -C c6c c99suite`）。
+（或 `cmake --build build --target c99suite`）。
 
 ## 来源
 
@@ -31,7 +31,7 @@ c6c 语言层 C99 兼容性的**外部闸门**。这里只是数据，跑法是 
 ## 跑法
 
 ```sh
-make -C c6c c99suite ROOT=$PWD           # 记分板（有失败时退出码非 0）
+cmake --build build --target c99suite     # 记分板（有失败时退出码非 0）
 C6C=build/c6c ./c6c/tests/c99-suite.sh -v # 逐条看分类
 ```
 

@@ -1,7 +1,8 @@
 # c6c 验收对照表
 
-四条验收各自的**命令**、**当前实测**、**还差什么**。全部在 `c6c/` 下执行，
-`ROOT` 指向放 `tcc/` 的那个检出。
+四条验收各自的**命令**、**当前实测**、**还差什么**。命令全部在仓库根执行；
+c6c 没有自己的 Makefile 了——它的每个目标都是 CMake target（`c6c/README.md`
+里有 `make -C c6c` → CMake target 的对照表）。
 
 ```sh
 # CMake 入口（仓库根，CI 走这条）
@@ -15,10 +16,11 @@ cmake --build build --target check-c6c-perf    # 再加验收 (4)
 ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
 ctest --test-dir build -L perf --output-on-failure           # 验收 (4)
 
-# 或者直接调 c6c 自己的 Makefile（等价，`make -C c6c` 也行）
-make -s fast            ROOT=/path/to/superc   # 快速门禁 ≈40 s
-make -s check-all       ROOT=/path/to/superc   # 验收 (1)(2)(3)
-make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
+# 同一条链的细分 target（都是 CMake target，等价于以前 c6c/Makefile 里的同名目标）
+cmake --build build --target fast              # 快速门禁 ≈40 s
+cmake --build build --target check-all-c6c     # 验收 (1)(2)(3)
+cmake --build build --target check-all-perf    # 上面 + 验收 (4)
+cmake --build build --target tests2-check      # 只跑 tcc 上游 tests2 闸门
 ```
 
 ## (0) 不用 tcc 的验收：`C6_ENABLE_TCC=OFF` / `BOOTSTRAP=host`
@@ -31,7 +33,7 @@ cmake -S . -B build -DC6_ENABLE_TCC=OFF -DBUILD_TESTING=ON
 cmake --build build --parallel                       # 只编 c6c，不碰 tcc/
 ctest --test-dir build -L c6c -LE perf --output-on-failure
 
-make -C c6c check-all BOOTSTRAP=host HOSTCC=gcc      # 不走 CMake 的同一条路
+cmake --build build --target check-all-c6c           # 同一条路，全部是 CMake target
 ```
 
 口径没变，只是 `tcc/` 从"必须先构建的 stage0"降成"语料 + oracle"：`build-tcc`
@@ -50,7 +52,7 @@ make -C c6c check-all BOOTSTRAP=host HOSTCC=gcc      # 不走 CMake 的同一条
 第三项是唯一绕不开 tcc 的地方：`libtcc1.a` 是运行时，用宿主 cc 编出来
 （上游的 `x86_64-libtcc1-usegcc=yes`）语义并不等价——实测 c6c 编出的 tcc
 只过 102/144，第三代 selfhost 坏 8；用 tcc 编的是 118/144、坏 0，与 tcc 自己
-构建运行时逐条一致。所以 `c6c/Makefile` 在 `tcc/c6` 缺席时会先用宿主 cc 把
+构建运行时逐条一致。所以 `c6c-tcc-corpus` 在 `tcc/c6` 缺席时会先用宿主 cc 把
 `tcc/tcc.c` 编成一个**参考 tcc**（`make -C tcc c6`，和产品构建同一条 cc 编译
 链，不经过 CMake、不安装、不进任何交付物），再由它编 `libtcc1.a`。它是
 G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个已知能工作的 tcc

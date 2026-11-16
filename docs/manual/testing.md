@@ -36,7 +36,7 @@ stderr、收尾统计在 stdout 最后一行、失败数当退出码、零块静
 
 `-test` 下用户 `main` 不执行；不给 `-o` 时编到临时 ELF 再 `exec`（和 `-run`
 同一条路）。只支持 native 后端，`-nostdlib` 会缺报告用的运行时助手。
-回归：`make -C c6c testflag`。
+回归：`cmake --build build --target testflag`。
 
 
 ## 测试
