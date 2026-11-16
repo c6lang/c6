@@ -186,6 +186,12 @@ c6c_target(ctest-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/run.sh
 
 # --- 2.3 各后端 / 各特性的专项回归 ---
 c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)
+# stage1 自编：c6c（不带运行时）直接编 c6c.c6。tcc 用 C89 口径收隐式声明，
+# 会遮住"头文件里少一个声明"这类问题（实测：memchr 只在 lib/rt.c6 里有定义，
+# string.h 里没声明，tcc 编得出、c6c 编不出）。放进 fast：它只编一遍全量源码，
+# 比 selfhost 的两遍便宜得多，却是引导链第一步的**唯一**机器证据。
+c6c_target(stage1check ENV C6C=${C6C_BIN} SRC=${C6C_DIR}/src/c6c.c6
+  COMMAND ./tests/stage1-check.sh)
 c6c_target(ldcheck ENV C6C=${C6C_BIN} COMMAND ./tests/ld-check.sh)
 c6c_target(dyncheck ENV C6C=${C6C_BIN} COMMAND ./tests/dyn-check.sh)
 c6c_target(sharedcheck ENV C6C=${C6C_BIN} COMMAND ./tests/shared-check.sh)
@@ -335,7 +341,7 @@ c6c_target(g2c-check DEPENDS build-tcc ENV ROOT=${C6C_ROOT}
 # c99test（51 条 gcc 差分，165 s）、build-tcc（编 tcc + 第三代 selfhost）。
 # ---------------------------------------------------------------------------
 add_custom_target(fast
-  DEPENDS lint unit irtest hello ctest-c6c runflag testflag
+  DEPENDS lint unit irtest hello ctest-c6c runflag testflag stage1check
           objcheck ldcheck dyncheck sharedcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
