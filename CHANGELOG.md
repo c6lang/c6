@@ -5,6 +5,37 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 0.6.2 — 2026-11-16
+
+### CI：发版说明直接取自版本提交的正文
+
+- release job 的正文改成取**版本提交**（主题正好是 `c6 <VERSION>`）的正文：发版
+  时在那条提交里写「改了什么、怎么验收的」，CI 只做取用、排版，末尾追加产物清单
+  与 sha256sum 校验方法。找不到版本提交时退到最后一个动 VERSION 的提交；正文为空
+  时退到**附注 tag** 的注解（轻量 tag 的 `%(contents)` 会回落到它指向的提交消息，
+  那不叫版本描述，所以只认附注 tag）。标题仍是 tag 注解的首行。
+- package job 把「版本提交存在且正文非空」提到打包前校验——三种包都打完才在最后
+  一步红太浪费。CHANGELOG 段落的校验保留：它仍是给人看的变更史，并且随包装进
+  `/usr/share/doc/c6/`。
+- 发版四件事写进文档（README「打包与发布」、`docs/reference/cli.md`、
+  `docs/README.md` 维护约定）：根 `VERSION`、CHANGELOG 一段、`c6 <版本>` 提交、
+  `v<版本>` tag。
+
+### 打包侧：Arch build log 的三类告警清零
+
+- `c6c/src/parse.c6` 里 `AGG_CAP0` 被定义了两次（1024 给聚合成员表、64 给
+  struct 体成员数组）——后者改名 `AGG_MEM_CAP0`，两个不同的初始容量不再共用
+  一个名字（改一个不会悄悄影响另一个）。
+- `c6c/src/lex.c6` 的 `Tok.syn` 改成 `const char *`、`tok_syn()` 的参数跟着改：
+  `-Wdiscarded-qualifiers` 那条告警消失（token 的文本从不原地改写），顺手去掉
+  三处 `(char *)` 强转。
+- `tcc/tcc-doc.texi` 的 Top 节点去掉 `(dir)` 前后指针：texinfo 7 生成
+  `tcc-doc.html` 时不再报「no HTML cross-references entry found for `dir'」。
+
+验收：本机 cmake 全量构建（stage0 = tcc/c6）零告警、`ctest -L c6c -LE perf`
+5/5；Arch 容器（gcc 16.2.1 + texinfo 7.3）重编 build log 零告警、
+`tcc-doc.html` 照常生成。
+
 ## 0.6.1 — 2026-11-16
 
 ### 修 `async` / `async_frame` 的段错误：退役的协程槽把还在用的栈给了下一个协程
