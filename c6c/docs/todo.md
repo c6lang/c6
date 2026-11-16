@@ -4552,3 +4552,43 @@ GEN_TY = mty4;                  /* 之后 `+ i` 按指针加法，步长 24 */
 剩下的 33 个还是老几类：libc 面（真信号投递 / 真 DNS / 非阻塞边角）、模板实例
 在跨 TU 时的成员类型（`c6c/docs/todo.md` 第 215 轮那条"两个类型 id"，现在看
 影响面比想象的小，但还在）、以及若干 `test` 块的语义差异。
+
+## 第 218 轮：std-client 的两个坎（解析 + getnameinfo）
+
+剩下的 33 个里先摸了 `std-client`。它现在编不过：
+
+```
+c6c: examples/stdclient.c6:260: 这里要 ')'（当前是 'int'）
+c6c: ./c6c/build/../lib/rt.c6:1: 这里要 '}'（当前是 ''）
+```
+
+错误报在函数末尾，实际是前面某处括号没闭合。把 `tour_httpc` 逐段删掉二分，
+定位到第 232 行的 `fetch(...)` 调用；再拆实参，结论是**嵌套复合字面量的初始化
+元素里带强制转换**：
+
+```c
+#define S(lit)  ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+/* 编不过 */
+fetch(SS("GET"), (Str){ (char[:]){ url, (int)5 } }, SS(""), ...);
+/* 把第二个实参提成局部量就编得过；去掉 (int) 也编得过；换成 strlen(url) 也编得过 */
+```
+
+矩阵（`examples/stdclient.c6` 的精简版，模块文件不变）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `(Str){ (char[:]){ url, (int)strlen(url) } }` | 解析失败 |
+| `(Str){ (char[:]){ url, (int)5 } }` | 解析失败 |
+| `(Str){ (char[:]){ url, strlen(url) } }` | 通过 |
+| `(Str){ (char[:]){ url, 3 } }` | 通过 |
+| 同样的表达式提成局部量 `Str su = …;` 再传 | 通过 |
+
+`Str` 是 `import std.net.httpc` 带来的 typedef。下一步从 `parse_primary` 的
+复合字面量分支切进去：`(` 类型 `)` `{` 这条判定在"元素里又出现 `(int)x`"时
+把 `(int)` 当成了外层初始化列表的结束/新元素，括号层级没退回来。
+
+另外这个用例还缺第二个东西：`未定义的符号 'getnameinfo'`（`std/net/resolver.c6`
+用它做反查）。即使解析修好，也得先补上 `getnameinfo` 才能在 c6c 上链出来。
+两个都补掉才算这一个用例全绿。
