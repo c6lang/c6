@@ -38,9 +38,11 @@ std-h2
 std-hash
 std-hash2
 std-img
+std-linalg
 std-linux
 std-markup
 std-match
+std-math3
 std-mgmt
 std-node
 std-ops
