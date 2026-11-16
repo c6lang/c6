@@ -3868,8 +3868,19 @@ static i64 const_cond(void)
         i64 b = 0;
 
         CONST_LAX = 1;
-        a = const_expr();
-        pa_expect_ch(':');
+        if (pa_is_ch(':')) {
+            /* GNU 省略中间操作数的三元 `a ?: b`：条件只求值一次，非 0 时
+             * 结果就是它自己。运行期那条路 gen_cond 早就认这个写法，
+             * 常量层这里以前没有，于是 `__aligned__( ( + 0) ? : (1 << 6) )`
+             * 一进常量求值就报"这里要 ':'（当前是 '('）"。内核
+             * include/linux/cache.h 的 __cacheline_group_begin/end 展开出来
+             * 就是这个形状（实测 lib/ 下 6 个文件卡在这条）。 */
+            a = c;
+            pa_advance();
+        } else {
+            a = const_expr();
+            pa_expect_ch(':');
+        }
         b = const_cond();
         CONST_LAX = save_lax;
         return c ? a : b;
@@ -4391,8 +4402,38 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
         }
     }
     pa_expect_ch('}');
-    ty = complete_id ? ty_agg_complete(complete_id, mem, bits, n, is_union)
-                     : ty_agg(mem, bits, n, is_union, tag);
+    /* `} __attribute__((aligned(N)))` / `} __packed`：属性写在**花括号后面**
+     * 这一形态要在算布局之前吃掉，TY_ALIGN/TY_PACK 才会被 agg_layout 看见。
+     *
+     * 少了这一条，内核 `struct page` 的尾部
+     *     } __attribute__((__aligned__(2 * sizeof(unsigned long))));
+     * 就被忽略，sizeof 给 56 而 gcc 给 64（对齐 16 要向上取整到 64）。
+     * 于是 mm/slab 的
+     *     static_assert(sizeof(struct slab) <= sizeof(struct page));
+     * 假失败——实测 mm/ 下 9 个文件都卡在这条。
+     *
+     * 属性只作用于这一个结构体：调用方在进体前把 TY_PACK/TY_ALIGN 存档、
+     * 出体后还原（见 NPACK_SAVE），所以这里改它们不会外溢。 */
+    {
+        int save_pk2 = TY_PACK;
+        int save_al2 = TY_ALIGN;
+
+        SAW_PACKED = 0;
+        SAW_ALIGN = 0;
+        skip_attributes();
+        if (SAW_PACKED) {
+            TY_PACK = 1;
+            SAW_PACKED = 0;
+        }
+        if (SAW_ALIGN > 0) {
+            TY_ALIGN = SAW_ALIGN;
+            SAW_ALIGN = 0;
+        }
+        ty = complete_id ? ty_agg_complete(complete_id, mem, bits, n, is_union)
+                         : ty_agg(mem, bits, n, is_union, tag);
+        TY_PACK = save_pk2;
+        TY_ALIGN = save_al2;
+    }
     if (getenv("C6C_DBG_AGG"))
         fprintf(stderr, "       [dbg] struct ty=%u members=%u\n",
                 (unsigned)ty, (unsigned)n);
@@ -7260,16 +7301,27 @@ static void skip_attributes(void)
                         && (TOK_EQ(c, "aligned") || TOK_EQ(c, "align")
                             || TOK_EQ(c, "__aligned") || TOK_EQ(c, "__aligned__"))) {
                         Tok *nx2 = pa_peek(1);
-                        Tok *ny2 = pa_peek(2);
 
-                        if (nx2 && ny2 && nx2->kind == TK_PUNCT && tok_eq(nx2, "(")
-                            && ny2->kind == TK_NUM) {
-                            char ab[24] = {0};
-                            u32 ak = ny2->len < 20 ? ny2->len : 20;
+                        if (nx2 && nx2->kind == TK_PUNCT && tok_eq(nx2, "(")) {
+                            /* 值要按**常量表达式**求，不能只认一个数字字面量：
+                             * 内核 include/linux/mm_types.h 里 struct page 的
+                             *     } __attribute__((__aligned__(2 * sizeof(unsigned long))));
+                             * 首 token 是 `2`，只取它会把对齐当成 2（实际是 16），
+                             * 于是 sizeof(struct page) 给 56 而不是 64。
+                             * 这里把整个 (…) 吃干净：查完求值，游标停在 `)` 之后。 */
+                            u32 save3 = FN.n;
+                            i64 av = 0;
 
-                            memcpy(ab, tok_data(ny2), ak);
-                            ab[ak] = 0;
-                            SAW_ALIGN = (int)strtol(ab, NULL, 0);
+                            pa_advance();      /* 对齐标识符 */
+                            pa_advance();      /* ( */
+                            av = const_expr();
+                            FN.n = save3;
+                            PEND_LVAL = 0;
+                            if (pa_is_ch(')'))
+                                pa_advance();
+                            if (av > 0 && (int)av > SAW_ALIGN)
+                                SAW_ALIGN = (int)av;
+                            continue;          /* 已消费整组，跳过末尾的 pa_advance() */
                         }
                     }
                     /* `__attribute__((alias("目标")))`：这个名字没有自己的
