@@ -1,0 +1,108 @@
+/* ctu.c6 —— per-TU C 后端（--emit-ctu）：一个输入文件出**一个** .c。
+ *
+ * 为什么要有它：rtos-c6 这类交叉构建要的不是"把整个程序翻成一份可执行文件"，
+ * 而是像 cc 一样一个翻译单元一个输出，再交给目标平台的 cc（xtensa-esp32s3-elf-gcc）
+ * 出机器码。老的 tcc/c6 就是这条路（`-c -o build/s3/c99/ kernel/os.c6` 出 os.c）。
+ * c6c 原来的两个文本后端都是**整程序虚拟机翻译**——`uint64_t R[]` + 每个函数
+ * `uint64_t f(uint64_t, ...)` + 自带 main 包装——换个目标平台就没法用，原因三条：
+ *
+ *   1. 粒度不对：老 c6 一个 TU 一个 .c，c6c 是一份整程序（还要求有 main）；
+ *   2. ABI 不对：c6c 的函数是"全部 64 位整数进、64 位整数出"的虚拟机约定，
+ *      C 侧（port/*.c、IDF）按真 C ABI 调它，参数位置/宽度全对不上；
+ *   3. 指针宽度不对：宿主 LP64 的 64 位指针 vs Xtensa 的 ILP32。
+ *
+ * 所以这个后端的口径是：**交出去的必须是目标 cc 能直接编的 C**，c6c 不掺和
+ * 机器码、不掺和 ABI、不掺和运行时：
+ *
+ *   - per TU：一个 .c6 → 一个 .c，不做整程序合成，**不要求 main**；
+ *   - 真 C ABI：ABI 由目标 cc 决定，不存在 `uint64_t f(uint64_t, ...)`；
+ *   - 不带 lib/rt.c6：c6c 的运行时只服务 native 后端，交叉构建里由目标平台的
+ *     rt/c6rt.c 顶上；进了这个模式就**根本不进 pa_compile_ex**，自然也不会去
+ *     找运行时、不会报"没有 main"。
+ *
+ * 产出怎么来：复用 `-E` 的发射器（main.c6 的 emit_one）——它把预处理后的
+ * token 流按**源文件行号**重排（`# 行 "文件"` 标记），所以：
+ *
+ *   - 对 c6 的 C 子集（rtos-c6 的 kernel/ 全部是这种，实测 0 个 c6 扩展）是
+ *     恒等翻译：预处理完的 token 流本身就是合法 C；
+ *   - 目标 cc 报错的行号仍指向原始 .c6 文件，不需要回头查 .c；
+ *   - 用了 c6 扩展（fn/let/defer/切片/泛型/async）的源会原样落到输出里，由
+ *     目标 cc 报错——**不会静默产出一份语义不对的 C**。真要把扩展也翻过去，
+ *     得在 parse 的 gen_* 上建一套按语句走的 C 发射器，那是后续的事；这里
+ *     先把"纯 C 的 TU 能交叉编"这条主路打通（rtos-c6 现在要的就是这条）。
+ *
+ * 速度：正常路径（native / --emit-c / --emit-llvm / -E）一行没动，本文件只
+ * 在 CTU_MODE 下才被调用；CTU_MODE 是全局 int，分派点上一个可预测分支。
+ */
+
+static int CTU_MODE;
+
+static void ctu_set_mode(void) { CTU_MODE = 1; }
+static int ctu_mode(void) { return CTU_MODE; }
+
+/* 输出路径：
+ *   -o 以 '/' 结尾  → 当目录：`<dir>/<base>.c`（rtos-c6 的 `-o build/s3/c99/`）
+ *   -o 是别的      → 当文件名（只有单输入时才说得清）
+ *   没有 -o        → 当前目录下的 `<base>.c`
+ * 返回 0 成功，-1 是用法错误（已经报过）。 */
+static int ctu_out_path(const char *src, const char *out, int nfiles,
+                        char *buf, size_t n)
+{
+    char stem[512] = {0};
+
+    obj_default_out(src, stem, sizeof(stem));      /* "kernel/os.c6" → "os.o" */
+    {
+        size_t sl = strlen(stem);
+
+        /* obj_default_out 收的是 .o，这里要的是 .c */
+        if (sl >= 2 && stem[sl - 2] == '.' && stem[sl - 1] == 'o')
+            stem[sl - 1] = 'c';
+    }
+    if (!out || !out[0]) {
+        snprintf(buf, n, "%s", stem);
+        return 0;
+    }
+    if (out[strlen(out) - 1] == '/') {
+        snprintf(buf, n, "%s%s", out, stem);
+        return 0;
+    }
+    if (nfiles > 1) {
+        diag_error_plain("--emit-ctu 有多个输入时 -o 要给目录（结尾带 '/'）："
+                         "一个 TU 一个 .c，不能都写进 '%s'", out);
+        return -1;
+    }
+    snprintf(buf, n, "%s", out);
+    return 0;
+}
+
+/* 把一个 TU 预处理成 C 写进去。返回 0 成功，非 0 失败（调用方据此非 0 退出）。 */
+static int ctu_emit(const char *src, const char *out, int nfiles)
+{
+    char path[1024] = {0};
+    int err0 = DG.errors;
+    FILE *f = NULL;
+    int rc = 0;
+
+    if (ctu_out_path(src, out, nfiles, path, sizeof(path)) != 0)
+        return 1;
+    OUTBUF.n = 0;
+    emit_one(src);
+    /* emit_one 里打不开源文件是 diag_error_plain：那时候别写空文件出去 */
+    if (DG.errors != err0)
+        return 1;
+    f = fopen(path, "wb");
+    if (!f) {
+        diag_error_plain("无法写出 %s（上一级目录存在吗？）", path);
+        return 1;
+    }
+    if (OUTBUF.n && fwrite(OUTBUF.buf, 1, OUTBUF.n, f) != OUTBUF.n) {
+        diag_error_plain("写出 %s 失败（磁盘满？）", path);
+        rc = 1;
+    }
+    if (fclose(f) != 0 && rc == 0) {
+        diag_error_plain("关闭 %s 失败", path);
+        rc = 1;
+    }
+    OUTBUF.n = 0;
+    return rc;
+}
