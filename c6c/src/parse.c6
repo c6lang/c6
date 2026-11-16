@@ -5563,7 +5563,7 @@ static u32 parse_enum_spec(void)
             if (pa_accept_ch('='))
                 val = (u32)(i32)const_expr();
             s = sym_add(nm, k, ty_int(), SC_ENUMC);
-            s->val = (i64)(val ? (val | ebase) : 0u);
+            s->val = (i64)(i32)(val ? (val | ebase) : 0u);
             {
                 /* 裸名也登记一份；已经存在就不覆盖，改成"毒化"——两个枚举
                  * 都有这个成员名，裸用就是歧义。 */
@@ -5571,7 +5571,7 @@ static u32 parse_enum_spec(void)
 
                 if (!bs) {
                     bs = sym_add(bare, bt->len, ty_int(), SC_ENUMC);
-                    bs->val = (i64)(val ? (val | ebase) : 0u);
+                    bs->val = (i64)(i32)(val ? (val | ebase) : 0u);
                 } else if ((u32)bs->val != (val ? (val | ebase) : 0u)) {
                     /* 同名但值不同：两个枚举真的都有这个成员 */
                     poison_add(bare, bt->len);
@@ -5599,7 +5599,7 @@ static u32 parse_enum_spec(void)
                 pa_error("redeclaration of '%s'", nm);
         }
         s = sym_add(nm, k, ty_int(), SC_ENUMC);
-        s->val = (i64)(val ? (val | ebase) : 0u);
+        s->val = (i64)(i32)(val ? (val | ebase) : 0u);
         /* 有标签就再登记一份限定名 `Tag.名字`（`enum Color { GREEN }` 之后
          * 也能写 `Color.GREEN`）；同名已存在就不覆盖。 */
         if (etaglen && etaglen + k + 2 < sizeof(nm)) {
@@ -5613,7 +5613,7 @@ static u32 parse_enum_spec(void)
             if (!sym_find(qn, qk)) {
                 Sym *qs = sym_add(qn, qk, ty_int(), SC_ENUMC);
 
-                qs->val = (i64)(val ? (val | ebase) : 0u);
+                qs->val = (i64)(i32)(val ? (val | ebase) : 0u);
             }
         }
         val++;
@@ -9093,11 +9093,14 @@ static u32 gen_postfix_ops(u32 v)
                                                                    : "__c6_co_wait"))));
                 FN.ops[FN.n - 1].narg = 1;
                 if (m == 1) {
-                    /* done() = 状态等于 C6_CO_STATE_DONE(0) */
+                    /* done() = 状态等于 C6_CO_STATE_DONE（就是 -1，64 位全 1；
+                     * 别写成 0xFFFFFFFF——那是"没按 int 符号扩展"的旧值，
+                     * 运行时写进去的是真 -1，两边对不上 done() 永远给 0） */
                     u32 z2 = irfn_vreg(&FN);
                     u32 c2 = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_I64, z2, 0, 0, 0, 0xFFFFFFFFu);
+                    irfn_push(&FN, IR_CONSTK, IRT_I64, z2, 0, 0, 0,
+                              irfn_kconst(&FN, ~0ull));
                     irfn_push(&FN, IR_CMP, IRT_I64, c2, dv, z2, 0, 0);
                     FN.ops[FN.n - 1].flags = (u8)IRCC_EQ;
                     dv = c2;
@@ -9635,6 +9638,7 @@ static u32 gen_int_lit(u64 c, u32 ty)
 {
     u32 d = irfn_vreg(&FN);
     u32 irt = ir_ty_of(ty);
+
 
     if (c <= 0xFFFFFFFFULL)
         irfn_push(&FN, IR_CONST, irt, d, 0, 0, 0, (u32)c);
@@ -10393,8 +10397,7 @@ static u32 gen_postfix(void)
                         u32 dv = irfn_vreg(&FN);
 
 
-                        irfn_push(&FN, IR_CONST, IRT_U64, dv, 0, 0, 0,
-                                  (u32)qs->val);
+                        dv = gen_int_lit((u64)qs->val, ty_int());
                         GEN_TY = ty_int();
                         PEND_LVAL = 0;
                         PEND_BITS = 0;
@@ -10728,8 +10731,9 @@ static u32 gen_postfix(void)
                          "'<enum>.%.*s'", (int)t->len, tok_data(t),
                          (int)t->len, tok_data(t));
             pa_advance();
-            d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, (u32)s->val);
+            /* 走 gen_int_lit：值可能超出 IR_CONST 的 32 位立即数（负数枚举常量
+             * 符号扩展后就是这样），那条路会改用 CONSTK。 */
+            d = gen_int_lit((u64)s->val, ty_int());
             GEN_TY = ty_int();
             return gen_postfix_ops(d);
         }
