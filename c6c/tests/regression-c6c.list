@@ -26,6 +26,7 @@ std-calc
 std-cfg2
 std-check
 std-clean
+std-cli
 std-color
 std-cont
 std-creds
@@ -74,6 +75,7 @@ std-proto2
 std-proto3
 std-proto4
 std-search
+std-search2
 std-sec
 std-ser
 std-serve
