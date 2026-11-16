@@ -224,7 +224,7 @@ elseif(BUILD_TESTING)
   # （见 cmake/C6C.cmake），所以这里如实说明而不是静默注册一堆必红的用例。
   message(STATUS
     "c6: C6_ENABLE_TCC=OFF —— 不注册 tcc 侧 CTest 用例；跑 c6c 的验收用 "
-    "`ctest -L c6c -LE perf` 或 `make -C c6c check-all BOOTSTRAP=host`")
+    "`ctest -L c6c -LE perf`，或者 `cmake --build build --target check-all-c6c`")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -240,7 +240,10 @@ set(_c6_reserved_targets
   wasmrt wasmtest distclean mode-ext mode-plain
   check-install c6-clean clean-all c6-help tcc-clean tcc-distclean
   check-all test-all check-std-serial test-plain check-aux
-  fast check-all-c6c check-c6c)
+  fast check-all-c6c check-c6c
+  # 这四个名字归 c6c 的验收（cmake/C6C.cmake 定义的 target）：它们跑的是 c6c
+  # 自己的脚本，不再转发给 tcc 侧的 CTest 用例。
+  selfhost selftest stdtest c99test)
 foreach(_case IN LISTS _c6_cases)
   if(NOT _case IN_LIST _c6_reserved_targets)
     if(BUILD_TESTING AND C6_ENABLE_TCC)
@@ -276,7 +279,7 @@ function(c6_add_ctest_target target)
     add_custom_target("${target}"
       COMMAND "${CMAKE_COMMAND}" -E echo
         "c6: ${target} 是 tcc 侧的聚合入口；本次 C6_ENABLE_TCC=OFF。"
-        "跑 c6c 的验收用 `ctest -L c6c -LE perf` 或 `make -C c6c check-all BOOTSTRAP=host`"
+        "跑 c6c 的验收用 `ctest -L c6c -LE perf` 或 `cmake --build build --target check-all-c6c`"
       VERBATIM)
     return()
   endif()

@@ -77,8 +77,9 @@ jobs:
   # -------------------------------------------------------------------------
   # c6c：用 c6 语言写的自举编译器（独立子目录 `c6c/`，三个后端）。
   #
-  # 它有自己的 Makefile 和语料，一条 `make -C c6c check-all` 覆盖验收 (1)(2)(3)：
-  # 自举 fixpoint 逐字节、三后端同一套用例、tests+std+诊断语料、c6c 编出上游
+  # 它没有自己的构建系统：全部目标是 CMake target（`cmake/C6C.cmake`），
+  # 一条 `cmake --build build --target check-all-c6c` 覆盖验收 (1)(2)(3)：
+  # 自举 fixpoint 逐字节、全部后端同一套用例、tests+std+诊断语料、c6c 编出上游
   # tcc 并让它跑 tests2（含**第三代 selfhost**：那个 tcc 再编一遍 tcc.c）。
   # 引导编译器是仓库自己的 `tcc/c6`，所以先按常规方式构建一次。
   # -------------------------------------------------------------------------
@@ -130,7 +131,8 @@ jobs:
   # 源码形式留下（c6c 的 build-tcc 与 tests1/tests2 闸门把它当语料）。
   #
   # 验收阶段会有一次例外，写在下面 ctest 那步的注释里：G2c 要一个能用的 tcc
-  # 来编 tcc 的运行时（libtcc1.a），c6c/Makefile 会用 cc 现编一个当夹具。
+  # 来编 tcc 的运行时（libtcc1.a），c6c-tcc-corpus 这个 target 会用 cc 现编一个
+  # 当夹具。
   #
   # 这条作业是"能退"的机器证据：它红了就说明 c6c 又悄悄依赖上 tcc 了。
   # -------------------------------------------------------------------------
@@ -168,14 +170,14 @@ jobs:
       # 并让它跑上游 tests1·tests2。G2c 判的是"c6c 编出的 tcc 能不能工作"，
       # 所以需要一个已知能工作的 tcc 来编 tcc 的 C 运行库 libtcc1.a：宿主 cc
       # 直接编的运行时不等价（实测 102/144，第三代 selfhost 坏 8），
-      # c6c/Makefile 因此在这里用 cc 现编 `tcc/c6` 当夹具（不安装、不进交付物），
-      # 编出的 c6c-built tcc 逐条对齐产品构建的 118/144、坏 0。
+      # 因此在这里用 cc 现编 `tcc/c6` 当夹具（不安装、不进交付物），编出的
+      # c6c-built tcc 逐条对齐产品构建的 118/144、坏 0。
       - name: 验收 c6c（stage0 = gcc）
         run: ctest --test-dir build-notcc -L c6c -LE perf --output-on-failure
 
-      # 同一件事的 Makefile 入口，顺带证明 `make -C c6c` 不经过 CMake 也能走。
-      - name: make -C c6c selfhost（BOOTSTRAP=host）
-        run: make -C c6c selfhost BOOTSTRAP=host HOSTCC=gcc
+      # 同一件事的单条 target 入口，顺带证明 selfhost 不依赖整条 ctest 链。
+      - name: selfhost（stage0 = gcc，CMake target）
+        run: cmake --build build-notcc --target selfhost
 
   # -------------------------------------------------------------------------
   # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
