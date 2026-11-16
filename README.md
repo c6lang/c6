@@ -85,6 +85,11 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 依赖：`cmake`（≥ 3.20，文档与 CI 使用 `ctest --test-dir`）、`make`、C 编译器（gcc/clang）、`binutils`。缺少工具链时构建会
 直接报错，请先按系统包管理器手动安装；不需要联网拉取源码。
 
+完整测试/跑分还依赖 `python3`（`find_package(Python3 COMPONENTS Interpreter REQUIRED)`）：`c6c/bench/bench.py`
+用它做性能基线、生成合成语料并断言 `bench/thresholds.json`；`ctest` 的 `perf` 标签（`bench` / `bench-c6c`）
+与 `check-all-c6c` 会调用它。只构建产品、不跑测试时不需要 Python；Arch/DPKG 打包请在 `check()` 阶段
+确保 `python3` 在 `PATH` 中（CMake 配置时即会查找解释器）。
+
 ```sh
 # 1. 配置（只有第一次需要；tcc/ 源码就在仓库里）
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
@@ -110,6 +115,10 @@ ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
 唯一的例外在验收里：`build-tcc` 量的是"c6c 编出的 tcc 能不能工作"，它的运行时
 `tcc/libtcc1.a` 必须由能用的 tcc 编，所以这一步会用宿主 cc 把 `tcc/tcc.c` 编一个
 参考 tcc 当夹具（不安装、不进交付物）。
+
+安装时 c6c 默认也装成 `bin/c6c`，和 tcc 版 `c6` 并存（`-DC6_INSTALL_C6C=OFF` 可
+关掉）；`C6_ENABLE_TCC=OFF` 时它就是 `bin/c6`。两种情况下它都跟自己的自带头文件与
+运行时（`<prefix>/lib/c6/`）一起装，二进制搬家也能自己找到。
 
 `cmake -S . -B build` 通过 `add_subdirectory(tcc)` 直接使用 `tcc/CMakeLists.txt`：它按上游
 `tcc/configure` 的规则在构建目录生成 `config.mak` / `config.h` / `config.texi`，把安装目录
@@ -179,6 +188,8 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_INSTALL_DOCS` | `ON` | 安装 c6 的 `docs/`、`README.md`、`CHANGELOG.md` 与 `copyright` |
 | `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
+| `C6_INSTALL_C6C` | `ON` | 安装自举编译器 `bin/c6c`（与 tcc 版 `c6` 并存；`C6_ENABLE_TCC=OFF` 时它同时是 `bin/c6`） |
+| `C6_PACKAGE_NAME` | 按 flavour | 包名（`c6` / `c6c`），同时决定 `<datarootdir>/doc/<名>` |
 | `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
 | `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
 | `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
@@ -230,11 +241,19 @@ cc $(pkgconf --cflags --libs c6) app.c -o app
 
 ### 打包与发布
 
-CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除编译器与
-`libtcc` 外还带上 c6 自己的文档：`docs/` 的 33 篇文档（保留子目录结构）与
+CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除 tcc 版 `c6` 与
+`libtcc` 外还有自举编译器 `bin/c6c`（连同它自己的 `lib/c6/`：自带头文件与
+`rt.c6` 运行时），以及 c6 自己的文档：`docs/` 的 33 篇文档（保留子目录结构）与
 `README.md` / `CHANGELOG.md` / `copyright` 装在 `/usr/share/doc/c6/`，上游
 tcc 的 `tcc-doc.html` 仍装在 `<datarootdir>/doc/tcc/`。用
 `-DC6_INSTALL_DOCS=OFF` 可关闭，`-DC6_INSTALL_C6_DOCDIR=...` 可改位置。
+
+同一份清单出两种 flavour：默认（`C6_ENABLE_TCC=ON`）出 **c6** 包；`-DC6_ENABLE_TCC=OFF`
+出 **c6c** 包——里面没有一行 tcc，编译器是 `bin/c6`（c6c，另加一个 `bin/c6c`），库是
+`libc6c`，文档落在 `/usr/share/doc/c6c/`，许可证是 c6c 的 MIT。包名由
+`C6_PACKAGE_NAME` 决定（留空时按 flavour 取 `c6` / `c6c`）；两种包装的是同一批路径，
+所以 `Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。c6c 包目前只作 CI
+artifact（`c6c-packages-*`）产出并验收，Release 里发的仍是 c6 包。
 
 ```sh
 cpack --config build/CPackConfig.cmake -G TGZ -B packages
@@ -428,7 +447,7 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE/Snappy、hexdump、DER/ASN.1、HOTP/TOTP、GIF 的 LZW
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE/Snappy、hexdump、DER/ASN.1、HOTP/TOTP、GIF 的 LZW、HPACK 头压缩
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -462,6 +481,7 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/otp.c6       std.encoding.otp       HOTP（RFC 4226）/TOTP（RFC 6238）：hotp/totp/otp_format、otp_verify_totp（前后各 window 步）；HMAC-SHA-1 动态截断，位数 4..9
   std/encoding/lzw.c6       std.encoding.lzw       GIF 变体 LZW：lzw_gif_decode（LSB、clear/eoi、码宽 2..12）/lzw_gif_encode（贪心最长匹配），坏流/越界/放不下返回 -1
   std/encoding/snappy.c6    std.encoding.snappy    Snappy 块格式：snappy_decode 严格校验、snappy_encode 用调用方 16 KB 哈希表贪心匹配（传 0 退化为字面量）
+  std/encoding/hpack.c6     std.encoding.hpack     HPACK 头压缩（RFC 7541）：静态/动态表 + 前缀整数 + Huffman，编码端不插表、解码端按对端指令插；敏感头强制 never-indexed
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
@@ -684,7 +704,7 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/plist.c6         std.data.plist         Apple 二进制 plist（bplist00）：plist_open/root/count/at/key/get + 各标量访问器，走偏移表与引用号
   std/text/markdown.c6      std.text.markdown      Markdown 常用子集 → HTML：markdown_render（标题/段落/围栏代码/引用/列表/分隔线）与 markdown_inline（代码/粗斜体/链接/转义）
 
-std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
+std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、HTTP/2（h2c）帧层与客户端/服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
   std/net/http.c6           std.net.http           HTTP/1.x 零分配解析：http_parse_request/response、HttpMessage 的 header/header_at/body/content_length、http_status_text
   std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
@@ -705,6 +725,9 @@ std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字�
   std/net/sse.c6            std.net.sse            Server-Sent Events：sse_open/next 按空行派发事件，多行 data 拼进调用方缓冲；注释/BOM/三种行结束符
   std/net/socks5.c6         std.net.socks5         SOCKS5 报文：问候/用户名口令/请求构建 + 方法/认证/应答/地址解析，IPv4/IPv6/域名
   std/net/mqtt.c6           std.net.mqtt           MQTT 3.1.1 报文：固定头与变长剩余长度、CONNECT/PUBLISH/SUBSCRIBE 构建解析、+ / # 主题通配
+  std/net/http2.c6          std.net.http2          HTTP/2 帧层（RFC 9113）：帧头读写/半包、PADDED/PRIORITY 前缀、preface、SETTINGS/WINDOW_UPDATE/RST_STREAM/PING/GOAWAY 编解码，H2Pipe 同步读写
+  std/net/http2c.c6         std.net.http2c         h2c 客户端：preface+SETTINGS 握手、HEADERS(+CONTINUATION)/DATA、窗口还额、GOAWAY/RST 失败，一条连接串行多流（GET/POST 快捷入口）
+  std/net/http2d.c6         std.net.http2d         h2c 服务端骨架：h2d_listen/h2d_accept、Conn 的 next_request（1/0/-1）/respond/respond_text、Request 的 method/authority/path/body/fields；一次一个流、非 h2 报文判协议错
 ```
 
 ```c
@@ -812,7 +835,8 @@ cmake --build build --target std-ops      # 编译并运行 examples/stdops.c6�
 cmake --build build --target std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
 cmake --build build --target std-mgmt     # 编译并运行 examples/stdmgmt.c6（第九十批 Prometheus/Gemini/SNMP/NNTP）
 cmake --build build --target std-util     # 编译并运行 examples/stdutil.c6（第九十一批 CIDR/字节序/排序键/断词）
-ctest --test-dir build -R '^std-quic$'  # 编译并运行 examples/stdquic.c6（第九十二批 QUIC/HTTP/3 全栈）
+ctest --test-dir build -R '^std-quic$'  # 编译并运行 examples/stdquic.c6（第九十三批 QUIC/HTTP/3 全栈）
+cmake --build build --target std-h2       # 编译并运行 examples/stdh2.c6（第九十二批 HPACK 与 h2c 客户端/服务端）
 # 覆盖面盘点（还缺什么、什么时候到头）：docs/stdlib-coverage.md
 cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```

@@ -6295,6 +6295,11 @@ static u32 parse_typespec(void)
         saw_complex = 0;
     }
     if (!base) {
+        /* C TU 里不带类型说明符的声明按隐式 int 处理，但要发 tcc 口径的
+         * warning（tests2/102_alignas.expect 与 60_errors_and_warnings.expect
+         * 的第一段都逐字要它）；c6 源码总是显式类型，不要打噪声。 */
+        if (!in_c6_tu())
+            pa_warn_tcc("type defaults to int");
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
         else if (nlong == 1)
@@ -13050,6 +13055,19 @@ static u32 ty_ternary(u32 a, u32 b, int anpc, int bnpc)
 {
     if (a == b)
         return a;
+    /* tcc 口径诊断：一支是指针、另一支是普通整数（且不是空指针常量）时
+     * 告警但照常合并类型（tests2/33_ternary_op.expect 第一行逐字要它）。
+     * void 表达式（`fp?0L:(void)0`）不算；c6 TU 自有诊断口径，不打这条。 */
+    if (!in_c6_tu()) {
+        /* 函数设计ator（`f`）在 ?: 里算指针侧，和 `&f` 一样。 */
+        int ap = ty_is_ptr(a) || ty_is_func(a);
+        int bp = ty_is_ptr(b) || ty_is_func(b);
+
+        if (ap && !bp && b != ty_void() && !bnpc)
+            pa_warn_tcc("pointer/integer mismatch in conditional expression");
+        else if (bp && !ap && a != ty_void() && !anpc)
+            pa_warn_tcc("pointer/integer mismatch in conditional expression");
+    }
     if (ty_is_ptr(a) && ty_is_ptr(b)) {
         u32 ta = ty_target(a);
         u32 tb = ty_target(b);

@@ -10,3 +10,4 @@
 145_winarm64_interlocked	要 windows.h + win-arm64 内建函数（上游也跳）
 99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
 94_generic	要**指向对象的**限定符进类型 id：`const int *` 必须和 `int *` 不同 id（指针层限定符已经有了，缺的是 `const` 修饰基类型这一层；`_Generic(ptr, int *:1, int * const:2, default:20)` 现在是 2、应为 20）
+112_backtrace	要 tcc 的 `-dt` 自动展开 `test_*` 宏并反复重跑 + `-b` 边界检查运行时；上游 tests2/Makefile 给这条用例加了 `FLAGS += -dt -b`，c6c 没有 `-dt`（同族的 113_btdll 已按"需要 tcc_backtrace"记为 n/a）

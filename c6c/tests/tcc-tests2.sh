@@ -75,10 +75,12 @@ one_case() {
     fi
     exp="$TCCDIR/$base.expect"
     [ -e "$exp" ] || exp=/dev/null
-    # 少数用例要带命令行参数（对齐上游 tests2/Makefile 里的 ARGS）
-    args=""
+    # 少数用例要带命令行参数（对齐上游 tests2/Makefile 里的 ARGS）。
+    # 用位置参数而不是字符串：46_grep 的正则里含空格和 `$`，字符串再展开会被拆坏。
+    set --
     case "$base" in
-    31_args) args="arg1 arg2 arg3 arg4 arg5" ;;
+    31_args) set -- arg1 arg2 arg3 arg4 arg5 ;;
+    46_grep) set -- '[^* ]*[:a:d: ]+\:\*-/: $' "$TCCDIR/46_grep.c" ;;
     esac
     # 编译期**告警**要进输出：上游的 .expect 里带着它们（`03_struct.expect`
     # 第一行就是那条 `__cleanup__ ignored on type`）。路径前缀按 expect 的
@@ -87,7 +89,10 @@ one_case() {
     if [ -s "$TMP/$base.err" ]; then
         sed "s|$TCCDIR/||g" "$TMP/$base.err" | grep -v '^$' >> "$TMP/$base.out" 2>/dev/null
     fi
-    ( cd "$TMP" && timeout -k 2 10 "./$base" $args >>"$TMP/$base.out" 2>"$TMP/$base.runerr" )
+    # 上游 T3 是 `2>&1 | sed 's,$(SRC)/,,g'`：程序 stdout/stderr 都要进输出，
+    # 且都要做路径归一化（129_scopes 的 __FILE__ 是绝对路径，expect 只要 basename）。
+    ( cd "$TMP" && timeout -k 2 10 "./$base" "$@" >"$TMP/$base.run" 2>&1 )
+    sed "s|$TCCDIR/||g" "$TMP/$base.run" >>"$TMP/$base.out" 2>/dev/null
     if diff -q "$exp" "$TMP/$base.out" >/dev/null 2>&1; then
         echo "PASS" >"$vf"
     else
