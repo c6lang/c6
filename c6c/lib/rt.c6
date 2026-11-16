@@ -4749,11 +4749,67 @@ int fileno(void *f)
     return (int)(long)f;
 }
 
+/* execvp：execve 不查 PATH，得自己按 PATH 一个个试。以前直接 syscall
+ * execve，于是 `execvp("sh", argv)` 永远 ENOENT——std-sys 的 pty 用例起不来
+ * 子进程（子进程 127 退出、一个字都没输出）。失败时按 C 的约定写 errno
+ * 返回 -1（syscall 返回的是负的 errno 本身）。 */
 int execvp(const char *file, char *const argv[])
 {
-    long r = c6c_sys3(59 /* execve */, (long)file, (long)argv, (long)environ);
+    char buf[1024] = {0};
+    const char *path = 0;
+    const char *p = 0;
+    long r = 0;
 
-    return (int)r;
+    if (!file || !*file) {
+        errno = 2;                  /* ENOENT */
+        return -1;
+    }
+    if (strchr(file, '/')) {        /* 带斜杠：不查 PATH */
+        r = c6c_sys3(59 /* execve */, (long)file, (long)argv, (long)environ);
+        if (r < 0) {
+            errno = (int)-r;
+            return -1;
+        }
+        return (int)r;
+    }
+    path = getenv("PATH");
+    if (!path || !*path)
+        path = "/bin:/usr/bin";
+    p = path;
+    {
+        int last = 2;               /* 一路都没找到 → ENOENT */
+
+        for (;;) {
+            const char *e = strchr(p, ':');
+            long dl = e ? (long)(e - p) : (long)strlen(p);
+            long fl = (long)strlen(file);
+
+            if (dl + fl + 2 <= (long)sizeof buf) {
+                long i = 0;
+
+                if (dl == 0) {      /* PATH 里的空项按 POSIX 就是当前目录 */
+                    memcpy(buf, file, (size_t)fl);
+                    i = fl;
+                } else {
+                    memcpy(buf, p, (size_t)dl);
+                    buf[dl] = '/';
+                    memcpy(buf + dl + 1, file, (size_t)fl);
+                    i = dl + 1 + fl;
+                }
+                buf[i] = 0;
+                r = c6c_sys3(59 /* execve */, (long)buf, (long)argv,
+                             (long)environ);
+                if (r >= 0)
+                    return (int)r;
+                last = (int)-r;     /* EACCES/ENOEXEC 之类：记下来继续找 */
+            }
+            if (!e)
+                break;
+            p = e + 1;
+        }
+        errno = last;
+    }
+    return -1;
 }
 
 /* realpath：相对路径按 cwd 展开、折叠 "." / ".." / 多余斜杠，最后确认文件存在。

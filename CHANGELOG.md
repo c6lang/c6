@@ -7,6 +7,18 @@
 
 ## 未发布
 
+### `execvp` 真的按 PATH 找程序：回归 83 → 84 / 92
+
+`c6c/lib/rt.c6` 里的 `execvp` 原来只是一条 `execve` 系统调用——`execve`
+不查 PATH，于是 `execvp("sh", argv)` 永远 `ENOENT`。`std/os/pty.c6` 的
+`pty_spawn()` 用它起子进程，结果子进程一上来就 127 退出、一个字都没输出
+（`std-sys` 的 pty 段两条断言全挂）。
+
+改成 POSIX 的行为：名字里带 `/` 就直接 `execve`；否则按 `PATH` 逐段拼
+`目录/名字` 试，空项算当前目录，全试完把最后那个 errno 交出去。顺带把
+"syscall 返回负 errno" 翻成 `errno = -r; return -1`——以前直接把负数当返回值
+给调用方，`errno` 一直是 0。
+
 ### 浮点 `==` / `!=` 认 NaN：回归 81 → 83 / 92
 
 x64 后端的浮点比较把 `EQ`/`NE` 直接交给 `sete`/`setne`。`ucomisd` 碰上 NaN

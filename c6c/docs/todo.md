@@ -4699,3 +4699,10 @@ Str l[3] = {
 
 顺带记一下没管的：`aout.c6` / `asmout.c6` 这两个"汇编文本"后端的 `IR_CMP`
 还是整数 `cmp`，浮点比较整个不对（它们只用于 `-S` 冒烟）。
+
+## 第 230 轮：execvp 不查 PATH（**已修**）
+
+`rt.c6` 的 `execvp` 直接 `execve`，而 `execve` 不查 PATH —— `execvp("sh", …)`
+永远 ENOENT。`pty_spawn()` 用它起子进程，子进程 127 退出、无输出，std-sys 的
+pty 段两条断言全挂。现已按 POSIX 补齐 PATH 查找，并把负 errno 翻成
+`errno = -r; return -1`。
