@@ -343,6 +343,83 @@ jobs:
           if-no-files-found: error
 
   # -------------------------------------------------------------------------
+  # c6c-only 打包：C6_ENABLE_TCC=OFF，包里没有 tcc——编译器是自举的 c6c
+  # （装成 bin/c6 与 bin/c6c），库是 libc6c，运行时是自己的 lib/c6/rt.c6，
+  # 文档在 share/doc/c6c。产物名 c6c-*，与上面的 c6 包互斥（Provides: c6 /
+  # Conflicts: c6, tcc）。目前只上传为 CI artifact、不进 Release：默认交付物
+  # 仍是 tcc 版 c6，等 c6c 的能力缺口补齐再换（见 CHANGELOG「未发布」）。
+  # -------------------------------------------------------------------------
+  package-c6c:
+    name: package c6c-only (${{ matrix.generator }})
+    needs: [test, no-tcc]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        generator: [DEB, RPM, TGZ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils dpkg-dev rpm
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build-notcc \
+            -DC6_ENABLE_TCC=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_TESTING=OFF \
+            -DC6_PACKAGE_RELEASE="${GITHUB_RUN_NUMBER}.$(git rev-parse --short=7 HEAD)"
+          cmake --build build-notcc --parallel "$(nproc)"
+
+      - name: Package (${{ matrix.generator }})
+        run: |
+          mkdir -p packages-notcc
+          cpack --config build-notcc/CPackConfig.cmake \
+            -G "${{ matrix.generator }}" -B packages-notcc
+
+      - name: Inspect package
+        run: |
+          rm -rf packages-notcc/_CPack_Packages
+          ls -lh packages-notcc/
+          case "${{ matrix.generator }}" in
+            DEB) list() { dpkg-deb --contents packages-notcc/*.deb; } ;;
+            RPM) list() { rpm -qlp packages-notcc/*.rpm; } ;;
+            TGZ) list() { tar tzf packages-notcc/*.tar.gz; } ;;
+          esac
+          list | head -40
+          # 该有的：编译器两个名字、自带头文件与运行时、嵌入库、pkgconf、文档。
+          for f in usr/bin/c6 usr/bin/c6c usr/lib/c6/rt.c6 usr/lib/c6/include/stddef.h \
+                   usr/lib/libc6c.a usr/lib/libc6c.so usr/include/c6lib.h \
+                   usr/lib/pkgconfig/c6.pc usr/share/doc/c6c/docs/README.md \
+                   usr/share/doc/c6c/copyright; do
+            if ! list | grep -q "$f"; then
+              echo "::error::c6c 包里缺 $f"
+              exit 1
+            fi
+          done
+          # 不该有的：tcc 的实现、它的运行时/文档与兼容命令名。
+          for pat in 'usr/lib/tcc' 'libtcc\.a' 'libtcc1\.a' 'usr/bin/tcc' 'tcc-doc' 'tcc\.1'; do
+            if list | grep -qE "$pat"; then
+              echo "::error::c6c 包里不该有 $pat（那是 tcc flavour 的东西）"
+              exit 1
+            fi
+          done
+          if [ "${{ matrix.generator }}" = DEB ]; then
+            dpkg-deb --field packages-notcc/*.deb Package Provides Conflicts
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c6c-packages-${{ matrix.generator }}
+          path: packages-notcc/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
   # 发布：仅在 v* tag 上，把三种包 + 校验和发到 GitHub Release。
   # -------------------------------------------------------------------------
   release:

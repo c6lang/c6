@@ -41,8 +41,36 @@ if(C6_INSTALL_C6C OR NOT C6_ENABLE_TCC)
   install(FILES "${C6C_DIR}/lib/rt.c6" DESTINATION "${C6_LIBDIR_REL}/c6")
 endif()
 
-# C6_ENABLE_TCC=OFF：没有 tcc 的 install-unx 清单可抄，装到这里为止；剩下的
-# 是 tcc 的库、头文件与文档。
+# ---------------------------------------------------------------------------
+# c6 自己的文档：语言扩展、std、测试与后端只在这里有说明，和上游 tcc 的
+# tcc-doc.html 分开装。保留 docs/ 子目录结构，文档内 reference/*.md 之类的
+# 相对链接才能继续用；根 README / CHANGELOG 放在它的上一层，正好对应
+# docs/README.md 的 ../README.md 与 docs/history/ 的 ../../CHANGELOG.md。
+#
+# 两种 flavour 都装（c6c 包没有 tcc 也照样要带文档）；落点跟着包名走：
+# c6 包在 share/doc/c6、c6c 包在 share/doc/c6c。
+# ---------------------------------------------------------------------------
+if(C6_INSTALL_DOCS)
+  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/docs/"
+          DESTINATION "${C6_C6_DOCDIR_REL}/docs"
+          FILES_MATCHING PATTERN "*.md")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+                "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md"
+          DESTINATION "${C6_C6_DOCDIR_REL}")
+  # Debian 惯例 /usr/share/doc/<pkg>/copyright；CPack DEB 不会自动生成。
+  # 许可证跟着 flavour 走：c6 包里是 tcc 的 LGPL（COPYING），c6c 包（没有 tcc）
+  # 里是 c6c 自己的 MIT——别装错那一份。
+  if(C6_ENABLE_TCC)
+    set(_c6_license_file "${C6_TCC_DIR}/COPYING")
+  else()
+    set(_c6_license_file "${CMAKE_CURRENT_SOURCE_DIR}/c6c/LICENSE")
+  endif()
+  install(FILES "${_c6_license_file}"
+          DESTINATION "${C6_C6_DOCDIR_REL}" RENAME "copyright" OPTIONAL)
+endif()
+
+# C6_ENABLE_TCC=OFF：c6c 的二进制与数据、文档都装完了，剩下的全是 tcc 的
+# 库、头文件、man/info 与兼容软链。
 if(NOT C6_ENABLE_TCC)
   return()
 endif()
@@ -83,24 +111,6 @@ install(FILES "${C6_TCC_DIR}/tcc-doc.info"
         DESTINATION "${C6_INFODIR_REL}" OPTIONAL)
 install(FILES "${C6_TCC_DIR}/tcc-doc.html"
         DESTINATION "${C6_DOCDIR_REL}" OPTIONAL)
-
-# ---------------------------------------------------------------------------
-# c6 自己的文档：语言扩展、std、测试与后端只在这里有说明，和上游 tcc 的
-# tcc-doc.html 分开装。保留 docs/ 子目录结构，文档内 reference/*.md 之类的
-# 相对链接才能继续用；根 README / CHANGELOG 放在它的上一层，正好对应
-# docs/README.md 的 ../README.md 与 docs/history/ 的 ../../CHANGELOG.md。
-# ---------------------------------------------------------------------------
-if(C6_INSTALL_DOCS)
-  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/docs/"
-          DESTINATION "${C6_C6_DOCDIR_REL}/docs"
-          FILES_MATCHING PATTERN "*.md")
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
-                "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md"
-          DESTINATION "${C6_C6_DOCDIR_REL}")
-  # Debian 惯例 /usr/share/doc/<pkg>/copyright；CPack DEB 不会自动生成。
-  install(FILES "${C6_TCC_DIR}/COPYING"
-          DESTINATION "${C6_C6_DOCDIR_REL}" RENAME "copyright" OPTIONAL)
-endif()
 
 # 交叉产物是构建期生成的，安装时才枚举（见 cmake/c6-install-cross.cmake.in）。
 if(C6_TCC_CROSS)

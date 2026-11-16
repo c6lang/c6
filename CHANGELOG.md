@@ -23,6 +23,23 @@
   安装清单加上 `bin/c6c` 并单独验一遍它的自找路径；CI 的打包步骤对 DEB / RPM / TGZ
   逐个断言 `usr/bin/c6c` 与 `usr/lib/c6/rt.c6` 在包里。
 
+### 打包：没有 tcc 也能出包（`c6c` flavour）
+
+- `cmake/C6Packaging.cmake` 以前在 `C6_ENABLE_TCC=OFF` 下直接 `return()`——「没有
+  tcc 就没有可打的包」。现在两种 flavour 都能打：默认出 `c6` 包（tcc 版编译器 +
+  `libtcc`），`-DC6_ENABLE_TCC=OFF` 出 `c6c` 包（自举编译器 + `libc6c` + `lib/c6/`，
+  没有一行 tcc）。包名、描述、许可证（LGPL-2.1 vs MIT）、`/usr/share/doc/<名>` 与
+  `Provides` / `Conflicts` 都跟着 flavour 走；新开关 `C6_PACKAGE_NAME` 可覆盖包名。
+- 文档安装从 tcc 分支里挪出来：`C6_ENABLE_TCC=OFF` 以前一份文档都不装，现在 c6c 包
+  也带 `share/doc/c6c/`（`docs/` 的 33 篇 + `README.md` / `CHANGELOG.md` /
+  `copyright`，其中 copyright 是 c6c 自己的 MIT，不是 tcc 的 `COPYING`）。
+- CI 新增 `package c6c-only (DEB|RPM|TGZ)` 作业：构建 c6c、打包、逐项断言「有
+  `usr/bin/c6`、`usr/bin/c6c`、`lib/c6/rt.c6`、`libc6c.a`、`libc6c.so`、
+  `share/doc/c6c/docs/README.md`」与「没有 `usr/lib/tcc`、`libtcc.a`、`libtcc1.a`、
+  `usr/bin/tcc`、`tcc-doc`、`tcc.1`」，产物作 `c6c-packages-*` artifact 上传。
+  Release 里发的仍是 `c6` 包：等 c6c 的能力缺口（`-shared`/`-fPIC`、libtcc 兼容面、
+  `tests/regression.sh` 的 91 个用例迁移）补齐再换默认。
+
 ## 0.6.2 — 2026-11-16
 
 ### CI：发版说明直接取自版本提交的正文
