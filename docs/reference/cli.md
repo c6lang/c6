@@ -5,7 +5,7 @@
 > 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
 
-## 工程管理子命令（c6c init / scan / build / test / run）
+## 工程管理子命令（c6c init / scan / build / test / package / flash …）
 
 `c6c` 除了编译源码，还带一组**工程管理子命令**（参考 cargo / go 的做法，
 用 c6 自身实现，子命令在 `c6c/src/pm.c6`）。第一个参数是这些名字时进入管理
@@ -14,9 +14,13 @@
 ```sh
 c6c scan              # 只扫描仓库：推断 name/version/kind、源文件、import、test 块
 c6c init [--force]    # 把扫描结果写成 c6c.yaml（已存在需 --force 覆盖）
-c6c build             # 按清单编译到 out（默认 build/<name>）
+c6c build [--force]   # 按清单编译到 out（默认 build/<name>）；mtime 增量
 c6c test              # 编译全部源文件并运行 `test "…" { }` 块
 c6c run [参数...]     # 先 build，再执行产物并把参数透传
+c6c package           # 按 pkg_files 装 staging 树，出 TGZ / DEB
+c6c install [--destdir=pkg] [--prefix=/usr]  # 按 pkg_files 安装（保留执行位）
+c6c publish [--tag]   # package + SHA256SUMS；--tag 再打 v<version>
+c6c flash|monitor|debug [--dry-run]  # 按 *_cmd 模板操作固件
 c6c help              # 子命令帮助
 ```
 
@@ -42,9 +46,40 @@ flags:
   - -b
 ```
 
-ELF/BIN/HEX 生成、烧录与调试、打包安装与发布等子命令将按同一清单逐步接入；
-`c6c help` 始终打印当前可用列表。回归入口：`cmake --build build --target pmtest`
-（或 `ctest -R '^c6c-pm$'`）。
+打包与固件的附加键（都由 `init` 生成空骨架，按需填）：
+
+```yaml
+pkg_name: hello
+pkg_desc: hello from c6
+pkg_license: MIT
+pkg_formats:            # tgz / deb（deb 需要 dpkg-deb）
+  - tgz
+pkg_files:              # "源:目标"，package/install 共用
+  - build/hello:bin/hello
+fw_formats:             # firmware 专用：ELF 由 cc 链接，BIN/HEX 用 objcopy
+  - elf
+  - bin
+  - hex
+link_flags:             # 传给链接固件的 cc（如 -T board.ld）
+flash_cmd:              # 参数列表；{elf} {bin} {out} {name} {version} 会展开
+  - openocd
+  - -f
+  - openocd.cfg
+  - -c
+  - "program {elf} verify reset exit"
+monitor_cmd:
+debug_cmd:
+```
+
+固件构建是两阶段：c6c 只认 `main` 当 ELF 入口，所以 `_start` 工程先用
+`c6c -c` 出 ET_REL，再由宿主 `cc -nostdlib -Wl,-e,_start` 链接（`link_flags`
+可追加 `-T` 等）；随后按 `fw_formats` 用 `objcopy` 出 `.bin` / `.hex`。
+`flash` / `monitor` / `debug` 只是模板执行器，`--dry-run` 先预览命令。
+
+`c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编
+`build/c6c-managed`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链。
+回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
+当前 21 项检查。
 
 ## 版本与发布号
 

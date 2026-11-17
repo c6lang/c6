@@ -18,10 +18,15 @@
   `c6c.yaml`（已存在需 `--force` 覆盖）。
 - `c6c build` / `test` / `run` 按清单编译、跑 test 块、执行产物；清单缺省时
   退化为临时扫描并提示先 `init`；固件工程自动带 `-nostdlib`。
-- 打包安装、ELF/BIN/HEX、烧录调试与发布等子命令留待同一清单上继续接入。
+- `package` / `install` / `publish` 共用 `pkg_files`：TGZ / DEB 打包、带执行位
+  的安装、`SHA256SUMS` 与可选 `v<version>` tag；`build` 按 mtime 增量。
+- 固件：`_start` 工程走「c6c -c → cc -nostdlib 链接」两阶段，`fw_formats` 用
+  objcopy 出 ELF/BIN/HEX；`flash` / `monitor` / `debug` 按清单中的命令模板
+  执行（`{elf}` / `{bin}` 等占位符展开，`--dry-run` 可预览）。
+- `c6c/c6c.yaml` 是 c6c 自身的工程配置（dogfood）：`pmtest` 真跑它的自编、
+  打包与 staged install；回归增加到 21 项。
 
-验证：`pmtest` 12/12（扫描、清单、build/test/run、覆盖保护、firmware 推断、
-原 CLI 不回归）；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+验证：`pmtest` 21/21；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 

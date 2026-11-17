@@ -82,5 +82,79 @@ printf 'int main(void){return 7;}\n' > "$WORK/hello.c6"
 "$WORK/hello"
 if [ $? -eq 7 ]; then ok "普通编译仍是编译器"; else bad "普通编译"; fi
 
+# 7) 固件：_start → 两阶段链接 + BIN/HEX + flash/monitor/debug 模板
+mkdir -p "$WORK/fwproj"
+cat > "$WORK/fwproj/start.c6" <<'EOF'
+void _start(void) { }
+EOF
+cat > "$WORK/fwproj/c6c.yaml" <<'EOF'
+name: fw
+version: 0.1.0
+kind: firmware
+out: build/fw.elf
+sources:
+  - start.c6
+include:
+  - .
+flags:
+  - -nostdlib
+fw_formats:
+  - elf
+  - bin
+  - hex
+flash_cmd:
+  - echo
+  - FLASH
+  - "{elf}"
+  - "{bin}"
+monitor_cmd:
+  - echo
+  - MONITOR
+debug_cmd:
+  - echo
+  - DEBUG
+  - "{elf}"
+EOF
+(cd "$WORK/fwproj" && "$C6C" build > build.log 2>&1)
+if [ -f "$WORK/fwproj/build/fw.elf" ] && [ -f "$WORK/fwproj/build/fw.elf.bin" ] \
+   && [ -f "$WORK/fwproj/build/fw.elf.hex" ]; then
+  ok "firmware: ELF + BIN + HEX"
+else
+  bad "firmware 产物"
+fi
+(cd "$WORK/fwproj" && "$C6C" flash --dry-run > flash.log 2>&1)
+if grep -q 'FLASH build/fw.elf build/fw.elf.bin' "$WORK/fwproj/flash.log"; then
+  ok "flash 模板展开 {elf}/{bin}"
+else
+  bad "flash 模板展开"
+fi
+(cd "$WORK/fwproj" && "$C6C" monitor > monitor.log 2>&1 && "$C6C" debug > debug.log 2>&1)
+if grep -q 'MONITOR' "$WORK/fwproj/monitor.log" && grep -q 'DEBUG build/fw.elf' "$WORK/fwproj/debug.log"; then
+  ok "monitor / debug 模板"
+else
+  bad "monitor / debug 模板"
+fi
+
+# 8) dogfood：c6c/ 自己的 c6c.yaml（真正的工程配置，不是玩具用例）
+SELF=$(cd "$(dirname "$C6C")/.." && pwd)
+if [ -f "$SELF/c6c.yaml" ]; then ok "c6c/ 自带 c6c.yaml"; else bad "c6c.yaml 缺失"; fi
+(cd "$SELF" && "$C6C" build > /dev/null 2>&1 && "$C6C" build > "$WORK/inc.log" 2>&1)
+if grep -q '已是最新' "$WORK/inc.log"; then ok "增量构建跳过重编"; else bad "增量构建"; fi
+if [ -x "$SELF/build/c6c-managed" ] && "$SELF/build/c6c-managed" --version > /dev/null 2>&1; then
+  ok "c6c 清单自编产物可用"
+else
+  bad "c6c 清单自编"
+fi
+(cd "$SELF" && "$C6C" package > "$WORK/pkg.log" 2>&1)
+if grep -q 'c6c-0.6.2.tar.gz' "$WORK/pkg.log"; then ok "package 出 TGZ"; else bad "package 出 TGZ"; fi
+(cd "$SELF" && "$C6C" install --destdir="$WORK/stage" > /dev/null 2>&1)
+if [ -x "$WORK/stage/usr/bin/c6c" ] && "$WORK/stage/usr/bin/c6c" --version > /dev/null 2>&1; then
+  ok "install 安装可执行 c6c"
+else
+  bad "install 安装"
+fi
+(cd "$SELF" && "$C6C" publish --dry-run > "$WORK/pub.log" 2>&1)
+if grep -q '预览' "$WORK/pub.log"; then ok "publish 预览"; else bad "publish 预览"; fi
+
 echo "c6c pm: 通过 $pass / 失败 $fail"
 [ "$fail" -eq 0 ]

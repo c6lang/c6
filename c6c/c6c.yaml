@@ -1,0 +1,24 @@
+# c6c 自身的工程管理清单（`c6c build/test/package/install` 的 dogfood 样本）
+# out 用 c6c-managed，避免覆盖 build/c6c（那个是当前正在用的编译器）。
+name: c6c
+version: 0.6.2
+kind: app
+out: build/c6c-managed
+sources:
+  - src/c6c.c6
+include:
+  - .
+  - include
+flags:
+pkg_name: c6c
+pkg_desc: c6c - the c6 compiler written in c6 (self-hosting)
+pkg_license: MIT
+pkg_formats:
+  - tgz
+pkg_files:
+  - build/c6c-managed:bin/c6c
+  - lib/rt.c6:lib/c6/rt.c6
+  - include/stddef.h:lib/c6/include/stddef.h
+  - include/stdarg.h:lib/c6/include/stdarg.h
+  - include/stdint.h:lib/c6/include/stdint.h
+  - include/c6lib.h:include/c6lib.h
