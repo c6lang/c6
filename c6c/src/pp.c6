@@ -1209,7 +1209,7 @@ static void pp_do_pragma_op(void)
     int k = 0;
 
     do {
-        k = raw_next(&t);
+        k = pp_next(&t);
     } while (k == TK_NL);
     if (!(k == TK_PUNCT && TOK_EQ(&t, "("))) {
         if (k != TK_EOF)
@@ -1217,19 +1217,46 @@ static void pp_do_pragma_op(void)
         return;
     }
     do {
-        k = raw_next(&t);
+        k = pp_next(&t);
     } while (k == TK_NL);
-    if (k != TK_STR) {
-        if (k != TK_EOF)
-            pp_pushback(&t, k);
-        return;
-    }
     str = t;
-    do {
-        k = raw_next(&t);
-    } while (k == TK_NL);
-    if (!(k == TK_PUNCT && TOK_EQ(&t, ")")) && k != TK_EOF)
+    if (k != TK_STR && k != TK_EOF)
         pp_pushback(&t, k);
+    if (str.kind != TK_STR) {
+        /* 操作数不是字面量字符串，说明它要先做宏展开
+         * （内核 compiler-gcc.h:118 的 `__diag(s)` 就是
+         * `_Pragma(__diag_str(GCC diagnostic s))`）：把整个实参重新扫一遍，
+         * 从展开结果里挑出唯一的字符串字面量当 pragma 正文。 */
+        int want = 1;
+        int got = 0;
+        int base = 0;
+
+        pp_pushback(&str, str.kind);
+        for (;;) {
+            k = pp_next(&t);
+            if (k == TK_EOF || k == TK_NL)
+                break;
+            if (k == TK_PUNCT && TOK_EQ(&t, "("))
+                base++;
+            else if (k == TK_PUNCT && TOK_EQ(&t, ")")) {
+                if (base == 0)
+                    break;
+                base--;
+            } else if (k == TK_STR && want) {
+                str = t;
+                want = 0;
+                got = 1;
+            }
+        }
+        if (!got)
+            return;
+    } else {
+        do {
+            k = raw_next(&t);
+        } while (k == TK_NL);
+        if (!(k == TK_PUNCT && TOK_EQ(&t, ")")) && k != TK_EOF)
+            pp_pushback(&t, k);
+    }
 
     txt = unquote(&str);
     if (!txt || !txt[0])
