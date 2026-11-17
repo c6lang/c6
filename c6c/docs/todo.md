@@ -4977,3 +4977,29 @@ xml 那两条断言（`item 有 id`、`id 的长度`）都是它。
 `Buf@(96) out`（定长缓冲结构体）、`foreach (int k = range(0, 3))` 的展开，
 或者 `int counts[3]` 这种小数组。下一轮在副本里从 `main` 第一行开始插
 `printf`，一行一行往下挪就能定位。
+
+### 第 250 轮：std-demo 崩在 `Span@int sp = { counts }`（独立复现出来了）
+
+`examples/wordcount.c6` 从 `main` 第一行开始插打印，一路走到 `D5 k=2`（循环正常）
+之后崩掉；再往里插一层：
+
+```
+D6 count=0     # Span@int sp = { counts }; 之后 sp.count() 是 0（应该是 3）
+```
+
+独立复现（`Span@int` 是 `struct Span@T { T[:] items; }`，见 std/container/span.c6）：
+
+```c
+int arr[3] = { 7, 8, 9 };
+Span@int a = { arr };      // c6c: count=0   tcc: 3   ← 坏
+Span@int b = arr;          // c6c: count=9            ← 坏（len 读成了 arr[2]）
+int[:]  s1 = arr;          // c6c: 3                   ✓
+int[:]  s2 = { arr };      // c6c: 0                   ← 坏
+```
+
+也就是说"数组 → 切片"的转换只在 `T[:] x = arr;` 这一种写法里做对了，**花括号包一层、
+或者装进带切片成员的结构体**都不做转换（直接把数组头两个元素当 `{ptr,len}` 拷）。
+试过在 `gen_init_obj` 入口和叶子引擎里补 `{ptr,len}` 的构造，前者没触发（Span 只有
+一个成员、走的是叶子路径），后者把本来对的 `s2` 也弄坏了（3 → 0），两次都 `git
+checkout` 回去了。下一轮从叶子引擎那条 `store_conv(LF_TY[li], v, vty)` 改，注意
+`vty` 在这条路上拿到的可能已经是**退化后的指针**而不是数组类型——先把它打出来。
