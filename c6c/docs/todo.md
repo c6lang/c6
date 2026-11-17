@@ -5418,3 +5418,15 @@ chan（和 5583）。根因很直接：`rt.c6` 里 `pthread_mutex_*` / `pthread_
 的最小用例（一个 waiter、主线程 signal 一次）跑通，再上 stdthread。
 
 （这一轮的改动整块撤回了，回归仍 90 / 92。）
+
+### 第 277 轮：互斥量 + 条件变量一起上也还挂（`/tmp/mx1.c6` = 124）
+
+第 276 轮修好的互斥量单独跑是对的（`counter=2000`），可把条件变量按"通知计数 +
+futex"接上之后，`mx1.c6`（两个 worker 各 1000 次加锁累加 + 主线程等一次
+broadcast）还是挂死。`mx1` 里 `while (!READY && i < 1000)` 有次数上限，所以不是
+主线程那一侧在转，是**某一次 futex WAIT 永远等不到**。
+
+下一轮第一件事：给 `mx1.c6` 每一段加 `fprintf`（worker 进/出锁、broadcast 前后、
+main 每次 wait 前后），先看挂在哪一段；别再整块上，按 worker→锁→signal→main
+的顺序一格一格接。
+（改动已撤回，回归仍 90 / 92。）
