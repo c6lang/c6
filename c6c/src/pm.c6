@@ -937,7 +937,10 @@ static int pm_firmware_outputs(const PmProject *p)
     snprintf(bin, sizeof(bin), "%s.bin", p->out);
     snprintf(hex, sizeof(hex), "%s.hex", p->out);
     if (pm_has_fmt(fmts, p->nfw_fmt, "bin")) {
-        char *av[5] = {(char *)0};
+        /* 5 个参数 → 数组要留第 6 个槽给 execvp 要求的 NULL 结尾；少了它
+         * argv 会读出栈上的垃圾指针，execve 在 /usr/bin/objcopy 上直接
+         * EFAULT（CI 上的 `FAIL firmware 产物` 就是这么来的）。 */
+        char *av[6] = {(char *)0};
         av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"binary";
         av[3] = p->out; av[4] = bin;
         if (pm_spawn(av) != 0) {
@@ -947,7 +950,7 @@ static int pm_firmware_outputs(const PmProject *p)
         printf("c6c: 固件 %s 已生成\n", bin);
     }
     if (pm_has_fmt(fmts, p->nfw_fmt, "hex")) {
-        char *av[5] = {(char *)0};
+        char *av[6] = {(char *)0};   /* 同上：多一个槽放 NULL 结尾 */
         av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"ihex";
         av[3] = p->out; av[4] = hex;
         if (pm_spawn(av) != 0) {
