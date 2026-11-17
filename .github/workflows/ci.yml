@@ -54,7 +54,7 @@ jobs:
       - name: Configure
         run: |
           # 这个 job 校验的是 tcc 形态（daily 矩阵 / libtcc 共享矩阵），
-          # 显式钉住：仓库默认已改为只构建 c6c（见 CHANGELOG「未发布」）。
+          # 显式钉住：仓库默认已改为只构建 c6c（见 CHANGELOG 0.6.3）。
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
@@ -359,7 +359,7 @@ jobs:
   # （装成 bin/c6 与 bin/c6c），库是 libc6c，运行时是自己的 lib/c6/rt.c6，
   # 文档在 share/doc/c6c。产物名 c6c-*，与上面的 c6 包互斥（Provides: c6 /
   # Conflicts: c6, tcc）。目前只上传为 CI artifact、不进 Release：默认交付物
-  # 仍是 tcc 版 c6，等 c6c 的能力缺口补齐再换（见 CHANGELOG「未发布」）。
+  # 仍是显式打开 C6_ENABLE_TCC=ON 的 c6 包；默认构建/包是 c6c（见 CHANGELOG 0.6.3）。
   # -------------------------------------------------------------------------
   package-c6c:
     name: package c6c-only (${{ matrix.generator }})
