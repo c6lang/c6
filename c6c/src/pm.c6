@@ -1008,7 +1008,8 @@ static int pm_firmware_outputs(const PmProject *p)
     if (pm_has_fmt(fmts, p->nfw_fmt, "bin")) {
         /* 5 个参数 → 数组要留第 6 个槽给 execvp 要求的 NULL 结尾；少了它
          * argv 会读出栈上的垃圾指针，execve 在 /usr/bin/objcopy 上直接
-         * EFAULT（CI 上的 `FAIL firmware 产物` 就是这么来的）。 */
+         * EFAULT（CI 上的 `FAIL firmware 产物` 就是这么来的）。NULL 末尾
+         * 再显式写一遍：自编译产物里 `{0}` 初始化不保证把整组清零。 */
         char *av[6] = {(char *)0};
         av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"binary";
         av[3] = p->out; av[4] = bin; av[5] = (char *)0;
