@@ -21282,7 +21282,7 @@ static int pa_finish(const char *out)
         diag_emit("c6c: 有未定义的外部符号，不写输出");
         return 1;
     }
-    if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC) {
+    if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC && !llvm_mode()) {
         diag_emit("c6c: 没有 main（可执行文件需要入口）");
         return 1;
     }
