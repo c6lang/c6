@@ -16,6 +16,7 @@ int memcmp(const void *a, const void *b, size_t n);
  * 第二步正好踩在这条上，第一步因为 C89 收隐式声明而看不出来。 */
 void *memchr(const void *s, int c, size_t n);
 size_t strlen(const char *s);
+size_t strnlen(const char *s, size_t n);
 char *strcpy(char *dst, const char *src);
 char *strncpy(char *dst, const char *src, size_t n);
 char *strcat(char *dst, const char *src);
