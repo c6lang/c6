@@ -7,6 +7,23 @@
 
 ## 未发布
 
+### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
+
+c6c 已经能自举：宿主 C 编译器把 c6 写的编译器引导出来，再由它自己编自己
+（fixpoint 逐字节一致）。仓库要发行的编译器就是 c6c，tcc 不再是交付物——但
+`tcc/` 的源码还不能删：tests1 / tests2 / c-testsuite 把它当**语料**直接编给
+c6c（那份源码 `#include "config.h"`），差分与 perf 用例拿它当**参考实现**。
+这两个角色都不需要把 tcc 产品编出来，默认编它只会拖慢每次构建，所以把
+`C6_ENABLE_TCC` 的默认值翻成 `OFF`：
+
+- 默认 configure / build / install / cpack 只处理 c6c（装成 `bin/c6c`，另留
+  兼容别名 `bin/c6`；包名 `c6c`，许可证 c6c 的 MIT）。tcc 的 `config.mak` /
+  `config.h` 仍会生成（语料要用），但不编译、不安装；
+- 需要旧的 tcc 版 `c6`（`libtcc`、`std-*` 全量回归矩阵、交叉安装、wasm 目标）
+  时显式 `-DC6_ENABLE_TCC=ON`，该路径的代码原样保留、配置验证通过；
+- CI 里假设 tcc 形态的 job（daily 矩阵、tag 上的完整回归、Release 包）显式传
+  `-DC6_ENABLE_TCC=ON`，行为不变；c6c-only 由 no-tcc job 把守。
+
 ### std-term 转绿（90 / 92）：`sigaction` / `sigprocmask` / `sigpending` 接上内核了
 
 这三个一直是空操作（"c6c 的运行时没有信号投递"），所以 `stdterm` 一装
