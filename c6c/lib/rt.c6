@@ -1081,11 +1081,22 @@ long __c6_co_run(void)
          * 以前这里漏了这个条件：父子两条协程同时在册时，主循环每轮都挑到被挡住
          * 的父任务并"恢复"它，子任务一直排不上队——实测同一个协程被恢复到 guard
          * 上限（`examples/stdhttps.c6` 的 co 段、最小复现 `/tmp/cm9`）。 */
-        for (c = C6_CO_ALL; c; c = c->next)
-            if (!c->done && !c->waiting && !c->blocked_on) {
-                c6c_co_resume(c);
-                break;
+        for (c = C6_CO_ALL; c; c = c->next) {
+            C6Co *t = 0;
+
+            if (c->done || c->waiting)
+                continue;
+            /* `blocked_on` 只在"等的那个任务还没结束"时才跳过。以前这里无条件
+             * 跳过 blocked_on 的协程，被等的任务一结束父任务就再也没人叫醒它；
+             * 不跳过又会在父任务上空转（第 301 轮实测恢复到 guard 上限）。 */
+            if (c->blocked_on) {
+                t = c6c_co_find(c->blocked_on);
+                if (t && !t->done)
+                    continue;
             }
+            c6c_co_resume(c);
+            break;
+        }
         if (c)
             continue;
         if (c6c_co_poll_ready(-1) <= 0)
