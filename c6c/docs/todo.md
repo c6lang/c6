@@ -5309,3 +5309,19 @@ if (poison_find(tok_data(t), t->len))
 `std.data.csv.PARSE` 打印的是 234991623（csv 自己的，对），所以那条路在**小程序**
 里是好的；stdbox 里不一样的地方只剩"主文件先解析、模块后内联"这个顺序。
 改动已撤回，回归仍是 88 / 92。
+
+### 第 270 轮：别名生效了（csv 那条断言已对），json 那条还红
+
+把登记挪到带 `= 值` 的公共路径后，`[q5]` 打印确认：
+
+```
+[q5] qd=std.data.csv.PARSE qm=std__data__csv__PARSE hit=1 val=234991623   ← csv 自己的
+```
+
+std-box 里 `csv: 未闭合引号报 PARSE` **已经通过**，只剩 `json: 语法错报 PARSE`。
+回归总数没变（88/92，std-box 整个用例还是红的），但这是个纯正确性改进，
+两边验收（93 个 ctest + tests2 意外失败 0）都过，已提交。
+
+下一轮：json 那条用的是 `catch e` 拿到的值跟 `std.data.json.PARSE` 比，
+`e` 的号段是 json 模块的（`atomic` 那侧），而常量这条现在应该也对了——
+先打一下两边的数。
