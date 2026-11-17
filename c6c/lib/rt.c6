@@ -4670,9 +4670,20 @@ int msync(void *addr, unsigned long len, int flags)
     return (int)c6c_sys3(26 /* msync */, (long)addr, (long)len, flags);
 }
 
+/* rt_sigpending(set, sigsetsize)：内核只填前 8 字节（x86-64 的 sigset 是
+ * 64 位），glibc 的 sigset_t 是 128 字节，剩下的清零。 */
 int sigpending(void *set)
 {
-    (void)set;
+    unsigned long k = 0;
+    long r = 0;
+
+    if (!set)
+        return -1;
+    r = c6c_sys2(127 /* rt_sigpending */, (long)&k, 8L);
+    if (r != 0)
+        return (int)r;
+    memset(set, 0, 128);
+    *(unsigned long *)set = k;
     return 0;
 }
 
@@ -5009,9 +5020,58 @@ void *dlsym(void *h, const char *name) { (void)h; (void)name; return 0; }
 int dlclose(void *h) { (void)h; return 0; }
 char *dlerror(void) { return (char *)"dynamic loading is not available"; }
 
-/* 信号：c6c 的运行时没有信号投递 */
-int sigprocmask(int how, const void *set, void *old) { (void)how; (void)set; (void)old; return 0; }
-int sigaction(int s, const void *act, void *old) { (void)s; (void)act; (void)old; return 0; }
+/* 信号：这两条走内核 syscall，装的是**内核**那份 struct sigaction
+ * （x86-64：handler@0、flags@8、restorer@16、mask@24），而调用方拿到的是
+ * glibc 的布局（handler@0、sa_mask@8 共 128 字节、sa_flags@136、
+ * sa_restorer@144）——所以两边逐字段翻。
+ *
+ * SA_RESTORER(0x04000000) 必须置上并给出 __c6_sigrestorer（rt_sigreturn 的
+ * 那 7 条指令，见 src/asmblob.c6），否则内核返回 -EFAULT。
+ * SIG_IGN(1) 不需要 restorer；SIGKILL/SIGSTOP 的 mask 被内核忽略。 */
+void __c6_sigrestorer(void);
+
+#define C6C_SA_RESTORER 0x04000000ul
+
+int sigaction(int s, const void *act, void *old)
+{
+    unsigned long kact[4] = { 0, 0, 0, 0 };
+    unsigned long kold[4] = { 0, 0, 0, 0 };
+    long r = 0;
+
+    if (act) {
+        unsigned long h = *(const unsigned long *)act;
+        unsigned long fl = (unsigned long)*(const unsigned int *)((const char *)act + 136);
+        unsigned long mk = *(const unsigned long *)((const char *)act + 8);
+
+        if (h != 1ul)
+            fl |= C6C_SA_RESTORER;
+        kact[0] = h;
+        kact[1] = fl;
+        kact[2] = (unsigned long)(void *)__c6_sigrestorer;
+        kact[3] = mk;
+    }
+    r = c6c_sys4(13, (long)s, act ? (long)kact : 0L, old ? (long)kold : 0L, 8L);
+    if (r == 0 && old) {
+        *(unsigned long *)old = kold[0];
+        *(unsigned long *)((char *)old + 8) = kold[3];
+        *(unsigned int *)((char *)old + 136) = (unsigned int)kold[1];
+        *(unsigned long *)((char *)old + 144) = kold[2];
+    }
+    return (int)r;
+}
+
+int sigprocmask(int how, const void *set, void *old)
+{
+    unsigned long ks = set ? *(const unsigned long *)set : 0ul;
+    unsigned long ko = 0;
+
+    long r = c6c_sys4(14, (long)how, set ? (long)&ks : 0L,
+                      old ? (long)&ko : 0L, 8L);
+
+    if (r == 0 && old)
+        *(unsigned long *)old = ko;
+    return (int)r;
+}
 
 /* 信号量：单线程，空操作 */
 int sem_init(void *s, int pshared, unsigned int v) { (void)s; (void)pshared; (void)v; return 0; }

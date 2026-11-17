@@ -136,6 +136,18 @@ static const u8 ASM_XCHG8[8] = { 0x89, 0xf0, 0x86, 0x07, 0x0f, 0xb6, 0xc0, 0xc3 
 
 #define ASM_REL1(a) { (a), 0 }
 
+/* void __c6_sigrestorer(void)：信号处理函数 `return` 之后内核跳到这里做
+ * rt_sigreturn（syscall 15）把被打断的上下文恢复回去。x86-64 的内核要求
+ * 用户态装处理函数时置 SA_RESTORER 并给出这段地址，否则 rt_sigaction 直接
+ * 返回 -EFAULT。
+ *   b8 0f 00 00 00   mov $15,%eax
+ *   0f 05            syscall
+ *   cc               int3            ; rt_sigreturn 不会返回
+ *   90 90 90 90      对齐用的 nop */
+static const u8 ASM_SIGRESTORE[12] = {
+    0xb8, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc, 0x90, 0x90, 0x90, 0x90
+};
+
 static const AsmBlob ASMBLOBS[] = {
     { "__c6_th_spawn", ASM_TH_SPAWN, 34, 1, { { 29, "__c6_th_entry" } },
       ".text\n.globl __c6_th_spawn\n__c6_th_spawn:\n"
@@ -169,6 +181,9 @@ static const AsmBlob ASMBLOBS[] = {
       "\tmov %esi, %eax\n\txchg %al, (%rdi)\n\tmovzbl %al, %eax\n\tret\n" },
     { "__c6_fsbase", ASM_FSBASE, 10, 0, { { 0, 0 } },
       ".text\n.globl __c6_fsbase\n__c6_fsbase:\n\tmov %fs:0, %rax\n\tret\n" },
+    { "__c6_sigrestorer", ASM_SIGRESTORE, 12, 0, { { 0, 0 } },
+      ".text\n.globl __c6_sigrestorer\n__c6_sigrestorer:\n"
+      "\tmov $15, %eax\n\tsyscall\n\tint3\n\tnop\n\tnop\n\tnop\n\tnop\n" },
 };
 
 #define NASMBLOB ((u32)(sizeof(ASMBLOBS) / sizeof(ASMBLOBS[0])))
