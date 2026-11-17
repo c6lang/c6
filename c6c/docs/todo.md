@@ -5273,3 +5273,21 @@ DBG attach a=(6,7,512,0x7ffd2b587010) b=(10,11,512,0x7ffd2b586dd0)   ← 调用�
 而裸名本该因为两个枚举值不同被 `poison_add` 标记成"歧义"（用的时候应当报错），
 这里却**静默**给了 err 的值。下一轮直接查 `poison_find` 在限定名回退那条路上
 有没有被查过。
+
+### 第 268 轮：`poison_find` 只在**裸名**那条路上查，限定名回退到裸名时绕过了它
+
+`gen_primary` 里 `SC_ENUMC` 分支开头就是
+
+```c
+if (poison_find(tok_data(t), t->len))
+    pa_error("'%.*s' is the member of more than one enum: write '<enum>.%.*s'", …);
+```
+
+但这条只在 `t` 已经是**裸名**时生效。限定名 `std.data.csv.PARSE` 走的是前面那段
+"最长前缀"逻辑：拼不出命中就把 `t` 推到 `PARSE` 再 `sym_find`——那时 `t` 是裸名
+没错，可**两边的值恰好一样**（csv 的 `PARSE=7` 和 err 的 `PARSE=7` 差在号段上，
+而号段是按模块算的，`ebase` 只有标了 `enum Error` 才有），所以 `poison_add` 那条
+`(u32)bs->val != 值` 判不出来，**没中毒**，于是静默给了先登记那份（err 的）。
+
+要修就得让"同名枚举成员"按**名字**就中毒（不看值），或者限定名解析不再退化成裸名。
+这条和 std-box 剩下的两条断言是同一个点，留给下一轮。
