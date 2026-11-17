@@ -3747,15 +3747,74 @@ void __assert_fail(const char *expr, const char *file, unsigned int line, const 
 int pthread_condattr_init(void *a) { (void)a; return 0; }
 int pthread_condattr_destroy(void *a) { (void)a; return 0; }
 int pthread_condattr_setpshared(void *a, int v) { (void)a; (void)v; return 0; }
-int pthread_cond_init(void *c, const void *a) { (void)c; (void)a; return 0; }
-int pthread_cond_destroy(void *c) { (void)c; return 0; }
-int pthread_cond_wait(void *c, void *m) { (void)c; (void)m; return 0; }
-int pthread_cond_signal(void *c) { (void)c; return 0; }
-int pthread_cond_broadcast(void *c) { (void)c; return 0; }
-int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
+/* 条件变量：第一个 int 当通知计数。 */
+#define C6C_FUTEX_WAIT 0
+#define C6C_FUTEX_WAKE 1
+
+static long c6c_futex(void *p, int op, int val)
+{
+    return c6c_sys6(202, (long)p, (long)op, (long)val, 0L, 0L, 0L);
+}
+
+/* 互斥量：第一个 long 当状态（0 空闲 / 1 占用）。获取用原子加，拿不到就
+ * 还回去再睡——和 /tmp/pool1.c6 里验证过的那版一致（第 282 轮）。 */
+int pthread_mutex_init(void *m, const void *a) { (void)a; if (m) *(long *)m = 0; return 0; }
 int pthread_mutex_destroy(void *m) { (void)m; return 0; }
-int pthread_mutex_lock(void *m) { (void)m; return 0; }
-int pthread_mutex_unlock(void *m) { (void)m; return 0; }
+
+int pthread_mutex_lock(void *m)
+{
+    if (!m)
+        return -1;
+    for (;;) {
+        if (__c6_atomic_inc(m) == 1)
+            return 0;
+        __c6_atomic_dec(m);
+        while (*(volatile long *)m != 0)
+            c6c_futex(m, C6C_FUTEX_WAIT, 0);
+    }
+}
+
+int pthread_mutex_unlock(void *m)
+{
+    if (!m)
+        return -1;
+    __c6_atomic_dec(m);
+    c6c_futex(m, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
+int pthread_cond_init(void *c, const void *a) { (void)a; if (c) *(int *)c = 0; return 0; }
+int pthread_cond_destroy(void *c) { (void)c; return 0; }
+int pthread_cond_wait(void *c, void *m)
+{
+    int seen = 0;
+
+    if (!c || !m)
+        return -1;
+    seen = *(volatile int *)c;
+    pthread_mutex_unlock(m);
+    while (*(volatile int *)c == seen)
+        c6c_futex(c, C6C_FUTEX_WAIT, seen);
+    pthread_mutex_lock(m);
+    return 0;
+}
+int pthread_cond_signal(void *c)
+{
+    if (!c)
+        return -1;
+    __c6_atomic_inc((long *)c);
+    c6c_futex(c, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+int pthread_cond_broadcast(void *c)
+{
+    if (!c)
+        return -1;
+    __c6_atomic_inc((long *)c);
+    c6c_futex(c, C6C_FUTEX_WAKE, 0x3fffffff);
+    return 0;
+}
+
 int pthread_attr_init(void *a) { (void)a; return 0; }
 int pthread_attr_destroy(void *a) { (void)a; return 0; }
 
