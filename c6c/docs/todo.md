@@ -5058,3 +5058,14 @@ checkout` 回去了。下一轮从叶子引擎那条 `store_conv(LF_TY[li], v, v
 在 `parse_decl` 处理 `= ` 初始化器的那个分叉（`type_name` 之后那段）加一条
 `getenv` 打印，把 `Span@int a = { arr };` 这条语句真正走进来的函数名列出来。
 四次实现尝试全部撤回，回归仍是 86 / 92、CI 绿。
+
+### 第 255 轮：std-https 的红在 `httpsa` 的两路协程（a=0/0，b=0/0）
+
+```
+DBG a=0/0 b=0/0      # status / body_len，__c6_co_run() 返回 0（"跑完"了）
+```
+
+也就是两路协程**跑完了但没拿到任何东西**。基础的 `co` + `__c6_co_run` 是对的：
+独立小程序里两个 `co work(1)/(2)` 都执行了（`G=3`）。所以问题在
+`httpsa_get` 里那条 `await c6_io(fd, ...)` 的读写路径，或者 `HAsync.attach` 的
+参数。下一轮在 `httpsa_get` 里打每次 `await` 前后返回的字节数。
