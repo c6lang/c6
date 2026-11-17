@@ -7,6 +7,18 @@
 
 ## 未发布
 
+### `pthread_create` 失败时不再漏放全局线程锁
+
+`c6c_th_lock()` 是全局自旋锁，而 mmap 失败、clone 失败两条 `return -1`
+没放锁——只要失败一次，进程里后面每一次 `pthread_create` 都会在那儿空转
+（stdthread 的线程池起 4 个 worker，实测只有 2 个进了 `cond_wait`）。
+现在两条失败路径都放锁；clone 失败那条还把槽位还回去并 munmap 掉已分配的栈。
+
+顺带记在 `c6c/docs/todo.md` 里的：这四种同步原语（互斥量 / 条件变量 /
+信号量 / 读写锁）的 futex 版已经逐段验证可用（`stdthread` 的 sync 段全绿），
+但线程池那一段还会挂死，所以整块没进这版。
+
+
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
 c6c 已经能自举：宿主 C 编译器把 c6 写的编译器引导出来，再由它自己编自己

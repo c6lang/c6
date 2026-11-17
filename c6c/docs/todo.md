@@ -5449,3 +5449,12 @@ main 每次 wait 前后），先看挂在哪一段；别再整块上，按 worke
 挂死比"跑完但断言红"更伤 CI，所以整块又撤回了（回归 90 / 92）。
 下一轮：先修那两条没解锁的 return，再在 `c6c_th_new()` 里打点看第 3、4 个
 worker 到底卡在哪一步。
+
+### 第 279 轮：先把 `pthread_create` 漏放全局锁的两条路修了（已提交）
+
+`c6c_th_lock()` 是全局自旋锁，mmap 失败 / clone 失败两条 `return -1` 没放锁：
+失败一次，后面每次 `pthread_create` 都空转。现在两条路都放锁，clone 失败那条
+还会把槽位还回去（`C6C_THS[i].stack = 0`）并 munmap 已分配的栈。
+
+回归仍是 90 / 92（stdthread 的 7 条断言没变），两边验收都过。
+下一步接着查线程池那段挂死：4 个 worker 只有 2 个进 `cond_wait`。

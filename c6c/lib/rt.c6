@@ -1422,8 +1422,12 @@ int pthread_create(unsigned long *th, const void *attr, void *(*fn)(void *), voi
     }
     st = (void *)c6c_sys6(C6C_SYS_MMAP, 0, C6C_TH_STACK, 3,
                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
-    if ((long)st < 0 && (long)st > -4096)
+    /* 失败也要把全局自旋锁放掉：`c6c_th_lock` 是**全局**的，漏一次
+     * 整个进程里后面每一次 pthread_create 都会在那儿空转（第 278 轮）。 */
+    if ((long)st < 0 && (long)st > -4096) {
+        c6c_th_unlock();
         return -1;
+    }
     sp = ((unsigned long)st + C6C_TH_STACK) / 16ul * 16ul - 16ul;
     C6C_THS[i].fn = fn;
     C6C_THS[i].arg = arg;
@@ -1434,8 +1438,12 @@ int pthread_create(unsigned long *th, const void *attr, void *(*fn)(void *), voi
     tid = __c6_th_spawn(C6C_CLONE_VM | C6C_CLONE_FS | C6C_CLONE_FILES
                         | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM,
                         (void *)sp, (void *)(long)i);
-    if (tid < 0)
+    if (tid < 0) {
+        C6C_THS[i].stack = 0;          /* 槽位还回去，别让它一直占着 */
+        c6c_sys6(C6C_SYS_MUNMAP, (long)st, C6C_TH_STACK, 0, 0, 0, 0);
+        c6c_th_unlock();
         return -1;
+    }
     C6C_THS[i].tid = (unsigned long)tid;
     if (th)
         *th = (unsigned long)&C6C_THS[i];
