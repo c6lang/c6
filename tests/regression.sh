@@ -43,8 +43,8 @@ mkdir -p "$C6_OUT" "$C6_SELFHOST" "$C6_BARE" "$C6_TMP"
 # 下面三行既是文档，也是 CTest 标签 / 互斥组的单一数据源，不要改名。
 
 C6_STD_TARGETS="stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2"
-C6_CHECK_PARALLEL="selftest errcheck c99test c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc test fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
-C6_TEST_ALL="selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
+C6_CHECK_PARALLEL="llvm-static-data selftest errcheck c99test c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc test fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
+C6_TEST_ALL="llvm-static-data selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util std-h2 fstest fstest-go fstest-noos fstest-qemu fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle fstest-bare-smp"
 
 case "${1:-}" in
 std-demo)
@@ -1060,6 +1060,31 @@ c99selfhost-tcc)
   echo "c99+tcc 自举完成：$C6_SELFHOST/c99tcc/tcc-stage2"
   ;;
 
+
+llvm-static-data)
+  # 静态指针初始化器必须是真正的静态初始化：以前的 LLVM IR 后端把指针槽留成
+  # 0，靠挂在 llvm.global_ctors 上的 @__llvm_init 在启动时补。带 C 运行时的
+  # 程序看不出问题，裸机/内核不跑构造函数，槽位就一直是 0。
+  # 这里不带任何 C 运行时链接（裸 _start 连构造函数都不跑），所以修之前必挂。
+  command -v "$C6_LLVMCC" >/dev/null || { echo "llvm-static-data: 没有 $C6_LLVMCC，跳过"; exit 0; }
+  mkdir -p "$C6_OUT"
+  "$C6_CC" -B "$C6_TCC_DIR" --emit-llvm \
+      -o "$C6_OUT/static_data.ll" tests/llvm/static_data.c6
+  if grep -q "__llvm_init" "$C6_OUT/static_data.ll"; then
+    echo "llvm-static-data: 指针槽还在等构造函数（__llvm_init），不是静态初始化"
+    exit 1
+  fi
+  "$C6_LLVMCC" -c "$C6_OUT/static_data.ll" -o "$C6_OUT/static_data.o"
+  "$C6_LLVMCC" -c tests/llvm/bare_start.c -o "$C6_OUT/bare_start.o"
+  "$C6_LLVMCC" -nostdlib -static -o "$C6_OUT/static_data" \
+      "$C6_OUT/bare_start.o" "$C6_OUT/static_data.o"
+  if "$C6_OUT/static_data"; then
+    echo "llvm-static-data: 无 crt 下静态指针表可取（文件作用域 + 函数内 static）"
+  else
+    echo "llvm-static-data: 退码 $?，静态指针表没接上"
+    exit 1
+  fi
+  ;;
 
 *)
   printf 'regression: 未知用例 %s\n' "${1:-}" >&2
