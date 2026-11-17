@@ -37,6 +37,7 @@ std-creds
 std-crypto
 std-data
 std-db
+std-demo
 std-disk
 std-doc
 std-docs
