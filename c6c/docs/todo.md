@@ -5767,3 +5767,20 @@ if (c && !c->done && c->waiting && !C6_CO_CUR) return -1;   /* 不谎报 DONE */
 
 下一轮从 `__c6_co_await` 读起：它把自己 `blocked_on` 到子任务上之后，谁负责在
 子任务推进/结束时把父任务放回可运行队列（`resumer` 链）。
+
+### 第 298 轮：`blocked_on` 不是原因，调度器这块要专门啃
+
+读了 `__c6_co_await` / `c6c_co_yield` / `c6_io` 三处：
+
+- `__c6_co_await` 把自己 `blocked_on = task` 然后 `c6c_co_yield(self)`；
+- `c6c_co_yield` 把令牌交给 `resumer`（`co` 起的协程 `resumer` 是 0，也就是主线程）；
+- `c6_io` 在协程里**总是**停一轮（约束 C31），`waiting = 1` 之后循环 yield。
+
+猜"`await async` 残留的 `blocked_on` 让调度器跳过这个协程"，所以在 `c6_io` 挂到
+fd 上之前加了一句 `C6_CO_CUR->blocked_on = 0;`——**没用**，`/tmp/cm9` 照样挂
+（`a=6,0,0 b=8,0,0`）。已撤回。
+
+现在的状态很清楚：`/tmp/cm9` 是一个 5 秒内必挂的最小复现（两条 `co`，每条都走
+`req → await snd → await c6_io(fd, WRITE)`），而把 `await snd` 摊平成直接在 `req`
+里 `await c6_io` 就正常。下一轮拿这个复现盯着 `__c6_co_run` 的主循环看：
+`c6c_co_poll_ready(-1)` 到底把 fd 8 的 POLLOUT 报出来没有、报出来之后恢复的是谁。
