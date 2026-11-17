@@ -1,0 +1,2145 @@
+/* pm.c6 —— c6c 的工程管理子命令（P0/P1：清单 + 扫描 + build/test/run）
+ *
+ * 由 c6c.c6 在 main.c6 之前 #include：所有符号用 pm_ 前缀，保持单 TU 的
+ * C6-BOOT 子集（宿主 cc -x c 与 c6c 自举都能编）。
+ *
+ * 清单是 c6c.yaml 的一个**受控子集**：
+ *
+ *   name: hello
+ *   version: 0.1.0
+ *   kind: app              # app / lib / firmware
+ *   out: build/hello
+ *   sources:
+ *     - src/main.c6
+ *   include:
+ *     - .
+ *   flags:
+ *     - -b
+ *
+ * 这里不引 std/data/yaml.c6：那是有 import 的模块，单 TU 引导链里用不了。
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#define PM_NOT_SUB (-1234)
+#define PM_MAX_SRCS 160
+#define PM_MAX_IMPS 160
+#define PM_MAX_INCS 32
+#define PM_MAX_FLAGS 32
+#define PM_MAX_ARGS 256
+#define PM_PATH 512
+#define PM_FILE_CAP (1024 * 1024)
+
+typedef struct {
+    char name[128];
+    char version[64];
+    char kind[32];              /* app / lib / firmware */
+    char out[PM_PATH];
+    char src[PM_MAX_SRCS][PM_PATH];
+    int nsrc;
+    char imp[PM_MAX_IMPS][128];
+    int nimp;
+    char inc[PM_MAX_INCS][PM_PATH];
+    int ninc;
+    char flag[PM_MAX_FLAGS][128];
+    int nflag;
+    int has_main;
+    int has_start;
+    int has_test;
+    /* 打包安装 / 固件烧录调试（P3/P4） */
+    char pkg_name[128];
+    char pkg_desc[256];
+    char pkg_license[64];
+    char pkg_fmt[8][16];
+    int npkg_fmt;
+    char pkg_file[32][1024];       /* "源:目标" */
+    int npkg_file;
+    char fw_fmt[8][16];
+    int nfw_fmt;
+    char flash[16][256];
+    int nflash;
+    char monitor[16][256];
+    int nmonitor;
+    char debug[16][256];
+    int ndebug;
+    char link_flag[16][128];
+    int nlink_flag;
+    /* cargo/go 习惯：安装落点 + profile（P5） */
+    char destdir[128];
+    char prefix[128];
+    char dev_flag[16][128];
+    int ndev_flag;
+    char rel_flag[16][128];
+    int nrel_flag;
+} PmProject;
+
+/* stage0（宿主 cc）没有 sys/wait.h 时不引整个头（c6c 自举的 #include 嵌套
+ * 有 64 层上限，sys/wait.h → signal.h → ucontext.h 会踩到）；只补这几个宏。 */
+#ifndef WIFEXITED
+#define WIFEXITED(s) (((s) & 0x7f) == 0)
+#define WEXITSTATUS(s) (((s) >> 8) & 0xff)
+#define WIFSIGNALED(s) ((((s) & 0x7f) + 1) >> 1 > 0)
+#define WTERMSIG(s) ((s) & 0x7f)
+#endif
+int waitpid(int pid, int *status, int options);
+
+static void pm_zero_project(PmProject *p)
+{
+    memset(p, 0, sizeof(*p));
+    strcpy(p->version, "0.1.0");
+    strcpy(p->kind, "app");
+    strcpy(p->out, "");
+    strcpy(p->pkg_license, "MIT");
+    strcpy(p->destdir, "pkg");
+    strcpy(p->prefix, "/usr");
+    strcpy(p->pkg_fmt[0], "tgz");
+    p->npkg_fmt = 1;
+    strcpy(p->fw_fmt[0], "elf");
+    strcpy(p->fw_fmt[1], "bin");
+    strcpy(p->fw_fmt[2], "hex");
+    p->nfw_fmt = 3;
+}
+
+static const char *pm_rel(const char *path)
+{
+    if (path[0] == '.' && path[1] == '/')
+        return path + 2;
+    return path;
+}
+
+static void pm_trim(char *s)
+{
+    char *end = 0;
+    char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
+    if (p != s)
+        memmove(s, p, strlen(p) + 1);
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t'
+                       || end[-1] == '\r' || end[-1] == '\n'))
+        *--end = 0;
+    /* 行尾注释（清单里不写带 # 的值，这里只做最基本剥离） */
+    p = s;
+    while (*p) {
+        if (*p == '#' && (p == s || p[-1] == ' ' || p[-1] == '\t')) {
+            *p = 0;
+            break;
+        }
+        p++;
+    }
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t'))
+        *--end = 0;
+}
+
+static int pm_read_file(const char *path, char *buf, size_t cap)
+{
+    FILE *fp = fopen(path, "rb");
+    size_t n = 0;
+    int c = 0;
+    if (!fp)
+        return -1;
+    while (n + 1 < cap) {
+        c = fgetc(fp);
+        if (c == EOF)
+            break;
+        buf[n++] = (char)c;
+    }
+    fclose(fp);
+    buf[n] = 0;
+    return (int)n;
+}
+
+static int pm_ends(const char *s, const char *suf)
+{
+    size_t a = strlen(s), b = strlen(suf);
+    if (b > a)
+        return 0;
+    return strcmp(s + a - b, suf) == 0;
+}
+
+static void pm_add_src(PmProject *p, const char *path)
+{
+    char buf[PM_FILE_CAP] = {0};
+    int i = 0;
+    if (p->nsrc >= PM_MAX_SRCS)
+        return;
+    for (i = 0; i < p->nsrc; i++) {
+        if (strcmp(p->src[i], path) == 0)
+            return;
+    }
+    snprintf(p->src[p->nsrc++], sizeof(p->src[0]), "%s", path);
+    if (pm_read_file(path, buf, sizeof(buf)) < 0)
+        return;
+    if (strstr(buf, "int main(") || strstr(buf, "int main ("))
+        p->has_main = 1;
+    if (strstr(buf, "_start(") || strstr(buf, "_start ("))
+        p->has_start = 1;
+    if (strstr(buf, "test \""))
+        p->has_test = 1;
+    /* import NAME; → NAME，转换成 a.b 的点分形式 */
+    {
+        char *q = buf;
+        while ((q = strstr(q, "import ")) != 0) {
+            char *b = q + 7, *e = b;
+            while (*e && *e != ';' && *e != ' ' && *e != '\t' && *e != '\n')
+                e++;
+            if (e > b && p->nimp < PM_MAX_IMPS) {
+                int j = 0, dup = 0;
+                size_t len = (size_t)(e - b);
+                if (len >= sizeof(p->imp[0]))
+                    len = sizeof(p->imp[0]) - 1;
+                for (j = 0; j < p->nimp; j++) {
+                    if (strlen(p->imp[j]) == len
+                        && strncmp(p->imp[j], b, len) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    memcpy(p->imp[p->nimp], b, len);
+                    p->imp[p->nimp][len] = 0;
+                    p->nimp++;
+                }
+            }
+            q = e;
+            if (!*q)
+                break;
+        }
+    }
+}
+
+static int pm_skip_dir(const char *name)
+{
+    if (name[0] == '.')
+        return 1;
+    if (strcmp(name, "build") == 0 || strcmp(name, "out") == 0
+        || strcmp(name, "dist") == 0 || strcmp(name, "target") == 0
+        || strcmp(name, "node_modules") == 0)
+        return 1;
+    return 0;
+}
+
+static void pm_scan_dir(PmProject *p, const char *dir, int depth)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e = (struct dirent *)0;
+    if (!d || depth > 6)
+        return;
+    while ((e = readdir(d)) != (struct dirent *)0) {
+        char path[PM_PATH] = {0};
+        struct stat st = {0};
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (pm_skip_dir(e->d_name))
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (stat(path, &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode)) {
+            pm_scan_dir(p, path, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            if (pm_ends(e->d_name, ".c6") || pm_ends(e->d_name, ".c"))
+                pm_add_src(p, path);
+        }
+    }
+    closedir(d);
+}
+
+static void pm_scan(PmProject *p)
+{
+    char cwd[PM_PATH] = {0};
+    char ver[PM_PATH] = {0};
+    char *slash = (char *)0;
+    pm_zero_project(p);
+    if (getcwd(cwd, sizeof(cwd)))
+        snprintf(p->name, sizeof(p->name), "%s", cwd);
+    slash = strrchr(p->name, '/');
+    if (slash)
+        memmove(p->name, slash + 1, strlen(slash + 1) + 1);
+    pm_scan_dir(p, ".", 0);
+    if (pm_read_file("VERSION", ver, sizeof(ver)) > 0) {
+        char t[64] = {0};
+        size_t n = strlen(ver);
+        if (n > 0 && ver[n - 1] == '\n')
+            ver[n - 1] = 0;
+        if (strlen(ver) < sizeof(t)) {
+            strcpy(t, ver);
+            pm_trim(t);
+            if (t[0])
+                strcpy(p->version, t);
+        }
+    }
+    strcpy(p->pkg_name, p->name);
+    if (p->has_start && !p->has_main)
+        strcpy(p->kind, "firmware");
+    else if (p->has_test && !p->has_main)
+        strcpy(p->kind, "lib");
+    else
+        strcpy(p->kind, "app");
+    if (p->has_start && !p->has_main) {
+        strcpy(p->flag[0], "-nostdlib");
+        p->nflag = 1;
+    }
+    snprintf(p->out, sizeof(p->out), "build/%s", p->name);
+}
+
+static int pm_check_imports(const PmProject *p)
+{
+    int i = 0, j = 0, found = 0, missing = 0;
+    for (i = 0; i < p->nimp; i++) {
+        char want[PM_PATH] = {0};
+        size_t k = 0;
+        for (k = 0; k < strlen(p->imp[i]); k++)
+            want[k] = p->imp[i][k] == '.' ? '/' : p->imp[i][k];
+        found = 0;
+        for (j = 0; j < p->nsrc; j++) {
+            char rel[PM_PATH] = {0};
+            const char *s = pm_rel(p->src[j]);
+            snprintf(rel, sizeof(rel), "%s.c6", want);
+            if (strcmp(s, rel) == 0 || pm_ends(s, rel)) {
+                found = 1;
+                break;
+            }
+            snprintf(rel, sizeof(rel), "%s.c", want);
+            if (strcmp(s, rel) == 0 || pm_ends(s, rel)) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "c6c: import %s 没有在仓库里找到对应源文件（请用 -I 或补源文件）\n",
+                    p->imp[i]);
+            missing++;
+        }
+    }
+    return missing;
+}
+
+static void pm_print_scan(const PmProject *p)
+{
+    int i = 0;
+    printf("c6c: 扫描结果：name=%s version=%s kind=%s out=%s\n",
+           p->name, p->version, p->kind, p->out);
+    printf("c6c: 源文件 %d 个：\n", p->nsrc);
+    for (i = 0; i < p->nsrc && i < 30; i++)
+        printf("  - %s\n", pm_rel(p->src[i]));
+    if (p->nsrc > 30)
+        printf("  ... 另有 %d 个\n", p->nsrc - 30);
+    printf("c6c: import %d 个，main=%d _start=%d test块=%d\n",
+           p->nimp, p->has_main, p->has_start, p->has_test);
+}
+
+static int pm_write_yaml(const PmProject *p, const char *path)
+{
+    FILE *fp = fopen(path, "wb");
+    int i = 0;
+    if (!fp) {
+        fprintf(stderr, "c6c: init: 写不出 %s\n", path);
+        return 1;
+    }
+    fprintf(fp, "# 由 `c6c init` 生成；只支持本工具用的 YAML 子集\n");
+    fprintf(fp, "name: %s\nversion: %s\nkind: %s\nout: %s\n",
+            p->name, p->version, p->kind, p->out);
+    fprintf(fp, "sources:\n");
+    for (i = 0; i < p->nsrc; i++)
+        fprintf(fp, "  - %s\n", pm_rel(p->src[i]));
+    fprintf(fp, "include:\n  - .\n");
+    fprintf(fp, "flags:\n");
+    for (i = 0; i < p->nflag; i++)
+        fprintf(fp, "  - %s\n", p->flag[i]);
+    fprintf(fp, "pkg_name: %s\npkg_desc: %s\npkg_license: %s\n",
+            p->pkg_name[0] ? p->pkg_name : p->name, p->pkg_desc, p->pkg_license);
+    fprintf(fp, "# install 默认落点；发行版可用 DESTDIR=\$pkgdir c6c install 覆盖\n");
+    fprintf(fp, "destdir: %s\nprefix: %s\n", p->destdir, p->prefix);
+    fprintf(fp, "dev_flags:\nrelease_flags:\n");
+    fprintf(fp, "pkg_formats:\n");
+    for (i = 0; i < p->npkg_fmt; i++)
+        fprintf(fp, "  - %s\n", p->pkg_fmt[i]);
+    fprintf(fp, "pkg_files:\n");
+    if (p->npkg_file == 0)
+        fprintf(fp, "  - %s:bin/%s\n", p->out[0] ? p->out : "build/a.out", p->name);
+    for (i = 0; i < p->npkg_file; i++)
+        fprintf(fp, "  - %s\n", p->pkg_file[i]);
+    if (strcmp(p->kind, "firmware") == 0) {
+        fprintf(fp, "fw_formats:\n");
+        for (i = 0; i < p->nfw_fmt; i++)
+            fprintf(fp, "  - %s\n", p->fw_fmt[i]);
+        fprintf(fp, "# flash_cmd / monitor_cmd / debug_cmd: 参数列表，支持 {elf} {bin} {out}\n");
+        fprintf(fp, "flash_cmd:\nmonitor_cmd:\ndebug_cmd:\n");
+        fprintf(fp, "# c6c 先 -c 出 ET_REL，再用 cc 链接；这里给 cc 的附加参数\n");
+        fprintf(fp, "link_flags:\n");
+    }
+    fclose(fp);
+    printf("c6c: init: 已写入 %s\n", path);
+    return 0;
+}
+
+static void pm_unquote(char *s);
+static int pm_spawn(char **av);
+static int pm_spawn_file(char **av, const char *path);
+static int pm_write_text(const char *path, const char *text);
+static void pm_rm_rf(const char *path);
+static void pm_sort_sources(PmProject *p);
+static void pm_expand_includes(PmProject *p);
+int pm_dispatch(int argc, char **argv);
+
+/* JSON 字符串转义：清单里的路径/名字可能含引号或反斜杠。 */
+static void pm_json_str(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    if (!cap)
+        return;
+    while (*src && n + 2 < cap) {
+        if (*src == '"' || *src == '\\')
+            dst[n++] = '\\';
+        dst[n++] = *src++;
+    }
+    dst[n] = 0;
+}
+
+/* 带边界的字段复制：超长值截断而不是写穿固定数组。 */
+static void pm_field(char *dst, size_t cap, const char *src)
+{
+    if (cap == 0)
+        return;
+    snprintf(dst, cap, "%s", src);
+    pm_trim(dst);
+    pm_unquote(dst);
+}
+
+/* 包名/版本/成员名只允许安全字符，避免拼出越界路径或命令。 */
+static int pm_safe_name(const char *v)
+{
+    const char *q = v;
+    if (!v || !*v)
+        return 0;
+    while (*q) {
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')
+              || (*q >= '0' && *q <= '9') || *q == '.' || *q == '-' || *q == '_'))
+            return 0;
+        q++;
+    }
+    return strcmp(v, ".") != 0 && strcmp(v, "..") != 0;
+}
+
+static int pm_safe_rel(const char *v)
+{
+    const char *q = v;
+    if (!v || !*v || v[0] == '/' || v[0] == '\\')
+        return 0;
+    while (*q) {
+        if (*q == '\\' || strncmp(q, "..", 2) == 0)
+            return 0;
+        q++;
+    }
+    return 1;
+}
+
+/* 自己切行：c6c 不认识 strtok，自举时不能用它。 */
+static char *pm_next_line(char **cursor)
+{
+    char *s = *cursor;
+    char *p = s;
+    if (!s || !*s)
+        return (char *)0;
+    while (*p && *p != '\n')
+        p++;
+    if (*p == '\n') {
+        *p = 0;
+        *cursor = p + 1;
+    } else {
+        *cursor = p;
+    }
+    return s;
+}
+
+/* 只解析上面这个子集：顶层 key: value，缩进列表项 `- value`。 */
+static int pm_load_yaml(const char *path, PmProject *p)
+{
+    char buf[PM_FILE_CAP] = {0};
+    char *line = (char *)0;
+    char *q = buf;
+    int section = 0;            /* 0=顶层，1..10=各类列表 */
+    if (pm_read_file(path, buf, sizeof(buf)) < 0)
+        return -1;
+    pm_zero_project(p);
+    p->npkg_fmt = 0;           /* 清单里的 pkg_formats 覆盖默认 tgz */
+    p->nfw_fmt = 0;
+    line = pm_next_line(&q);
+    while (line) {
+        char t[PM_PATH] = {0};
+        size_t n = strlen(line);
+        if (n >= sizeof(t))
+            n = sizeof(t) - 1;
+        memcpy(t, line, n);
+        t[n] = 0;
+        pm_trim(t);
+        if (t[0] == 0 || t[0] == '#') {
+            line = pm_next_line(&q);
+            continue;
+        }
+        if (t[0] == '-' && t[1] == ' ') {
+            char val[PM_PATH] = {0};
+            strcpy(val, t + 2);
+            pm_trim(val);
+            pm_unquote(val);
+            if (section == 1 && p->nsrc < PM_MAX_SRCS)
+                pm_add_src(p, val);
+            else if (section == 2 && p->ninc < PM_MAX_INCS)
+                pm_field(p->inc[p->ninc++], sizeof(p->inc[0]), val);
+            else if (section == 3 && p->nflag < PM_MAX_FLAGS)
+                pm_field(p->flag[p->nflag++], sizeof(p->flag[0]), val);
+            else if (section == 4 && p->npkg_fmt < 8)
+                pm_field(p->pkg_fmt[p->npkg_fmt++], sizeof(p->pkg_fmt[0]), val);
+            else if (section == 5 && p->npkg_file < 32)
+                pm_field(p->pkg_file[p->npkg_file++], sizeof(p->pkg_file[0]), val);
+            else if (section == 6 && p->nfw_fmt < 8)
+                pm_field(p->fw_fmt[p->nfw_fmt++], sizeof(p->fw_fmt[0]), val);
+            else if (section == 7 && p->nflash < 16)
+                pm_field(p->flash[p->nflash++], sizeof(p->flash[0]), val);
+            else if (section == 8 && p->nmonitor < 16)
+                pm_field(p->monitor[p->nmonitor++], sizeof(p->monitor[0]), val);
+            else if (section == 9 && p->ndebug < 16)
+                pm_field(p->debug[p->ndebug++], sizeof(p->debug[0]), val);
+            else if (section == 10 && p->nlink_flag < 16)
+                pm_field(p->link_flag[p->nlink_flag++], sizeof(p->link_flag[0]), val);
+            else if (section == 11 && p->ndev_flag < 16)
+                pm_field(p->dev_flag[p->ndev_flag++], sizeof(p->dev_flag[0]), val);
+            else if (section == 12 && p->nrel_flag < 16)
+                pm_field(p->rel_flag[p->nrel_flag++], sizeof(p->rel_flag[0]), val);
+        } else if (strncmp(t, "name:", 5) == 0) {
+            pm_field(p->name, sizeof(p->name), t + 5); section = 0;
+        } else if (strncmp(t, "version:", 8) == 0) {
+            pm_field(p->version, sizeof(p->version), t + 8); section = 0;
+        } else if (strncmp(t, "kind:", 5) == 0) {
+            pm_field(p->kind, sizeof(p->kind), t + 5); section = 0;
+        } else if (strncmp(t, "out:", 4) == 0) {
+            pm_field(p->out, sizeof(p->out), t + 4); section = 0;
+        } else if (strcmp(t, "sources:") == 0) {
+            section = 1;
+        } else if (strcmp(t, "include:") == 0) {
+            section = 2;
+        } else if (strcmp(t, "flags:") == 0) {
+            section = 3;
+        } else if (strncmp(t, "pkg_name:", 9) == 0) {
+            pm_field(p->pkg_name, sizeof(p->pkg_name), t + 9); section = 0;
+        } else if (strncmp(t, "pkg_desc:", 9) == 0) {
+            pm_field(p->pkg_desc, sizeof(p->pkg_desc), t + 9); section = 0;
+        } else if (strncmp(t, "pkg_license:", 12) == 0) {
+            pm_field(p->pkg_license, sizeof(p->pkg_license), t + 12); section = 0;
+        } else if (strncmp(t, "destdir:", 8) == 0) {
+            pm_field(p->destdir, sizeof(p->destdir), t + 8); section = 0;
+        } else if (strncmp(t, "prefix:", 7) == 0) {
+            pm_field(p->prefix, sizeof(p->prefix), t + 7); section = 0;
+        } else if (strcmp(t, "pkg_formats:") == 0) {
+            section = 4;
+        } else if (strcmp(t, "pkg_files:") == 0) {
+            section = 5;
+        } else if (strcmp(t, "fw_formats:") == 0) {
+            section = 6;
+        } else if (strcmp(t, "flash_cmd:") == 0) {
+            section = 7;
+        } else if (strcmp(t, "monitor_cmd:") == 0) {
+            section = 8;
+        } else if (strcmp(t, "debug_cmd:") == 0) {
+            section = 9;
+        } else if (strcmp(t, "link_flags:") == 0) {
+            section = 10;
+        } else if (strcmp(t, "dev_flags:") == 0) {
+            section = 11;
+        } else if (strcmp(t, "release_flags:") == 0) {
+            section = 12;
+        } else if (strchr(t, ':') != (char *)0) {
+            section = 0;          /* 未知顶层键：不要继承上一个列表 */
+        }
+        line = pm_next_line(&q);
+    }
+    return 0;
+}
+
+static void pm_mkdir_p(const char *path)
+{
+    char cur[PM_PATH] = {0};
+    char *p = (char *)path;
+    if (*p == '/')
+        strcpy(cur, "/");
+    while (*p) {
+        if (*p == '/' && cur[0] && cur[strlen(cur) - 1] != '/')
+            strcat(cur, "/");
+        else if (*p != '/')
+            strncat(cur, p, 1);
+        if (*p == '/' && strlen(cur) > 1)
+            mkdir(cur, 0755);
+        p++;
+    }
+    if (cur[0])
+        mkdir(cur, 0755);
+}
+
+static void pm_unquote(char *s)
+{
+    size_t n = strlen(s);
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"')
+                   || (s[0] == '\'' && s[n - 1] == '\''))) {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = 0;
+    }
+}
+
+static int pm_copy_file(const char *src, const char *dst)
+{
+    FILE *fi = fopen(src, "rb");
+    FILE *fo = (FILE *)0;
+    char parent[PM_PATH] = {0};
+    char *slash = (char *)0;
+    int c = 0;
+    if (!fi) {
+        fprintf(stderr, "c6c: 拷不到 %s\n", src);
+        return 1;
+    }
+    snprintf(parent, sizeof(parent), "%s", dst);
+    slash = strrchr(parent, '/');
+    if (slash) {
+        *slash = 0;
+        pm_mkdir_p(parent);
+    }
+    fo = fopen(dst, "wb");
+    if (!fo) {
+        fprintf(stderr, "c6c: 写不出 %s\n", dst);
+        fclose(fi);
+        return 1;
+    }
+    while ((c = fgetc(fi)) != EOF)
+        fputc(c, fo);
+    fclose(fi);
+    fclose(fo);
+    {
+        struct stat sm = {0};
+        if (stat(src, &sm) == 0)
+            chmod(dst, sm.st_mode & 0777);
+    }
+    return 0;
+}
+
+
+/* {elf} / {bin} / {out} / {name} / {version} 替换，用于 flash/monitor/debug 模板。
+ * n 只在实际写入后推进，不能用 snprintf 的"本应写入长度"累加（会越界）。 */
+static const char *pm_expand(const char *tpl, const PmProject *p,
+                             const char *elf, const char *bin)
+{
+    static char buf[2048] = {0};
+    size_t n = 0;
+    const char *q = tpl;
+    buf[0] = 0;
+    while (*q) {
+        const char *val = (const char *)0;
+        size_t step = 0, need = 0;
+        if (strncmp(q, "{elf}", 5) == 0) { val = elf; step = 5; }
+        else if (strncmp(q, "{bin}", 5) == 0) { val = bin; step = 5; }
+        else if (strncmp(q, "{out}", 5) == 0) { val = p->out; step = 5; }
+        else if (strncmp(q, "{name}", 6) == 0) { val = p->name; step = 6; }
+        else if (strncmp(q, "{version}", 9) == 0) { val = p->version; step = 9; }
+        if (val) {
+            need = strlen(val);
+            if (n + need + 1 >= sizeof(buf))
+                break;
+            memcpy(buf + n, val, need);
+            n += need;
+            q += step;
+        } else {
+            if (n + 2 >= sizeof(buf))
+                break;
+            buf[n++] = *q++;
+        }
+    }
+    buf[n] = 0;
+    return buf;
+}
+
+static int pm_run_template(char cmd[][256], int ncmd, const PmProject *p,
+                           const char *elf, const char *bin, int dry)
+{
+    char *av[PM_MAX_ARGS] = {(char *)0};
+    char expanded[16][2048] = {0};
+    char binpath[PM_PATH] = {0};
+    int i = 0;
+    if (ncmd == 0) {
+        fprintf(stderr, "c6c: 清单里没有配置命令模板（flash_cmd / monitor_cmd / debug_cmd）\n");
+        return 2;
+    }
+    if (!bin[0])
+        snprintf(binpath, sizeof(binpath), "%s.bin", elf);
+    for (i = 0; i < ncmd && i + 1 < PM_MAX_ARGS; i++) {
+        snprintf(expanded[i], sizeof(expanded[i]), "%s",
+                 pm_expand(cmd[i], p, elf, bin[0] ? bin : binpath));
+        av[i] = expanded[i];
+    }
+    av[ncmd] = (char *)0;
+    if (dry) {
+        printf("c6c: 预览：");
+        for (i = 0; i < ncmd; i++)
+            printf(" %s", av[i]);
+        printf("\n");
+        return 0;
+    }
+    return pm_spawn(av);
+}
+
+static int pm_has_fmt(const char **fmts, int n, const char *want)
+{
+    int i = 0;
+    for (i = 0; i < n; i++) {
+        if (strcmp(fmts[i], want) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static const char *pm_self(const char *argv0)
+{
+    static char buf[PM_PATH] = {0};
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        return buf;
+    }
+    if (argv0 && argv0[0])
+        return argv0;
+    return "c6c";
+}
+
+static int pm_status(int st)
+{
+    if (WIFEXITED(st))
+        return WEXITSTATUS(st);
+    if (WIFSIGNALED(st))
+        return 128 + WTERMSIG(st);
+    return 1;
+}
+
+/* 起一个进程并等它：返回子进程退出码；fork/exec 失败返回 2。 */
+static int pm_spawn(char **av)
+{
+    int pid = 0, st = 0, wr = 0;
+    fflush((FILE *)0);          /* 避免 fork 后父/子两边重复缓冲输出 */
+    pid = fork();
+    if (pid == 0) {
+        execvp(av[0], av);
+        fprintf(stderr, "c6c: 无法执行 %s\n", av[0]);
+        _exit(127);
+    }
+    if (pid < 0) {
+        fprintf(stderr, "c6c: fork 失败\n");
+        return 2;
+    }
+    do {
+        wr = waitpid(pid, &st, 0);
+    } while (wr < 0 && errno == EINTR);
+    if (wr < 0) {
+        fprintf(stderr, "c6c: 等待 %s 失败\n", av[0]);
+        return 2;
+    }
+    return pm_status(st);
+}
+
+/* stdout 重定向到文件：直接 fork/dup2/exec，不经 sh -c（无命令注入面）。 */
+static int pm_spawn_file(char **av, const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int pid = 0, st = 0, wr = 0;
+    if (fd < 0) {
+        fprintf(stderr, "c6c: 写不出 %s\n", path);
+        return 2;
+    }
+    fflush((FILE *)0);
+    pid = fork();
+    if (pid == 0) {
+        if (dup2(fd, 1) < 0)
+            _exit(127);
+        close(fd);
+        execvp(av[0], av);
+        fprintf(stderr, "c6c: 无法执行 %s\n", av[0]);
+        _exit(127);
+    }
+    close(fd);
+    if (pid < 0) {
+        fprintf(stderr, "c6c: fork 失败\n");
+        return 2;
+    }
+    do {
+        wr = waitpid(pid, &st, 0);
+    } while (wr < 0 && errno == EINTR);
+    if (wr < 0) {
+        fprintf(stderr, "c6c: 等待 %s 失败\n", av[0]);
+        return 2;
+    }
+    return pm_status(st);
+}
+
+/* go.mod 风格：从当前目录向上找 c6c.yaml，返回相对路径并停在清单所在目录。 */
+static int pm_find_up(char *buf, size_t cap)
+{
+    int up = 0, k = 0, j = 0;
+    struct stat st = {0};
+    const char *names[2] = {"c6c.yaml", "c6c.yml"};
+    for (;;) {
+        for (j = 0; j < 2; j++) {
+            if (stat(names[j], &st) == 0) {
+                size_t n = 0;
+                for (k = 0; k < up; k++) {
+                    if (n + 3 >= cap) return 0;
+                    memcpy(buf + n, "../", 3);
+                    n += 3;
+                }
+                snprintf(buf + n, cap - n, "%s", names[j]);
+                return 1;
+            }
+        }
+        if (up >= 8 || chdir("..") != 0)
+            return 0;
+        up++;
+    }
+}
+
+static int pm_load(PmProject *p, const char *manifest)
+{
+    struct stat st = {0};
+    if (stat(manifest, &st) == 0) {
+        if (pm_load_yaml(manifest, p) == 0)
+            return 0;
+        fprintf(stderr, "c6c: %s 解析失败\n", manifest);
+        return 1;
+    }
+    fprintf(stderr, "c6c: 找不到 %s，先用 `c6c init` 生成；本次按扫描结果构建\n", manifest);
+    pm_scan(p);
+    return 0;
+}
+
+
+/* 只比 mtime 不够：profile / flags / 清单 / 本地 #include 的头文件都要进键。
+ * 指纹文件放在 out 旁边，内容是这些输入的快照。 */
+static void pm_fingerprint_text(const PmProject *p, int release,
+                                const char *manifest, char *buf, size_t cap)
+{
+    PmProject copy = {0};
+    struct stat st = {0};
+    int i = 0, n = 0;
+    n = snprintf(buf, cap, "profile=%s\nout=%s\nkind=%s\n",
+                 release ? "release" : "dev", p->out, p->kind);
+    if (n < 0 || (size_t)n >= cap)
+        return;
+    for (i = 0; i < p->ninc; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "I:%s\n", p->inc[i]);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    for (i = 0; i < p->nflag; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "F:%s\n", p->flag[i]);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    for (i = 0; release ? 0 : i < p->ndev_flag; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "D:%s\n", p->dev_flag[i]);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    for (i = 0; !release ? 0 : i < p->nrel_flag; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "R:%s\n", p->rel_flag[i]);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    for (i = 0; i < p->nlink_flag; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "L:%s\n", p->link_flag[i]);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    if (stat(manifest, &st) == 0) {
+        n += snprintf(buf + n, cap - (size_t)n, "manifest=%s:%ld\n",
+                      manifest, (long)st.st_mtime);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+    /* 源列表本身也进键：新增一个 mtime 更早的源文件也必须触发重编。 */
+    memcpy(&copy, p, sizeof(copy));
+    pm_expand_includes(&copy);   /* 本地 #include 的头文件同样算构建输入 */
+    for (i = 0; i < copy.nsrc; i++) {
+        long mt = 0;
+        if (stat(copy.src[i], &st) == 0)
+            mt = (long)st.st_mtime;
+        n += snprintf(buf + n, cap - (size_t)n, "S:%s:%ld\n",
+                      pm_rel(copy.src[i]), mt);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
+}
+
+static int pm_fingerprint_ok(const PmProject *p, int release, const char *manifest)
+{
+    char want[16384] = {0}, got[16384] = {0};
+    char fp[PM_PATH] = {0};
+    pm_fingerprint_text(p, release, manifest, want, sizeof(want));
+    snprintf(fp, sizeof(fp), "%s.fingerprint", p->out);
+    if (pm_read_file(fp, got, sizeof(got)) < 0)
+        return 0;
+    return strcmp(want, got) == 0;
+}
+
+static void pm_fingerprint_write(const PmProject *p, int release, const char *manifest)
+{
+    char want[16384] = {0}, fp[PM_PATH] = {0};
+    pm_fingerprint_text(p, release, manifest, want, sizeof(want));
+    snprintf(fp, sizeof(fp), "%s.fingerprint", p->out);
+    pm_write_text(fp, want);
+}
+
+
+static int pm_up_to_date(const PmProject *p)
+{
+    struct stat so = {0};
+    struct stat ss = {0};
+    const char *sufs[4] = {"", ".o", ".bin", ".hex"};
+    int need[4] = {1, 1, 0, 0};
+    char f[PM_PATH] = {0};
+    int i = 0, j = 0;
+    int fw = strcmp(p->kind, "firmware") == 0;
+    if (stat(p->out, &so) != 0)
+        return 0;
+    for (i = 0; i < p->nfw_fmt; i++) {
+        if (strcmp(p->fw_fmt[i], "bin") == 0) need[2] = 1;
+        if (strcmp(p->fw_fmt[i], "hex") == 0) need[3] = 1;
+    }
+    for (j = 0; j < (fw ? 4 : 1); j++) {
+        if (!need[j])
+            continue;
+        snprintf(f, sizeof(f), "%s%s", p->out, sufs[j]);
+        if (stat(f, &so) != 0)
+            return 0;
+        for (i = 0; i < p->nsrc; i++) {
+            if (stat(p->src[i], &ss) != 0 || ss.st_mtime > so.st_mtime)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+/* 固件目标的 BIN/HEX：c6c 出 ELF，objcopy 负责摊平（链接脚本场景仍用
+ * examples/boot/flat.py；这里只做常规裸机镜像）。 */
+static int pm_firmware_outputs(const PmProject *p)
+{
+    const char *fmts[8] = {0};
+    int i = 0;
+    char bin[PM_PATH] = {0}, hex[PM_PATH] = {0};
+    for (i = 0; i < p->nfw_fmt && i < 8; i++)
+        fmts[i] = p->fw_fmt[i];
+    if (!pm_has_fmt(fmts, p->nfw_fmt, "bin") && !pm_has_fmt(fmts, p->nfw_fmt, "hex"))
+        return 0;
+    snprintf(bin, sizeof(bin), "%s.bin", p->out);
+    snprintf(hex, sizeof(hex), "%s.hex", p->out);
+    if (pm_has_fmt(fmts, p->nfw_fmt, "bin")) {
+        char *av[5] = {(char *)0};
+        av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"binary";
+        av[3] = p->out; av[4] = bin;
+        if (pm_spawn(av) != 0) {
+            fprintf(stderr, "c6c: 固件 BIN 生成失败\n");
+            return 1;
+        }
+        printf("c6c: 固件 %s 已生成\n", bin);
+    }
+    if (pm_has_fmt(fmts, p->nfw_fmt, "hex")) {
+        char *av[5] = {(char *)0};
+        av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"ihex";
+        av[3] = p->out; av[4] = hex;
+        if (pm_spawn(av) != 0) {
+            fprintf(stderr, "c6c: 固件 HEX 生成失败\n");
+            return 1;
+        }
+        printf("c6c: 固件 %s 已生成\n", hex);
+    }
+    return 0;
+}
+
+static int pm_build(PmProject *p, const char *self, int force, int release,
+                    const char *manifest)
+{
+    char *av[PM_MAX_ARGS] = {(char *)0};
+    int n = 0, i = 0, rc = 0;
+    char parent[PM_PATH] = {0};
+    char *slash = (char *)0;
+    if (p->nsrc == 0) {
+        fprintf(stderr, "c6c: build: 没有源文件\n");
+        return 2;
+    }
+    if (!force && pm_up_to_date(p) && pm_fingerprint_ok(p, release, manifest)) {
+        printf("c6c: build: %s 已是最新（--force 强制重编）\n", p->out);
+        return 0;
+    }
+    strcpy(parent, p->out[0] ? p->out : "build/a.out");
+    slash = strrchr(parent, '/');
+    if (slash) {
+        *slash = 0;
+        if (parent[0])
+            pm_mkdir_p(parent);
+    }
+    av[n++] = (char *)self;
+    av[n++] = (char *)"-o";
+    av[n++] = p->out[0] ? p->out : "build/a.out";
+    for (i = 0; i < p->ninc && n + 2 < PM_MAX_ARGS; i++) {
+        av[n++] = (char *)"-I";
+        av[n++] = p->inc[i];
+    }
+    for (i = 0; i < p->nflag && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->flag[i];
+    for (i = 0; release ? 0 : i < p->ndev_flag && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->dev_flag[i];
+    for (i = 0; !release ? 0 : i < p->nrel_flag && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->rel_flag[i];
+    for (i = 0; i < p->nsrc && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->src[i];
+    if (strcmp(p->kind, "firmware") == 0) {
+        char obj[PM_PATH] = {0};
+        char *oa[PM_MAX_ARGS] = {(char *)0};
+        char *lv[PM_MAX_ARGS] = {(char *)0};
+        int m = 0, k = 0;
+        snprintf(obj, sizeof(obj), "%s.o", p->out);
+        /* c6c 只认 main 当入口：固件走 -c 出 ET_REL，再交给 cc 链接
+         * （link_flags 可给 -T 链接脚本等）。 */
+        oa[k++] = (char *)self;
+        oa[k++] = (char *)"-c";
+        oa[k++] = (char *)"-o";
+        oa[k++] = obj;
+        for (i = 0; i < p->ninc && k + 2 < PM_MAX_ARGS; i++) {
+            oa[k++] = (char *)"-I";
+            oa[k++] = p->inc[i];
+        }
+        for (i = 0; i < p->nflag && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->flag[i];
+        for (i = 0; release ? 0 : i < p->ndev_flag && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->dev_flag[i];
+        for (i = 0; !release ? 0 : i < p->nrel_flag && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->rel_flag[i];
+        for (i = 0; i < p->nsrc && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->src[i];
+        rc = pm_spawn(oa);
+        if (rc)
+            return rc;
+        lv[m++] = (char *)"cc";
+        lv[m++] = (char *)"-nostdlib";
+        lv[m++] = (char *)"-Wl,-e,_start";
+        lv[m++] = (char *)"-o";
+        lv[m++] = p->out;
+        lv[m++] = obj;
+        for (i = 0; i < p->nlink_flag && m + 1 < PM_MAX_ARGS; i++)
+            lv[m++] = p->link_flag[i];
+        rc = pm_spawn(lv);
+        if (rc)
+            return rc;
+        rc = pm_firmware_outputs(p);
+        if (rc)
+            return rc;
+        pm_fingerprint_write(p, release, manifest);
+        return 0;
+    }
+    av[n] = (char *)0;
+    rc = pm_spawn(av);
+    if (rc == 0)
+        pm_fingerprint_write(p, release, manifest);
+    return rc;
+}
+
+static int pm_test(PmProject *p, const char *self)
+{
+    char *av[PM_MAX_ARGS] = {(char *)0};
+    int n = 0, i = 0;
+    if (!p->has_test && p->nsrc > 0) {
+        /* 清单里 test 块可能来自没被 pm_add_src 读到的源文件，重新读一遍 */
+        char buf[PM_FILE_CAP] = {0};
+        for (i = 0; i < p->nsrc; i++) {
+            if (pm_read_file(p->src[i], buf, sizeof(buf)) >= 0
+                && strstr(buf, "test \"")) {
+                p->has_test = 1;
+                break;
+            }
+        }
+    }
+    if (!p->has_test) {
+        printf("c6c: test: 没有找到 test 块\n");
+        return 0;
+    }
+    av[n++] = (char *)self;
+    av[n++] = (char *)"-test";
+    for (i = 0; i < p->ninc && n + 2 < PM_MAX_ARGS; i++) {
+        av[n++] = (char *)"-I";
+        av[n++] = p->inc[i];
+    }
+    for (i = 0; i < p->nsrc && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->src[i];
+    av[n] = (char *)0;
+    return pm_spawn(av);
+}
+
+static int pm_write_text(const char *path, const char *text)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "c6c: 写不出 %s\n", path);
+        return 1;
+    }
+    fputs(text, fp);
+    fclose(fp);
+    return 0;
+}
+
+/* package：按 pkg_files 装一份 staging 树，再由 tar / dpkg-deb 出包。 */
+
+static int pm_package(const PmProject *p)
+{
+    char stage[PM_PATH] = {0}, control[PM_PATH] = {0};
+    char body[2048] = {0};
+    char pkgname[128] = {0};
+    const char *fmts[8] = {0};
+    int i = 0, rc = 0, made = 0;
+    pm_mkdir_p("build");
+    snprintf(pkgname, sizeof(pkgname), "%s-%s",
+             p->pkg_name[0] ? p->pkg_name : p->name, p->version);
+    if (!pm_safe_name(pkgname)) {
+        fprintf(stderr, "c6c: package: 包名/版本含非法字符：%s\n", pkgname);
+        return 2;
+    }
+    snprintf(stage, sizeof(stage), "build/package/%s", pkgname);
+    pm_rm_rf(stage);                 /* 上次残留不能混进新包 */
+    for (i = 0; i < p->npkg_file; i++) {
+        char src[512] = {0}, dst[512] = {0}, full[PM_PATH] = {0};
+        const char *colon = strchr(p->pkg_file[i], ':');
+        if (!colon) {
+            fprintf(stderr, "c6c: package: pkg_files 条目缺 ':'：%s\n", p->pkg_file[i]);
+            return 2;
+        }
+        snprintf(src, sizeof(src), "%.*s", (int)(colon - p->pkg_file[i]), p->pkg_file[i]);
+        snprintf(dst, sizeof(dst), "%s", colon + 1);
+        {
+            const char *rel = dst[0] == '/' ? dst + 1 : dst;
+            if (!pm_safe_rel(src) || !pm_safe_rel(rel)) {
+                fprintf(stderr, "c6c: package: pkg_files 只接受安全路径：%s\n", p->pkg_file[i]);
+                return 2;
+            }
+            snprintf(full, sizeof(full), "%s/%s", stage, rel);
+        }
+        rc = pm_copy_file(src, full);
+        if (rc)
+            return rc;
+    }
+    for (i = 0; i < p->npkg_fmt && i < 8; i++)
+        fmts[i] = p->pkg_fmt[i];
+    if (pm_has_fmt(fmts, p->npkg_fmt, "deb")) {
+        char arch[64] = "amd64";
+        int word = (int)(sizeof(void *) * 8);
+        if (word == 32)
+            snprintf(arch, sizeof(arch), "i386");
+        {
+            char dir[PM_PATH] = {0};
+            snprintf(dir, sizeof(dir), "%s/DEBIAN", stage);
+            pm_mkdir_p(dir);
+            snprintf(control, sizeof(control), "%s/control", dir);
+        }
+        snprintf(body, sizeof(body),
+                 "Package: %s\nVersion: %s\nSection: utils\nPriority: optional\n"
+                 "Architecture: %s\nMaintainer: %s contributors <%s@c6.local>\n"
+                 "License: %s\nDescription: %s\n",
+                 p->pkg_name[0] ? p->pkg_name : p->name, p->version, arch,
+                 p->pkg_name[0] ? p->pkg_name : p->name, p->name,
+                 p->pkg_license, p->pkg_desc[0] ? p->pkg_desc : p->name);
+        rc = pm_write_text(control, body);
+        if (rc)
+            return rc;
+        {
+            char *av[5] = {(char *)0};
+            char out[PM_PATH] = {0};
+            snprintf(out, sizeof(out), "build/%s.deb", pkgname);
+            av[0] = (char *)"dpkg-deb"; av[1] = (char *)"--build";
+            av[2] = stage; av[3] = out;
+            rc = pm_spawn(av);
+            if (rc) {
+                fprintf(stderr, "c6c: package: DEB 生成失败\n");
+                return rc;
+            }
+            printf("c6c: package: %s\n", out);
+            made++;
+        }
+    }
+    if (pm_has_fmt(fmts, p->npkg_fmt, "tgz")) {
+        char *av[8] = {(char *)0};
+        char out[PM_PATH] = {0};
+        snprintf(out, sizeof(out), "build/%s.tar.gz", pkgname);
+        av[0] = (char *)"tar"; av[1] = (char *)"-czf"; av[2] = out;
+        av[3] = (char *)"-C"; av[4] = stage;
+        av[5] = (char *)"--exclude=./DEBIAN"; av[6] = (char *)".";
+        rc = pm_spawn(av);
+        if (rc) {
+            fprintf(stderr, "c6c: package: TGZ 生成失败\n");
+            return rc;
+        }
+        printf("c6c: package: %s\n", out);
+        made++;
+    }
+    if (!made) {
+        fprintf(stderr, "c6c: package: pkg_formats 里没有可用格式\n");
+        return 2;
+    }
+    printf("c6c: package: staging 树在 %s\n", stage);
+    return 0;
+}
+
+static int pm_install(const PmProject *p, const char *destdir, const char *prefix)
+{
+    int i = 0;
+    char root[PM_PATH] = {0};
+    for (i = 0; i < p->npkg_file; i++) {
+        char src[512] = {0}, dst[512] = {0}, full[PM_PATH] = {0};
+        const char *colon = strchr(p->pkg_file[i], ':');
+        if (!colon) {
+            fprintf(stderr, "c6c: install: pkg_files 条目缺 ':'：%s\n", p->pkg_file[i]);
+            return 2;
+        }
+        snprintf(src, sizeof(src), "%.*s", (int)(colon - p->pkg_file[i]), p->pkg_file[i]);
+        snprintf(dst, sizeof(dst), "%s", colon + 1);
+        {
+            const char *rel = dst;
+            size_t pl = strlen(prefix);
+            if (dst[0] == '/') {
+                if (pl && strncmp(dst, prefix, pl) == 0 && dst[pl] == '/')
+                    rel = dst + pl + 1;   /* /usr/bin/x + prefix=/usr → bin/x */
+                else
+                    rel = dst + 1;        /* 其他绝对路径：落 DESTDIR 根 */
+            }
+            if (!pm_safe_rel(src) || !pm_safe_rel(rel)) {
+                fprintf(stderr, "c6c: install: pkg_files 只接受安全路径：%s\n", p->pkg_file[i]);
+                return 2;
+            }
+            snprintf(root, sizeof(root), "%s%s%s", destdir, prefix,
+                     pl && prefix[pl - 1] == '/' ? "" : "/");
+            snprintf(full, sizeof(full), "%s%s", root, rel);
+        }
+        if (pm_copy_file(src, full) != 0)
+            return 1;
+        printf("c6c: install: %s -> %s\n", src, full);
+    }
+    return 0;
+}
+
+/* publish：package + SHA256SUMS；--tag 时再打一个 v<version> 注解 tag。 */
+
+static int pm_publish(const PmProject *p, int tag, int dry)
+{
+    char name[128] = {0};
+    char cwd[PM_PATH] = {0};
+    char files[2][128] = {{0}, {0}};
+    char *sav[5] = {(char *)0};
+    int rc = 0, n = 0, i = 0;
+    if (dry) {
+        printf("c6c: publish: 预览（不打包、不打 tag）：c6c package → sha256sum → git tag v%s\n",
+               p->version);
+        return 0;
+    }
+    rc = pm_package(p);
+    if (rc)
+        return rc;
+    snprintf(name, sizeof(name), "%s-%s",
+             p->pkg_name[0] ? p->pkg_name : p->name, p->version);
+    if (!pm_safe_name(name)) {
+        fprintf(stderr, "c6c: publish: 包名/版本含非法字符：%s\n", name);
+        return 2;
+    }
+    if (!getcwd(cwd, sizeof(cwd)) || chdir("build") != 0) {
+        fprintf(stderr, "c6c: publish: 进不了 build/\n");
+        return 2;
+    }
+    snprintf(files[0], sizeof(files[0]), "%s.tar.gz", name);
+    snprintf(files[1], sizeof(files[1]), "%s.deb", name);
+    sav[n++] = (char *)"sha256sum";
+    for (i = 0; i < 2; i++) {
+        struct stat st = {0};
+        if (stat(files[i], &st) == 0)
+            sav[n++] = files[i];
+    }
+    sav[n] = (char *)0;
+    rc = pm_spawn_file(sav, "SHA256SUMS");
+    chdir(cwd);
+    if (rc)
+        return rc;
+    printf("c6c: publish: build/SHA256SUMS 已生成\n");
+    if (tag) {
+        char msg[256] = {0};
+        char *tav[7] = {(char *)0};
+        char vtag[64] = {0};
+        snprintf(msg, sizeof(msg), "c6 %s", p->version);
+        snprintf(vtag, sizeof(vtag), "v%s", p->version);
+        tav[0] = (char *)"git"; tav[1] = (char *)"tag"; tav[2] = (char *)"-a";
+        tav[3] = vtag; tav[4] = (char *)"-m"; tav[5] = msg;
+        rc = pm_spawn(tav);
+        if (rc == 0)
+            printf("c6c: publish: 已打 tag %s\n", p->version);
+    }
+    return rc;
+}
+
+/* cargo check 风格：只做语法检查，不落盘。 */
+static int pm_check(const PmProject *p, const char *self)
+{
+    char *av[PM_MAX_ARGS] = {(char *)0};
+    int n = 0, i = 0;
+    av[n++] = (char *)self;
+    av[n++] = (char *)"-fsyntax-only";
+    for (i = 0; i < p->ninc && n + 2 < PM_MAX_ARGS; i++) {
+        av[n++] = (char *)"-I";
+        av[n++] = p->inc[i];
+    }
+    for (i = 0; i < p->nsrc && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->src[i];
+    av[n] = (char *)0;
+    return pm_spawn(av);
+}
+
+static void pm_rm_rf(const char *path)
+{
+    DIR *d = opendir(path);
+    struct dirent *e = (struct dirent *)0;
+    if (!d) {
+        unlink(path);
+        return;
+    }
+    while ((e = readdir(d)) != (struct dirent *)0) {
+        char child[PM_PATH] = {0};
+        struct stat st = {0};
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode))
+            pm_rm_rf(child);
+        else
+            unlink(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+
+/* 只清本清单产出的文件，不删整个 build/（c6c/ 的 build/c6c 还在用）。 */
+static int pm_clean(const PmProject *p, int dry)
+{
+    const char *sufs[5] = {"", ".o", ".bin", ".hex", ".fingerprint"};
+    const char *exts[2] = {".tar.gz", ".deb"};
+    char stage[PM_PATH] = {0}, base[PM_PATH] = {0}, f[PM_PATH] = {0};
+    int i = 0;
+    if (!pm_safe_rel(p->out)) {
+        fprintf(stderr, "c6c: clean: out 不是安全的相对路径：%s\n", p->out);
+        return 2;
+    }
+    for (i = 0; i < 5; i++) {
+        snprintf(f, sizeof(f), "%s%s", p->out, sufs[i]);
+        if (dry)
+            printf("c6c: clean 预览：rm -f %s\n", f);
+        else
+            unlink(f);
+        if (!dry)
+            printf("c6c: clean: %s\n", f);
+    }
+    snprintf(base, sizeof(base), "%s-%s",
+             p->pkg_name[0] ? p->pkg_name : p->name, p->version);
+    if (!pm_safe_name(base)) {
+        fprintf(stderr, "c6c: clean: 包名/版本含非法字符：%s\n", base);
+        return 2;
+    }
+    for (i = 0; i < 2; i++) {
+        snprintf(f, sizeof(f), "build/%s%s", base, exts[i]);
+        if (dry)
+            printf("c6c: clean 预览：rm -f %s\n", f);
+        else
+            unlink(f);
+        if (!dry)
+            printf("c6c: clean: %s\n", f);
+    }
+    snprintf(f, sizeof(f), "build/SHA256SUMS");
+    if (dry)
+        printf("c6c: clean 预览：rm -f %s\n", f);
+    else
+        unlink(f);
+    if (!dry)
+        printf("c6c: clean: %s\n", f);
+    snprintf(stage, sizeof(stage), "build/package/%s", base);
+    if (dry)
+        printf("c6c: clean 预览：rm -rf %s\n", stage);
+    else
+        pm_rm_rf(stage);
+    return 0;
+}
+
+
+static void pm_list(const PmProject *p, int json)
+{
+    char a[PM_PATH * 2] = {0}, b[PM_PATH * 2] = {0};
+    char c[PM_PATH * 2] = {0}, d[PM_PATH * 2] = {0};
+    int i = 0;
+    if (json) {
+        pm_json_str(a, sizeof(a), p->name);
+        pm_json_str(b, sizeof(b), p->version);
+        pm_json_str(c, sizeof(c), p->kind);
+        pm_json_str(d, sizeof(d), p->out);
+        printf("{\n  \"name\": \"%s\",\n  \"version\": \"%s\",\n"
+               "  \"kind\": \"%s\",\n  \"out\": \"%s\",\n  \"sources\": [",
+               a, b, c, d);
+        for (i = 0; i < p->nsrc; i++) {
+            pm_json_str(a, sizeof(a), pm_rel(p->src[i]));
+            printf("%s\"%s\"", i ? ", " : "", a);
+        }
+        printf("]\n}\n");
+        return;
+    }
+    printf("%s %s (%s) -> %s\n", p->name, p->version, p->kind, p->out);
+    for (i = 0; i < p->nsrc; i++)
+        printf("%s\n", pm_rel(p->src[i]));
+}
+
+/* ---------------- lockfile：不依赖外部 registry，锁住源文件与元数据 ---------------- */
+
+static unsigned int pm_hash_file(const char *path)
+{
+    unsigned int h = 2166136261u;
+    FILE *fp = fopen(path, "rb");
+    int c = 0;
+    if (!fp)
+        return 0;
+    while ((c = fgetc(fp)) != EOF) {
+        h ^= (unsigned int)c;
+        h *= 16777619u;
+    }
+    fclose(fp);
+    return h;
+}
+
+static void pm_sort_sources(PmProject *p)
+{
+    int i = 0, j = 0;
+    for (i = 0; i < p->nsrc; i++) {
+        for (j = i + 1; j < p->nsrc; j++) {
+            if (strcmp(p->src[i], p->src[j]) > 0) {
+                char tmp[PM_PATH] = {0};
+                strcpy(tmp, p->src[i]);
+                strcpy(p->src[i], p->src[j]);
+                strcpy(p->src[j], tmp);
+            }
+        }
+    }
+}
+
+static void pm_add_src_unique(PmProject *p, const char *path)
+{
+    int i = 0;
+    if (p->nsrc >= PM_MAX_SRCS)
+        return;
+    for (i = 0; i < p->nsrc; i++) {
+        if (strcmp(p->src[i], path) == 0)
+            return;
+    }
+    strcpy(p->src[p->nsrc++], path);
+}
+
+/* c6c 是单 TU：清单里写一个 c6c.c6，但它 #include 了十几个模块；锁文件必须
+ * 把这些本地 include 也锁进去，否则改了 pm.c6 而 c6c.lock 还是绿的。 */
+static void pm_expand_includes(PmProject *p)
+{
+    char buf[PM_FILE_CAP] = {0};
+    int pass = 0, i = 0;
+    for (pass = 0; pass < 3; pass++) {
+        int before = p->nsrc;
+        for (i = 0; i < before; i++) {
+            const char *slash = strrchr(p->src[i], '/');
+            char dir[PM_PATH] = {0};
+            char *q = buf;
+            if (pm_read_file(p->src[i], buf, sizeof(buf)) < 0)
+                continue;
+            if (slash) {
+                int n = (int)(slash - p->src[i]);
+                if (n > 0 && n < (int)sizeof(dir)) {
+                    memcpy(dir, p->src[i], n);
+                    dir[n] = 0;
+                }
+            }
+            while ((q = strstr(q, "#include ")) != (char *)0) {
+                char name[256] = {0}, path[PM_PATH] = {0};
+                char *e = q + 9, *n = name;
+                struct stat st = {0};
+                if (*e != '"') { q = e; continue; }
+                e++;
+                while (*e && *e != '"' && n - name < (int)sizeof(name) - 1)
+                    *n++ = *e++;
+                *n = 0;
+                if (dir[0])
+                    snprintf(path, sizeof(path), "%s/%s", dir, name);
+                else
+                    snprintf(path, sizeof(path), "%s", name);
+                if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+                    pm_add_src_unique(p, path);
+                q = e;
+                if (!*q)
+                    break;
+            }
+        }
+        if (p->nsrc == before)
+            break;
+    }
+}
+
+
+static int pm_lock_text(const PmProject *p, char *buf, size_t cap)
+{
+    char esc[PM_PATH * 2] = {0};
+    char e1[PM_PATH * 2] = {0}, e2[PM_PATH * 2] = {0};
+    char e3[PM_PATH * 2] = {0}, e4[PM_PATH * 2] = {0};
+    int i = 0, n = 0;
+    pm_json_str(e1, sizeof(e1), p->name);
+    pm_json_str(e2, sizeof(e2), p->version);
+    pm_json_str(e3, sizeof(e3), p->kind);
+    pm_json_str(e4, sizeof(e4), p->out);
+    n = snprintf(buf, cap,
+        "{\n  \"name\": \"%s\",\n  \"version\": \"%s\",\n  \"kind\": \"%s\",\n"
+        "  \"out\": \"%s\",\n  \"include\": [\n",
+        e1, e2, e3, e4);
+    if (n < 0 || (size_t)n >= cap) return n;
+    for (i = 0; i < p->ninc; i++) {
+        pm_json_str(esc, sizeof(esc), p->inc[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->ninc ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"flags\": [\n");
+    for (i = 0; i < p->nflag; i++) {
+        pm_json_str(esc, sizeof(esc), p->flag[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->nflag ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"link_flags\": [\n");
+    for (i = 0; i < p->nlink_flag; i++) {
+        pm_json_str(esc, sizeof(esc), p->link_flag[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->nlink_flag ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"dev_flags\": [\n");
+    for (i = 0; i < p->ndev_flag; i++) {
+        pm_json_str(esc, sizeof(esc), p->dev_flag[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->ndev_flag ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"release_flags\": [\n");
+    for (i = 0; i < p->nrel_flag; i++) {
+        pm_json_str(esc, sizeof(esc), p->rel_flag[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->nrel_flag ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"pkg_formats\": [\n");
+    for (i = 0; i < p->npkg_fmt; i++) {
+        pm_json_str(esc, sizeof(esc), p->pkg_fmt[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->npkg_fmt ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"pkg_files\": [\n");
+    for (i = 0; i < p->npkg_file; i++) {
+        pm_json_str(esc, sizeof(esc), p->pkg_file[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->npkg_file ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"fw_formats\": [\n");
+    for (i = 0; i < p->nfw_fmt; i++) {
+        pm_json_str(esc, sizeof(esc), p->fw_fmt[i]);
+        n += snprintf(buf + n, cap - (size_t)n, "    \"%s\"%s\n",
+                      esc, i + 1 < p->nfw_fmt ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ],\n  \"sources\": [\n");
+    for (i = 0; i < p->nsrc; i++) {
+        struct stat st = {0};
+        size_t sz = 0;
+        if (stat(p->src[i], &st) == 0)
+            sz = (size_t)st.st_size;
+        pm_json_str(esc, sizeof(esc), pm_rel(p->src[i]));
+        n += snprintf(buf + n, cap - (size_t)n,
+            "    [\"%s\", %u, \"%08x\"]%s\n", esc, (unsigned int)sz,
+            pm_hash_file(p->src[i]), i + 1 < p->nsrc ? "," : "");
+        if (n < 0 || (size_t)n >= cap) return n;
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ]\n}\n");
+    return n;
+}
+
+static int pm_lock_write(const PmProject *p)
+{
+    char text[65536] = {0};
+    PmProject copy = {0};
+    memcpy(&copy, p, sizeof(copy));
+    pm_expand_includes(&copy);
+    pm_sort_sources(&copy);
+    pm_lock_text(&copy, text, sizeof(text));
+    if (pm_write_text("c6c.lock", text))
+        return 1;
+    printf("c6c: lock: 已写入 c6c.lock（%d 个源文件，含本地 #include）\n", copy.nsrc);
+    return 0;
+}
+
+static int pm_lock_verify(const PmProject *p)
+{
+    char want[65536] = {0};
+    char got[65536] = {0};
+    PmProject copy = {0};
+    memcpy(&copy, p, sizeof(copy));
+    pm_expand_includes(&copy);
+    pm_sort_sources(&copy);
+    pm_lock_text(&copy, want, sizeof(want));
+    if (pm_read_file("c6c.lock", got, sizeof(got)) < 0) {
+        fprintf(stderr, "c6c: --locked 要求 c6c.lock（先跑 `c6c lock`）\n");
+        return 1;
+    }
+    if (strcmp(want, got) != 0) {
+        fprintf(stderr, "c6c: c6c.lock 与当前源文件不符（跑 `c6c lock` 更新）\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* ---------------- workspace：c6c-workspace.yaml ---------------- */
+
+typedef struct {
+    char member[32][PM_PATH];
+    int n;
+} PmWorkspace;
+
+static int pm_ws_load(PmWorkspace *ws, const char *path)
+{
+    char buf[65536] = {0};
+    char *q = buf, *line = (char *)0;
+    int section = 0;
+    memset(ws, 0, sizeof(*ws));
+    if (pm_read_file(path, buf, sizeof(buf)) < 0)
+        return -1;
+    while ((line = pm_next_line(&q)) != (char *)0) {
+        char t[PM_PATH] = {0};
+        size_t n = strlen(line);
+        if (n >= sizeof(t)) n = sizeof(t) - 1;
+        memcpy(t, line, n);
+        t[n] = 0;
+        pm_trim(t);
+        if (strcmp(t, "members:") == 0) {
+            section = 1;
+        } else if (t[0] == '-' && t[1] == ' ' && section == 1) {
+            char val[PM_PATH] = {0};
+            strcpy(val, t + 2);
+            pm_trim(val);
+            pm_unquote(val);
+            if (ws->n < 32)
+                strcpy(ws->member[ws->n++], val);
+        }
+    }
+    return 0;
+}
+
+static int pm_ws_init(void)
+{
+    DIR *d = opendir(".");
+    struct dirent *e = (struct dirent *)0;
+    FILE *fp = (FILE *)0;
+    PmWorkspace ws = {0};
+    int i = 0;
+    if (!d)
+        return 1;
+    while ((e = readdir(d)) != (struct dirent *)0) {
+        char mp[PM_PATH] = {0}, mp2[PM_PATH] = {0};
+        struct stat st = {0};
+        if (e->d_name[0] == '.' || strcmp(e->d_name, "build") == 0)
+            continue;
+        snprintf(mp, sizeof(mp), "%s/c6c.yaml", e->d_name);
+        snprintf(mp2, sizeof(mp2), "%s/c6c.yml", e->d_name);
+        if (stat(e->d_name, &st) == 0 && S_ISDIR(st.st_mode)
+            && (stat(mp, &st) == 0 || stat(mp2, &st) == 0)
+            && ws.n < 32)
+            strcpy(ws.member[ws.n++], e->d_name);
+    }
+    closedir(d);
+    fp = fopen("c6c-workspace.yaml", "wb");
+    if (!fp)
+        return 1;
+    fprintf(fp, "# 由 `c6c workspace init` 生成：c6c workspace <命令> 逐成员执行\n");
+    fprintf(fp, "members:\n");
+    for (i = 0; i < ws.n; i++)
+        fprintf(fp, "  - %s\n", ws.member[i]);
+    fclose(fp);
+    printf("c6c: workspace: 写入 c6c-workspace.yaml（%d 个成员）\n", ws.n);
+    return 0;
+}
+
+static int pm_workspace(const char *sub, const char *self, int force,
+                        int release, int dry, int locked)
+{
+    PmWorkspace ws = {0};
+    char cwd[PM_PATH] = {0};
+    char *av[8] = {(char *)0};
+    int i = 0, n = 0, rc = 0;
+    if (strcmp(sub, "init") == 0)
+        return pm_ws_init();
+    if (pm_ws_load(&ws, "c6c-workspace.yaml") != 0
+        && pm_ws_load(&ws, "c6c-workspace.yml") != 0) {
+        fprintf(stderr, "c6c: 没有 c6c-workspace.yaml（先跑 `c6c workspace init`）\n");
+        return 2;
+    }
+    if (strcmp(sub, "list") == 0) {
+        for (i = 0; i < ws.n; i++)
+            printf("%s\n", ws.member[i]);
+        return 0;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "c6c: workspace: 取不到当前目录\n");
+        return 2;
+    }
+    av[n++] = (char *)self;
+    av[n++] = (char *)sub;
+    if (force) av[n++] = (char *)"--force";
+    if (release) av[n++] = (char *)"--release";
+    if (dry) av[n++] = (char *)"--dry-run";
+    if (locked) av[n++] = (char *)"--locked";
+    for (i = 0; i < ws.n; i++) {
+        if (ws.member[i][0] == '/' || strstr(ws.member[i], "..")) {
+            fprintf(stderr, "c6c: workspace: 非法成员路径 %s\n", ws.member[i]);
+            return 2;
+        }
+        if (chdir(ws.member[i]) != 0) {
+            fprintf(stderr, "c6c: workspace: 进不了 %s\n", ws.member[i]);
+            chdir(cwd);
+            return 2;
+        }
+        printf("c6c: workspace [%s] $ c6c %s\n", ws.member[i], sub);
+        rc = pm_dispatch(n, av);
+        chdir(cwd);
+        if (rc == PM_NOT_SUB) {
+            fprintf(stderr, "c6c: workspace: 未知子命令 %s\n", sub);
+            return 2;
+        }
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+/* ---------------- 迁移：从 CMakeLists.txt / Cargo.toml / Makefile 提取元数据 ---------------- */
+
+static void pm_kv_str(const char *line, const char *key, char *out, size_t cap)
+{
+    const char *p = strstr(line, key);
+    const char *v = (const char *)0;
+    size_t n = 0;
+    if (!p)
+        return;
+    v = strchr(p, '=');
+    if (!v)
+        return;
+    v++;
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v == '"' || *v == '\'') {
+        char quote = *v++;
+        while (v[n] && v[n] != quote && n + 1 < cap) {
+            out[n] = v[n];
+            n++;
+        }
+    } else {
+        while (v[n] && v[n] != ' ' && v[n] != '\t' && v[n] != '\r'
+               && v[n] != '\n' && n + 1 < cap) {
+            out[n] = v[n];
+            n++;
+        }
+    }
+    out[n] = 0;
+}
+
+static void pm_next_token(const char **q, char *out, size_t cap)
+{
+    const char *p = *q;
+    size_t n = 0;
+    while (*p == ' ' || *p == '\t' || *p == '(' || *p == ')')
+        p++;
+    while (*p && *p != ' ' && *p != '\t' && *p != ')' && n + 1 < cap) {
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+    *q = p;
+}
+
+static void pm_import_meta(PmProject *p, const char *from)
+{
+    char buf[65536] = {0};
+    char *q = buf, *line = (char *)0;
+    struct stat st = {0};
+    const char *src = (const char *)0;
+    int in_pkg = 1;
+    if (strcmp(from, "auto") == 0) {
+        if (stat("CMakeLists.txt", &st) == 0)
+            from = "cmake";
+        else if (stat("Cargo.toml", &st) == 0)
+            from = "cargo";
+        else if (stat("Makefile", &st) == 0)
+            from = "make";
+        else
+            return;
+    }
+    if (strcmp(from, "cargo") == 0)
+        src = "Cargo.toml";
+    else if (strcmp(from, "make") == 0)
+        src = "Makefile";
+    else
+        src = "CMakeLists.txt";
+    if (pm_read_file(src, buf, sizeof(buf)) < 0)
+        return;
+    while ((line = pm_next_line(&q)) != (char *)0) {
+        char t[PM_PATH] = {0};
+        size_t n = strlen(line);
+        if (n >= sizeof(t)) n = sizeof(t) - 1;
+        memcpy(t, line, n);
+        t[n] = 0;
+        pm_trim(t);
+        if (strcmp(from, "cargo") == 0) {
+            char v[256] = {0};
+            if (t[0] == '[') {
+                in_pkg = strcmp(t, "[package]") == 0;
+                continue;
+            }
+            if (!in_pkg)
+                continue;
+            pm_kv_str(t, "name", v, sizeof(v));
+            if (v[0]) { snprintf(p->name, sizeof(p->name), "%s", v); continue; }
+            pm_kv_str(t, "version", v, sizeof(v));
+            if (v[0]) { snprintf(p->version, sizeof(p->version), "%s", v); continue; }
+            pm_kv_str(t, "description", v, sizeof(v));
+            if (v[0]) { snprintf(p->pkg_desc, sizeof(p->pkg_desc), "%s", v); continue; }
+            pm_kv_str(t, "license", v, sizeof(v));
+            if (v[0]) snprintf(p->pkg_license, sizeof(p->pkg_license), "%s", v);
+        } else if (strcmp(from, "cmake") == 0) {
+            const char *pr = strstr(t, "project(");
+            if (pr) {
+                char tok[128] = {0};
+                const char *r = pr + 7;
+                pm_next_token(&r, tok, sizeof(tok));
+                if (tok[0]) snprintf(p->name, sizeof(p->name), "%s", tok);
+                pm_next_token(&r, tok, sizeof(tok));
+                while (tok[0] && strcmp(tok, "VERSION") != 0)
+                    pm_next_token(&r, tok, sizeof(tok));
+                if (tok[0]) {
+                    pm_next_token(&r, tok, sizeof(tok));
+                    if (tok[0]) snprintf(p->version, sizeof(p->version), "%s", tok);
+                }
+                break;
+            }
+        } else if (strcmp(from, "make") == 0) {
+            char v[256] = {0};
+            pm_kv_str(t, "NAME", v, sizeof(v));
+            if (v[0]) snprintf(p->name, sizeof(p->name), "%s", v);
+            pm_kv_str(t, "VERSION", v, sizeof(v));
+            if (v[0]) snprintf(p->version, sizeof(p->version), "%s", v);
+        }
+    }
+    printf("c6c: init: 从 %s 迁移元数据 → name=%s version=%s\n",
+           from, p->name, p->version);
+}
+
+static int pm_doctor(const PmProject *p)
+{
+    int i = 0, miss = 0, unresolved = 0;
+    struct stat st = {0};
+    for (i = 0; i < p->nsrc; i++) {
+        if (stat(p->src[i], &st) != 0) {
+            fprintf(stderr, "c6c: doctor: 源文件不存在：%s\n", p->src[i]);
+            miss++;
+        }
+    }
+    unresolved = pm_check_imports(p);
+    printf("c6c: doctor: 源文件 %d（缺失 %d），import %d（未解析 %d），kind=%s，out=%s\n",
+           p->nsrc, miss, p->nimp, unresolved, p->kind, p->out);
+    return (miss || unresolved) ? 1 : 0;
+}
+
+static void pm_help(void)
+{
+    printf("用法：c6c <子命令> [参数]\n"
+           "\n"
+           "  init [--force] [--from=cmake|cargo|make|auto]  扫描仓库生成 c6c.yaml\n"
+           "  scan            只打印扫描结果，不写文件\n"
+           "  build [--release] [--force]  按清单编译（mtime 增量，可选 profile）\n"
+           "  test            编译并运行全部 `test \"…\" { }` 块\n"
+           "  run [参数...]   先 build，再用参数运行产物\n"
+           "  package         按 pkg_files / pkg_formats 打包（tgz / deb）\n"
+           "  install         按 pkg_files 安装；认 DESTDIR / PREFIX 环境变量\n"
+           "  check           只做语法检查（-fsyntax-only）\n"
+           "  clean           只删本清单产物（不删整个 build/）\n"
+           "  env / list      打印解析后的配置 / 源文件列表（list --json）\n"
+           "  lock            生成 c6c.lock（build --locked 校验源文件漂移）\n"
+           "  doctor          检查源文件 / import 是否齐全\n"
+           "  workspace <cmd> 多包：init / list / build / test / check / clean / lock\n"
+           "  publish         打包 + SHA256SUMS，--tag 再打 v<version>\n"
+           "  flash / monitor / debug  按 *_cmd 模板操作固件（--dry-run 预览）\n"
+           "  help            打印本帮助\n"
+           "\n"
+           "向上找 c6c.yaml（go.mod 风格）；--manifest-path=... 可显式指定。\n"
+           "清单格式：name/version/kind/out + sources/include/flags 三个列表，\n"
+           "另有 destdir/prefix、dev_flags/release_flags。\n"
+           "kind 由 init 按 main() / _start / test 块推断：app / firmware / lib。\n"
+           "固件默认带 -nostdlib，build 会用 objcopy 追加 BIN/HEX；烧录调试用\n"
+           "清单里的 flash_cmd / monitor_cmd / debug_cmd 模板（{elf}/{bin}/{out}）。\n");
+}
+
+static int pm_is_build_flag(const char *a)
+{
+    return strcmp(a, "--release") == 0 || strcmp(a, "--force") == 0
+        || strcmp(a, "--locked") == 0 || strcmp(a, "--dry-run") == 0
+        || strcmp(a, "--tag") == 0 || strcmp(a, "--json") == 0
+        || strncmp(a, "--profile=", 10) == 0
+        || strncmp(a, "--destdir=", 10) == 0
+        || strncmp(a, "--prefix=", 9) == 0
+        || strncmp(a, "--manifest-path=", 16) == 0
+        || strncmp(a, "--from=", 7) == 0;
+}
+
+int pm_dispatch(int argc, char **argv)
+{
+    PmProject p = {0};
+    const char *cmd = (argc >= 2) ? argv[1] : "";
+    const char *self = pm_self(argv[0]);
+    const char *destdir = "pkg";
+    const char *prefix = "/usr";
+    const char *mpath = (const char *)0;
+    const char *from = "auto";
+    char manifest[PM_PATH] = "c6c.yaml";
+    char startcwd[PM_PATH] = {0};
+    int dd_set = 0, px_set = 0, release = 0, json = 0;
+    int force = 0, dry = 0, tag = 0, locked = 0, i = 0;
+    int rc = 0;
+    if (getcwd(startcwd, sizeof(startcwd)) == 0)
+        startcwd[0] = 0;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--force") == 0)
+            force = 1;
+        else if (strcmp(argv[i], "--dry-run") == 0)
+            dry = 1;
+        else if (strcmp(argv[i], "--tag") == 0)
+            tag = 1;
+        else if (strncmp(argv[i], "--destdir=", 10) == 0) {
+            destdir = argv[i] + 10;
+            dd_set = 1;
+        } else if (strncmp(argv[i], "--prefix=", 9) == 0) {
+            prefix = argv[i] + 9;
+            px_set = 1;
+        } else if (strncmp(argv[i], "--manifest-path=", 16) == 0)
+            mpath = argv[i] + 16;
+        else if (strcmp(argv[i], "--release") == 0
+                 || strcmp(argv[i], "--profile=release") == 0)
+            release = 1;
+        else if (strcmp(argv[i], "--profile=dev") == 0)
+            release = 0;
+        else if (strcmp(argv[i], "--json") == 0)
+            json = 1;
+        else if (strcmp(argv[i], "--locked") == 0)
+            locked = 1;
+        else if (strncmp(argv[i], "--from=", 7) == 0)
+            from = argv[i] + 7;
+    }
+
+    if (strcmp(cmd, "help") == 0) {
+        pm_help();
+        return 0;
+    }
+    if (strcmp(cmd, "scan") != 0 && strcmp(cmd, "init") != 0
+        && strcmp(cmd, "workspace") != 0) {
+        if (mpath) {
+            char dir[PM_PATH] = {0};
+            const char *slash = strrchr(mpath, '/');
+            if (slash) {
+                int n = (int)(slash - mpath);
+                if (n > 0 && n < (int)sizeof(dir)) {
+                    memcpy(dir, mpath, n);
+                    dir[n] = 0;
+                    if (chdir(dir) != 0) {
+                        fprintf(stderr, "c6c: 进不了 %s\n", dir);
+                        return 2;
+                    }
+                }
+                snprintf(manifest, sizeof(manifest), "%s", slash + 1);
+            } else {
+                snprintf(manifest, sizeof(manifest), "%s", mpath);
+            }
+        } else if (!pm_find_up(manifest, sizeof(manifest))) {
+            /* 没有清单时退回普通编译语义：保持在原目录，pm_load 会临时扫描 */
+            if (startcwd[0])
+                chdir(startcwd);
+            snprintf(manifest, sizeof(manifest), "c6c.yaml");
+        } else {
+            /* find_up 已经 chdir 到清单所在目录，这里只留文件名 */
+            char *slash = strrchr(manifest, '/');
+            if (slash)
+                memmove(manifest, slash + 1, strlen(slash + 1) + 1);
+        }
+    }
+    if (strcmp(cmd, "scan") == 0) {
+        pm_scan(&p);
+        (void)pm_check_imports(&p);
+        pm_print_scan(&p);
+        return 0;
+    }
+    if (strcmp(cmd, "init") == 0) {
+        struct stat st = {0};
+        if (!force && stat("c6c.yaml", &st) == 0) {
+            fprintf(stderr, "c6c: init: c6c.yaml 已存在（--force 覆盖）\n");
+            return 2;
+        }
+        pm_scan(&p);
+        pm_import_meta(&p, from);
+        (void)pm_check_imports(&p);
+        pm_print_scan(&p);
+        return pm_write_yaml(&p, "c6c.yaml");
+    }
+    if (strcmp(cmd, "build") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (locked && pm_lock_verify(&p) != 0)
+            return 2;
+        return pm_build(&p, self, force, release, manifest);
+    }
+    if (strcmp(cmd, "test") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_test(&p, self);
+    }
+    if (strcmp(cmd, "run") == 0) {
+        char *av[PM_MAX_ARGS] = {(char *)0};
+        int i = 0;
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        rc = pm_build(&p, self, force, release, manifest);
+        if (rc != 0)
+            return rc;
+        {
+            int k = 1;
+            int passthrough = 0;
+            av[0] = p.out[0] ? p.out : "build/a.out";
+            for (i = 2; i < argc && k + 1 < PM_MAX_ARGS; i++) {
+                if (!passthrough && strcmp(argv[i], "--") == 0) {
+                    passthrough = 1;
+                    continue;
+                }
+                if (!passthrough && pm_is_build_flag(argv[i]))
+                    continue;
+                av[k++] = argv[i];
+            }
+            av[k] = (char *)0;
+        }
+        return pm_spawn(av);
+    }
+    if (strcmp(cmd, "package") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        rc = pm_build(&p, self, force, release, manifest);
+        return rc ? rc : pm_package(&p);
+    }
+    if (strcmp(cmd, "install") == 0) {
+        const char *d = destdir, *pr = prefix;
+        const char *env_d = getenv("DESTDIR");
+        const char *env_p = getenv("PREFIX");
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (!dd_set)
+            d = env_d ? env_d : p.destdir;
+        if (!px_set)
+            pr = env_p ? env_p : p.prefix;
+        rc = pm_build(&p, self, force, release, manifest);
+        return rc ? rc : pm_install(&p, d, pr);
+    }
+    if (strcmp(cmd, "publish") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (!dry) {
+            rc = pm_build(&p, self, force, release, manifest);
+            if (rc)
+                return rc;
+        }
+        return pm_publish(&p, tag, dry);
+    }
+    if (strcmp(cmd, "lock") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_lock_write(&p);
+    }
+    if (strcmp(cmd, "doctor") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_doctor(&p);
+    }
+    if (strcmp(cmd, "workspace") == 0) {
+        const char *sub = (argc >= 3) ? argv[2] : "list";
+        return pm_workspace(sub, self, force, release, dry, locked);
+    }
+    if (strcmp(cmd, "check") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_check(&p, self);
+    }
+    if (strcmp(cmd, "clean") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_clean(&p, dry);
+    }
+    if (strcmp(cmd, "env") == 0) {
+        char cwd[PM_PATH] = {0};
+        const char *d = destdir, *pr = prefix;
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (!dd_set && getenv("DESTDIR"))
+            d = getenv("DESTDIR");
+        if (!dd_set && !getenv("DESTDIR"))
+            d = p.destdir;
+        if (!px_set && getenv("PREFIX"))
+            pr = getenv("PREFIX");
+        if (!px_set && !getenv("PREFIX"))
+            pr = p.prefix;
+        if (getcwd(cwd, sizeof(cwd))) {
+            size_t n = strlen(cwd);
+            if (n + 1 < sizeof(cwd)) {
+                cwd[n] = '/';
+                cwd[n + 1] = 0;
+            }
+        }
+        printf("c6c_self=%s\nmanifest=%s%s\nname=%s\nversion=%s\n"
+               "kind=%s\nout=%s\ndestdir=%s\nprefix=%s\nprofile=%s\n",
+               self, cwd, manifest, p.name, p.version, p.kind, p.out,
+               d, pr, release ? "release" : "dev");
+        return 0;
+    }
+    if (strcmp(cmd, "list") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        pm_list(&p, json);
+        return 0;
+    }
+    if (strcmp(cmd, "flash") == 0 || strcmp(cmd, "monitor") == 0
+        || strcmp(cmd, "debug") == 0) {
+        char bin[PM_PATH] = {0};
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        snprintf(bin, sizeof(bin), "%s.bin", p.out);
+        if (strcmp(cmd, "flash") == 0)
+            return pm_run_template(p.flash, p.nflash, &p, p.out, bin, dry);
+        if (strcmp(cmd, "monitor") == 0)
+            return pm_run_template(p.monitor, p.nmonitor, &p, p.out, bin, dry);
+        return pm_run_template(p.debug, p.ndebug, &p, p.out, bin, dry);
+    }
+    return PM_NOT_SUB;
+}

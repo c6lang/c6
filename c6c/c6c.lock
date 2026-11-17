@@ -1,0 +1,59 @@
+{
+  "name": "c6c",
+  "version": "0.6.2",
+  "kind": "app",
+  "out": "build/c6c-managed",
+  "include": [
+    ".",
+    "include"
+  ],
+  "flags": [
+  ],
+  "link_flags": [
+  ],
+  "dev_flags": [
+  ],
+  "release_flags": [
+  ],
+  "pkg_formats": [
+    "tgz"
+  ],
+  "pkg_files": [
+    "build/c6c-managed:bin/c6c",
+    "lib/rt.c6:lib/c6/rt.c6",
+    "include/stddef.h:lib/c6/include/stddef.h",
+    "include/stdarg.h:lib/c6/include/stdarg.h",
+    "include/stdint.h:lib/c6/include/stdint.h",
+    "include/c6lib.h:include/c6lib.h"
+  ],
+  "fw_formats": [
+  ],
+  "sources": [
+    ["src/aout.c6", 19435, "90996c7b"],
+    ["src/arena.c6", 3152, "2d457e9c"],
+    ["src/asmblob.c6", 10164, "af108489"],
+    ["src/asmout.c6", 21273, "213529d2"],
+    ["src/asmx.c6", 39263, "7fc023b8"],
+    ["src/c6c.c6", 1501, "620a1517"],
+    ["src/c99.c6", 24288, "d9421bc6"],
+    ["src/diag.c6", 3076, "0d68bdb9"],
+    ["src/dw.c6", 10782, "278be54c"],
+    ["src/elf.c6", 8183, "ea766e50"],
+    ["src/embed.c6", 20263, "481ed636"],
+    ["src/ir.c6", 20134, "e2587212"],
+    ["src/ld.c6", 79304, "adcc378a"],
+    ["src/lex.c6", 23324, "95a900e7"],
+    ["src/llvm.c6", 43929, "2028cc89"],
+    ["src/macro.c6", 13758, "fb77ff31"],
+    ["src/main.c6", 45571, "8f258e72"],
+    ["src/mod.c6", 6603, "3c797e0b"],
+    ["src/obj.c6", 26649, "f3884129"],
+    ["src/parse.c6", 824849, "ea0576ef"],
+    ["src/pm.c6", 72969, "410f1466"],
+    ["src/pp.c6", 49466, "2337aba7"],
+    ["src/src.c6", 15673, "a058d0d9"],
+    ["src/sym.c6", 13320, "35dcb0a0"],
+    ["src/type.c6", 30597, "d27073be"],
+    ["src/x64.c6", 63086, "a40033eb"]
+  ]
+}

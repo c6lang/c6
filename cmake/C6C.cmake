@@ -27,9 +27,9 @@
 # `ctest` → `ctest-c6c`，因为 `test` 是 CMake 内建 target）。
 #
 # 引导编译器（stage0）：
-#   C6_ENABLE_TCC=ON（默认）→ 仓库自己的 tcc/c6，`-B tcc` 带 crt / libtcc1.a；
-#   C6_ENABLE_TCC=OFF        → 宿主 C 编译器，`-x c` 直接编 c6c 的单 TU 源码。
-# 两条路产物同一份源码、同一套语义；OFF 这条路**不需要任何 tcc 构建产物**。
+#   C6_ENABLE_TCC=ON（需显式打开）→ 仓库自己的 tcc/c6，`-B tcc` 带 crt / libtcc1.a；
+#   C6_ENABLE_TCC=OFF（默认）      → 宿主 C 编译器，`-x c` 直接编 c6c 的单 TU 源码。
+# 两条路产物同一份源码、同一套语义；默认这条路**不需要任何 tcc 构建产物**。
 
 set(C6C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/c6c")
 set(C6C_BUILD "${C6C_DIR}/build")

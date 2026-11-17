@@ -116,6 +116,69 @@ worker 抢一个累加器，和自然是乱的。
 但线程池那一段还会挂死，所以整块没进这版。
 
 
+### c6c 工程管子命令：init / scan / build / test / run
+
+参考 cargo / go 的做法给 `c6c` 加了子命令（实现在 `c6c/src/pm.c6`，用 c6 自身
+写、随 c6c 单 TU 自举；`c6c help` 列出当前可用的名字）：
+
+- `c6c scan` 递归扫描仓库：收集 `.c6` / `.c` 源文件，按 `main()` / `_start` /
+  `test "…"` 块推断 `kind: app / firmware / lib`，核对 `import a.b;` 是否有
+  对应源文件，版本号取仓库根的 `VERSION`；`c6c init` 把结果写成受控子集的
+  `c6c.yaml`（已存在需 `--force` 覆盖）。
+- `c6c build` / `test` / `run` 按清单编译、跑 test 块、执行产物；清单缺省时
+  退化为临时扫描并提示先 `init`；固件工程自动带 `-nostdlib`。
+- `package` / `install` / `publish` 共用 `pkg_files`：TGZ / DEB 打包、带执行位
+  的安装、`SHA256SUMS` 与可选 `v<version>` tag；`build` 按 mtime 增量。
+- 固件：`_start` 工程走「c6c -c → cc -nostdlib 链接」两阶段，`fw_formats` 用
+  objcopy 出 ELF/BIN/HEX；`flash` / `monitor` / `debug` 按清单中的命令模板
+  执行（`{elf}` / `{bin}` 等占位符展开，`--dry-run` 可预览）。
+- `c6c/c6c.yaml` 是 c6c 自身的工程配置（dogfood）：`pmtest` 真跑它的自编、
+  打包与 staged install。
+- 取 cargo/go 的长处：从当前目录向上找 `c6c.yaml` / `c6c.yml`（go.mod 风格），
+  `--manifest-path=` 显式指定；`build --release` + `dev_flags` / `release_flags`
+  两档 profile；`check`（-fsyntax-only）、`clean`（只删本清单产物）、`env` /
+  `list --json`（脚本可读）。
+- 清单新增 `destdir` / `prefix` 安装落点，`install` 认标准 `DESTDIR` /
+  `PREFIX` 环境变量（命令行 > 环境变量 > 清单），发行版可直接
+  `DESTDIR="${pkgdir}" c6c install --prefix=/usr`。
+
+- `c6c lock` 生成 `c6c.lock`（元数据 + 源文件大小/FNV 校验和，自动展开本地
+  `#include`），`build --locked` 检测漂移；`c6c doctor` 报告缺失源文件与未解析
+  import。
+- `workspace`：仓库根 `c6c-workspace.yaml` 的 `members:` 列出子包，`c6c workspace
+  init` 自动发现，`workspace build|test|check|clean|lock|list` 逐成员执行；
+  本仓库已自带一份（成员 c6c）。
+- `c6c init --from=cmake|cargo|make|auto` 从既有工程的 `project()` / `[package]`
+  提取 name/version/description/license 等元数据，便于迁移。
+
+验证：`pmtest` 56 项（54 常规 + 2 DEB；无 `dpkg-deb` 时 54/54，跳过 2 项）；
+`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+
+### c6c 工程管理交叉审计修复
+
+多 agent 交叉验证后又补了一轮边界与一致性修复：
+
+- `help` 真正打印帮助；清单 `sources:` 也走 `pm_add_src()`，`doctor` 的 import
+  统计在清单模式下不再恒为 0；`run` 不再把 `--release` 等构建选项透传给产物。
+- 构建指纹纳入 profile / flags / include / link_flags / 清单 mtime；固件把
+  `.o` / `.bin` / `.hex` 的缺失与 `objcopy` 失败都算作需要重编。
+- `pm_spawn()` 补 fork/exec 错误与 EINTR；`rm_rf()` 用 `lstat`，不跟随符号
+  链接；清单字段全部带界复制，未知顶层键不再污染上一个列表。
+- `package` 先清 staging、拒绝 `pkg_files` 里的 `..`/绝对路径、DEB control
+  带 `License`，TGZ 排除 `DEBIAN/`，任一格式失败不再被后一个成功覆盖。
+- `publish` 先 build，SHA256SUMS 覆盖 TGZ/DEB 且不经过 `sh -c`；`clean` 连
+  归档、指纹和 staging 一起清。
+- `lock` 除源码外还锁 include / flags / link_flags / dev+release flags /
+  pkg_formats / pkg_files / fw_formats；workspace 拒绝越界成员与未知子命令。
+- Cargo 元数据迁移只取 `[package]` 段；CI 的 c6c job 显式打开
+  `C6_ENABLE_TCC`（默认已为 OFF），文档同步当前 `VERSION` 与 `fast` 清单。
+
+第二轮交叉复核继续修掉：烧录模板展开的缓冲区越界、`install` / `package` 对
+绝对路径落点不一致、增量指纹漏掉源文件/头文件 mtime 与 `--manifest-path`
+清单、固件未配置 BIN/HEX 时永远重编、迁移输出的换行笔误、`list --json`
+与锁文件的字符串转义；测试侧修正 `--locked` 与 TGZ 的恒真断言，文档同步
+std/诊断/C99 等当前基线。
+
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
 c6c 已经能自举：宿主 C 编译器把 c6 写的编译器引导出来，再由它自己编自己
