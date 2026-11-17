@@ -53,9 +53,12 @@ jobs:
 
       - name: Configure
         run: |
+          # 这个 job 校验的是 tcc 形态（daily 矩阵 / libtcc 共享矩阵），
+          # 显式钉住：仓库默认已改为只构建 c6c（见 CHANGELOG「未发布」）。
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DC6_TCC_SHARED_LIBTCC=${{ matrix.shared }} \
             -DBUILD_TESTING=ON
 
@@ -208,8 +211,9 @@ jobs:
             qemu-user qemu-system-x86 clang golang-go nodejs
       - name: Configure and build
         run: |
+          # 完整回归矩阵（-L regression）的被测编译器是 tcc/c6，显式钉住。
           cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr \
-            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=ON
+            -DCMAKE_INSTALL_LIBDIR=lib -DC6_ENABLE_TCC=ON -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
       # aux（check-tcc / ubcheck / safegate / bench-async）不属于回归门禁；
       # bench-async 需要 g++/rustc/go/uya，用 check-aux 在完整环境里单独跑。
@@ -290,9 +294,12 @@ jobs:
 
       - name: Configure
         run: |
+          # Release 里发的仍是 c6 包（tcc 形态），显式钉住；c6c 包由
+          # package-c6c job 单独产出验收。
           cmake -S . -B build-pkg \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DC6_TCC_SHARED_LIBTCC=ON \
             -DBUILD_TESTING=OFF \
             -DC6_PACKAGE_RELEASE="${{ steps.meta.outputs.release }}"

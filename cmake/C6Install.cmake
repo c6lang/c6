@@ -67,11 +67,13 @@ if(C6_INSTALL_DOCS)
   endif()
   install(FILES "${_c6_license_file}"
           DESTINATION "${C6_C6_DOCDIR_REL}" RENAME "copyright" OPTIONAL)
-  # 仓库根的 LICENSE（LGPL-2.1，与 tcc/COPYING 逐字一致）作为总许可声明也
-  # 随包装：c6 包里与 copyright 同文（都是 tcc 的 LGPL），c6c 包里则是
-  # 补充——c6c 自身按 MIT（copyright），仓库其余部分（tcc/）按 LGPL。
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
-          DESTINATION "${C6_C6_DOCDIR_REL}" OPTIONAL)
+  # 仓库根的 LICENSE 现在就是 c6c 的 MIT（仓库主体是 c6c；tcc/ 子目录仍按
+  # 上游 LGPL-2.1 走自己的 tcc/COPYING）。它只随 c6c 包：c6/tcc 包装一份
+  # MIT 会误导（那份包里的代码是 LGPL）。
+  if(NOT C6_ENABLE_TCC)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+            DESTINATION "${C6_C6_DOCDIR_REL}" OPTIONAL)
+  endif()
 endif()
 
 # C6_ENABLE_TCC=OFF：c6c 的二进制与数据、文档都装完了，剩下的全是 tcc 的
