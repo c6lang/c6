@@ -42,7 +42,33 @@
 - `c6c init --from=cmake|cargo|make|auto` 从既有工程的 `project()` / `[package]`
   提取 name/version/description/license 等元数据，便于迁移。
 
-验证：`pmtest` 40/40；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+验证：`pmtest` 56 项（54 常规 + 2 DEB；无 `dpkg-deb` 时 54/54，跳过 2 项）；
+`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+
+### c6c 工程管理交叉审计修复
+
+多 agent 交叉验证后又补了一轮边界与一致性修复：
+
+- `help` 真正打印帮助；清单 `sources:` 也走 `pm_add_src()`，`doctor` 的 import
+  统计在清单模式下不再恒为 0；`run` 不再把 `--release` 等构建选项透传给产物。
+- 构建指纹纳入 profile / flags / include / link_flags / 清单 mtime；固件把
+  `.o` / `.bin` / `.hex` 的缺失与 `objcopy` 失败都算作需要重编。
+- `pm_spawn()` 补 fork/exec 错误与 EINTR；`rm_rf()` 用 `lstat`，不跟随符号
+  链接；清单字段全部带界复制，未知顶层键不再污染上一个列表。
+- `package` 先清 staging、拒绝 `pkg_files` 里的 `..`/绝对路径、DEB control
+  带 `License`，TGZ 排除 `DEBIAN/`，任一格式失败不再被后一个成功覆盖。
+- `publish` 先 build，SHA256SUMS 覆盖 TGZ/DEB 且不经过 `sh -c`；`clean` 连
+  归档、指纹和 staging 一起清。
+- `lock` 除源码外还锁 include / flags / link_flags / dev+release flags /
+  pkg_formats / pkg_files / fw_formats；workspace 拒绝越界成员与未知子命令。
+- Cargo 元数据迁移只取 `[package]` 段；CI 的 c6c job 显式打开
+  `C6_ENABLE_TCC`（默认已为 OFF），文档同步当前 `VERSION` 与 `fast` 清单。
+
+第二轮交叉复核继续修掉：烧录模板展开的缓冲区越界、`install` / `package` 对
+绝对路径落点不一致、增量指纹漏掉源文件/头文件 mtime 与 `--manifest-path`
+清单、固件未配置 BIN/HEX 时永远重编、迁移输出的换行笔误、`list --json`
+与锁文件的字符串转义；测试侧修正 `--locked` 与 TGZ 的恒真断言，文档同步
+std/诊断/C99 等当前基线。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
