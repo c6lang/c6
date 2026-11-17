@@ -4761,10 +4761,28 @@ int sigpending(void *set)
     return 0;
 }
 
+/* 读写锁：字节 0..8 当自旋锁（xchg），偏移 8 是读者数，偏移 12 是写者标记。
+ * 自旋锁只用来保护"检查条件 + 改计数"这一小段，睡之前一定先放掉。
+ * 用 xchg 是因为 c6c 的运行时里已经有一个可用的 8 字节原子交换，不必再引 CAS。 */
+static void c6c_rw_spin(void *l)
+{
+    while (__c6_xchg8(l, 1) != 0)
+        ;
+}
+
+static void c6c_rw_unspin(void *l)
+{
+    *(volatile long *)l = 0;
+}
+
 int pthread_rwlock_init(void *l, const void *a)
 {
-    (void)l;
     (void)a;
+    if (l) {
+        *(long *)l = 0;
+        *(int *)((char *)l + 8) = 0;
+        *(int *)((char *)l + 12) = 0;
+    }
     return 0;
 }
 
@@ -4776,32 +4794,80 @@ int pthread_rwlock_destroy(void *l)
 
 int pthread_rwlock_rdlock(void *l)
 {
-    (void)l;
-    return 0;
+    if (!l)
+        return -1;
+    for (;;) {
+        c6c_rw_spin(l);
+        if (*(int *)((char *)l + 12) == 0) {
+            *(int *)((char *)l + 8) += 1;
+            c6c_rw_unspin(l);
+            return 0;
+        }
+        c6c_rw_unspin(l);
+        while (*(volatile int *)((char *)l + 12) != 0)
+            c6c_futex(l, C6C_FUTEX_WAIT, *(volatile int *)((char *)l + 12));
+    }
 }
 
 int pthread_rwlock_wrlock(void *l)
 {
-    (void)l;
-    return 0;
+    if (!l)
+        return -1;
+    for (;;) {
+        c6c_rw_spin(l);
+        if (*(int *)((char *)l + 12) == 0 && *(int *)((char *)l + 8) == 0) {
+            *(int *)((char *)l + 12) = 1;
+            c6c_rw_unspin(l);
+            return 0;
+        }
+        c6c_rw_unspin(l);
+        while (*(volatile int *)((char *)l + 12) != 0 || *(volatile int *)((char *)l + 8) != 0)
+            c6c_futex(l, C6C_FUTEX_WAIT, *(volatile int *)((char *)l + 12) | *(volatile int *)((char *)l + 8));
+    }
 }
 
 int pthread_rwlock_unlock(void *l)
 {
-    (void)l;
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) != 0)
+        *(int *)((char *)l + 12) = 0;
+    else if (*(int *)((char *)l + 8) > 0)
+        *(int *)((char *)l + 8) -= 1;
+    c6c_rw_unspin(l);
+    c6c_futex(l, C6C_FUTEX_WAKE, 0x3fffffff);
     return 0;
 }
 
 int pthread_rwlock_tryrdlock(void *l)
 {
-    (void)l;
-    return 0;
+    int ok = 0;
+
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) == 0) {
+        *(int *)((char *)l + 8) += 1;
+        ok = 1;
+    }
+    c6c_rw_unspin(l);
+    return ok ? 0 : -1;
 }
 
 int pthread_rwlock_trywrlock(void *l)
 {
-    (void)l;
-    return 0;
+    int ok = 0;
+
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) == 0 && *(int *)((char *)l + 8) == 0) {
+        *(int *)((char *)l + 12) = 1;
+        ok = 1;
+    }
+    c6c_rw_unspin(l);
+    return ok ? 0 : -1;
 }
 
 /* 屏障 / 自旋锁：rt.c6 的线程实现没有屏障语义，这里如实退化（init/destroy
@@ -5148,15 +5214,64 @@ int sigprocmask(int how, const void *set, void *old)
 }
 
 /* 信号量：单线程，空操作 */
-int sem_init(void *s, int pshared, unsigned int v) { (void)s; (void)pshared; (void)v; return 0; }
-int sem_wait(void *s) { (void)s; return 0; }
-int sem_post(void *s) { (void)s; return 0; }
+/* 信号量：第一个 int 当计数。glibc 的 sem_t 只有 32 字节，这里只用前 4 个。
+ * wait 用原子减——减完还是 >= 0 说明本来就有一张"票"，直接拿到；减成负数就
+ * 说明没票，原地睡到计数变正（睡之前把值读出来交给 futex 做比较，避免丢唤醒）。 */
+int sem_init(void *s, int pshared, unsigned int v)
+{
+    (void)pshared;
+    if (s)
+        *(int *)s = (int)v;
+    return 0;
+}
+
+int sem_wait(void *s)
+{
+    if (!s)
+        return -1;
+    for (;;) {
+        if (__c6_atomic_dec(s) >= 0)
+            return 0;
+        __c6_atomic_inc(s);
+        while (*(volatile int *)s <= 0)
+            c6c_futex(s, C6C_FUTEX_WAIT, *(volatile int *)s);
+    }
+}
+
+int sem_post(void *s)
+{
+    if (!s)
+        return -1;
+    __c6_atomic_inc(s);
+    c6c_futex(s, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
 int sem_destroy(void *s) { (void)s; return 0; }
 /* 信号量这几个也是空操作（rt.c6 的 sem_* 没有计数），trywait/timedwait 一律
  * "拿到了"，getvalue 给 0——调用方按返回值分支的逻辑在单线程用例里成立。 */
-int sem_trywait(void *s) { (void)s; return 0; }
+int sem_trywait(void *s)
+{
+    if (!s)
+        return -1;
+    for (;;) {
+        int v = *(volatile int *)s;
+
+        if (v <= 0)
+            return -1;
+        if (__c6_atomic_dec(s) >= 0)
+            return 0;
+        __c6_atomic_inc(s);
+        return -1;
+    }
+}
 int sem_timedwait(void *s, const void *abstime) { (void)s; (void)abstime; return 0; }
-int sem_getvalue(void *s, int *v) { (void)s; if (v) *v = 0; return 0; }
+int sem_getvalue(void *s, int *v)
+{
+    if (v)
+        *v = s ? *(volatile int *)s : 0;
+    return 0;
+}
 
 /* longjmp：没有可恢复的栈上下文（要保存 rsp/rip），明确退出而不是静默错走 */
 int _setjmp(void *buf) { (void)buf; return 0; }
