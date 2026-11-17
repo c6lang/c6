@@ -301,9 +301,11 @@ cpack --config build/CPackConfig.cmake -G RPM -B packages  # 需要 rpmbuild
 并用 `pkgconf` 校验 `c6.pc` 的 prefix 随 DESTDIR 重定位；CI 每次构建都会跑这一条。
 
 GitHub Actions（`.github/workflows/ci.yml`）在 push / PR 上做两版 Ubuntu 的编译、
-CTest 与安装校验，并产出三种包。假设 tcc 形态的 job（daily 矩阵、tag 上的完整
-回归、Release 包）显式传 `-DC6_ENABLE_TCC=ON`，行为与默认翻转之前一致；
-c6c-only 由 no-tcc job（显式 OFF + `test ! -e tcc/c6` 的硬断言）把守。
+CTest 与安装校验，并产出三种包。c6c job 与 no-tcc job 都显式传
+`-DC6_ENABLE_TCC=OFF`，并断言构建完没有 `tcc/c6` / `libtcc`；假设 tcc 形态的
+job（daily 矩阵、tag 上的完整回归、Release 包）才显式传 `-DC6_ENABLE_TCC=ON`，
+行为与默认翻转之前一致。c6c 自管清单 `c6c/c6c.yaml` 也直接输出到
+`c6c/build/c6c`，同样不依赖 tcc。
 手动触发 `full_regression` 或打 `v*` tag 时跑完整回归（CI 补齐 qemu/clang/go
 依赖，避免用例静默跳过）。
 发版说明取自**版本提交**的正文：发版时提交一条主题为 `c6 <VERSION>` 的提交，正文
