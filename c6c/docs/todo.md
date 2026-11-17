@@ -5486,3 +5486,20 @@ worker 到底卡在哪一步。
 
 下一轮：拿 `/tmp/pool1.c6`（内联锁，已验证能过）和 rt.c6 的版本对着改——
 差别只在"锁的实现在库里"这一层，把它逼到和 pool1 一样的时序就能收敛。
+
+### 第 282 轮：把 pool1 的算法原样搬进 rt.c6，sync/thread 都对了，chan 还挂
+
+按上一轮说的"对齐 pool1"：库里的互斥量改成 64 位原子加/减 + futex（和
+`/tmp/pool1.c6` 那份内联版一模一样），条件变量用第一个 int 当通知计数。连跑三次：
+
+```
+run1 rc=1   : stdthread: 29 check(s), 3 failure(s)      ← 跑完了，只剩 sem×2 + rwlock
+run2 rc=124 : thread: …1..400 的和=80200                ← 挂在 chan 段
+run3 rc=124 : 同上
+```
+
+也就是 `sync`、`thread` 两段现在都能过，卡在 `chan`。`chan` 用的是
+`std/container/chan.c6` 自己那套（互斥量在锁内 signal），所以下一个怀疑点是
+"signal 在锁内 → 等待方在 unlock 之后才进 futex"那个经典丢唤醒窗口。
+
+挂死会让 CI 超时（比断言红更伤），所以没提交改动，回归仍 90 / 92。
