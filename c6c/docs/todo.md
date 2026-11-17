@@ -5882,3 +5882,17 @@ a=6,0,0 b=8,0,0           ← 再也没出来，但进程正常结束、也没�
 "总让一轮"在 `tests/async.c6` 和 91 个回归用例上是绿的，就保持原样。
 
 门禁现状：96 个 ctest 全绿、tests2 意外失败 0、回归 91 / 92（只差 std-https）。
+
+### 第 304 轮：`C6_CO_EV_WRITE` 的映射是对的，`poll` 那一环还得盯
+
+核对了一遍参数：`C6_CO_EV_READ = 1 / C6_CO_EV_WRITE = 2`（`rt.c6` 的 enum），
+`c6_io` 里 `want = (ev == C6_CO_EV_WRITE ? 4 : 1)` 就是 POLLOUT/POLLIN，
+`c6c_co_poll_ready` 用的也是 `c->wait_ev`（同一份 `want`），所以"fd 事件掩码搞错"
+这条排除了。
+
+`__c6_co_run` 的循环是：`reap → 挑一个 !done && !waiting 的恢复 → 一个都挑不到就
+c6c_co_poll_ready(-1)`。两个 co 都 `waiting` 时应该走到 poll，poll 立刻返回（POLLOUT
+恒就绪）→ 清 `waiting` → `continue` → 恢复。逻辑上没问题，但实测没发生。
+
+下一轮就在 `c6c_co_poll_ready` 里打一行（fd/events/revents/返回值），看它到底被调到
+没有、返回了什么。这是整条链上唯一还没直接观测过的一环。
