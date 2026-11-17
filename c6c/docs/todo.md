@@ -5325,3 +5325,22 @@ std-box 里 `csv: 未闭合引号报 PARSE` **已经通过**，只剩 `json: 语
 下一轮：json 那条用的是 `catch e` 拿到的值跟 `std.data.json.PARSE` 比，
 `e` 的号段是 json 模块的（`atomic` 那侧），而常量这条现在应该也对了——
 先打一下两边的数。
+
+### 第 271 轮：std-box 转绿（89 / 92）
+
+真正的病根不是"哪个模块先登记"，而是 `gen_postfix` 里这句：
+
+```c
+while (… 还有 '.' …) { pa_advance(); pa_advance(); t = pa_cur(); }
+s = sym_find(tok_data(t), t->len);       // ← 无条件，把 best_sym 盖掉
+```
+
+最长前缀已经命中 `std__data__json__PARSE`（值 235847687，json 自己的），紧接着
+这一句又把 `s` 换成裸名 `PARSE`（err 那份，234881031）。加 `if (!s)` 就对了。
+
+配套的一步：模块枚举成员要**真的**按 `std__data__json__PARSE` 登记一份；值必须
+用和裸名同一个表达式 `(val ? (val | ebase) : 0u)`，否则 `OK = 0` 会被加上基址，
+`tests/err_ids.c6` 的两条自测就红。
+
+`stdbox: 59 check(s), 0 failure(s)`，回归 **89 / 92**，两边验收（93 个 ctest、
+tests2 意外失败 0）全过。剩 `std-term` / `std-thread` / `std-https` 三个。
