@@ -2964,6 +2964,9 @@ static int CONST_LAX;
 /* 常量求值刚返回的值是**符号下标**（全局量/函数名）而不是整数：
  * 全局初始化器据此决定要不要生成一条重定位。 */
 static u32 CONST_SYM;
+/* 和 CONST_SYM 一起用：`&sym` / `&sym.member` 是"符号 + 偏移"，偏移放这里。
+ * 0 表示不加（裸符号名的情况）。 */
+static i64 CONST_SYM_ADD;
 /* 枚举措名既是类型名又是常量名。`(CT_STATE_MAX - 1)` 这种写法里，括号
  * **不是**强制转换——把枚举成员当类型名去 parse_typename，就会在 `-` 上
  * 报"这里要 ')'"。内核 include/linux/log2.h 的 bits_per() 正好这么用。 */
@@ -3051,6 +3054,7 @@ static i64 const_unary(void)
         u32 off = 0;
         u32 mty = 0;
         int extra = 0;
+        Sym *sbase = NULL;
 
         while (extra < 4 && pa_is_ch('(') && !is_typename_tok(pa_peek(1))) {
             pa_advance();
@@ -3084,36 +3088,60 @@ static i64 const_unary(void)
                 pa_expect_ch(')');
                 extra--;
             }
-            for (;;) {
-                int arrow = 0;
-                char *nm = NULL;
-                u32 nl = 0;
-                u32 mo = 0;
-
-                if (pa_accept_punct("->"))
-                    arrow = 1;
-                else if (!pa_accept_ch('.'))
-                    break;
-                if (arrow)
-                    ty = ty_target(ty);
-                if (pa_cur()->kind != TK_IDENT) {
-                    pa_error("常量表达式里的取地址只能跟成员名");
-                    return 0;
-                }
-                nm = (char *)tok_data(pa_cur());
-                nl = pa_cur()->len;
+        } else if (pa_cur()->kind == TK_IDENT
+                   && (sbase = sym_find(tok_data(pa_cur()), pa_cur()->len)) != NULL
+                   && sbase->kind == SC_GLOBAL) {
+            /* `&全局对象` / `&函数名`：早期这里只认 `&((T *)0)->member`，
+             * 直接报"只支持 … 形式的取地址"。可内核里到处都是它的变体：
+             *   .driver_data = (kernel_ulong_t)(&i830_early_ops)
+             *   DECLARE_WORK(n, &fn)          → .func = (&fn)
+             *   unsigned long *p = cpumask_bits(&mask)   → &mask.bits[0]
+             * 这些在全局初始化器里落地的方式和裸符号名一样：写一条重定位
+             * （符号下标 + 偏移），不是整数。 */
+            ty = sbase->type;
+            pa_advance();
+            while (extra > 0 && pa_is_ch(')')) {
                 pa_advance();
-                if (!agg_find_promoted(ty, nm, nl, &mty, &mo)) {
-                    pa_error("常量表达式里的取地址找不到成员");
-                    return 0;
-                }
-                off += mo;
-                ty = mty;
+                extra--;
             }
-            return (i64)off;
+        } else {
+            pa_error("常量表达式里只支持 &((T *)0)->member 形式的取地址");
+            return 0;
         }
-        pa_error("常量表达式里只支持 &((T *)0)->member 形式的取地址");
-        return 0;
+        /* 成员链：`&((T *)0)->m` 和 `&sym.m` 走同一段。 */
+        for (;;) {
+            int arrow = 0;
+            char *nm = NULL;
+            u32 nl = 0;
+            u32 mo = 0;
+
+            if (pa_accept_punct("->"))
+                arrow = 1;
+            else if (!pa_accept_ch('.'))
+                break;
+            if (arrow)
+                ty = ty_target(ty);
+            if (pa_cur()->kind != TK_IDENT) {
+                pa_error("常量表达式里的取地址只能跟成员名");
+                return 0;
+            }
+            nm = (char *)tok_data(pa_cur());
+            nl = pa_cur()->len;
+            pa_advance();
+            if (!agg_find_promoted(ty, nm, nl, &mty, &mo)) {
+                pa_error("常量表达式里的取地址找不到成员");
+                return 0;
+            }
+            off += mo;
+            ty = mty;
+        }
+        if (sbase) {
+            /* 是个"符号 + 偏移"，交给全局初始化器补重定位。 */
+            CONST_SYM = 1;
+            CONST_SYM_ADD = (i64)off;
+            return sbase->val;
+        }
+        return (i64)off;
     }
     /* `_Generic` 也要能出现在常量上下文（`_Static_assert(_Generic(...), "…")`）。
      * 控制表达式只取类型：发一条赋值再撤销，和表达式那条路是同一招。 */
@@ -15260,11 +15288,24 @@ static void glob_store(u32 goff, u32 off, u32 ty, u64 v)
 
 /* 全局初始化器里的标量常量：走完整的常量表达式链（`A | B`、`sizeof(T)`、
  * 三目都算），而不是只认单个字面量——tcc 的 DWARF 表就是 `VT_LONG | VT_INT`。 */
+/* 上一次 parse_const_u64 求出来的值是"符号下标 + 偏移"吗？
+ * 整型字段里装地址常量时（`(kernel_ulong_t)(&sym)`）不能把下标当整数落地。 */
+static int CONST_LAST_SYM;
+static i64 CONST_LAST_ADD;
 static int parse_const_u64(u64 *out)
 {
     u32 save = PA_ERRS;
-    i64 v = const_expr();
+    u32 save_sym = CONST_SYM;
+    i64 v = 0;
 
+    /* 自己重置再还原：以前不重置，前一次 `&符号` 留下的 CONST_SYM 会一直粘着，
+     * 把后面普通的整数初始化器误判成地址常量。 */
+    CONST_SYM = 0;
+    CONST_SYM_ADD = 0;
+    v = const_expr();
+    CONST_LAST_SYM = (int)CONST_SYM;
+    CONST_LAST_ADD = CONST_SYM_ADD;
+    CONST_SYM = save_sym;
     if (PA_ERRS != save)
         return 0;
     *out = (u64)v;
@@ -16247,11 +16288,14 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             u32 save = FN.n;
             u32 save_sym = CONST_SYM;
             i64 cv = 0;
+            i64 sym_add = 0;
             int is_sym = 0;
 
             CONST_SYM = 0;
+            CONST_SYM_ADD = 0;
             cv = const_expr();
             is_sym = (int)CONST_SYM;
+            sym_add = CONST_SYM_ADD;
             CONST_SYM = save_sym;
             FN.n = save;
             PEND_LVAL = 0;
@@ -16261,7 +16305,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
                  * 内核 include/linux/debugfs.h:59 的 `.write = cond ? a : b`
                  * 以前会编成 0x194 这种"下标"。 */
                 glob_store(goff, off, ty, 0);
-                data_fixup_add(goff + off, (u32)cv);
+                data_fixup_add_ex(goff + off, (u32)cv, sym_add);
                 return;
             }
             glob_store(goff, off, ty, (u64)cv);
@@ -16306,6 +16350,18 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
         u64 v = 0;
 
         if (parse_const_u64(&v)) {
+            if (CONST_LAST_SYM && !GLOB_BF_BITS) {
+                /* 整型字段里装的是**地址常量**：`.driver_data =
+                 * (kernel_ulong_t)(&i830_early_ops)`、
+                 * `cpumask_bits(&mask)` → `&mask.bits[0]`。往常量求值拿到的是
+                 * 符号下标，直接当整数写进数据段就变成 0xC2 这种"下标"
+                 * （内核 arch/x86/kernel/early-quirks.c 的 intel_early_ids、
+                 * kernel/watchdog.c 的 watchdog_cpumask_bits）。和指针那条路
+                 * 一样补一条重定位。 */
+                glob_store(goff, off, ty, 0);
+                data_fixup_add_ex(goff + off, (u32)v, CONST_LAST_ADD);
+                return;
+            }
             if (GLOB_BF_BITS) {
                 /* 位域初始化：在数据段上做读-改-写 */
                 u64 unit = 0;
@@ -21804,8 +21860,26 @@ static void gen_one_global(u32 ty, Declarator *d)
     }
     {
         i64 v = 0;
+        u32 save_sym2 = CONST_SYM;
+        int is_sym2 = 0;
+        i64 sym_add2 = 0;
 
+        CONST_SYM = 0;
+        CONST_SYM_ADD = 0;
         v = const_expr();
+        is_sym2 = (int)CONST_SYM;
+        sym_add2 = CONST_SYM_ADD;
+        CONST_SYM = save_sym2;
+        if (is_sym2) {
+            /* 整型字段里装的是**地址常量**：`(kernel_ulong_t)(&i830_early_ops)`、
+             * `(unsigned long)&g`。往常量求值拿到的是符号下标，直接当整数存进去
+             * 就编成了 0xC2 这种"下标"（内核 arch/x86/kernel/early-quirks.c 的
+             * intel_early_ids、kernel/watchdog.c 的 watchdog_cpumask_bits 都是
+             * 这个形状）。和指针那条路一样补一条重定位。 */
+            glob_store(goff, 0, ty, 0);
+            data_fixup_add_ex(goff, (u32)v, sym_add2);
+            return;
+        }
         glob_store(goff, 0, ty, (u64)v);
     }
 }
