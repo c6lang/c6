@@ -494,6 +494,33 @@ error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own'
 （可 grep、可 review、可统计），并对这些类型提供运行期环回收（P3 之后）。
 在豁免引入之前，通用图只能写成 `own`（独占树）或 `weak`（不持有边）。
 
+### 8.5 多态（`interface`）参与引用图时查到什么
+
+多态值 `interface Shape { … }` 在运行期是 `struct Shape { void *self; const struct Shape_vt *vt; }`：
+`self` 是指向实现者对象的**裸 `void *`**（`__tcc_iface_init` 只是拷贝，见 §9 的 vtable
+手法）。它不是托管槽，也不计数，所以**引用图里没有 `interface` 边** —— 这不是漏做，
+而是 `interface` 值本身不持有引用。（`struct→interface` 转换不 +1、作用域退出不释放：
+`@Counted c = new Counted; Node n = *c;` 之后 `__c6_gc_live()` 回到基线，实测 rc=0。）
+
+由此，多态下环检测的行为分三种，全部实测（`tcc/c6 -run` / `-o`）：
+
+| 情形 | 图里有边吗 | 结论 |
+|---|---|---|
+| `struct B { @A a; Node n; }` —— 字段是 `interface`，运行期可能装着 `A` 的 `self` | ❌ 不建边 | **查不到**。`A -b-> B` 与「B 的接口值指向 A」之间的回边编译器看不见 |
+| `struct P { @A a; }` 实现了接口，另一个结构体 `struct B { @P p; }` **按值嵌入** P | ✅ `C6_GCK_EMBED` 边 | **查得到**：`P -a-> A -b-> B -p-> P` 照常报 E-GC1 |
+| `struct B { weak @A a; Node n; }` —— `weak` 字段旁放接口值 | ✅ 只有 `weak`，不建边 | 合法；`weak` 要先升级才能解引用（§6） |
+
+也就是说：**环只要完全由 `@T` 字段（含数组、含按值嵌入）串起来，不论那些类型是不是
+接口的实现者、方法是不是虚分派，都会报错**；环一旦经由 `interface` 值闭合就查不到，
+因为那个 `self` 在类型层是 `void *`。后一种情况不会泄漏（接口不计数），但**实现者
+对象之间的环仍然存在**，只是不再由接口值持有——真正决定生命周期的是那批 `@T` 字段。
+
+**为什么不能给 `interface` 也建边**：一个接口值可以是任何实现者，签名级建边就等于对
+每个实现者的类型图加满边（`closure` 已经因为签名级保守边有过这种取舍，见
+[closure-design.md](closure-design.md) §7.2），`interface` 的签名数远多于闭包，
+必然大面积误报。要闭合这一格，正确做法是**在转换点检查**（把「装进接口的 `self`」
+和这条边记进同一个图），而不是在类型图上加泛边 —— 归入 §13 第 2 类的后续工作。
+
 ---
 
 ## 9. `async` / `spawn` 集成
@@ -748,8 +775,10 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 闭不上（文档化，不静默）：
 
 1. 手写汇编、外部（非本编译器编译的）代码里构造的指针；
-2. `c6_graph` 豁免类型里的运行期环；
-3. 主动调用内部 `__c6_gc_*`（不导出给用户，头文件里只给编译器用）。
+2. 经由 `interface` 值闭合的环 —— 接口值的 `self` 是裸 `void *`，类型图上没有边
+   （§8.5：按值嵌入的实现者照常查得到，只有「环走接口值」这一格查不到）；
+3. `c6_graph` 豁免类型里的运行期环；
+4. 主动调用内部 `__c6_gc_*`（不导出给用户，头文件里只给编译器用）。
 
 ---
 
