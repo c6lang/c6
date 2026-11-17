@@ -5356,3 +5356,20 @@ tests2 意外失败 0）全过。剩 `std-term` / `std-thread` / `std-https` 三
 
 `stdterm: 45 check(s), 0 failure(s)`，回归 **90 / 92**。剩 `std-thread`（协程/线程
 时序，10~25% 概率挂死）和 `std-https`（co 任务里看到的 `HAsync` 是垃圾）。
+
+### 第 273 轮：指针是对的、进函数时字段也是对的，坏在 `httpsa_request` 里面
+
+在 `httpsa_get` 入口打 `hp` 和 `hp->wfd/rfd/bcap/tls_on`：
+
+```
+[A] &a=0x7ffc98f62da0 &b=0x7ffc98f62ca0
+[B] hp=0x7ffc98f62da0 wfd=6  rfd=7  bcap=512 tls=0 host=a.example
+[B] hp=0x7ffc98f62ca0 wfd=10 rfd=11 bcap=512 tls=0 host=b.example
+```
+
+地址和字段**全对**。而跑到 `httpsa_request` 末尾再看就是 `wfd=1 / bcap=4592989` 了。
+`httpsa_send`/`httpsa_recv`/`httpsa_parse_head` 里的读写都按 `blen/bcap` 夹过，
+`HAsync` 也不含托管字段，`C6_CO_STACK` 是 64 KB、`wire` 才 1088 字节——看不出越界。
+所以更像是**编译器在 async 帧里写错了地方**（`await` 出现在循环里、函数有 7 个形参、
+又跨模块），而不是库的问题。下一步的最小复现：拿 `co5.c6` 那个能过的形状，把
+`inner` 改成"循环里 await 一个带 7 个形参的 async 函数，并在循环之后继续用 `pv` 的字段"。
