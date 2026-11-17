@@ -5600,6 +5600,27 @@ static u32 parse_enum_spec(void)
         }
         s = sym_add(nm, k, ty_int(), SC_ENUMC);
         s->val = (i64)(i32)(val ? (val | ebase) : 0u);
+        if (ebase && pa_cur() && mod_of_file((u32)pa_cur()->file)) {
+            const char *mpA = mod_path(mod_of_file((u32)pa_cur()->file));
+            char qA[320] = {0};
+            u32 wA = 0;
+            u32 jA = 0;
+
+            if (mpA) {
+                for (jA = 0; mpA[jA] && wA + 2 < 300; jA++)
+                    if (mpA[jA] == '.') { qA[wA++] = '_'; qA[wA++] = '_'; }
+                    else if (wA + 1 < 300) qA[wA++] = mpA[jA];
+                qA[wA++] = '_'; qA[wA++] = '_';
+                if (wA + k < 316) {
+                    Sym *sqA = NULL;
+
+                    memcpy(qA + wA, tok_data(t), k);
+                    wA += k;
+                    sqA = sym_add(qA, wA, ty_int(), SC_ENUMC);
+                    sqA->val = (i64)((i32)val | (i32)ebase);
+                }
+            }
+        }
         /* 有标签就再登记一份限定名 `Tag.名字`（`enum Color { GREEN }` 之后
          * 也能写 `Color.GREEN`）；同名已存在就不覆盖。 */
         if (etaglen && etaglen + k + 2 < sizeof(nm)) {
