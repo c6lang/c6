@@ -1,0 +1,75 @@
+# c6c 的编译规则：自举编译器本体、跑分用的测量二进制、嵌入库 libc6c。
+#
+# 由 cmake/C6C.cmake 顺序 include；这里用的 C6C_DIR / C6C_BIN / C6C_SRCS /
+# _c6c_ld_env 等都在那里定义，单独 include 本文件没有意义。
+#
+# 引导编译器（stage0）两条路：
+#   C6_ENABLE_TCC=ON  → 仓库自己的 tcc/c6，`-B tcc` 带 crt / libtcc1.a；
+#   C6_ENABLE_TCC=OFF → 宿主 C 编译器 `-x c`，不需要任何 tcc 构建产物。
+
+if(C6_ENABLE_TCC)
+  set(C6C_STAGE0 "${C6_TCC_DIR}/c6${C6_TCC_EXESUF}")
+  add_custom_command(
+    OUTPUT "${C6C_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+    COMMAND ${CMAKE_COMMAND} -E env ${_c6c_ld_env}
+            "${C6C_STAGE0}" -B "${C6_TCC_DIR}" -g -o "${C6C_BIN}"
+            "${C6C_DIR}/src/c6c.c6"
+    DEPENDS ${C6C_SRCS} "${C6C_STAGE0}"
+    COMMENT "c6c: 用 ${C6C_STAGE0} 编出自举编译器 (c6c/build/c6c)"
+    VERBATIM)
+else()
+  set(C6C_STAGE0 "${CMAKE_C_COMPILER}")
+  add_custom_command(
+    OUTPUT "${C6C_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+    COMMAND "${CMAKE_C_COMPILER}" -x c -O2 -o "${C6C_BIN}" "${C6C_DIR}/src/c6c.c6"
+    DEPENDS ${C6C_SRCS}
+    COMMENT "c6c: 用 ${CMAKE_C_COMPILER} 编出自举编译器 (c6c/build/c6c，stage0 = 宿主 CC)"
+    VERBATIM)
+endif()
+
+add_custom_target(c6c ALL DEPENDS "${C6C_BIN}")
+if(C6_ENABLE_TCC)
+  add_dependencies(c6c tcc-build)
+else()
+  # 不建 tcc，但 tcc 的**配置文件**还是要生成：build-tcc 把 tcc/*.c 当语料编，
+  # 那份源码 `#include "config.h"`。tcc-config 只同步配置头，不碰编译产物。
+  add_dependencies(c6c tcc-config)
+  add_dependencies(c6 c6c)
+  add_dependencies(build c6c)
+endif()
+set_target_properties(c6c PROPERTIES ADDITIONAL_CLEAN_FILES "${C6C_BIN}")
+
+# 性能口径的测量二进制：gcc -O3（tcc 的代码生成比 gcc 差 4 倍，拿 tcc 编的
+# 二进制量性能等于在量 tcc 的寄存器分配）。
+add_custom_command(
+  OUTPUT "${C6C_OPT}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+  COMMAND "${CMAKE_C_COMPILER}" -x c -O3 -o "${C6C_OPT}" "${C6C_DIR}/src/c6c.c6"
+  DEPENDS ${C6C_SRCS}
+  COMMENT "c6c: 编测量二进制 c6c/build/c6c-opt（${CMAKE_C_COMPILER} -O3）"
+  VERBATIM)
+add_custom_target(c6c-opt DEPENDS "${C6C_OPT}")
+set_target_properties(c6c-opt PROPERTIES ADDITIONAL_CLEAN_FILES "${C6C_OPT}")
+
+# 库形态：同一份源码（src/c6c-lib.c6 = -DC6C_NO_MAIN + #include "c6c.c6"）编成
+# libc6c.a / libc6c.so，导出 c6_* 嵌入 API 与 tcc_* 兼容层。它**不是** libtcc：
+# 不链接 tcc、不 include tcc 的头，只是把同类能力用 c6c 自己的实现提供出来。
+set(_c6c_lib_defs
+    "-DC6_DEFAULT_RT=\"${C6C_DIR}/lib/rt.c6\""
+    "-DC6_DEFAULT_INC=\"${C6C_DIR}/include\"")
+add_custom_command(
+  OUTPUT "${C6C_LIB_A}" "${C6C_LIB_SO}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+  COMMAND "${CMAKE_C_COMPILER}" -x c -O2 -fPIC ${_c6c_lib_defs}
+          -c -o "${C6C_BUILD}/libc6c.o" "${C6C_DIR}/src/c6c-lib.c6"
+  COMMAND "${CMAKE_AR}" rcs "${C6C_LIB_A}" "${C6C_BUILD}/libc6c.o"
+  COMMAND "${CMAKE_C_COMPILER}" -x c -O2 -fPIC -shared ${_c6c_lib_defs}
+          -o "${C6C_LIB_SO}" "${C6C_DIR}/src/c6c-lib.c6"
+  DEPENDS ${C6C_SRCS}
+  COMMENT "c6c: 编出嵌入库 libc6c.a / libc6c.so（宿主 C 编译器，-DC6C_NO_MAIN）"
+  VERBATIM)
+add_custom_target(c6c-lib ALL DEPENDS "${C6C_LIB_A}" "${C6C_LIB_SO}")
+set_target_properties(c6c-lib PROPERTIES
+  ADDITIONAL_CLEAN_FILES "${C6C_LIB_A};${C6C_LIB_SO};${C6C_BUILD}/libc6c.o")

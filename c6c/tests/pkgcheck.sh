@@ -1,13 +1,15 @@
 #!/bin/sh
 # 库形态与安装契约的回归：没有 tcc 也照样能装、能 find_package、能 pkgconf。
 #
-# 验四件事：
+# 验六件事：
 #   1. 安装树长什么样（bin/c6 + 嵌入库 + 头文件 + 自带头文件/运行时 + 元数据）；
 #   2. find_package(c6 COMPONENTS libtcc) 拿到的 c6::libtcc 真能编能跑
 #      （tcc 不在场时由 libc6c + tcc_* 兼容层顶上）；
-#   3. pkgconf --cflags --libs c6lib 的旗子对**宿主 C 程序**是干净的
+#   3. find_package(c6c COMPONENTS compiler libc6c) 拿到 c6c 自己的名字
+#      （c6 与 c6c 是两个产品，各有各的包名与 pkgconf 名）；
+#   4. pkgconf --cflags --libs c6lib / c6c 的旗子对**宿主 C 程序**是干净的
 #      （c6 自己的 stdio.h 不能盖掉系统的）；
-#   4. 装到别的前缀的 c6 二进制还能自己找到自带头文件和 rt.c6。
+#   5. 装到别的前缀的 c6 二进制还能自己找到自带头文件和 rt.c6。
 set -u
 
 CC=${CC:-cc}
@@ -55,7 +57,8 @@ ok "安装完成（--prefix 到临时目录）"
 miss=""
 for f in bin/c6 bin/c6c include/c6lib.h include/libtcc.h lib/libc6c.a lib/libc6c.so \
          lib/c6/rt.c6 lib/c6/include/stddef.h lib/c6/include/stdarg.h \
-         lib/pkgconfig/c6.pc lib/pkgconfig/c6lib.pc lib/cmake/c6/c6Config.cmake; do
+         lib/pkgconfig/c6.pc lib/pkgconfig/c6lib.pc lib/pkgconfig/c6c.pc \
+         lib/cmake/c6/c6Config.cmake lib/cmake/c6c/c6cConfig.cmake; do
     [ -e "$PREFIX/$f" ] || miss="$miss $f"
 done
 if [ -z "$miss" ]; then
@@ -113,7 +116,38 @@ else
     bad "find_package(c6 COMPONENTS libtcc)" "$(tail -3 "$WORK/cons-cfg.log" "$WORK/cons-b.log" 2>/dev/null | tr '\n' ' ')"
 fi
 
-# --- 3. pkgconf 旗子对宿主 C 程序是干净的 ---
+# --- 3. find_package(c6c COMPONENTS compiler libc6c) ---
+# c6c 有自己的包名：它不是"另一个 c6"，下游依赖的是自举编译器 + libc6c。
+mkdir -p "$WORK/consumer-c6c"
+cp "$WORK/consumer/main.c" "$WORK/consumer-c6c/main.c"
+cat >"$WORK/consumer-c6c/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.16)
+project(consumer-c6c C)
+find_package(c6c 0.1 REQUIRED COMPONENTS compiler libc6c)
+if(NOT TARGET c6c::compiler)
+  message(FATAL_ERROR "缺 c6c::compiler（bin/c6c 没被找到）")
+endif()
+if(NOT TARGET c6c::libc6c)
+  message(FATAL_ERROR "缺 c6c::libc6c（libc6c.a 没被找到）")
+endif()
+add_executable(consumer main.c)
+target_link_libraries(consumer PRIVATE c6c::libc6c)
+EOF
+if cmake -S "$WORK/consumer-c6c" -B "$WORK/consumer-c6c/b" \
+        -DCMAKE_PREFIX_PATH="$PREFIX" >"$WORK/cons6-cfg.log" 2>&1 &&
+        cmake --build "$WORK/consumer-c6c/b" >"$WORK/cons6-b.log" 2>&1; then
+    got=$("$WORK/consumer-c6c/b/consumer")
+    if [ "$got" = "pkg ok" ]; then
+        ok "find_package(c6c COMPONENTS compiler libc6c)：c6c::libc6c 真能编能跑"
+    else
+        bad "c6c find_package 消费者运行" "输出『$got』"
+    fi
+else
+    bad "find_package(c6c COMPONENTS compiler libc6c)" \
+        "$(tail -3 "$WORK/cons6-cfg.log" "$WORK/cons6-b.log" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# --- 4. pkgconf 旗子对宿主 C 程序是干净的 ---
 if command -v pkgconf >/dev/null 2>&1 || command -v pkg-config >/dev/null 2>&1; then
     PC=$(command -v pkgconf || command -v pkg-config)
     flags=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PC" --cflags --libs c6lib 2>"$WORK/pc.log")
@@ -130,11 +164,26 @@ if command -v pkgconf >/dev/null 2>&1 || command -v pkg-config >/dev/null 2>&1; 
             bad "pkgconf 消费者运行" "输出『$got』"
         fi
     fi
+    # c6c 的 pkgconf 名：同一个库、无歧义的名字
+    flags6=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PC" --cflags --libs c6c 2>"$WORK/pc6.log")
+    if [ -z "$flags6" ]; then
+        bad "pkgconf c6c" "$(cat "$WORK/pc6.log")"
+    elif ! "$CC" -O1 -Wall -Werror -o "$WORK/pc-cons6" "$WORK/consumer/main.c" $flags6 \
+            >"$WORK/pc6-cc.log" 2>&1; then
+        bad "pkgconf c6c 旗子能编宿主程序（-Wall -Werror）" "$(tail -3 "$WORK/pc6-cc.log")"
+    else
+        got=$(LD_LIBRARY_PATH="$PREFIX/lib" "$WORK/pc-cons6")
+        if [ "$got" = "pkg ok" ]; then
+            ok "pkgconf --cflags --libs c6c：-Wall -Werror 编得过、跑得通"
+        else
+            bad "pkgconf c6c 消费者运行" "输出『$got』"
+        fi
+    fi
 else
     echo "skip pkgconf（没装 pkgconf/pkg-config）"
 fi
 
-# --- 4. 装到别处的前缀，二进制自己找自带头文件与运行时 ---
+# --- 5. 装到别处的前缀，二进制自己找自带头文件与运行时 ---
 cat >"$WORK/self.c6" <<'EOF'
 #include <stddef.h>
 #include <stdarg.h>

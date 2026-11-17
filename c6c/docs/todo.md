@@ -2,6 +2,8 @@
 
 > **状态**：P0 全部完成 · **索引**：[README](../README.md) · **计划**：[plan.md](plan.md) · **设计**：[design.md](design.md)
 >
+> **历史施工账本**：下面「接手先看」是当时的轮次快照，不是当前缺口；现行基线见 [acceptance.md](acceptance.md) 与根 `CHANGELOG.md`。
+>
 > 规则：**一项一个提交**，提交信息 `c6c: <ID> <一句话>`，正文附验收命令与实测数字；
 > 每完成一项把状态改成 ✅ 并在同一提交里更新本文件。状态：⬜ 未开始 / 🚧 进行中 / ✅ 完成 / ⛔ 阻塞。
 
@@ -3414,7 +3416,7 @@ int main(void) { struct S t = mk(3.0); return t.a == 3.0 ? 0 : 1; }
 | --- | --- | --- |
 | 引导器可选 | `c6c/Makefile` 的 `BOOTSTRAP=tcc\|host` | `BOOTSTRAP=host` 走 `$(HOSTCC) -x c -O2 -o build/c6c src/c6c.c6`；`tcc` 仍是默认 |
 | 构建开关 | `C6_ENABLE_TCC`（默认 ON） | OFF 时 `add_subdirectory(tcc)` 不执行，c6c 的 stage0 换成 `CMAKE_C_COMPILER`，`c6c` 不再依赖 `tcc-build` |
-| 依赖关系 | `cmake/C6C.cmake` | OFF 时反过来 `c6` / `build` 依赖 `c6c`（ALL 上只有 c6c） |
+| 依赖关系 | `cmake/C6CBuild.cmake` | OFF 时反过来 `c6` / `build` 依赖 `c6c`（ALL 上只有 c6c） |
 | 侧翼 | 安装 / `find_package(c6)` / pkgconf / CPack / wasm / `check-install` / `test-plain` / `c6-clean` | OFF 时逐个退化成打印说明，不生成指向不存在产物的清单 |
 | tcc 侧用例 | `cmake/C6Testing.cmake` | OFF 时 115 个 tcc 回归用例**不注册**（它们描述 tcc 产品面），`check-all` / `test-all` 等聚合入口改为打印"用 `ctest -L c6c`"；汇总行明确写"CTest 用例 0 个（tcc 侧 114 个未注册）" |
 | 机器证据 | `.github/workflows/ci.yml` 的 `no-tcc` 作业 | 只用 cmake+gcc 配置构建，**断言 `tcc/c6`、`tcc/libtcc.a` 不存在**，再跑 `ctest -L c6c -LE perf` + `make -C c6c selfhost BOOTSTRAP=host` |
@@ -4179,3 +4181,1837 @@ self:src/c6c.c6   115 ms → 114 ms
 **已知（不在本轮）**：`-c -o <目录>/` 这类"目标不是文件"的写出失败在 native
 路径上仍然打印错误但退出码为 0（`elf.c6:203` 等几处 `fprintf` 后没有把错误
 回传给 `main`）；ctu 路径已经是非 0 退出。
+## 第 209 轮：把回归迁到 c6c（第一步：开关 + 基线 + 42/92）
+
+硬缺口③（**93 个交付物里不再有 tcc**）的最后一块：`tests/regression.sh` 那
+92 个 `std-*` 用例的被测编译器一直是 `$C6_TCC_DIR/c6`（tcc 那一侧），所以
+`C6_ENABLE_TCC=OFF` 的构建里干脆一个都不注册。这一轮先把**开关**和**基线**做出来。
+
+**做了什么**：
+
+* `tests/regression.sh`：被测编译器改成 `$C6_CC`（默认仍是 `$C6_TCC_DIR/c6`），
+  98 处调用点统一替换；selfhost / c99selfhost 那几个拿 tcc **源码**自举的用例
+  仍直接用 `$C6_TCC_DIR/c6`（它们不在迁移目标里）。
+* `c6c/tests/regression-c6c.sh` + `regression-c6c.list`：前者跑列表里的用例
+  （`--all` 跑全部 std-* 量基线，也可以点名几个），后者是"c6c 已全绿"的
+  单一数据源；CMake 目标 `cmake --build build --target regression-c6c`。
+* `cmake/C6Testing.cmake`：`C6_ENABLE_TCC=OFF` 时把这张表注册成 CTest 用例
+  （label `regression-c6c`，同时带 `c6c`）。以前那句话是"没有 tcc 就没有可测
+  对象"，现在改成了前半句仍成立、但 c6c 这一侧有 42 个真回归。
+* `c6c/lib/rt.c6` 补了一批 POSIX 面（**全 `weak`**，程序自己的强定义会盖掉）：
+  `poll` / `nanosleep` / `uname` / `rmdir` / `tcgetattr` / `chdir` / `sysinfo` /
+  `mkfifo` / `fsync` / `ftruncate`、`ntohs`/`ntohl`/`htons`/`htonl`、`cfmakeraw`，
+  以及整族 socket：`socket` / `bind` / `listen` / `accept` / `connect` /
+  `send` / `recv` / `sendto` / `recvfrom` / `setsockopt` / `getsockopt` /
+  `getsockname` / `getpeername` / `socketpair` / `shutdown`。
+  为什么必须 weak：std 里 `Chan.send` / `ACancel.poll` 那种**同名全局函数**是
+  程序自己的强定义，tcc 走 libc.so.6 时靠 ELF 符号覆盖，静态 rt.c6 只能用
+  weak 表达同一件事。
+
+**实测**：
+
+```
+./c6c/tests/regression-c6c.sh --all      # 38 → 42 / 92（这一批新增 4 个：
+                                         # std-async / std-async2 / std-async5 / std-crypto）
+cmake --build build --target regression-c6c   # 42/42（13.6 s）
+ctest -L regression-c6c -j 4（C6_ENABLE_TCC=OFF 的构建）  # 42/42，4.3 s
+cmake --build build --target lint embedcheck pkgcheck sharedcheck ldcheck dyncheck objcheck
+                                         # 全绿（rt.c6 改动没有回退）
+```
+
+**还差的 50 个**，四类：
+
+| 类 | 个数 | 卡在哪 |
+| --- | --- | --- |
+| libc 面 | ~16 | `getaddrinfo` / `opendir`+`readdir` / `tcsetattr` / `getrusage` 还没有（要补 syscall 与结构体） |
+| `-lm` | 10 | 用例命令行带 `-lm`；c6c 的默认产物是静态的，既没有 `-l` 也没有 libm，`std-linalg` 去掉 `-lm` 就能过，`std-geo` 真需要 `atan2` |
+| 跨 TU 符号 | 9 | 模板成员函数（`std__container__vec__Iter_int_has`）与 `static`/`$2` 名字（`p_atom$2`、`jp_value$2`、`take_n`、`next_set`）在别的 TU 里被引用 |
+| 行为差异 | ~15 | `test` 块里浮点打印、`cfmakeraw` 之后的 termios 细节、`std-net`/`std-util` 的段错误（各 1 个） |
+
+下一轮的顺序：先补 libc 面（`opendir`/`readdir`/`getrusage`/`tcsetattr` 各一条
+syscall，能把 std-fsx/std-ub/std-sys/std-term 一起点亮），再看跨 TU 符号那 9 个
+（那是多 TU 语义，得先定规则），最后才碰行为差异。
+
+## 第 210 轮：运行时第二批 + `errno` 真的会设（回归 42 → 45）
+
+上一轮把开关和基线做出来了，这一轮往缺口里填东西。结论只有一句话：
+**卡住那些用例的从来不是"缺函数"，而是"缺 `errno`"**。
+
+**做了什么**：
+
+* `c6c/src/main.c6`：预定义宏里加 `_GNU_SOURCE 1`——和 tcc 一个口径。glibc 把
+  `pthread_setname_np`、`cfmakeraw`、`strsignal` 一大片藏在 `__USE_GNU` 后面，
+  不开就「未声明的标识符」。这一条不改变行为，只是让系统头把该给的东西给全。
+* `c6c/lib/rt.c6` 第二批（全是薄壳，能弱定义的一律 `weak`）：
+  * 目录：`opendir` / `readdir` / `closedir` / `rewinddir`（自己 decode
+    `getdents64`，`DIR *` 其实是「fd + 4 KiB 缓冲 + 游标」）；
+  * 进程/终端：`getrusage`、`tcsetattr`/`tcflush`/`tcdrain`；
+  * 线程身份：`pthread_self`（`gettid`）、`pthread_equal`、`pthread_detach`、
+    `pthread_once`、`pthread_key_create`/`setspecific`/`getspecific`、
+    `pthread_mutex_trylock`/`timedlock`、`pthread_cond_timedwait`、
+    `pthread_rwlock_*`、`pthread_attr_setstacksize`/`setdetachstate`、
+    `pthread_setname_np`（自己的线程走 `prctl`，别人的线程写
+    `/proc/self/task/<tid>/comm`）/`pthread_getname_np`、`sched_yield`；
+  * 文件/链接：`symlink`、`link`、`readlink`、`fcntl`、`msync`；
+  * 口令库：`getpwuid` / `getpwnam`（解析 `/etc/passwd`，字段指进静态缓冲）；
+  * 信号**集合**：`sigemptyset`/`sigfillset`/`sigaddset`/`sigdelset`/`sigismember`
+    改成真位操作（glibc 的 `sigset_t` 就是 1024 位位图）；`sigpending` 返回 0。
+    `sigaction`/`sigprocmask` **仍是空操作**——没有信号投递，这一条没变。
+  * 名字解析：`getaddrinfo` / `freeaddrinfo` / `gai_strerror` / `inet_addr` /
+    `inet_ntoa` / `inet_pton` / `inet_ntop`。**只认**数字点分 IPv4、`localhost`
+    和数字/常见名字的端口（http/https/ssh/domain）；真域名返回 `EAI_NONAME`，
+    不假装解析成功。结构体按 glibc 的 ABI 摆，调用方用的是系统 `<netdb.h>`。
+  * stdio 的 `ferror`/`feof`/`clearerr`/`fileno`：前三个只能是"没错误、没到
+    EOF"（rt.c6 的 `FILE` 就是 fd，没有标志位），`fileno` 是准的。
+* **`errno` 现在真的会设**：rt.c6 一直只返回 `-errno`、不设 errno，于是
+  `errno == EINPROGRESS` / `EAGAIN` / `EINTR` 这类分支永远走失败那条路——
+  `std/net/tcp.c6` 的非阻塞 connect 就是这么被卡掉的（`poll` 明明可写，却因为
+  `errno` 还是 0 被判成"连接失败"）。做法是在六个 `c6c_sys*` 薄壳里统一
+  `if (r < 0 && r > -4096) errno = -r;`，返回值口径不变。`errno` 的**定义**按
+  `#ifdef errno` 分岔：系统 `<errno.h>`（glibc/musl）把它做成宏
+  `(*__errno_location())`，那就用系统那份；c6c 自己的 `<errno.h>` 是
+  `extern int errno;`，那就给一个 `weak` 定义（多 TU 链接不会撞"重复定义"）。
+
+**实测**（`./c6c/tests/regression-c6c.sh --all`，即全部 92 个 std-* 用例）：
+
+```
+42 → 45 / 92     新增全绿：std-fsx（33 条自检）/ std-h2（49 条）/ std-wire（19 条）
+                 没有一条从绿变红
+差一点的：std-serve 28 条只差 1 条（assets: Content-Type）、std-pack 差 1 条
+         （hexdump 大写列）、std-cipher 差 1 条（AES CTR 向量）、std-db 差 1 条
+```
+
+`std-term` 现在是「tty 那半段全过，跑到信号那半段被 SIGUSR1 打死」——因为
+`sigaction` 还是空操作。要做真信号（`rt_sigaction` + `SA_RESTORER` 跳板）才能过，
+不是这一轮的量级。
+
+**还差的 47 个**，分类没变（libc 面 / `-lm` / 跨 TU 符号 / 行为差异），但每一类
+都薄了一层。下一轮的顺序：`getgrgid`+`getgrouplist` 补完口令那半边、`-lm` 走
+动态依赖（`DT_NEEDED` 加一条 libm）、再看跨 TU 的模板成员函数与 `$2` 符号。
+
+## 第 211 轮：`-lm` 那一族解锁（回归 45 → 47）
+
+`std-*` 里有一整批用例（10 个）挂在 `c6c: error: 未知选项 '-lm'` 上——命令行是
+照 tcc 的口径写的，而 c6c 不认 `-l`。这一轮把这件事弄清楚并落地。
+
+**做了什么**：
+
+* `c6c/src/main.c6`：`-l<name>`（`-lm` 最常见）**收下不报错**。理由不是"懒得实现"，
+  而是 c6c 的产物是静态的、没有动态库可依赖：libc/libm 的常用面本来就在
+  `c6c/lib/rt.c6` 里（`sqrt`/`pow`/`sin`/`cos`/`log`/`exp`/`hypot`/`atan`…… 一大堆，
+  见那节的注释）。真少了某个符号，链接期照旧如实报「未定义的符号」——不会因为
+  收下 `-lm` 就变成运行时炸。
+* `c6c/lib/rt.c6`：补齐这条路上真缺的几个数学函数 `atan2`（std/geo 就是卡在它）、
+  `exp2`、`fdim`、`nextafter`（`log2`/`copysign` 早就有）。`atan2` 用 `atan` 加象限
+  修正，不查表。
+* `c6c/lib/rt.c6` 顺手补的符号：`getgrgid`（`/etc/group` 的解析，`struct group`
+  按 glibc 的 ABI 摆，成员列表就地切开）、`sem_trywait`/`sem_timedwait`/
+  `sem_getvalue`、`pthread_rwlock_tryrdlock`/`trywrlock`、`pthread_barrier_*`、
+  `pthread_spin_*`。
+
+**实测**（`./c6c/tests/regression-c6c.sh --all`）：
+
+```
+45 → 47 / 92     新增全绿：std-linalg（31 条自检）/ std-math3（25 条）
+                 没有一条从绿变红
+从"链不上"变成"跑起来但自检有差"：std-sys（13 条里差 2，pty 那两条）、
+         std-thread（29 条里差 7，线程池语义）、std-geo（30 条里差 19）
+```
+
+**还差的 45 个**，四类的排序变了：跨 TU 的模板/`static` 符号现在是最扎眼的一堆
+（`std-demo`/`std-kit`/`std-tour`/`std-box`/`std-more`/`std-mw`/`std-docs`/
+`std-async3`/`std-ub`/`std-mesh` 十个，缺的都是 `Iter_int_has`、`p_atom$2`、
+`take_n`、`next_set` 这种"某个 TU 里生成了、别的 TU 看不见"的名字）。下一轮先
+把这一类的成因弄清楚（是不是模板实例化按 TU 局部生成了）。
+
+## 第 212 轮：格式化与二进制转义（回归 47 → 52）
+
+这一轮去查"自检只差一两条"的那几个用例，最后落在两个**口径**问题上——都在
+`test` 块里表现为某个字符串比较不等，错误信息完全指不到根。
+
+**① 格式化跟 glibc 对不上**（`c6c/lib/rt.c6` 的 `c6c_vfmt` / `c6c_fmt_double`）：
+
+先把差异钉出来：`c6c/tests/printf-matrix.c` 写了 68 条格式（宽度/精度/标志/各
+进制/长度修饰/`%f%e%g`/截断与返回值），同一份源码用宿主 `cc` 和 c6c 各跑一遍，
+逐行 diff。第一遍 24 行不同，7 个真 bug：
+
+| 现象 | glibc | 修之前 |
+| --- | --- | --- |
+| `%.0d`，值 0 | 空 | `0` |
+| `%#x`，值 0 | `0` | `0x0` |
+| `%+.1f`，2.25 | `+2.2` | `2.3`（还丢符号） |
+| `%g`，100000.0 | `100000` | `1`（剥尾零没看小数点） |
+| `%f`，-0.0 | `-0.000000` | `0.000000`（`dv < 0` 对 -0.0 为假） |
+| `%f`，1e300 | 全 300 位 | `0.000000`（整数部分被 2^64 截断） |
+| `%.0f`，2.5 | `2` | `3`（少了"正好 .5 取偶"） |
+
+修法：`c6c_round_even`（正好 .5 取偶）；`%g` 只在小数点存在时剥尾零；`-0.0` 看
+符号位；2^64 以上走 `c6c_fmt_big`（10^9 进制小 bignum 反复乘 2，精确展开）；
+浮点也认 `+`/空格标志。现在 68 条**逐字节一致**，`printfcheck` 这个 target 把它
+钉住（没有宿主 `cc` 时会如实报"给不出基准"）。
+
+**② `\xNN` 被当成了码点**（`c6c/src/parse.c6`）：
+
+窄字面量解码时，凡是值 >= 0x80 的转义都被重新 UTF-8 编码——`"\xde"` 于是变成
+`0xc3 0x9e`。`\xNN` / `\NNN` 在 C 里是**字节**转义，只有 `\uXXXX` / `\UXXXXXXXX`
+是码点。修法：`esc_decode` 用一个 `ESC_IS_UCN` 报告"这次是不是通用字符名"，
+编码分支只看 `esc_ucn || src_utf8`；顺手补上"编码分支也要记码点"（`L"\u4e2d"`
+此前拿不到码点）。`esccheck` 钉 16 条：`\x` 的贪心（`"\x00ab"` 是一个 0xab）、
+八进制等价、`'\xde' == -34`、`\u00e9`/`\u4e2d` 的 UTF-8 字节、宽字面量的码点、
+嵌入式 `\0` 不截断、跨转义边界的字面量拼接。
+
+**实测**（`./c6c/tests/regression-c6c.sh --all`）：
+
+```
+47 → 52 / 92     新增全绿：std-db / std-gfx / std-pack / std-proto2 / std-words
+                 没有一条从绿变红
+```
+
+五个全是被 `\xNN` 带偏的（拼二进制数据的那些）。格式化那条线这一轮没有再解锁
+用例，但把"打印不一致"这种噪声源清掉了——后面再看 `test` 块的差异，就不用先
+排除 printf。
+
+**还差的 40 个**：跨 TU 的模板/`static`/`$2` 符号仍是最大一堆（10 个），其次
+是真信号投递（`std-term` 的 `sigaction` 还是空实现）、真 DNS（`std-net`）、非阻塞
+IO（`std-util`）。下一轮先挑跨 TU 符号这一类把成因弄清楚。
+
+**已知没动的**：`float_lit_bits` 的十进制→double 差 1 ulp（`1e300` 的位模式末位
+与 glibc 不同）。`%f` 现在能把那个 double 一位不差地印出来，错在解析侧的
+正确舍入，是另一件事。
+
+**顺带清掉的一处噪声**：`...` 在声明符的形参表里先经过 `parse_typespec`，在
+说明符位置没有类型，于是被当成"隐式 int 的形参"——每个变参原型多一条
+`type defaults to int` 警告（c6c 自己的 `stdio.h` 4 条、`unistd.h` 还有）。
+在 `parse_typespec` 之前把省略号拦下来（它本来就是一个 token），`#include
+<stdio.h>` 的编译输出就只剩产物那一行了。连带效果：`testflag` 的
+「全部通过时 stderr 干净」「-test-filter 过滤空」「没有 test 块」三条同时转绿
+（16/3 → 19/0），CI 的 `c6c-check-all` 不再红。回归基线不动（仍 52 / 92）。
+
+## 第 213 轮：跨 TU 的模板/方法符号（回归 52 → 57）
+
+「未定义的符号」那一类（10 个用例）这一轮收掉了大半。症状是两种名字：
+`p_atom$2`（TU 后缀）和 `std__container__vec__Iter_int_has`（模块前缀），
+查下来是两处互不相干的成因。
+
+**① 方法式函数的前向声明把引用悬空了**
+
+`static int poke(Bucket *b);` 先声明、后面才定义时：
+
+1. 声明处按**短名**（static 就是 `poke$<TU>`）建了一条 ELF 符号；
+2. 中间的调用点（`poke_pub` 里那句 `poke(b)`）已经按这条符号发了重定位；
+3. 定义处的发射名换成真名 `<接收者>_<方法>`（再套模块前缀），`s->val` 一改，
+   旧的那条就永远没人定义——链接期报 `poke$2` 未定义。
+
+修法：定义处换名之前把旧符号记下来（`meth_alias_register`），等所有 TU 解析完、
+代码都发出来了，在 `alias_apply()` 里统一 `x64_alias_idx` 接过去。
+
+**这里踩了一个大坑**：第一版是定义处当场接的，本地 57 个用例全绿、`build-tcc`
+却整个塌了——c6c 编出的 tcc 一启动就段错误，tests2 通过数从 118 掉到 0。
+原因是 `x64_alias_idx` 干的是**复制偏移**（off/va），定义处这会儿函数体还没
+生成，复制过去的是 0，再把旧符号标成 defined；引用于是跳到地址 0，而且因为
+"已经 defined"，链接器不再报未定义——错得很安静。演一遍：
+
+```
+# 当场接（错的）           build-tcc: 通过 0 / 编不过 144   （floor 100 → 失败）
+# 记账 + 收尾接（对的）     build-tcc: 通过 118 / 输出不符 8 / 编不过 18
+```
+
+判断"旧的那条是不是短名建的"也有个细节：声明那条的发射名是
+`tu_static_name(nm)`，**不带**模块前缀（`s->val = x64_sym(&X64, enf)` 里那个
+enf），所以比名字要用 `tu_static_name(s->name)` 的裸口径，套了 `emit_name`
+就一条都匹配不上（五个用例又全体变红）。
+
+非 static 的同理（`take_n`、`next`、`next_set`、`add_irregular`、`jp_value`、
+`p_atom`、`ps_typespec`）。
+
+**② 嵌套实例化只有签名、没有体**
+
+模板体带方法时先跑一遍"只登记签名"，然后原样重放一遍发代码。可是当模板 A 的
+**方法签名**里出现 `B@T` 时，B 在那一遍里就被实例化了（`PA_SIG_ONLY=1`，只登记
+签名）；外层第二遍重放到同样的实参，`tmpl_inst` 的缓存直接短路返回，B 的方法体
+再也没机会展开。`Vect@T.iter()` 返回 `Iter@T` 正是这个形状。
+
+修法：嵌套实例的重放期间把 `PA_SIG_ONLY` 清零，让它一次展开完。三个用例从
+「链接不上」变成「能跑但段错误」：
+
+```
+std-demo / std-kit / std-tour   未定义符号 → Segmentation fault
+```
+
+段错误是下一步：`Iter@int` 这个实例在 `Vect_int_iter()` 里建、在主程序里用，
+类型 id / 布局对不上（同一个实例名可能被建了两次占位类型）。下一轮从这里接着
+查——`c6c/tests/tmpl-check.sh` 那份 fixture 已经能跑通，说明还差一个"实例跨
+函数边界"的情形。
+
+**实测**：
+
+```
+52 → 57 / 92     新增全绿：std-async3 / std-docs / std-mesh / std-mw / std-ub
+                 没有一条从绿变红
+新增 check：tmplcheck（4 条）
+```
+
+## 第 214 轮：下标赋值的托管判定（std-tour 段错误）
+
+上一轮把 `std-demo`/`std-kit`/`std-tour` 从"链接不上"推到"跑起来段错误"，
+这一轮查的就是这个段错误。
+
+现象：`examples/stdtour.c6` 打印完标题就崩，崩在 `lock xadd %rax,(%rdi)`，
+`rdi = 0x3c = 60`。把 `tour_strbuf` 单独拎出来还崩，最后缩到
+
+```c
+@StrBuf b = new StrBuf;
+b->write((char[:]){ (char *)"abcdef", 6 }) catch e { return 1; };
+b->truncate(3);          /* <-- 崩 */
+return 0;
+```
+
+反汇编 `StrBuf_truncate` 看到它写结尾 NUL 时多了一条：
+
+```
+movsbq 0x0(%rax),%rdx     ; 旧值 = data[n]（一个字节）
+mov    %dl,0x0(%rax)      ; 存 0
+mov    %rdx,%rdi
+call   __c6_gc_release    ; 把旧字节当指针 release
+```
+
+100 就是 `'d'`——"abcdef" 的第 4 个字符。运行时的 release 先算
+`ptr - 40`（引用计数头）再 `lock xadd`，于是拿 60 当地址。
+
+根因在 `gen_postfix_ops` 的下标分支：`pmgd`（基址那层给的托管标记）**非 0 就**
+传给元素，`@char` 这种"托管指针指向普通标量"也跟着传。改成"基址是数组/切片
+**且元素是指针**"才传。
+
+判据第一版按"成员 kind 2（引用数组）"写，CI 立刻在 `tests/foreach_iter` 上抓到：
+局部 `@MNode a[2]` 的 `a[i] = v` 没有成员 kind（不是成员访问），元素却是托管
+引用——于是那条赋值不再 retain/release。局部引用数组也得算，所以最终判据是
+"元素类型是数组/切片的元素、并且是指针"。
+- 收效：std-tour 段错误 → `73 check(s), 1 failure(s)`，只剩
+  `deque: 迭代顺序与求和`（`Deque@int.iter()`，实例身份那条线，下一轮）；
+  std-kit 的崩溃点往后挪到 num 段之后；std-demo 仍在别的段错误上。
+- 基线不变（57 / 92）：三个用例都还没全绿。
+
+## 第 215 轮：模板实例的"两个类型 id"（deque 迭代器只吐第一个元素）
+
+std-tour 上一轮剩下的那条断言：
+
+```
+deque   窗口=[3 4 5 6] 加上 1 2 后 sum=6      （应该是 21）
+foreach (int x = d->iter())  →  1 1 1 1 1 1
+```
+
+`DIter@T.next()` 里 `i++` 没生效、`has()` 永远真：接收者按**另一份布局**在读。
+
+**最小复现**（模块 + 调用方两个 TU）：
+
+```c
+/* itm.c6 */
+module itm;
+struct Box@T { T *p; int n; };
+struct It@T {
+    Box@T *b;
+    int i;
+    int has() { return i < b->n; }
+    T next() { T x = b->p[i]; i = i + 1; return x; }
+};
+```
+
+```c
+import itm;
+int a[3] = { 1, 2, 3 };
+Box@int b = { a, 3 };
+It@int it = { &b, 0 };
+while (it.has()) printf("%d ", it.next());     /* 期望 1 2 3 */
+```
+
+- 同一个文件里写这两段（单 TU）：**正常**。
+- 拆成两个 TU：**一次都不进循环**（`has()` 直接假）。
+- 在模块里再补一句 `int it_size(void) { return sizeof(It@int); }`：**又正常了**。
+  典型的"物化顺序决定布局"的海森堡 bug。
+
+**根因方向**：`tmpl_inst` 里那句注释已经写明了——"第二个 TU 里再写一遍同一个
+实例是合法的（类型表跨 TU 共享，占位类型 id 会不一样）"。也就是说同一个实例名
+`It_int` 会有**两个类型 id**，各自 replay 一次体；方法符号名只有一个
+（`It_int_next`），链接时谁赢看 TU 顺序，而调用方的变量用的是**自己那个 id** 的
+布局。两边布局本该一样，但只要有一次 replay 没跑到（或跑到时某个成员类型还
+不完整），偏移就分叉了。
+
+**下一步**（下一轮从这里切进去）：
+
+1. `tmpl_inst` 新建占位之前先按实例名查 `TINST_NM`：已经有就直接复用那个 id
+   （而不是再造一个），并保证那个 id 的体已经/将会被 replay 一次。
+2. 或者把实例缓存从"每个模板定义一份"改成"全局按 (模板名, 实参) 一份"，
+   让跨 TU 的实例天然同一个 id。
+3. 回归口径：`c6c/tests/` 加一份两 TU 的 fixture（像 `tmpl-check.sh` 那样），
+   断言 `It@int` 在两个 TU 里 `sizeof` 一致、`it.next()` 真的推进。
+
+当前基线仍 **57 / 92**：std-tour 73 条断言只差这一条，std-kit / std-demo 还各有
+别的段错误。
+
+## 第 216 轮：方法体的裸名字被实例化点的局部量遮住（回归 57 → 58）
+
+第 215 轮把 deque 迭代器的问题定位成"两个类型 id"，这一轮发现**还有一半**
+是作用域问题，而且更好修。
+
+模板实例的体在实例化点展开，那一刻作用域链上挂着**调用方函数的局部量**。
+方法体里裸写的成员名走的是 `sym_find`，于是：
+
+```c
+struct DIter@T { Deque@T *d; int i; ... }      /* has() { return i < d->n; } */
+void tour_deque(void) { @Deque@int d = ...; int i = 0; ... }
+foreach (int x = d->iter())                    /* 实例在这里展开 */
+```
+
+`i` 撞上 `tour_deque` 的循环变量 `i`、`d` 撞上它的队列指针。现象就是
+`i++` 改的是外层循环变量，`has()` 永远真、`next()` 永远返回第一个元素
+（std-tour 的 `sum` 恒为 6）。`It@T` 里写 `b->n` 时更明显：外层那个 `b` 是
+值，取成员读到的是临时量里的 0。
+
+修法：`pa_func_def` 里 `scope_enter()` 之后记下 `METHOD_SCOPE_BASE`；裸名字
+解析时如果查到的符号（`SC_LOCAL`/`SC_PARAM`）**不在** `SCOPE` 到
+`METHOD_SCOPE_BASE` 这条链上，就当没查到，转而按接收者的成员走。方法自己的
+形参/局部量仍在链上，遮蔽字段的语义不变。
+
+- `std-net` 从段错误变全绿；`std-tour` 的迭代器正常推进了
+- 57 → 58 / 92，无回退
+
+**还剩一半**：同一个 `DIter@int.next()` 的 IR 里，`d->head`/`d->cap` 被当成
+8 字节指针读、`(d->head + i)` 的 stride 是 `i * 24`（24 = sizeof(Deque@int)）：
+
+```
+R(12) = ld8(d + 12)          ; cap 读成 8 字节
+R(19) = i * 24               ; 指针算术的 stride 用了 Deque@int 的尺寸
+R(25) = ld8(d + 8)           ; head 同理
+R(26) = (cap + i*24) % head  ; 连操作数顺序都翻了
+```
+
+说明 `Deque@T` 的**成员类型**在实例里被替换错了（`int head` 变成了
+`Deque@int *`）。下一轮从 `parse_struct_body` 重放实例体时的成员类型登记
+切进去：比对同一个实例在两个 TU 里的 `ty_member()`，找出谁把成员类型换掉了。
+
+## 第 217 轮：裸字段后缀链的类型（std-tour 全绿，58 → 59）
+
+接第 216 轮。修完作用域之后 deque 的迭代器 `i` 会推进了，但每次取到的还是
+第一个元素。IR 里是这么写的：
+
+```
+R(12) = ld8(d + 12)      ; d->head（8 字节宽，应该是 4）
+R(16) = ld4s(self + 8)   ; i ✓
+R(19) = i * 24           ; 指针加法的步长
+R(26) = (head + i*24) % cap   ; 下标恒为 0
+```
+
+`head`/`cap` 的偏移都对（12/8），错的是**类型**。根因在方法体裸字段那条路：
+解析完裸字段 `d`（类型 `Deque@T *`）后调 `gen_postfix_ops` 接 `->head`，链尾
+已经把类型推到 `int`（`PEND_TY`），可收尾代码还是按成员类型：
+
+```c
+if (PEND_LVAL)
+    rv = load_lval(rv, mty4);   /* mty4 = Deque@int * → 读 8 字节 */
+PEND_LVAL = 0;
+GEN_TY = mty4;                  /* 之后 `+ i` 按指针加法，步长 24 */
+```
+
+改成按 `PEND_TY` 取值/回填即可；链上一个后缀都没接时它等于成员类型，行为不变。
+
+- std-tour 73 条断言全绿
+- 58 → 59 / 92，无回退
+
+剩下的 33 个还是老几类：libc 面（真信号投递 / 真 DNS / 非阻塞边角）、模板实例
+在跨 TU 时的成员类型（`c6c/docs/todo.md` 第 215 轮那条"两个类型 id"，现在看
+影响面比想象的小，但还在）、以及若干 `test` 块的语义差异。
+
+## 第 218 轮：std-client 的两个坎（解析 + getnameinfo）
+
+剩下的 33 个里先摸了 `std-client`。它现在编不过：
+
+```
+c6c: examples/stdclient.c6:260: 这里要 ')'（当前是 'int'）
+c6c: ./c6c/build/../lib/rt.c6:1: 这里要 '}'（当前是 ''）
+```
+
+错误报在函数末尾，实际是前面某处括号没闭合。把 `tour_httpc` 逐段删掉二分，
+定位到第 232 行的 `fetch(...)` 调用；再拆实参，结论是**嵌套复合字面量的初始化
+元素里带强制转换**：
+
+```c
+#define S(lit)  ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+/* 编不过 */
+fetch(SS("GET"), (Str){ (char[:]){ url, (int)5 } }, SS(""), ...);
+/* 把第二个实参提成局部量就编得过；去掉 (int) 也编得过；换成 strlen(url) 也编得过 */
+```
+
+矩阵（`examples/stdclient.c6` 的精简版，模块文件不变）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `(Str){ (char[:]){ url, (int)strlen(url) } }` | 解析失败 |
+| `(Str){ (char[:]){ url, (int)5 } }` | 解析失败 |
+| `(Str){ (char[:]){ url, strlen(url) } }` | 通过 |
+| `(Str){ (char[:]){ url, 3 } }` | 通过 |
+| 同样的表达式提成局部量 `Str su = …;` 再传 | 通过 |
+
+`Str` 是 `import std.net.httpc` 带来的 typedef。下一步从 `parse_primary` 的
+复合字面量分支切进去：`(` 类型 `)` `{` 这条判定在"元素里又出现 `(int)x`"时
+把 `(int)` 当成了外层初始化列表的结束/新元素，括号层级没退回来。
+
+另外这个用例还缺第二个东西：`未定义的符号 'getnameinfo'`（`std/net/resolver.c6`
+用它做反查）。即使解析修好，也得先补上 `getnameinfo` 才能在 c6c 上链出来。
+两个都补掉才算这一个用例全绿。
+
+## 第 219 轮：浮点/整数比较（std-geo 全绿，59 → 64）
+
+顺着 std-geo 那 16 条失败摸下去的。`geo_distance` 里 haversine 的 `h` 算出来
+是对的（0.006999873），可 `if (h > 1) h = 1;` 之后 `h` 变成 1，距离直接从
+1067 km 跳到 20015 km（半圈）。
+
+`gen_cmp3` 的浮点分支把整数那一侧只做了 `gen_cast_to`（按位截断），没转成
+浮点——注释里写着这是给"通用 `task` 句柄的 `t->val` 按位和浮点字面量比"留的
+偏门。于是 `h > 1` 拿 `h` 的位模式当整数和 1 比，恒为真。加法那边是对的
+（`h + 1` = 1.005），只有比较走这条偏门。
+
+改成两边都 `gen_convert` 到公共浮点宽度。`tests/async.c6` 里那处
+`t->val != i * 2 + 0.5` 改成显式 union 还原 double（旧写法就是靠这条偏门）。
+
+```
+59 → 64 / 92   新增：std-audio2 / std-font / std-legacy / std-math2 / std-packet
+               test-c6c 66/1/0（async 改完之后）
+```
+
+剩下 28 个：libc 面（信号投递 / 真 DNS / 非阻塞边角）、若干模块的数值细节、
+以及 `std-client` 的解析坑（见第 218 轮）。
+
+## 第 220 轮：`static struct E t[] = {…}` 的 sizeof 是 0
+
+std-web / std-serve 的 mime 断言全挂在"查不到类型"上，根子在**不完整数组的
+长度没按初始化器补全**（数组元素是**结构体**时才有，标量数组正常）：
+
+```c
+struct E { char *ext; char *type; };
+static struct E etab[] = { {"html","text/html"}, {"gz","application/gzip"}, … };
+static int n(void) { return (int)(sizeof etab / sizeof etab[0]); }  /* 0，应该是 3 */
+```
+
+调试数据（`init_count_of` 打印）：`ty=313 lpe=2 max=0 cur=6` —— 叶子数、元素叶子数
+都对，`INIT_CUR` 也走到了 6，但 **`INIT_MAX` 一直是 0**。`INIT_MAX` 只在
+`init_store` → `init_mark()` 里更新；而结构体元素那几层 `{…}` 是走嵌套
+`init_brace` 收尾的（`INIT_CUR = init_leaf_at(末尾)`），一次 `init_store` 都没
+调到，所以"填过的最大叶子"没被记账，`(INIT_MAX + lpe - 1) / lpe` 得 0，数组长度
+就成了 0。
+
+试过但**没有**用的改法（已回退）：把 `init_count_of` 里的 `lpe` 从
+`init_leaf_at(元素大小)` 换成 `init_leaf_walk(元素类型)`——lpe 本来就算对了，
+问题在 `INIT_MAX`。下一步从 `init_brace` 收尾处补一次记账（按本层写到的最后
+一个叶子更新 `INIT_MAX`），或者让结构体元素的嵌套 `init_brace` 也走
+`init_mark()`。
+
+影响面：凡是"表 + `sizeof 表 / sizeof 表[0]`"数条目、且元素是结构体的 std 模块
+都会数成 0（mime 的扩展名表就是典型），std-web / std-serve 因此各有 2 条断言红。
+
+## 第 226 轮：数组初始化器里的**嵌套复合字面量**只存第一个元素（**已修**）
+
+std-search2 的倒排索引统计不上（`terms()` 给 6，应该 4），根子在初始化：
+
+```c
+struct Str { char[:] s; };
+Str l[3] = {
+    (Str){ (char[:]){ a, 2 } },     /* 只有这个元素被写进去 */
+    (Str){ (char[:]){ b, 4 } },     /* 这两个是 0 */
+    (Str){ (char[:]){ c, 3 } },
+};
+```
+
+已排除的：
+- 元素类型是**纯整数结构体**（8 / 16 / 24 字节、带填充）→ 三个元素都对
+- 元素写成 `(Str){ sa }`（切片来自变量，没有内层复合字面量）→ 三个都对
+- `m[0] = (Str){ S("go") };` 逐个赋值 → 都对
+- 静态数组里放切片复合字面量 → 报"要常量表达式"（**故意的**，见
+  parse.c6 的 14462 行那条错误）
+
+触发条件就是**内层还有一层 `{…}`**：`(Str){ (char[:]){ … } }`。怀疑外层初始化器
+把内层复合字面量的 `}` 当成自己的收尾，后面两个元素被当成多余的值吞掉
+（`init_body` 的 `INIT_CUR >= LF_N` 早退 + `skip_init_list`）。下一步从
+`init_body` 的元素循环和"复合字面量 (T){…}"那段（parse.c6 12458 起）交接处看。
+
+影响面：std 里凡是"用 `(T){…}` 拼表"的地方（std-search2 的 `Str d0[3]`），
+以及任何"结构体里带切片、数组整体初始化"的写法。
+
+**结论**：外层初始化器的游标被内层复合字面量重建了。`init_save`/`init_restore`
+在复合字面量进出各存/取一次叶子表、游标、层栈和 `INIT_COUNT`，两处 `return` 前都
+要还原（数组那条 `(int[]){…}` 和普通那条）。修完 `std-search2` 的 `terms()` 从 6
+回到 4、`std-cli` 的 proc 表也正常了，回归 77 → 79。
+
+## 第 228 轮：负数枚举常量在表达式里变成正数（**已修**）
+
+`enum { M = -2147483647 - 1 }` 用到表达式里是 `+2147483648`。定位过程记一笔
+（下次遇到同类问题可以少走弯路）：
+
+- `static long long g = M;`、`long long a = (long long)M;`、`(int)M` 全都错，
+  只有 `int i = M;` 对——因为赋给 `int` 时会把高 32 位截掉，正好掩住。
+- 调试钩子打出来 `s->val` 是对的，可生成的 C 里还是
+  `R(1) = (uint64_t)2147483648;`。
+- 根因有两层：`s->val` 存的是 `(i64)0x80000000`（没按 `int` 符号扩展），而
+  物化用的 `IR_CONST` **立即数只有 32 位**，`0xFFFFFFFF80000000` 又被截回去。
+- 修法：定义处 `(i64)(i32)(…)`；物化处改调 `gen_int_lit()`，它超过 32 位会
+  自动走 `CONSTK`（64 位常量池）。
+
+## 第 229 轮：浮点 ==/!= 的 NaN 语义（**已修**）
+
+`ucomisd` 的有序比较（`<`/`<=`/`>`/`>=`）在无序时给 0，正好是 IEEE 要的，
+所以只有 `EQ`/`NE` 需要额外处理：`EQ = setnp & sete`、`NE = setp | setne`。
+
+判 NaN 只能靠 `dv != dv`（仓库里 printf 的 `c6c_fmt_double`、half 模块的
+`double_to_half` 都这么写），这条一反，NaN 就被当成普通数印成垃圾。
+
+顺带记一下没管的：`aout.c6` / `asmout.c6` 这两个"汇编文本"后端的 `IR_CMP`
+还是整数 `cmp`，浮点比较整个不对（它们只用于 `-S` 冒烟）。
+
+## 第 230 轮：execvp 不查 PATH（**已修**）
+
+`rt.c6` 的 `execvp` 直接 `execve`，而 `execve` 不查 PATH —— `execvp("sh", …)`
+永远 ENOENT。`pty_spawn()` 用它起子进程，子进程 127 退出、无输出，std-sys 的
+pty 段两条断言全挂。现已按 POSIX 补齐 PATH 查找，并把负 errno 翻成
+`errno = -r; return -1`。
+
+## 第 231 轮：`((T){…})` 前面有带强转的复合字面量时解析错位（**未修，已定位到最小复现**）
+
+最小复现（`c6c` 报 `这里要 '}'（当前是 ')'）`，tcc 侧正常）：
+
+```c
+typedef struct Str { char[:] s; } Str;
+typedef struct P { int a; } P;
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+static int h2(P a, Str b) { return a.a + b.s.len; }
+...
+h2((P){ (int)2 }, ((Str){ S("a") }));   /* ✗ */
+```
+
+排查结论（都是实测，不是猜）：
+- 只留一个实参、把第二个换成不带最外层括号的 `(Str){ … }`、或把第一个实参的
+  初始化值从 `(int)2` 换成 `2` / `(2)` / `-2`，都**通过** —— 所以既要"第一个复合
+  字面量里带一个强转"，又要"第二个复合字面量套着括号"；
+- 给第二个实参**多加一层括号**（`(((Str){ … }))`）就不报错 ✗ → 现象是"多吃了一个
+  `(`"，但吃在哪一步还没查出来；
+- 同一形状不限于函数实参，两条声明连着写也复现：
+  `P p = (P){ (int)2 }; Str s = ((Str){ S("a") });`
+- 在 `init_save`/`init_restore` 上打过 `LF_N/INIT_CUR/INIT_MAX/LV_DEPTH` 的临时
+  trace：复现时**只有一次** save/restore，且进出数值一致（`LF_N=2 cur=0 max=0
+  lvd=2`），所以不是第 226 轮那个初始化器游标问题的同类；另外注意 `INIT_MAX`
+  在这条路径上是 0 而 `LF_N` 是 2，两者的不变式本身就值得单独查一次。
+
+影响：`std-client`（examples/stdclient.c6 的 `SS(...)` 宏）因此编译不过，是
+9 个红用例之一。绕过它不影响正确性但会改示例写法的可读性，所以先记着，下一轮
+继续从 `gen_init_obj` 的实参/声明初始化入口查。
+
+### 第 232 轮：继续查上面这条，又排除两步
+
+给 `init_brace` / `init_body` 打了临时 trace（`C6C_DBG_LIT`，已撤），结论：
+
+- 出错的那个 `init_brace` 进来时 `LF_N=1 cur=0 max=0 lvd=0`、body 第一个 token 是
+  `(`（就是 `P p = (P){ (int)2 };` 里的 `(P){`）；
+- `init_brace` 结束时 `pa_expect_ch('}')` 看到的是 `;`，说明 `}` 在 `init_body`
+  **里面**就被吃掉了；
+- 在 `init_body` 的循环体里逐点打点（循环头 / 多余值早退 / 普通项 / 落值），
+  trace 显示 `( int ) 2 }` 这 5 个 token 全部是在"循环头刚过"那个点被消费的，
+  而且**没有**走到 `DBG_SITE = 13`（普通项）那条打点 —— 也就是说吃 token 的
+  调用夹在循环头和普通项之间，但不在 `skip_init_list()` 那条早退分支里。
+  下一轮就从这段（设计符分支 + 花括号标量分支）逐个打点，应该一两轮能收敛。
+
+（现在的 `todo.md` 记的是"未修"，不是"绕过"：示例本身没改。）
+
+### 第 233 轮：**已修**
+
+上面那个错位的根因就是 `pa_is_compound_lit()` 第一段的括号深度少算一层（从
+`q = 1` 起数，`peek(0)` 的 `(` 没算进去，深度直接变负、永远等不到 0），改成从
+`peek(0)` 起数就好了。修完 std-client 又缺 `getnameinfo`，`rt.c6` 里补了个只做
+数字形式的版本。std-client 现在 36 项全过，回归 85 / 92。
+
+## 第 234 轮：模块限定的枚举成员解析到别处去了（**已定位，未修**）
+
+`std.data.csv.PARSE` 求出来是 `0x0E01B007`（234991623），不是 7，所以
+`examples/stdbox.c6` 里 `r.error == std.data.csv.PARSE` 永远不成立 —— 这是
+std-box 两个红用例的根因。最小复现：
+
+```c
+import std.data.csv;
+int main(void) { int e = 0; e = std.data.csv.PARSE; printf("%d\n", e); }
+/* 期望 7，实际 0x0E01B007 */
+```
+
+已排除的：
+- 不是"裸名被污染"：`poison_add()` 只记一张 POISON_NM 表供**报歧义**用，不改
+  `bs->val`，所以裸 `PARSE` 的值仍是 `ebase|7`；
+- 不是 ebase 没加：csv 的 `PARSE` = `mod_err_base(csv)|7`，这个加对了。
+
+下一步的切入点：`0x0E01B007` 的高位 `0x0E000000` 正是模块错误码号段基址，
+低位 `0x1B007` 不是 7 —— 看起来是"把**同名字段的其它枚举值**也用同一份基址
+OR 了一遍"。下一轮从 `parse.c6` 里最长前缀那圈（约 10450 行）跟着 `qd`/`qm`
+两个拼法打印一次，看最后 `sym_find` 命中的到底是哪个符号。
+
+### 第 235 轮：上面那条结论被自己的复现推翻了
+
+按 stdbox 的编译顺序（`std/core/err.c6` 在 `std/data/csv.c6` 之前）写了个最小复现：
+
+```c
+Str bad = { S("a,\"unterminated") };
+CsvReader r = csv_reader(bad);
+while (r.next(&f) > 0) ;
+printf("%d %d\n", (int)r.error, (int)std.data.csv.PARSE);
+```
+
+输出 `error=234991623 qualified=234991623` —— **两边相等**，而且都带着模块号段
+基址（`(1<<27)|(csv 的 slot<<12)|7`）。所以"两个符号值对不上"这个判断是错的：
+`enum Error` 在模块里本来就会被加上号段，模块内部和外部拿到的是同一个。
+
+std-box 那条 `csv: 未闭合引号报 PARSE` 另有原因（多半是那个 `bad_text` 在示例
+里跟别的 csv 状态混在一起，或者 `next` 先返回了 0），下一轮直接从
+`examples/stdbox.c6` 的 `box_csv()` 里把 `r.error` 打出来看。
+
+### 第 236 轮：把两边都打出来，错的是**限定名那一侧**
+
+在 `examples/stdbox.c6` 的副本里插一行打印（仓库里没改）：
+
+```
+DBG csv error=234991623 q=234881031 badlen=15
+```
+
+- `r.error` = 234991623 = `0x0E01_B007` = `(1<<27)|(csv 的 slot 0x6010<<12)|7` ✓
+  这是 **csv 自己的**值，模块内部用裸名 `PARSE` 拿到的就是它 ✓；
+- `std.data.csv.PARSE` = 234881031 = `0x0E00_0007` = `(1<<27)|(err 的 slot 0x6000<<12)|7`
+  ✗ 这是 **std.core.err 的**值。
+
+所以红的是**限定名解析**：`std.data.csv.PARSE` 一路退到裸名 `PARSE`，而裸名表里
+留的是先登记的 std.core.err 那份。试过在枚举定义处额外登记
+`std__data__csv__PARSE` 让最长前缀那圈命中它，**没有效果**（打印的 q 不变），
+说明那条路没走到该分支（或在它之前就已经命中了别的符号），改动已撤回。
+下一轮从 `parse.c6` 最长前缀那圈（约 10450 行）把 `qd`/`qm` 每次拼出来的串
+打出来，看 `sym_find` 究竟命中了谁。
+
+### 第 237 轮：精确登记也压不过那个回退（再排除一步）
+
+在枚举定义处额外 `sym_add("std.data.csv.PARSE")`（模块全路径 + 成员名）之后，
+`std.data.csv.PARSE` **仍然**打印 234881031（std.core.err 的值）。说明问题不在
+"没有精确符号"，而在 `sym_find` 自己：它遇到带点的名字会**先剥掉模块前缀再查
+一次**（parse.c6 里那条注释"剥模块前缀再查一遍"），这一查比精确登记更早命中裸名
+`PARSE`。下一轮的正确改法是在 `sym_find` 里**先查精确名、查不到才走剥前缀回退**，
+而不是在枚举那边加别名。改动已撤回，树是干净的。
+
+### 第 238 轮：**已修** —— `++` 的表达式值不回绕
+
+std-cipher 的红因不在 AES 本身：`ctr_xor` 和 `encrypt_block` 都是对的（第一块
+keystream `ec8cdf73…` 和 SP 800-38A 完全一致），错的是 counter 递增——
+`if (++ctr[i] != 0)` 在 c6c 下永远为真（值留了 64 位的 256），进位传不下去。
+见 CHANGELOG。
+
+### 第 240 轮：futex 同步原语的实现**回滚了**（会挂）
+
+第 239 轮那版互斥锁/条件变量/读写锁/信号量本地一次就过了 std-thread，但它有
+**25% 概率挂死**：连跑 20 次，5 次 30 秒超时退出（`rc=124`）。CI 上同样表现为
+`std-thread (Timeout)`。挂死是"活锁/丢唤醒"那一类，定位需要能复现的压测循环
+（`for i in $(seq 1 20); do timeout 30 ./stdthread; done` 就够），在没修好之前
+不进主干，所以整个改动回滚了，回归回到 86 / 92。
+
+留着的线索：
+- `__c6_tsl` 返回的是"拿到没有"（1 = 拿到），不是"之前是不是 0"；
+- 互斥锁解锁里**无条件** FUTEX_WAKE 一个（只在"看到 2"时唤醒会漏掉置 2 与解锁
+  之间的窗口）；
+- 读写锁和信号量用的是全局自旋锁护计数，CI 单核上可能把 `__c6_tsl` 自旋拖成
+  长尾——下一版先把它换成 futex 排队，或直接用 CAS（c6c 目前没有 `__sync_*`
+  内建，要另加）。
+
+### 第 241 轮：挂死点缩到 chan（条件变量那一节）
+
+用第 239 轮那版（`/tmp/thr_futex`，二进制还留着）连跑，第 4 次挂住，最后几行是：
+
+```
+atomic: 计数=20000，自旋锁求和=2000
+sync: 计数=2000，信号量=1
+thread: 4 个 worker 跑完 4 个任务，1..400 的和=80200
+```
+
+——`sync` 段（互斥锁/信号量）已经跑完且数字对，**挂的是 chan 段**。chan 用的是
+`Mutex` + `Cond not_empty/not_full` 同一个 `std.os.sync`，所以嫌疑落在条件变量：
+`cond_wait` 里"读序号→放锁→FUTEX_WAIT(序号)"这一段，和 `chan` 的
+"push 之后 signal / pop 之后 signal" 在什么交错下丢唤醒还没看出来。下一版要么
+把序号读放在锁外、要么在 wait 里加一层"放锁前再确认一次谓词变了没"的重试。
+
+### 第 242 轮：把 cond_wait 改成"序号没变就继续等"**更糟**（10/20 挂）
+
+又试了标准写法：
+
+```c
+s = *seq; unlock(m);
+while (*seq == s) futex_wait(seq, s);
+lock(m);
+```
+
+连跑 20 次挂了 10 次（原来 5 次）。所以"单次 FUTEX_WAIT 提前返回"不是原因，
+问题更可能在**谓词与信号之间的一致性**（chan 的 `not_empty/not_full` 用同一个
+Mutex 保护队列，但 signal 发生在 unlock 之后的那一侧）。下一版要先把
+`Chan` 的 push/pop 与 signal 的顺序打出来（或换成"signal 在锁内"）再看。
+改动依旧没进主干（`git checkout` 回去了），回归 86 / 92、CI 绿。
+
+### 第 243 轮：chan 的 signal 本来就在锁内，交互协议没问题
+
+看了 `std/container/chan.c6`：`send`/`try_send`/`send_ms`/`recv` 都是
+`m.lock(); …; not_empty.signal(); m.unlock();`——signal **在**互斥锁内，和我实现
+的条件变量是配套的安全写法（consumer 读序号、放锁、FUTEX_WAIT 之间不可能有
+silgnal 插进来）。所以第 242 轮"谓词与信号不一致"的猜测也排除了。
+
+剩下的嫌疑就落在**互斥锁本身**（`__c6_tsl` + FUTEX_WAIT(2) 那套）或者
+`wait_ms`（`pthread_cond_timedwait` 在 rt.c6 里仍是桩，`sync.c6` 的 `wait_ms`
+会立刻返回 0）上。下一版建议：先把 `pthread_cond_timedwait` 也实装（返回 ETIMEDOUT
+要走序号 + futex 的相对超时），再看还有没有挂。
+
+### 第 244 轮：`pthread_cond_timedwait` 实装了，挂死还在（5/20）
+
+把 timedwait 按 futex 的相对超时实装（`wait_ms` 以前拿到"恒返回 0"的桩，会在
+"队列满"里死循环且一直握着锁，这条路确实是错的），顺手一起带上了第 239 轮的
+互斥锁/条件变量/读写锁/信号量。连跑 20 次**还是挂 5 次**，说明它不是唯一的
+挂点（甚至不是主要的那个）。
+
+改动照旧没进主干（`git checkout` 回去了），回归 86 / 92、CI 绿。下一版要么先
+把 `stdthread` 的 chan 段单独拿出来做最小复现（现在一个例子里 4 段串着跑，
+看不出是哪一对 send/recv 挂住），要么干脆给 `sync.c6` 写一组自己的互斥/条件
+压力用例——比在示例里猜快。
+
+### 第 245 轮：关键更正 —— **回滚后的主干自己也会挂**（1/10）
+
+把 rt.c6 退回提交状态（同步原语还是空操作）后连跑 10 次，**仍然挂了 1 次**。
+所以 std-thread 的挂死不是第 239 轮那版同步原语引入的，底下的线程实现
+（`std/os/thread.c6` + rt.c6 的线程跳板/join，或 chan 自己）本来就有这个问题，
+只是概率不同（空操作互斥锁时不互斥，很多等待被绕过去了）。
+
+这也解释了以前 CI 上偶尔出现的 `两个线程的错误槽互不干扰` 失败——同一个根因。
+下一轮的第一件事应该是：把 stdthread 的 chan 段单独拎出来（或给 sync 写独立
+压力用例），确认挂死的到底是 `pthread_join`、线程跳板还是 chan；在弄清之前
+不要再动同步原语的实现。
+
+### 第 246 轮：std-conf 的 xml attr —— 内联调用实参被弄坏（复现已缩小）
+
+`examples/stdconf.c6` 的 `e.attr(conf_str(S("id")), &v)` 返回 0，而把同一个值
+**先赋给一个局部变量**再传就返回 1。在示例副本里加的打印：
+
+```
+DBG attr=0 vlen=0 name=[ id="a"]      # 内联：e.attr(conf_str(S("id")), &v)
+DBG attr=1 vlen=1 name=[ id="a"]      # 先建局部：Str nmid = conf_str(S("id")); e.attr(nmid, &v)
+```
+
+也就是说：**"返回结构体的调用"作为方法调用的实参、它自己的实参又是复合字面量**时，
+传进去的那个 Str 是坏的（`attr` 里按名字比长度/memcmp 对不上，所以返回 0）。
+xml 那两条断言（`item 有 id`、`id 的长度`）都是它。
+
+下一轮的最小复现：`struct S {…}; S f(char[:]); void g(S, int*); g(f((char[:]){"x",1}), &p);`
+——注意这和 std-box 的 `std.data.csv.PARSE` 不是同一个问题（那个是限定名解析）。
+
+### 第 247 轮：那个"内联实参"的最小复现**复现不出来**
+
+按第 246 轮的描述写了两个小例子（结构体带 `char[:]`、`f(复合字面量)` 返回结构体、
+`g(f(…), &p)` 内联传参 + 方法糖 + 先赋局部三种写法），c6c 三种都对：
+`plain=1 sugar=1 local=1`。所以 std-conf 那条不是"内联聚合实参"本身，得带上真实
+的 xml 模块和那几个 import 才出得来。
+
+下一轮的做法：在 `/tmp/conf_dbg2.c6`（第 246 轮那份，内联版本坏、局部版本好的
+副本）里，把 `attr` 的形参 `Str name` 的 `len/data` 直接打出来——现在只是从
+"返回 0"推断它坏了，还没有直接证据。
+
+## 第 248 轮：剩下的五个红用例 + 各自的下一步（交接用）
+
+回归 86 / 92（`std-thread` 偶尔会挂，见第 245 轮那条更正：回滚后的主干本身就有
+1/10 的挂死率，不是同步原语引入的）。五个稳定红的是：
+
+| 用例 | 现象 | 已知 | 下一步 |
+| --- | --- | --- | --- |
+| `std-box` | csv 未闭合引号不报 PARSE；json 解析失败 | 常量本身对（两边都是 `0x0E01B007`，见第 235 轮） | 直接在 `stdbox` 的 `box_csv()` 里打 `r.error` 与 `csv_parse` 的失败点 |
+| `std-conf` | xml `item 有 id` / `id 的长度` | 内联 `e.attr(conf_str(S("id")), &v)` 返回 0，先赋局部变量再传返回 1（第 246 轮） | 在 `attr` 里打形参 `name.s.len/data`（第 247 轮想做的事，独立小例复现不出来） |
+| `std-demo` | 段错误（rc=139） | 二进制 2176531 字节 / 4337 符号 | 先 `gdb` 或 `C6C_DBG_*` 二分定位函数 |
+| `std-term` | `User defined signal 1`（rc=138） | rt.c6 里 `sigaction` 是空操作、没有信号投递（文件头注释就写着） | 实装 `rt_sigaction` + 汇编 restorer，是独立的一大块 |
+| `std-https` | 两路都是 200 / body_len / body 各归各的 | 3 条断言，和 co/fiber 调度有关 | 先看 `std/net/https.c6` 的两路并发是怎么起的 |
+
+公共基础设施（已经稳定、可直接用）：
+- 基线脚本 `/tmp/wt-baseline.sh` + 用例表 `/tmp/rc5-cases.txt`（92 条）；
+- 回归用例清单 `c6c/tests/regression-c6c.list`（追加即可，**别排序整份文件**，
+  会把头部注释块打乱）；
+- 验收：`ctest --test-dir build -L c6c -LE perf`（92 个）+ 
+  `cmake --build build-tcc --target tests2-check`（意外失败 0）。
+
+### 第 249 轮：std-demo 的段错误已开始二分
+
+`examples/wordcount.c6` 编出来直接 `rc=139`，**一行输出都没有**——崩在第一个
+`printf` 之前。先排除了泛型容器本身：`@Vect@int v = new Vect@int; push/count/at`
+在独立小程序里正常（`len=2 sum=42`）。所以嫌疑在 `main` 开头那几样：
+`Buf@(96) out`（定长缓冲结构体）、`foreach (int k = range(0, 3))` 的展开，
+或者 `int counts[3]` 这种小数组。下一轮在副本里从 `main` 第一行开始插
+`printf`，一行一行往下挪就能定位。
+
+### 第 250 轮：std-demo 崩在 `Span@int sp = { counts }`（独立复现出来了）
+
+`examples/wordcount.c6` 从 `main` 第一行开始插打印，一路走到 `D5 k=2`（循环正常）
+之后崩掉；再往里插一层：
+
+```
+D6 count=0     # Span@int sp = { counts }; 之后 sp.count() 是 0（应该是 3）
+```
+
+独立复现（`Span@int` 是 `struct Span@T { T[:] items; }`，见 std/container/span.c6）：
+
+```c
+int arr[3] = { 7, 8, 9 };
+Span@int a = { arr };      // c6c: count=0   tcc: 3   ← 坏
+Span@int b = arr;          // c6c: count=9            ← 坏（len 读成了 arr[2]）
+int[:]  s1 = arr;          // c6c: 3                   ✓
+int[:]  s2 = { arr };      // c6c: 0                   ← 坏
+```
+
+也就是说"数组 → 切片"的转换只在 `T[:] x = arr;` 这一种写法里做对了，**花括号包一层、
+或者装进带切片成员的结构体**都不做转换（直接把数组头两个元素当 `{ptr,len}` 拷）。
+试过在 `gen_init_obj` 入口和叶子引擎里补 `{ptr,len}` 的构造，前者没触发（Span 只有
+一个成员、走的是叶子路径），后者把本来对的 `s2` 也弄坏了（3 → 0），两次都 `git
+checkout` 回去了。下一轮从叶子引擎那条 `store_conv(LF_TY[li], v, vty)` 改，注意
+`vty` 在这条路上拿到的可能已经是**退化后的指针**而不是数组类型——先把它打出来。
+
+### 第 251 轮：`Span@int s = { arr }` **不走叶子引擎**
+
+在叶子路径上加打印（`LF_TY[li]` / `LF_N` / 当前记号）跑 `/tmp/sp2.c6`：
+`lst` 全是 0——也就是说那几行初始化**没有一次**把"切片"当成叶子类型交给
+`store_conv`。同时 `LF_N` 在不同语句下差很多（192 / 3 / 2 / 32 / 64 …），说明这条
+循环是给别的聚合初始化用的。
+
+所以第 250 轮那条路走错了：`Span@int s = { arr }` 应该是在**进入叶子引擎之前**
+（`gen_init_braced` / `init_save`-`init_restore` 那套，或者 `ty_is_agg(vty)` 的整块
+拷贝分支）就被处理掉了。下一轮从 `gen_init_obj` 里 `pa_is_ch('{')` 那个分叉开始，
+把走到哪条分支打出来，别再在叶子那边猜。改动已撤回。
+
+### 第 252 轮：找到了 `if (tty)` 那一段，但"唯一成员是切片"的条件没命中
+
+在 `ty_is_agg(vty)` 整块拷贝分支前面加打印，`/tmp/sp2.c6` 跑出来是：
+
+```
+[cp] tty=313 agg=1 vty=64 vagg=0 vptr=1     # tty = 聚合类型，vty 已经是退化后的指针
+```
+
+按这个线索在 `if (tty)` 里加了一段"聚合只有一个成员、那成员是切片、当前记号是数组
+变量 → 现搭 {ptr,len}"，**结果没变**（`braced_span` 还是 0）——也就是说
+`ty_member_n(tty) == 1 && ty_is_slice(ty_member(tty, 0))` 这个条件在这里不成立
+（313 这个类型要么成员数不是 1，要么成员的 `ty_is_slice` 为假）。下一轮先把
+`ty_member_n(tty)` 和 `ty_is_slice(ty_member(tty,0))` 打出来再看，别再盲改。
+
+三次尝试（叶子引擎、gen_init_obj 入口、这里）都没成，全部撤回；回归仍是 86 / 92。
+
+### 第 253 轮：`tty=313` 的两个成员分别是 64 和别的东西（不是切片）
+
+按第 252 轮说的把成员信息打出来：
+
+```
+[m1] tty=313 n=2 m0=64 m0slice=0 kind=1
+```
+
+`ty_member_n(313) == 2`、`ty_member(313,0) == 64` 而 `ty_is_slice(64) == 0`。
+所以 313 不是 `stuct Span@T { T[:] items; }` 那个"一个切片成员"的形状——要么
+313 是别的结构体（这段代码在 `sp2.c6` 的四条语句上都被调到），要么 `T[:]` 在
+类型系统里根本不是 `ty_is_slice`。下一步：把 `Span@int` 的类型 id 直接打出来
+（`ty_of(...)`），再对比 `int[:]` 的 id，确认切片到底用哪个谓词判。
+三次实现尝试都已撤回，回归仍是 86 / 92。
+
+### 第 254 轮：`ty_is_slice` 也不是这条路上的判据
+
+怀疑"泛型实例化出来的 `T[:]` 没登记进 SLICE_TY 缓存"，就在 `ty_is_slice` 里加了
+按形状的兜底（两个成员：指针 + 8 字节标量）。强制重建后跑 `/tmp/sp2.c6`，
+**四个值一个没变**（`braced_span=0 plain_span=9 slice=3 braced_slice=0`）。
+所以初始化这条路上根本没调 `ty_is_slice`，我一直在改下游的谓词。
+
+结论：别再靠"猜哪段代码在处理它"了。下一轮的办法只能是**打印语句入口**：
+在 `parse_decl` 处理 `= ` 初始化器的那个分叉（`type_name` 之后那段）加一条
+`getenv` 打印，把 `Span@int a = { arr };` 这条语句真正走进来的函数名列出来。
+四次实现尝试全部撤回，回归仍是 86 / 92、CI 绿。
+
+### 第 255 轮：std-https 的红在 `httpsa` 的两路协程（a=0/0，b=0/0）
+
+```
+DBG a=0/0 b=0/0      # status / body_len，__c6_co_run() 返回 0（"跑完"了）
+```
+
+也就是两路协程**跑完了但没拿到任何东西**。基础的 `co` + `__c6_co_run` 是对的：
+独立小程序里两个 `co work(1)/(2)` 都执行了（`G=3`）。所以问题在
+`httpsa_get` 里那条 `await c6_io(fd, ...)` 的读写路径，或者 `HAsync.attach` 的
+参数。下一轮在 `httpsa_get` 里打每次 `await` 前后返回的字节数。
+
+### 第 256 轮：json **全部**解析失败，实参 Str 是栈上的垃圾
+
+`std-box` 的 `json: 解析失败` 不是某个文档写错，最小的 `{"a":1}`、`{}`、`1` 全都失败
+（`/tmp/js5.c6`）。在 `json_parse_at` 里打形参：
+
+```
+[json_at] len=1 data=0x7ffc8edd0340 c0=64 a=0x7ffc8edd06f0
+```
+
+`len` 是对的（1、2 都对），但 `data` 指向**栈**、首字节是 `64`（`'@'`），而且
+`"1"` 和 `"{}"` 两次拿到的是**同一个**地址——说明 `str((char *)t)` 这个实参没被真正
+求值/传进去，形参读到的是调用者栈上的残留。`jp_ws` 于是返回 `64`，`jp_value` 走到
+最后一个 `jp_fail(ps, PARSE, "不是合法的 JSON 值")`。
+
+同族的现象还有 std-conf 的 xml `attr`（第 246 轮：内联 `e.attr(conf_str(S("id")), &v)`
+返回 0、先赋局部变量就正常）。所以这条线索大概率是**一个**编译器 bug：带
+`!error` 返回值的函数、实参又是由调用构造出来的聚合临时量时，实参槽没填对。
+下一轮的最小复现就是它：`int f(Str s) !error`，调用 `x->f(str(p))`，在 f 里打
+`s.len/s.data`。改动已撤回，回归 86 / 92、CI 绿。
+
+### 第 257 轮：**已修** —— 方法糖的聚合实参没落到帧槽（std-conf 绿、json 好了）
+
+见 CHANGELOG。json 现在能正确解析（`1`/`{}`/`[]`/`"x"`/`true` 的 kind 都对），
+std-conf 从红变绿（回归 86 → 87）。std-box 仍红在 csv 那半，std-demo 仍红在
+数组→切片（第 250-254 轮那条）。
+
+### 第 258 轮：两个模块的同名枚举常量 —— 裸名共享一格，限定名退化成裸名
+
+最小复现（`/tmp/q1.c6`，链 csv + err 两个模块）：
+
+```c
+printf("%d\n", (int)std.data.csv.PARSE);    // 234991623 = 0x0E01B007（csv 自己的）✓
+printf("%d\n", (int)std.core.err.PARSE);    // 234991623 ✗ 也成了 csv 的（应该是 0x0E000007）
+```
+
+也就是说 `std.core.err.PARSE` 并没有定位到 err 那个枚举成员，而是退回了**裸名**
+`PARSE`——裸名是各模块共享的一格，谁先登记谁留下（这里 csv 后登记，把它覆盖了）。
+`enum Error` 的成员是各模块都有的（INVAL/RANGE/PARSE/NOMEM…），所以这不是孤例。
+
+试过在枚举定义处按 `mod_prefix(...)+成员` 再登记一份（`std__core__err__PARSE`），
+**四个值一个没变**——说明限定名的解析根本没走到 `std__…__PARSE` 这种拼法上，
+或者它在更早的地方就被常量化成了裸名。改动已撤回。
+
+下一步：把 `std.core.err.PARSE` 这条表达式在 `gen_primary` 里的**实际查名串**打出来
+（第 32 轮打的是 `qd`/`qm`，那时看到 `qm=std__data__csv__PARSE`——但那是 csv 的，
+err 这条还没打过）。std-box 剩下的两条（csv/json 各一条"报 PARSE"）都是它。
+
+### 第 259 轮：**已修** —— 方法体里数组成员不退化（std-demo 绿）
+
+见 CHANGELOG。最小复现：
+
+```c
+typedef struct G@(int N) { char d[N]; int n; char *p() { return d; } } G;
+G@(8) g = { { 0 }, 0 };
+g.d[0] = 'z';
+printf("%p vs %p\n", (void *)g.p(), (void *)g.d);   // 修前 0x7a / 0x7ffe…
+```
+
+std-demo（wordcount）从段错误变成通过；回归 87 → 88。
+
+### 第 260 轮：限定名的回退点找到了，但别名登记那段**根本没执行**
+
+在 `gen_primary` 的最长前缀那圈加打印，stdbox 里跑出来：
+
+```
+[q2] qd=std.data.csv       qm=std__data__csv        hit=0
+[q2] qd=std.data.csv.PARSE qm=std__data__csv__PARSE hit=1 val=234881031
+```
+
+`qm` 命中了，但值 **234881031 = std.core.err 的号段**。于是按 `mod_path` 手动拼
+`std__data__csv__PARSE` 再 `sym_add` 一份，并在登记处加打印——**打印一次都没出**
+（`C6C_DBG_Q3` 无输出），说明 `parse_enum_spec` 里"给模块错误码表登记"那段对
+`std/data/csv.c6` 根本没跑到：`[en]` 那条 trace 里 `tag=Error` 只出现一次
+（file=15，即 err.c6），csv 的 `enum Error` 是走**别的路径**解析的。
+
+所以下一轮要找的是"模块文件里的枚举到底由谁解析"——不是在 `parse_enum_spec`
+里加别名。改动已撤回，回归仍是 88 / 92、CI 绿。
+
+### 第 261 轮：八个 `enum Error` 里有六个拿到的是**同一个** ebase
+
+```
+1 [en] Error file=15 ebase=234881024
+1 [en] Error file=20 ebase=234881024
+1 [en] Error file=23 ebase=234881024
+1 [en] Error file=24 ebase=235847680
+1 [en] Error file=26 ebase=234881024
+1 [en] Error file=29 ebase=234881024
+1 [en] Error file=34 ebase=234881024
+1 [en] Error file=35 ebase=235114496
+```
+
+`parse_enum_spec` 里 `ebase = mod_err_base(mod_of_file(CUR_FILE->id))`——被 import
+的模块是**文本内联**的，`CUR_FILE` 还停在别处，于是六个模块的号段全等于 err 的
+（234881024 = 0x0E000000）。只有 file=24 / 35 两个拿到了自己的号段。
+
+这就是 std-box 两条 "报 PARSE" 的真正根因：同一个 `enum Error` 的成员在不同模块里
+拿到一样的号段，`r.error == std.data.csv.PARSE` 自然时对时错（取决于 CUR_FILE 当时
+指向谁）。修法不是加别名，是让"当前模块"跟着 `module X;` 那行走（新增 `CUR_MOD`，
+在 `pa_parse` 处理 module 语句时更新，枚举/模块级登记都用它，不再用 CUR_FILE）。
+改动已撤回，回归 88 / 92、CI 绿。
+
+### 第 262 轮：`CUR_FILE` 换成 token 的文件号也没用（又排除一条）
+
+`__c6_module_decl` 那段自己就写着"`CUR_FILE` 在解析期是 NULL，用 token 的"
+（`mfile = pa_cur()->file`），所以照着把 `parse_enum_spec` 里的
+`mod_of_file((u32)CUR_FILE->id)` 换成 `mod_of_file((u32)pa_cur()->file)`——stdbox
+的两条还是红。说明拿到 err 号段的原因不在取哪个 file id，更可能是**枚举定义本身就
+在一片被共享的符号表里**：`enum Error` 的成员是按**裸名**登记的，后登记的模块覆盖
+前一个（`poison_add` 只在值不同时中毒，而这里值恰好相同 = 都没中毒），于是无论
+哪个模块先解析，最后一个模块的号段赢。真要修得先决定"同名成员到底能不能共享"。
+改动已撤回，回归 88 / 92、CI 绿。
+
+### 第 263 轮：std-https 的 `co` 任务里有**一路还没跑**，检查就已经做了
+
+在 `httpsa_request` 入口打打印，输出顺序是：
+
+```
+[ha] h=…fa84f260 method=GET host=example.com path=/async     # 同步那路（先跑的，正常）
+[ha] h=…fa84e080 method=GET host=b.example path=/2           # co 的第二路
+   ✗ 两路都是 200                                             # ← 检查在这里
+[ha] h=…fa84e180 method=GET host=a.example path=/1           # co 的第一路，晚了一步
+```
+
+也就是 `__c6_co_run()` 在 a 那路还没开跑时就返回了（`run=0`），于是 `a.status()`
+还是 0（读的是全零的 `HAsync`）。所以不是 `httpsa_get` 读坏了，是 **co 事件循环提前
+收工**。`rt.c6` 的 `__c6_co_run` 是「找一个不在等待的 resume；一个都没有就阻塞
+poll_ready(-1)；poll 不到就 break」——提前 break 的条件得再查（`c6c_co_reap_done`
+回收 detached 任务时会不会把还在排队的算成"没人等了"）。
+
+下一轮：在 `__c6_co_run` 里打每次循环的 `C6_CO_ALL` 长度 / waiting 位数 / poll 结果。
+
+### 第 264 轮：co 循环是排干了的（all=7 done=7），a 那路确实跑了但什么也没写
+
+把 `__c6_co_run` 的循环打出来：
+
+```
+[co] loop=5   all=507 wait=0 done=7 poll=1
+[co] loop=506 all=7   wait=0 done=7 poll=0   → break
+```
+
+最后一轮 `all=7 / done=7 / wait=0`——排干了，没提前收工（第 263 轮的猜测不成立）。
+所以 a 那路的 `httpsa_get` 是**跑完了但没写进 `HAsync`**，和第 255 轮看到的
+`a=0/0` 一致。
+
+注意 `all=507` 那个数是前面几段 `task` 留下的（`C6_CO_ALL` 是全局链，不随
+`__c6_co_run` 清空）。下一轮该打的是 `httpsa_get` 的返回值
+（`httpsa_request` 返回 -1 还是 3）以及 `a.attach()` 之后 `a.wfd/a.rfd` 是不是
+真的落到了 `HAsync`（`attach` 是普通方法，`co` 传进去的是 `&a`）。
+
+### 第 265 轮：`attach` 是对的，但 `co` 任务里看到的 `HAsync` 是垃圾
+
+在示例的 `attach` 之后打一行、再在 `httpsa_get` 里打一行：
+
+```
+DBG attach a=(6,7,512,0x7ffd2b587010) b=(10,11,512,0x7ffd2b586dd0)   ← 调用方：对
+[ha] get(b.example) -> -1 wfd=1 rfd=0 bcap=512 rbuf=0x7ffd601a6970     ← co 任务里：wfd/rfd=0
+[ha] get(a.example) -> -1 wfd=95 rfd=0 bcap=4592989 rbuf=0x1
+```
+
+`wfd/rfd` 在任务里是 0 或 95 这种垃圾，`bcap`=4592989——**传进 `co` 的那个
+`&a` 不是调用方的 `&a`**。而独立小程序里 `co` 传指针/字符串/6~7 个实参**都对**
+（`/tmp/co3.c6`~`co6.c6`），`await` 转发也对——所以差别在"跨模块 + 结构体更大"，
+或者 gcc 与 c6c 对 `HAsync` 这种 300 多字节结构体的按值传参口径不同。
+
+下一轮的最小复现要带上模块边界（`module demo.m;` 里定义 async，主文件 co 调用），
+在任务里打 `pv` 与调用方 `&a` 的差值。
+
+### 第 266 轮：`co` 的实参块是 `clos_alloc(thunk, 16 + 8*narg)` 现填的
+
+看了发射侧（`parse.c6` 的 async 调用）：`co f(a,b,c)` 会
+`clos_alloc(thunk, 16 + 8*narg)` 后把每个实参 `IR_STORE` 进 `env+16+8*i`，
+再 `__c6_co_new(env, 1)` + `__c6_co_launch`。`arg` 全是**指针**（`&a`、两个字面量）
+时这条路上没有聚合拷贝的问题。
+
+独立复现里 `co` 传指针 / 字符串 / 6~7 个实参、跨模块、块作用域**全对**
+（`/tmp/co3..co7.c6`、`/tmp/cm2`），所以 std-https 里那个"任务里 `&a` 变了"
+还是要靠**在示例里**二分：把 `co httpsa_get(&a, …)` 挪到示例最前面（其它段之前）
+再跑一次，如果那时是对的，就是前面几百个 task/co 把 env 块用坏了
+（`C6_CO_ALL` 里堆着 507 个协程）。
+
+顺手记一个看到的可疑点：`IR_CALL __c6_co_new` 之后
+`FN.ops[FN.n-1].narg = 2;` 紧接着又被 `= 1;` 覆盖——那行是给
+`__c6_co_launch` 的，写错位置了（不影响参数个数，但值得核一下）。
+
+### 第 267 轮：那些"同一个 ebase"的文件，其实是 **err.c6 被重复 include**
+
+打 `__c6_module_decl` 的登记处：
+
+```
+[e3] mfile=15 mnm=std.core.err  mod=2
+[e3] mfile=20 mnm=std.core.err  mod=2     ← 同一个 err.c6 的另一份副本
+[e3] mfile=21 mnm=std.text.num  mod=5
+```
+
+也就是说 file 15 / 20 / 23 / 26 … 都是 `std/core/err.c6` 的**不同包含副本**，
+它们映射到同一个模块是**对的**。所以第 261 轮"六个模块共用一个号段"的判断是错的
+（只看了 print 的 file 号，没看模块名）。
+
+真正还剩的现象只有一条：stdbox 里 `r.error` = 0x0E01B007（csv 自己的），而
+`std.data.csv.PARSE` = 0x0E000007（err 的）——限定名还是退回了裸名 `PARSE`，
+而裸名本该因为两个枚举值不同被 `poison_add` 标记成"歧义"（用的时候应当报错），
+这里却**静默**给了 err 的值。下一轮直接查 `poison_find` 在限定名回退那条路上
+有没有被查过。
+
+### 第 268 轮：`poison_find` 只在**裸名**那条路上查，限定名回退到裸名时绕过了它
+
+`gen_primary` 里 `SC_ENUMC` 分支开头就是
+
+```c
+if (poison_find(tok_data(t), t->len))
+    pa_error("'%.*s' is the member of more than one enum: write '<enum>.%.*s'", …);
+```
+
+但这条只在 `t` 已经是**裸名**时生效。限定名 `std.data.csv.PARSE` 走的是前面那段
+"最长前缀"逻辑：拼不出命中就把 `t` 推到 `PARSE` 再 `sym_find`——那时 `t` 是裸名
+没错，可**两边的值恰好一样**（csv 的 `PARSE=7` 和 err 的 `PARSE=7` 差在号段上，
+而号段是按模块算的，`ebase` 只有标了 `enum Error` 才有），所以 `poison_add` 那条
+`(u32)bs->val != 值` 判不出来，**没中毒**，于是静默给了先登记那份（err 的）。
+
+要修就得让"同名枚举成员"按**名字**就中毒（不看值），或者限定名解析不再退化成裸名。
+这条和 std-box 剩下的两条断言是同一个点，留给下一轮。
+
+### 第 269 轮：别名终于登记成功了，但**没人查它**
+
+找到之前别名一直"注册不上"的原因：`enum Error { INVAL = 1, … }` 的成员**都带
+`= 值`**，走的是 `parse_enum_spec` 里最后那段公共路径（`s = sym_add(nm, k, …)`），
+而我前几轮把别名代码放在**不带值**那条 `continue` 分支上——那段对 `std/` 里的枚举
+根本不执行。挪到公共路径后打印确认登记成功了：
+
+```
+[e5] alias=std__data__csv__INVAL val=234991617     # csv 自己的号段
+[e5] alias=std__data__json__PARSE val=235847687
+```
+
+但 stdbox 的两条断言**一点没变**，生成物字节数都和改之前一样——说明限定名解析
+根本没走到 `qm`（`std__data__csv__PARSE`）这条拼法上。`/tmp/q1.c6` 里
+`std.data.csv.PARSE` 打印的是 234991623（csv 自己的，对），所以那条路在**小程序**
+里是好的；stdbox 里不一样的地方只剩"主文件先解析、模块后内联"这个顺序。
+改动已撤回，回归仍是 88 / 92。
+
+### 第 270 轮：别名生效了（csv 那条断言已对），json 那条还红
+
+把登记挪到带 `= 值` 的公共路径后，`[q5]` 打印确认：
+
+```
+[q5] qd=std.data.csv.PARSE qm=std__data__csv__PARSE hit=1 val=234991623   ← csv 自己的
+```
+
+std-box 里 `csv: 未闭合引号报 PARSE` **已经通过**，只剩 `json: 语法错报 PARSE`。
+回归总数没变（88/92，std-box 整个用例还是红的），但这是个纯正确性改进，
+两边验收（93 个 ctest + tests2 意外失败 0）都过，已提交。
+
+下一轮：json 那条用的是 `catch e` 拿到的值跟 `std.data.json.PARSE` 比，
+`e` 的号段是 json 模块的（`atomic` 那侧），而常量这条现在应该也对了——
+先打一下两边的数。
+
+### 第 271 轮：std-box 转绿（89 / 92）
+
+真正的病根不是"哪个模块先登记"，而是 `gen_postfix` 里这句：
+
+```c
+while (… 还有 '.' …) { pa_advance(); pa_advance(); t = pa_cur(); }
+s = sym_find(tok_data(t), t->len);       // ← 无条件，把 best_sym 盖掉
+```
+
+最长前缀已经命中 `std__data__json__PARSE`（值 235847687，json 自己的），紧接着
+这一句又把 `s` 换成裸名 `PARSE`（err 那份，234881031）。加 `if (!s)` 就对了。
+
+配套的一步：模块枚举成员要**真的**按 `std__data__json__PARSE` 登记一份；值必须
+用和裸名同一个表达式 `(val ? (val | ebase) : 0u)`，否则 `OK = 0` 会被加上基址，
+`tests/err_ids.c6` 的两条自测就红。
+
+`stdbox: 59 check(s), 0 failure(s)`，回归 **89 / 92**，两边验收（93 个 ctest、
+tests2 意外失败 0）全过。剩 `std-term` / `std-thread` / `std-https` 三个。
+
+### 第 272 轮：std-term 转绿（90 / 92），信号真的接上内核了
+
+`sigaction`/`sigprocmask`/`sigpending` 原来都是空操作，`stdterm` 一装 SIGUSR1
+就被默认动作杀掉（rc=138 = 128+10）。现在：
+
+- `src/asmblob.c6` 加 `__c6_sigrestorer`（`mov $15,%eax; syscall`，12 字节）；
+- `sigaction` 把 glibc 布局翻成内核那份，置 SA_RESTORER，走 syscall 13；
+- `sigprocmask` 走 14，`sigpending` 走 127。
+
+`stdterm: 45 check(s), 0 failure(s)`，回归 **90 / 92**。剩 `std-thread`（协程/线程
+时序，10~25% 概率挂死）和 `std-https`（co 任务里看到的 `HAsync` 是垃圾）。
+
+### 第 273 轮：指针是对的、进函数时字段也是对的，坏在 `httpsa_request` 里面
+
+在 `httpsa_get` 入口打 `hp` 和 `hp->wfd/rfd/bcap/tls_on`：
+
+```
+[A] &a=0x7ffc98f62da0 &b=0x7ffc98f62ca0
+[B] hp=0x7ffc98f62da0 wfd=6  rfd=7  bcap=512 tls=0 host=a.example
+[B] hp=0x7ffc98f62ca0 wfd=10 rfd=11 bcap=512 tls=0 host=b.example
+```
+
+地址和字段**全对**。而跑到 `httpsa_request` 末尾再看就是 `wfd=1 / bcap=4592989` 了。
+`httpsa_send`/`httpsa_recv`/`httpsa_parse_head` 里的读写都按 `blen/bcap` 夹过，
+`HAsync` 也不含托管字段，`C6_CO_STACK` 是 64 KB、`wire` 才 1088 字节——看不出越界。
+所以更像是**编译器在 async 帧里写错了地方**（`await` 出现在循环里、函数有 7 个形参、
+又跨模块），而不是库的问题。下一步的最小复现：拿 `co5.c6` 那个能过的形状，把
+`inner` 改成"循环里 await 一个带 7 个形参的 async 函数，并在循环之后继续用 `pv` 的字段"。
+
+### 第 274 轮：std-thread 是**确定性**红的（8 次全红），不是偶发
+
+连跑 8 次：7 次 `stdthread: 29 check(s), 7 failure(s)`、1 次超时。失败点集中在
+sync（读写锁、信号量 try_wait/V）、thread（1..400 的和对不上，6502）、
+chan（和 5583）。根因很直接：`rt.c6` 里 `pthread_mutex_*` / `pthread_cond_*` /
+`sem_*` / `pthread_rwlock_*` **全是空操作**，而 `pthread_create` 是真起线程
+（clone）——空锁等于没锁，四个 worker 抢一个累加器自然是乱的。
+
+试着把它们换成 futex 版（另加了一个 32 位 CAS 的汇编 blob `__c6_cas32`）：
+互斥量按教科书的三态协议写、条件变量用"通知计数 + futex"、信号量用原子加减，
+编译都过，但 `stdthread` 和最小的 `mx1.c6` 都会**挂死**（`timeout` 124）。
+所以整块撤回了——宁可保持"红但能跑完"，也不要"挂死"。
+
+下一轮要做得先把最小复现跑通（两个线程各 1000 次 lock/unlock + 一次 cond 等待），
+顺序建议：先只上互斥量（cond 仍然是空操作但让它**不睡**，直接返回），确认
+`COUNTER == 2000` 且不挂；再单独上 cond。
+
+### 第 275 轮：只上互斥量也一样挂，说明问题不在 cond
+
+按上一轮的建议拆开试：只把 `pthread_mutex_*` 换成 futex 版（cond 保持空操作），
+`/tmp/mx2.c6`（两个线程各 1000 次 lock/unlock + join）照样 `timeout` 124。
+所以不是条件变量的事。
+
+最省事的下一步是**先证明 futex syscall 这条路本身可用**：写一个
+`while (futex_wait(&w, 0) == -1)` 的单线程小程序，主线程 `futex_wake`，
+看能不能醒；再把 `__c6_cas32` 单独测一遍（`printf` 出返回值和事后的内存值）。
+这两条都对了，才轮到锁的协议。整块已撤回，回归仍是 90 / 92。
+
+### 第 276 轮：futex 和 CAS 都验证过了，互斥量也修对了——卡在条件变量
+
+三步都单独测过：
+
+1. `futex`(syscall 202) 跨线程 wait/wake 正常：`woken=1`、`waiter: futex returned 0`；
+2. 新加的 `__c6_cas32` 汇编 blob 正常：`cas(5->9)=5 v=9`、`cas(5->7)=9`；
+3. **互斥量有一个真 bug**：`unlock` 只处理了状态 2（有人等），状态 1 的锁
+   永远放不掉，第二个线程原地空转——修成"2 → 叫醒一个；否则 1 → 0"之后，
+   `/tmp/mx2.c6`（两个线程各 1000 次 lock/unlock）从挂死变成
+   `counter=2000 (want 2000)`。
+
+接着上条件变量（"通知计数 + futex"，wait 记下计数→放锁→睡→比一次→重新加锁），
+`/tmp/mx1.c6` 还是挂（124）。所以下一轮只剩条件变量这一块：先把 wait/signal
+的最小用例（一个 waiter、主线程 signal 一次）跑通，再上 stdthread。
+
+（这一轮的改动整块撤回了，回归仍 90 / 92。）
+
+### 第 277 轮：互斥量 + 条件变量一起上也还挂（`/tmp/mx1.c6` = 124）
+
+第 276 轮修好的互斥量单独跑是对的（`counter=2000`），可把条件变量按"通知计数 +
+futex"接上之后，`mx1.c6`（两个 worker 各 1000 次加锁累加 + 主线程等一次
+broadcast）还是挂死。`mx1` 里 `while (!READY && i < 1000)` 有次数上限，所以不是
+主线程那一侧在转，是**某一次 futex WAIT 永远等不到**。
+
+下一轮第一件事：给 `mx1.c6` 每一段加 `fprintf`（worker 进/出锁、broadcast 前后、
+main 每次 wait 前后），先看挂在哪一段；别再整块上，按 worker→锁→signal→main
+的顺序一格一格接。
+（改动已撤回，回归仍 90 / 92。）
+
+### 第 278 轮：真锁全部写出来并逐段验证过了，但 stdthread 卡在 thread 段
+
+这一轮把四种原语都换成 futex 版并**逐段**验证：
+
+- 互斥量 + 条件变量：`/tmp/mx1.c6` 通过（`[cv] wait enter/leave`），
+  `/tmp/mx2.c6` 两个线程各 1000 次加锁 `counter=2000`；
+- 信号量：`sync` 段的三条断言（try_wait / V / 计数）**全绿**；
+- 读写锁：`trywrlock` 补上之后 `sync: 有读者时写锁拿不到` 也过了；
+- 4 个线程直接 spawn 正常（`/tmp/sp4.c6`，`hits=4`）。
+
+但 `stdthread` 走到 `thread:` 段会**挂死**：`C6C_DBG_CV` 只看到 **2 个**
+`[cv] wait enter`（线程池起了 4 个 worker，只有 2 个进了等待），剩下的进不去。
+另外 `pthread_create` 里 mmap/spawn 失败那两条 `return -1` **没解锁**
+（`c6c_th_lock` 是全局自旋锁），虽然这次不像走到了那里，但那是真 bug。
+
+挂死比"跑完但断言红"更伤 CI，所以整块又撤回了（回归 90 / 92）。
+下一轮：先修那两条没解锁的 return，再在 `c6c_th_new()` 里打点看第 3、4 个
+worker 到底卡在哪一步。
+
+### 第 279 轮：先把 `pthread_create` 漏放全局锁的两条路修了（已提交）
+
+`c6c_th_lock()` 是全局自旋锁，mmap 失败 / clone 失败两条 `return -1` 没放锁：
+失败一次，后面每次 `pthread_create` 都空转。现在两条路都放锁，clone 失败那条
+还会把槽位还回去（`C6C_THS[i].stack = 0`）并 munmap 已分配的栈。
+
+回归仍是 90 / 92（stdthread 的 7 条断言没变），两边验收都过。
+下一步接着查线程池那段挂死：4 个 worker 只有 2 个进 `cond_wait`。
+
+### 第 280 轮：线程池那段的下一步（没动代码）
+
+看了 `std/os/thread.c6` 的 `start`：起 worker 时**不持** `self->m`，worker 一上来
+就是 `pthread_mutex_lock(&m)` + `cond_wait(&work, &m)`。上一轮 `C6C_DBG_CV` 只看到
+2 个 `[cv] wait enter`、而且都 leave 了，说明第 3、4 个 worker 卡在
+`pthread_mutex_lock(&m)` 上——要么我的 `unlock` 没真正让出去（状态 1 那条分支
+`cas(1,0)` 失败），要么 `cond_wait` 重新加锁那一下丢了。
+
+下一轮的打点就放在 `pthread_mutex_lock` 的三条出口（快路径 / 重抢 / 睡醒）上，
+每次打印 tid 和当时的 `*v`，跑 `stdthread` 看第 3 个 worker 停在哪条。
+
+### 第 281 轮：互斥量的 unlock 有个真 bug（修对了），但 cond 还有竞态窗口
+
+继续把 futex 版的四种原语贴回去逐段试，**又抓到一个真 bug**：`unlock` 里
+"读到状态 → CAS 放成 0" 之间，等待方可能刚好把状态改成 2，于是 CAS 失败、
+锁是放掉了（2 也算空闲），可**没人去叫醒等待者** → 双 b 都睡死在 `st=2` 上。
+改成「循环重试 CAS，放之前的状态是 2 就叫醒一个」之后：
+
+- `stdthread` 的 `sync` 段全绿、`thread` 段 `1..400 的和=80200` 对、
+  `chan` 段 `和=5050` 也对——只剩 3 条（两个 sem、一个 rwlock）；
+- 但这是**带 `C6C_DBG_CV` 打印**时跑出来的；不加打印再跑，又会挂在 `thread` 段。
+
+也就是说 mutex/cond 这对还有竞态窗口（打印改变了时序）。sem 和 rwlock 单独上
+也会挂，先不动。整块又撤回了，回归仍是 90 / 92。
+
+下一轮：拿 `/tmp/pool1.c6`（内联锁，已验证能过）和 rt.c6 的版本对着改——
+差别只在"锁的实现在库里"这一层，把它逼到和 pool1 一样的时序就能收敛。
+
+### 第 282 轮：把 pool1 的算法原样搬进 rt.c6，sync/thread 都对了，chan 还挂
+
+按上一轮说的"对齐 pool1"：库里的互斥量改成 64 位原子加/减 + futex（和
+`/tmp/pool1.c6` 那份内联版一模一样），条件变量用第一个 int 当通知计数。连跑三次：
+
+```
+run1 rc=1   : stdthread: 29 check(s), 3 failure(s)      ← 跑完了，只剩 sem×2 + rwlock
+run2 rc=124 : thread: …1..400 的和=80200                ← 挂在 chan 段
+run3 rc=124 : 同上
+```
+
+也就是 `sync`、`thread` 两段现在都能过，卡在 `chan`。`chan` 用的是
+`std/container/chan.c6` 自己那套（互斥量在锁内 signal），所以下一个怀疑点是
+"signal 在锁内 → 等待方在 unlock 之后才进 futex"那个经典丢唤醒窗口。
+
+挂死会让 CI 超时（比断言红更伤），所以没提交改动，回归仍 90 / 92。
+
+### 第 283 轮：最小 chan 复现写错了（n=0），先把状态记清楚
+
+想把 `chan` 的挂死降到最小复现：`/tmp/ch1.c6`（一个生产者线程 send 1..100 +
+主线程 recv）在 `c6c` 下五次全是 `n=0 sum=0`——说明我这个复现自己写错了
+（`Chan.init` 的实参/`close_chan` 的用法不对），不是运行时的问题。抄 API 之前
+先读 `std/container/chan.c6` 的 `init`/`close_chan` 签名再写。
+
+本轮结论回到第 282 轮那条：**把 pool1 的算法搬进 rt.c6 之后，sync 和 thread 两段
+都能过（`1..400 的和=80200`），只有 chan 段偶发挂死**，所以那版没进主干。
+
+接下来建议换个顺序：先把 `stdthread` 的 chan 段单独拆成一个用例（现在它和
+sync/thread 挤在一个 `test` 文件里，挂死时看不出来是哪一段），再决定是修 rt.c6
+还是修 `std/container/chan.c6` 的丢唤醒。
+
+### 第 284 轮：互斥量 + 条件变量的 futex 版进主干了（90 / 92 不变）
+
+按第 282 轮的结论定稿：只上**互斥量 + 条件变量**（和 `/tmp/pool1.c6` 同一套
+算法），信号量和读写锁保持空操作。
+
+- 门禁：93 个 ctest 全过；tests2 意外失败 0；
+- 连跑两次完整回归都是 90 / 92，`std-thread` 一次 `rc=124`（chan 段挂死）、
+  一次跑完但两条 semaphore 断言红；
+- `stdthread` 跑完那次：`sync` 全绿、`1..400 的和=80200`、`chan 和=5050`。
+
+`std-thread` 不在 `regression-c6c.list` 里（表里 88 条全绿），所以门禁不受影响。
+下一轮接着收 `chan` 段的丢唤醒，然后把 semaphore / 读写锁也接上。
+
+### 第 285 轮：`spawn` 出去的函数里，**打印出来的字符串会串**
+
+用最小复现 `/tmp/sp6.c6`（两个 `spawn`，分别跑 `fa`/`fb`，各自 `fprintf` 一行
++ 给一个全局变量 +1）：
+
+```
+run1: [fa] ran A=1 [fa] ran A=1 A=1 B=1 (want 1/1)
+run2: [fb] ran B=1 [fb] ran B=1 A=1 B=1
+run3: [fa] ran A=1 [fb] ran B=1 A=1 B=1     ← 只有这一次两边都对
+```
+
+**计数是对的**（A=1、B=1），但 stderr 上打出来的**字符串**会错：两个线程都打了
+`[fa]…` 或都打了 `[fb]…`。说明 `spawn` 起的线程里，函数体引用**字面量**那一条
+路径有问题（不是线程本身跑错，是"读到的字符串"不对）。
+
+这很可能就是 `chan` 段偶发挂死的根因之一：`std/container/chan.c6` 的
+`send`/`recv` 里也有 `return 0` 之类的分支，一旦字面量/常量被串，`closed`
+判断就会错。
+
+下一轮：把 `/tmp/sp6.c6` 缩小到"两个字面量 + 一个 spawn"，看是**数据段重定位**
+还是**任务前缀里的实参块**把字面量指针弄错了。
+
+### 第 286 轮：printf 的全局格式化缓冲是多线程踩踏源，改栈上
+
+第 285 轮那个"`spawn` 里打印的字符串会串"的根因找到了：**不是** 字面量/重定位，
+而是 `c6c/lib/rt.c6` 的 `printf`/`fprintf`/`vfprintf`/`vprintf` 共用一张全局
+`c6c_obuf` 做格式化，两个线程同时打印就互相踩。
+
+- 复现 `/tmp/sp6.c6`：c6c 编出来 3 次错 2 次；`tcc/c6` 编出来 3 次全对；
+- 改成每次调用在栈上开 `char obuf[4096]`：5 次全对；
+- `chan` 复现 `/tmp/ch3.c6`：修前 3 次挂 3 次，修后 5 次挂 2 次（`sum=5050`
+  那次是对的），说明 chan 段还有另一个竞态。
+
+门禁：93 个 ctest 全过、tests2 意外失败 0；回归两次都是 90 / 92。
+下一个目标就是这个"五次挂两次"的 chan 竞态。
+
+### 第 287 轮：chan 竞态带打印就不复现，先记一笔
+
+给 `pthread_mutex_lock`/`pthread_cond_wait`/`pthread_cond_signal` 加
+`C6C_DBG_CV3` 打印（`getenv` 门控）后跑 `/tmp/ch8`，三次**全过**——又是典型的
+"带打印就不复现"。trace 里能看到 `[mx] lock=2`（有争抢时原子加会到 2，
+说明等待方确实在抢），`[cv] … wait seen=98 → signal=98 → 唤醒` 也都成对。
+
+也就是说现在的竞态窗口非常窄，靠加打印定位行不通了。下一步要么：
+1. 在 `rt.c6` 里维持一个**环形缓冲**记录最近 N 次锁/条件变量事件（不在热路径
+   上打印，挂死之后由 `SIGALRM`/超时那侧 dump）；
+2. 或者直接把 `std/container/chan.c6` 的 `send`/`recv` 改成"用信号量"——
+   但信号量现在还是空操作，得先把 sem 接上。
+
+更省事的方向可能是 (2)：`Chan` 本来就是个有界队列，用 sem 表达比 cond 简单。
+
+### 第 288 轮：sem / rwlock 接上真实现，stdthread 跑到 29/29、回归最高 91/92
+
+- `sem_*`：第一个 int 当计数，`sem_wait` 原子减、成负数就还回去睡到变正；
+  `sem_trywait`/`sem_getvalue` 一起补；
+- `pthread_rwlock_*`：字节 0..8 自旋锁（`__c6_xchg8`）、偏移 8 读者数、偏移 12
+  写者标记；`trywrlock` 原来恒返回 0（"总是成功"），导致"有读者时写锁拿不到"
+  那条断言红，一并修好。
+
+`stdthread` 现在跑完就是 29 check / 0 failure；连跑四次两次挂死（都在 `chan` 段）。
+回归：run1 **91 / 92**（只差 std-https），run2 90/92（std-thread 那次挂死）。
+
+下一步只剩两件事：`chan` 的挂死、`std-https`。
+
+### 第 289 轮：互斥量改用原子交换，std-thread 连跑 8 次全绿，回归稳定 91/92
+
+根因是第 288 轮那版互斥量的"原子加 1、出 1 就拿到"：两个线程同时抢时计数会加到 2，
+谁都没拿到又各自减回去，等待方就可能永远等在一个非 0 的值上。最小复现
+`/tmp/cv1.c6`（mutex + 两个 cond 的有界队列）6 次挂 3 次。
+
+改成 `__c6_xchg8(m, 1) == 0` 取锁、放锁直接写 0：
+
+```
+/tmp/cv1.c6           ok=10 timeout=0
+examples/stdthread.c6 8/8 全绿（29 check / 0 failure）
+回归                  run1/run2/run3 都是 91 / 92（只剩 std-https）
+```
+
+`std-box` / `std-term` / `std-thread` 一并补进 `regression-c6c.list`（91 条），
+CTest 96 个用例全过。下一步只剩 `std-https`。
+
+### 第 290 轮：`co` 调用点把 `__c6_co_new` 的第二个实参丢了
+
+`gen_postfix` 里 `co f(…)` 的发射是：搭实参块 `{thunk, 目标, 实参…}` →
+`__c6_co_new(env, nogate)` → `__c6_co_launch(co)`。但代码里 `narg = 2` 紧跟着
+又被改成 `narg = 1`，第二个实参 `nogate` 根本没人填，`__c6_co_new` 拿到的是
+寄存器里剩下的垃圾：
+
+```
+void *__c6_co_new(void *env, long nogate) { … c->nogate = nogate ? 1 : 0; … }
+```
+
+于是 `co` 出去的任务"到不到第一个挂起点"就看运气。`std-https` 的 co 那两路
+看到 `wfd=1 / bcap=4592989 / rbuf=0x1` 这种值，和这条对得上。
+
+已删掉那行覆盖（两行 `IR_ARG` 本来就都推了）。改完回归仍是 91 / 92（`std-https`
+还红，但在 co 段之前的 `task` 段是绿的），门禁 96 个 ctest + tests2 全过。
+
+下一轮：拿 `examples/stdhttps.c6` 里那两条 `co httpsa_get(&a, …)` 的形状继续缩
+（我写的 `/tmp/cm4` 复现卡在 `co` 的语法上前提上——`co` 的实参里不能直接出现
+类型转换，得照抄例子里那种纯左值写法）。
+
+### 第 291 轮：`co` 的最小复现卡在"标识符可见性"上，不再往下钻
+
+`co f(…)` 的软关键字判定在 `parse_stmt` 里：`co` + `标识符` + `(` 才算，之后要求
+`GEN_TY` 是 `thread` 或 `task*`，否则报"'co' 的操作数必须是一次 async 调用"。
+
+我用 `/tmp/cm5`（`demo.m` 里 `async int fill(void*, const char*, const char*)`，
+`main.c6` 里两条 `co fill(…)`）复现，报的却是 `这里要 ';'（当前是 '('）` —— 说明
+`fill` 在这个位置**根本没被认成标识符**（当成声明了），所以软关键字那条路没走到。
+第 288 轮的 `/tmp/cm3`（同样的模块结构、实参是 `void*/C*/int`）是能编过的，差别只在
+形参类型和函数体里有 `char buf[512]` + 一次 `await`。
+
+不再往这个方向钻：`examples/stdhttps.c6` 本身是能编过的，说明问题在**任务前缀里的
+局部变量**（`HAsync *h` 在 `await` 之后被读成垃圾），而不是语法。下一轮直接对着
+`co` 任务的前缀/溢出布局查（`PA_CO_STMT` 那段），拿 `examples/stdhttps.c6` 当唯一
+复现。
+
+### 第 292 轮：co 那两路的实参是对的，坏在 `httpsa_request` 里面
+
+给 `httpsa_get` / `httpsa_request` 临时加了打印（都已撤回）：
+
+```
+[get] hp=0x7ffd…e860 h->wfd=6  h->bcap=512 host=a.example path=/1     ← a 入口对
+[get] hp=0x7ffd…e760 h->wfd=10 h->bcap=512 host=b.example path=/2     ← b 入口对
+[req] before h=0x7ffd…e760 wfd=10 n=55                                ← b 进 request 还对
+[req] before h=0x7ffd…e860 wfd=3108159 n=55                           ← a 进 request：指针对、内容坏
+```
+
+也就是说：**co 的任务实参传得没问题**，`httpsa_get` 收到的 `hp`/`host`/`path` 全对；
+坏的是 `httpsa_request` 里 `h` 指向的那块内存——`h` 这个**指针**还是原值（指向
+`main` 的栈），但 `*h` 被别的东西覆盖了（`wfd=3108159` 是 ASCII 味儿的垃圾）。
+
+`__c6_co_new` 那边也查了：11 个协程的 `stack` 各不相同（`0x7f9c2cfb4000`、
+`…cfa4000`、`…cf94000`…），所以不是"两个任务共用一块协程栈"。
+
+下一个怀疑点：协程**挂起时保存的寄存器**（`c6c_co_resume` 的 swap 只存了部分
+callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之后还要用 `h`，
+如果 `h` 被放在一个没被保存的寄存器里，恢复后就可能是别的任务留下的值。下一轮
+直接看 `__c6_swapstack` 存/取了哪几个寄存器，和 `x64` 后端"跨调用要活的变量"是否
+对得上。
+
+### 第 293 轮：gdb 上没抓到写手，先把"下一步怎么抓"写清楚
+
+想用硬件观察点抓谁写了 `HAsync` 第一个字：`break httpsa_request` →
+`set $hp = $rdi` → `watch *(long*)$hp` → `continue`。跑完没有命中——因为
+`httpsa_request` 在**同步那一路**也被调用，断点停在了第一个（那次是对的），
+观察点挂在了错的地址上。而且 c6c 的输出没有 DWARF，只能用寄存器/符号。
+
+下一步这么抓：`break httpsa_request` 后先 `ignore 1 N`（N = 前几次同步调用），
+或者干脆在 `httpsa_get` 里（只有 co/task 两路会进）断下来再 `watch`。
+另一个更省事的办法：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，看是不是
+"换栈"这一步把它踩掉的。
+
+### 第 294 轮：排除了"7 个实参"和"协程栈太小"，还摸清了两条语法约束
+
+两件事：
+
+1. 用 `/tmp/cm6` 复现"7 个实参 + await + co"：**结果完全正确**
+   （`a=21,106 b=210,1060`），所以不是实参多了的问题；
+2. 把 `C6_CO_STACK` 从 64 KB 调到 256 KB 再跑 `examples/stdhttps.c6`：
+   还是那 3 条红，**不是协程栈溢出**。已改回 64 KB。
+
+顺带摸清了两条 c6c 的语法约束（之前 `co` 的最小复现一直编不过就是卡在这里）：
+
+- 模块文件必须放在 `<include 根>/<模块路径>.c6`，比如 `module demo.m;` 要写成
+  `demo/m.c6`，只放在 `-I` 根目录下**找不到**；
+- `async` 函数**不能是方法**：第一个形参是 `struct X *` 的普通函数会被当成方法，
+  所以 `async int go(S *a, S *b)` 报 "'async' functions cannot be methods"，
+  改成 `async int go(void *pv, S *a, S *b)` 才行（`httpsa_get(void *hp, …)` 正是
+  这个形状）。
+
+下一步：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，直接看是不是换栈那一步踩的。
+
+### 第 295 轮：把 httpsa 的调用形状逐条搬进最小复现，**全对**
+
+对照 `httpsa` 的实际形状搭了三个复现，全部通过：
+
+| 复现 | 形状 | 结果 |
+|------|------|------|
+| `/tmp/cm6` | 7 个实参 + 一次 `await` + 两条并发 `co` | `a=21,106 b=210,1060` ✓ |
+| `/tmp/cm7` | 三层 async 嵌套（`get → req → snd`）、`req` 里 `char buf[1200]`、`snd` 里**循环 await** | `a=11,97 b=11,98` ✓ |
+| `/tmp/cm8` | 两条 `co` 都 `await c6_io(fd, C6_CO_EV_WRITE)` 往同一个 pipe 写 | `a=55,66 b=55,66 got=0011223344` ✓ |
+
+也就是说：多实参、深层嵌套、循环挂起、`await c6_io` 的挂起恢复、两个协程交替跑，
+这些 c6c 都是对的。`stdhttps` 的 co 那两路仍是 3 条红，说明触发条件还差一个我没
+搬过来的东西——最可能是 `httpsa_send` 里那句 `await c6_io(h->wfd, …)` 用的是
+**从结构体字段读出来的 fd**（我 cm8 用的是形参 `wfd`），以及 `httpsa_recv` 那边
+`await c6_io(h->rfd, …)` 和读写两个等待点混用。
+
+下一轮把这个再搬一次：`await c6_io(h->wfd, …)`，并且同一协程里**先写后读**。
+
+### 第 296 轮：找到 co 的真正触发条件——**被 await 的子任务自己会挂起**
+
+`/tmp/cm9` 把 httpsa 的形状搬全了（`H` 里放 `wfd/rfd/rbuf/bcap/blen`，
+`snd` 里 `await c6_io(h->wfd, C6_CO_EV_WRITE)` 再 `write`，`rcv` 里
+`await c6_io(h->rfd, C6_CO_EV_READ)` 再 `read`，`req` 里 `char buf[1200]`
+再 `await snd` → `await rcv`），两条 `co req(...)`，各自独立的 pipe：
+
+```
+[req] in h=…b2b0 wfd=6 rfd=9      ← a 的句柄全对
+[req] before snd n=11 wfd=6
+[req] in h=…b240 wfd=8 rfd=11     ← b 的句柄全对
+[req] before snd n=11 wfd=8
+[snd] fd=8                        ← 只有 b 进了 snd
+[snd] await fd=8
+a=6,0,0 b=8,0,0                   ← 两边都没跑完，但 co_run 正常返回
+```
+
+和前面几轮那些"能过"的复现相比，唯一没搬过的差别是：**被 `await` 的那个 async
+函数自己会挂起在 `await c6_io` 上**（`/tmp/cm7` 里 `snd` await 的 `tick` 是立刻
+返回的，所以没暴露）。也就是 `httpsa_request → httpsa_send → await c6_io` 这条链。
+
+`__c6_co_wait` 里 `while (!c->done && rounds < 1000) { if (!c6c_co_pump(c)) break; }`
+——`c6c_co_pump` 一旦返回 0（这一轮没推进）就 **break 出去**，紧接着无条件把任务的
+state 写成 DONE 并返回。孩子还挂在 `c6_io` 上时，父任务就会"以为它跑完了"继续往下
+走，或者干脆卡住。
+
+下一轮直接改这里：父任务等子任务时，把子任务的等待点（fd + 事件）接力给自己
+（或者把自己挂到子任务的 `waiter` 上），不要靠"泵一次不动就算完"。
+
+### 第 297 轮：改了「推一次就 break」那处，复现还是挂——父任务走的不是 `__c6_co_wait`
+
+按上一轮的想法把 `__c6_co_wait` 里那段改成：
+
+```c
+if (c && !c->done) c6c_co_pump(c);
+if (c && !c->done && c->waiting && !C6_CO_CUR) return -1;   /* 不谎报 DONE */
+```
+
+`/tmp/cm9` 还是挂（`a=6,0,0 b=8,0,0`），说明 `await snd(…)` 这条路根本不经过
+`__c6_co_wait`——它走的是 `__c6_co_await`（`async_unwind_gate` 那边发的
+`IR_CALL __c6_co_await`）。已撤回改动。
+
+下一轮从 `__c6_co_await` 读起：它把自己 `blocked_on` 到子任务上之后，谁负责在
+子任务推进/结束时把父任务放回可运行队列（`resumer` 链）。
+
+### 第 298 轮：`blocked_on` 不是原因，调度器这块要专门啃
+
+读了 `__c6_co_await` / `c6c_co_yield` / `c6_io` 三处：
+
+- `__c6_co_await` 把自己 `blocked_on = task` 然后 `c6c_co_yield(self)`；
+- `c6c_co_yield` 把令牌交给 `resumer`（`co` 起的协程 `resumer` 是 0，也就是主线程）；
+- `c6_io` 在协程里**总是**停一轮（约束 C31），`waiting = 1` 之后循环 yield。
+
+猜"`await async` 残留的 `blocked_on` 让调度器跳过这个协程"，所以在 `c6_io` 挂到
+fd 上之前加了一句 `C6_CO_CUR->blocked_on = 0;`——**没用**，`/tmp/cm9` 照样挂
+（`a=6,0,0 b=8,0,0`）。已撤回。
+
+现在的状态很清楚：`/tmp/cm9` 是一个 5 秒内必挂的最小复现（两条 `co`，每条都走
+`req → await snd → await c6_io(fd, WRITE)`），而把 `await snd` 摊平成直接在 `req`
+里 `await c6_io` 就正常。下一轮拿这个复现盯着 `__c6_co_run` 的主循环看：
+`c6c_co_poll_ready(-1)` 到底把 fd 8 的 POLLOUT 报出来没有、报出来之后恢复的是谁。
+
+### 第 299 轮：把 pump 的主循环读完了，`c6_io` 的"停一轮"和 co 并发撞在一起
+
+`c6c_co_pump` 每一轮先 `c6c_co_poll_ready(0)`（不等），再从 `C6_CO_ALL` 里挑一个
+`!waiting && !blocked_on` 的协程恢复；挑不到就顺着 `blocked_on` 链找，最后
+`c6c_co_poll_ready(-1)` 阻塞等下一个就绪 fd。
+
+`c6_io` 在协程里是**总是**停一轮（约束 C31：即使已经就绪也停）。两个 `co` 任务
+同时挂在"永远就绪"的 POLLOUT 上时，就变成：A 停一轮 → poll 立刻说 A 就绪 →
+恢复 A → A 又停一轮 → B 同理……两边来回倒，谁也没往 `write` 之后走。
+（`/tmp/cm9` 里 `[snd] await fd=8` 之后永远没有 `[snd] woke`，就是这么卡住的；
+`c6_io` 里那个 `g++ < 1000000` 的保险丝要等 100 万次 yield，实际等于无限。）
+
+下一轮的方向：给"同一轮里已经恢复过一次的协程"记个数（类似 epoll 的
+one-shot），或者让 `c6_io` 在 `poll_ready` 已经报过这个 fd 就绪时**不再停一轮**。
+这条改完再跑 `examples/stdhttps.c6`。
+
+### 第 300 轮：不是"倒来倒去"，是**恢复之后没接着往下跑**
+
+给 `c6_io` 加了"倒 64 轮就自己阻塞 poll 一次"的保险丝（保证一定有进展，C31 的
+"即使就绪也停一轮"照旧满足），跑 `/tmp/cm9`：
+
+```
+[snd] fd=8
+[snd] await fd=8          ← 从这里进去
+a=6,0,0 b=8,0,0           ← 再也没出来，但进程正常结束、也没卡死
+```
+
+保险丝让它在 64 次 yield 后自己 poll 返回 1，可是**返回之后的那行 `write` 根本没
+执行**（`[snd] woke` 一次都没打）。也就是说：**协程恢复时没有接着挂起点后面跑**，
+而是回到了别处 / 直接算作结束。
+
+对照 `/tmp/cm8`（同一个协程里**只有一条** `co`，直接 `await c6_io`）是对的，
+`/tmp/cm9`（**两条** `co`，各自 `req → await snd → await c6_io`）就坏——差别是
+"一个协程挂起时另一个也已经挂起"。
+
+下一轮直接盯 `__c6_swapstack` 的保存/恢复：两条协程各自 mmap 一块栈，
+`c6c_co_resume` 把 rsp 换过去、`ret` 到挂起点。挂起时保存的 `rsp` 如果存进了
+**协程结构体的公共槽**（而不是各自的槽），第二次挂起就会把第一次的覆盖掉。
+
+### 第 301 轮：抓到了——`__c6_co_run` 里**同一个协程被恢复一百万次**
+
+在 `__c6_co_run` 主循环和 `c6_io` 的挂起点都打上 `C6C_DBG_SCH`，跑 `/tmp/cm9`：
+
+```
+[run] resume c=0xacfa300 task=0xacfa380 |[snd] fd=8
+[snd] await fd=8
+[sch] io park fd=8 ev=4 task=0xacfa380 blocked=0
+[run] resume c=0xacfa210 task=0xacfa290 |[run] resume c=0xacfa210 …（重复到 guard 上限）
+```
+
+`c=0xacfa210 / task=0xacfa290` 是**另一个**协程（a），它被**连续恢复**到
+`guard > 1000000` 才停。也就是说 `c6c_co_resume(c)` 这一**次**调用里，控制权
+在 main 和 a 之间来回倒了一百万次，`c6c_co_resume` 自己一直没返回：
+
+- a 在 `c6_io` 的 `while (waiting …) c6c_co_yield(self)` 里；
+- `c6c_co_yield` 把令牌交给 `resumer`（这里是 main）然后等自己的令牌；
+- main 从 `c6c_co_await_turn` 回来 → `c6c_co_resume` 返回 → 主循环下一轮又把
+  **同一个 a** 选出来（它 `waiting` 仍为 1 却不该被选）→ 再 give → a 又转一圈。
+
+修的方向有两个，下一轮挑一个试：
+1. `__c6_co_run` 的主循环选人时把 `waiting` 为真的**排除掉**（现在看起来它没被
+   排除干净，或者 `c6c_co_resume` 递归进来了）；
+2. `c6_io` 的 `while` 里在 yield 之前先把 `waiting` 清掉再睡，醒来由调度器置 1，
+   这样"谁在等"只有一个地方说了算。
+
+### 第 302 轮：递归防护反而更糟，说明"递归进来"是**故意**的
+
+给 `c6c_co_resume` 加了个 `C6_CO_RESUMING` 重入保护（递归进来直接返回），
+`/tmp/cm9` 变成连 b 都进不去就停了——说明嵌套恢复是**正常路径**（父任务驱动子
+任务就靠它），不能一刀切。
+
+不过上一轮那个"同一个协程被恢复一百万次"仍然是真的。把两件事拼起来，最可能的
+解释是：`c6_io` 里 `while (waiting) yield` 那一圈，`waiting` 在某一刻被清成了 0，
+`c6_io` 返回，但**返回地址落在 `c6c_co_yield` 里面**——也就是恢复点错位，协程回到
+"yield 之后"而不是"`c6_io` 调用者之后"。这会同时解释：
+（a）`[snd] woke` 一次都不打；（b）同一个协程被反复恢复。
+
+下一轮就从 `__c6_swapstack` 的恢复点查起（36 字节的汇编跳板：push rbp/rbx/r12-r15
+→ 存 rsp → 换 rsp → pop 回去 → ret），核对 `c6c_co_yield` 存的返回地址和
+`c6c_co_await_turn` 的调用点是不是同一个。
+
+### 第 303 轮：把 `c6_io` 的"总让一轮"换成"只让一次"，语义对了但对端没醒
+
+读懂了 `tests/async.c6` 的轮转断言：两个 `co` 各 `await c6_io` 一次（fd 都**已经
+就绪**，pipe 里各写了一个字节），断言 `LG_IS("ab")` —— 要求**每个任务至少让出
+一轮**才能真交替。所以"永远就绪就直接返回"不行（那条路让 `tests/async.c6` 的
+3 条断言全红），"每次都想让一轮"又会让 `stdhttps` 的 co 段互相倒。
+
+改成"**每个任务对同一个 fd 只让一次**"（`C6Co.parked_fd`）：语义上两头都对，
+但实测 `/tmp/cm9` 还是停在第一个 `[snd] await fd=8` 之后——**第一次让出之后对端
+就没醒过**，这和轮转断言的场景一模一样。
+
+也就是说真正要修的是"让出之后谁把它放回可跑队列"（`__c6_co_run` 的
+`c6c_co_poll_ready(-1)` 这一环），不是 `c6_io` 让不让。目前主干的
+"总让一轮"在 `tests/async.c6` 和 91 个回归用例上是绿的，就保持原样。
+
+门禁现状：96 个 ctest 全绿、tests2 意外失败 0、回归 91 / 92（只差 std-https）。
+
+### 第 304 轮：`C6_CO_EV_WRITE` 的映射是对的，`poll` 那一环还得盯
+
+核对了一遍参数：`C6_CO_EV_READ = 1 / C6_CO_EV_WRITE = 2`（`rt.c6` 的 enum），
+`c6_io` 里 `want = (ev == C6_CO_EV_WRITE ? 4 : 1)` 就是 POLLOUT/POLLIN，
+`c6c_co_poll_ready` 用的也是 `c->wait_ev`（同一份 `want`），所以"fd 事件掩码搞错"
+这条排除了。
+
+`__c6_co_run` 的循环是：`reap → 挑一个 !done && !waiting 的恢复 → 一个都挑不到就
+c6c_co_poll_ready(-1)`。两个 co 都 `waiting` 时应该走到 poll，poll 立刻返回（POLLOUT
+恒就绪）→ 清 `waiting` → `continue` → 恢复。逻辑上没问题，但实测没发生。
+
+下一轮就在 `c6c_co_poll_ready` 里打一行（fd/events/revents/返回值），看它到底被调到
+没有、返回了什么。这是整条链上唯一还没直接观测过的一环。
+
+### 第 305 轮：`__c6_co_run` 主循环补上 `!blocked_on`，饿死问题解决（但没修好 std-https）
+
+`c6c_co_pump` 挑候选时的条件是 `!done && !waiting && !blocked_on`，而
+`__c6_co_run` 自己的主循环只看前两个。父子两条协程同时在册时（`await 某个 async
+调用` 会在父任务里建一个子任务），主循环每轮都挑到被挡住的父任务去"恢复"，子任务
+永远排不上队——这就是第 301 轮抓到的"同一个协程被恢复到 guard 上限"。
+
+补上 `&& !c->blocked_on` 之后，`/tmp/cm9` 里**两个子任务都能跑起来、也都能被唤醒**
+（以前只有一个跑、另一个连 `[snd]` 都不打）：
+
+```
+[req] before snd n=11 wfd=6 / wfd=8
+[snd] fd=6 await fd=6 / [snd] fd=8 await fd=8
+[snd] woke fd=8 / [snd] woke fd=6
+```
+
+但任务还是停在"子任务跑完之后父任务不往下走"，所以 `examples/stdhttps.c6` 仍是
+3 条红、回归仍是 91 / 92。也就是说这条修的是**饿死**，剩下的问题是
+`__c6_co_await` 等子任务结束时没被唤醒（子任务 `done` 之后父任务还挂在
+`blocked_on` 上）。
+
+门禁：96 个 ctest 全绿、tests2 意外失败 0。
+
+### 第 306 轮：`blocked_on` 只在"等的任务还没结束"时跳过 —— 回归 92 / 92
+
+第 305 轮补上 `!blocked_on` 之后，饿死没了但父任务再也不往下走：那个条件把父任务
+**永久**排除在可跑队列之外，子任务结束之后没人把它放回去。
+
+正确的判断是「只在等的那个任务**还没结束**时才跳过」：
+
+```c
+if (c->blocked_on) {
+    C6Co *t = c6c_co_find(c->blocked_on);
+    if (t && !t->done)
+        continue;              /* 还在等，别叫醒它 */
+}
+c6c_co_resume(c);
+break;
+```
+
+改完 `/tmp/cm9` 立刻对：`a=6,11,3 b=8,11,3`（pad[0]=11、blen=3 都和期望一致），
+`examples/stdhttps.c6` **25 check / 0 failure**。
+
+收口动作：`std-https` 进 `regression-c6c.list`（**92** 条），CTest **97** 个用例
+全绿；回归连跑两次 **92 / 92**；tests2 意外失败 0。
+
+回头看这条 bug 的形状：`co` 任务各自跑在 mmap 出来的栈上、靠执行权令牌串行，
+父子任务互相等待时必须让"最能推进的那个"先跑——只看 `waiting` 不够，`blocked_on`
+还要追一层。第 296~306 轮一路排除掉的：实参传递、协程栈大小、`swapstack` 的寄存器
+保存、事件掩码映射、`blocked_on` 的一刀切清空。

@@ -1,0 +1,105 @@
+# 用 c6c 跑 `tests/regression.sh` 时**已经全绿**的用例（单一数据源）。
+#
+# 谁读它：
+#   * `c6c/tests/regression-c6c.sh`（CMake 目标 `regression-c6c`）——跑这一批；
+#   * `cmake/C6Testing.cmake`——`C6_ENABLE_TCC=OFF` 时把这一批注册成 CTest 用例
+#     （label `regression-c6c`），tcc 一侧那 115 个用例在没有 tcc 时没有可测对象。
+#
+# 加一行的条件：`C6_CC=c6c/build/c6c tests/regression.sh <用例>` 真的全绿，
+# 且不是靠运气（用例自己会写 build/ 下相对路径的那几个要串行跑）。
+# 量基线：`./c6c/tests/regression-c6c.sh --all`（跑全部 std-* 用例，打印通过/失败）。
+#
+# 目标（见 c6c/docs/todo.md「把回归迁到 c6c」）：这一批涨到 91 个，tcc 只留作
+# 开发期 oracle 与语料，不再进交付物。
+std-algo
+std-arch
+std-async
+std-async2
+std-async3
+std-async4
+std-async5
+std-audio
+std-audio2
+std-bin
+std-bin2
+std-bwt
+std-calc
+std-cfg2
+std-check
+std-cipher
+std-clean
+std-cli
+std-client
+std-color
+std-conf
+std-cont
+std-creds
+std-crypto
+std-data
+std-db
+std-demo
+std-disk
+std-doc
+std-docs
+std-ds
+std-embed
+std-enc
+std-exec
+std-font
+std-form
+std-fsx
+std-geo
+std-geo2
+std-gfx
+std-graph2
+std-h2
+std-hash
+std-hash2
+std-img
+std-kit
+std-legacy
+std-linalg
+std-linux
+std-markup
+std-match
+std-math2
+std-math3
+std-mesh
+std-mgmt
+std-more
+std-mw
+std-net
+std-next
+std-node
+std-num
+std-ops
+std-ordered
+std-pack
+std-packet
+std-pkg
+std-proto
+std-proto2
+std-proto3
+std-proto4
+std-search
+std-search2
+std-sec
+std-ser
+std-serve
+std-stats
+std-subs
+std-sys
+std-text
+std-textan
+std-time
+std-tour
+std-transcode
+std-ub
+std-util
+std-web
+std-wire
+std-words
+std-box
+std-term
+std-thread
+std-https

@@ -1,5 +1,10 @@
 # c6c —— 用 c6 写的 c6 编译器
 
+[![CI](https://github.com/c6lang/c6/actions/workflows/ci.yml/badge.svg)](https://github.com/c6lang/c6/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/c6lang/c6)](https://github.com/c6lang/c6/releases)
+[![License](https://img.shields.io/github/license/c6lang/c6)](https://github.com/c6lang/c6)
+[![AUR package](https://repology.org/badge/version-for-repo/aur/c6.svg)](https://repology.org/project/c6/versions)
+
 自举、脱离 tcc、多后端（native x86-64 / C99 / LLVM IR）的 c6 编译器。
 
 本目录是**独立项目边界**：自己的构建入口（CMake target `c6c`，没有自己的 Makefile 了）、
@@ -12,7 +17,8 @@
 
 ```sh
 cmake -S . -B build -DC6_ENABLE_TCC=OFF && cmake --build build --target c6c
-# 只要一个宿主 C 编译器：连 tcc 都不构建（默认 ON 时 stage0 是 tcc/c6）
+# 只要一个宿主 C 编译器：连 tcc 都不构建（默认，C6_ENABLE_TCC=OFF）
+# 显式 -DC6_ENABLE_TCC=ON 时 stage0 才是 tcc/c6
 ```
 
 `tcc/` 剩下的是"语料 + oracle"这一件事：`build-tcc` / `tests1-check` /
@@ -26,6 +32,7 @@ CI 的 `no-tcc` 作业就是这条路的机器证据（构建完断言 `tcc/c6` 
 
 | 文档 | 内容 |
 |---|---|
+| [docs/management.md](docs/management.md) | 工程管理规范：清单 / 打包 / 固件 / lock / workspace |
 | [docs/plan.md](docs/plan.md) | 目标、验收口径、实测基线、阶段计划、风险 |
 | [docs/design.md](docs/design.md) | 架构、流式 IR（24 字节/条）、三后端、类型表位分配、镜像与落盘 |
 | [docs/concurrency.md](docs/concurrency.md) | 协程 / 线程 / 原子 / TLS |
@@ -74,7 +81,7 @@ cmake --build build --target objcheck        # 只跑 -c 目标文件的回归
 
 | # | 要求 | 现状 |
 |---|---|---|
-| 1 | 自举 fixpoint 逐字节、tests+std+诊断、三后端同一套用例 | ✅ fixpoint 逐字节相同；前端 123/0 + 跑通 67/0、std 377/377、诊断 314/314、C99 32/32、LLVM 29/29 |
+| 1 | 自举 fixpoint 逐字节、tests+std+诊断、三后端同一套用例 | ✅ fixpoint 逐字节相同；前端 52/0 + c6c 回归 92/0、std 381/381、诊断 316/316、C99 51/51、LLVM 51/0 |
 | 2 | c6c 编出可用的 tcc，并由它跑通 tests2 与 selfhost | ✅ 那个 tcc 跑 tests2 118/144；**第三代 selfhost**（它再编一遍 tcc.c）出体 |
 | 3 | c6c 直接跑 tcc 上游用例 | 通过 **115/144**，其余是 7 条架构性 n/a（每条写死了卡点）、8 条上游只编不跑、14 条上游 expect 过期；**意外失败 0** |
 | 4 | native ≤135 ms、自编译 ≤100 ms、RSS ≤32 MB、线性度 ≤2.6x | ✅ **112 ms / 88 ms / 25 MB / 每行成本 0.39x** |
@@ -103,7 +110,7 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 后端；`-o`、`-c`、`-E`、`-fsyntax-only`、`--emit-c`、`--emit-llvm` 都跟它互斥。
 回归：`cmake --build build --target runflag`。
 
-许可证：`LICENSE` 为 MIT，与 `tcc/`（LGPL-2.1）严格分离；若项目所有者另有安排，替换本文件即可。
+许可证：仓库根的 `LICENSE` 现在就是本文件的 MIT；与 `tcc/`（LGPL-2.1，见 `tcc/COPYING`）严格分离。
 
 ## 跑 `test "…" { }` 块：`-test`
 
@@ -447,6 +454,42 @@ cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 回归：`cmake --build build --target pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
 `include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
 `-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
+
+## 回归：让 `tests/regression.sh` 换编译器跑
+
+根目录那 92 个 `std-*` 用例写在 `tests/regression.sh` 里，被测编译器现在是
+**`$C6_CC`**（默认 `$C6_TCC_DIR/c6`，也就是 tcc 那一侧）。把它指到 c6c 就整批换
+编译器：
+
+```sh
+C6_CC=c6c/build/c6c tests/regression.sh std-demo     # 单个用例
+cmake --build build --target regression-c6c         # 已全绿的那批（列表见下）
+./c6c/tests/regression-c6c.sh --all                 # 量基线：全部 std-* 用例
+```
+
+* `c6c/tests/regression-c6c.list` 是**单一数据源**：c6c 已经跑绿的用例名一行一个；
+* `C6_ENABLE_TCC=OFF` 时 `cmake/C6Testing.cmake` 把这张表注册成 CTest 用例
+  （label `regression-c6c`，同时也带 `c6c`），所以没有 tcc 的构建里也有真回归：
+  `ctest --test-dir build-notcc -L regression-c6c -j 4`；
+* selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
+  仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
+
+当前基线（第 306 轮实测）：**92 / 92 全绿**，`regression-c6c.list` 92 条、CTest
+97 个用例。之前挂到最后的 `std-https`（co 那两路）在第 306 轮修好：根因是
+`__c6_co_run` 的主循环对 `blocked_on` 的处理——`await 某个 async 调用` 会在父任务里
+建一个子任务，主循环要么无条件跳过被挡住的父任务（子任务结束之后没人叫醒它），
+要么无条件恢复它（父任务空转，实测同一个协程被恢复到 guard 上限）。正确条件是
+"只在等的那个任务还没结束时才跳过"，历史过程记在 `c6c/docs/todo.md` 第
+301~306 轮。当前基线与剩余缺口以 [docs/acceptance.md](docs/acceptance.md) 和
+根 `CHANGELOG.md` 为准；`todo.md` 是施工账本，不应当作现行缺口清单。
+
+格式化那一片（`%f` 的舍入、`%g` 的尾零、`%.0d`、`%#x`、`-0.0`、1e19 以上的
+整数部分、二进制转义 `"\xde"`）已经在第 212 轮对齐 glibc，并各钉了一个
+check（`printfcheck` / `esccheck`）——这两条线不再是用例挂掉的原因。
+
+顺带一个容易掉进去的坑：`rt.c6` 的 syscall 薄壳现在会**设 `errno`**（返回值
+仍是 `-errno`）。在这之前 `errno == EINPROGRESS` / `EAGAIN` / `EINTR` 这类分支
+永远走失败那条路——`std/net/tcp.c6` 的非阻塞 connect 就是这么被卡死的。
 
 ## 第二套 native 后端：aarch64
 

@@ -19,10 +19,14 @@
  *    - comparisons are materialised into a 32 byte array %cnd right away
  *      (LLVM has no CPU flags), two bytes per comparison pair, so VT_CMP /
  *      VT_JMP / VT_JMPI keep their usual meaning
- *    - data sections become one byte array each and the pointer slots are
- *      patched from the relocation records by __llvm_init(), which runs from
- *      @llvm.global_ctors: the symbol table is not relocatable at run time,
- *      exactly like in the C back-end
+ *    - data sections become one byte array each; a slot the front-end recorded
+ *      a relocation for becomes an i8/i16/i32/i64 member of a packed struct
+ *      that holds the address, so the object file carries an ordinary
+ *      relocation.  (It used to be patched after load by a constructor, which
+ *      left the slot zero on a target with no C run time to run
+ *      llvm.global_ctors -- a kernel, for one.  wasm is the exception: it has
+ *      no absolute address for a function, so there the slots stay zero and
+ *      @__llvm_init fills them in from @llvm.global_ctors.)
  *    - symbols are referred to as '@S<idx>+<addend>@' / '@SC<idx>+...@'
  *      placeholders while code is emitted and resolved when the file is
  *      written, because a tentative definition can still move to another
@@ -408,7 +412,7 @@ static int l_nins, l_ins_cap;
 static int l_tmpn;
 static int l_stable;            /* the caller owns the frame (async body) */
 static LBuf l_prog;             /* finished functions */
-static LBuf l_init;             /* body of __llvm_init() */
+static LBuf l_init;             /* body of __llvm_init() (wasm only) */
 static int l_init_used;
 
 static int l_dead(void)
@@ -2312,7 +2316,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType *ftype = &func_sym->type;
     CType *ret = &ftype->ref->type;
     Sym *s;
-    const char *fname;
+    const char *fname, *lnk = "";
     char tb[1024], pb[1024];
     int idx, size, align, n = 0, np = 0, is_vararg, i;
     int ret_struct, small_sret = 0, hidden_sret;
@@ -2329,6 +2333,15 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         && func_sym->c < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))
         && l_name_ok(l_esym_name(func_sym->c)))
         fname = l_esym_name(func_sym->c);
+    /* A function whose Elf symbol is STB_LOCAL was declared 'static' in the
+       source: the module has to keep that private, or two translation units
+       with a same-named static helper collide at link time ("multiple
+       definition").  This is the LLVM counterpart of c99_is_static_fn(). */
+    if (func_sym->c > 0
+        && func_sym->c < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))
+        && strcmp(fname, "main") != 0
+        && ELFW(ST_BIND)(l_esym(func_sym->c)->st_info) == STB_LOCAL)
+        lnk = "internal ";
     l_skip_fn = 0;
     if (!strcmp(fname, "main")) {
         if (tcc_state && tcc_state->c6_test_mode)
@@ -2360,13 +2373,14 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     if (hidden_sret) {
         l_type(tb, sizeof tb, ret);
         n += snprintf(l_header + n, LHDR_SZ - n,
-                      "define void @%s(ptr sret(%s) %%aret", l_q(fname), tb);
+                      "define %svoid @%s(ptr sret(%s) %%aret", lnk,
+                      l_q(fname), tb);
         np = 1;
     } else if (small_sret) {
-        n += snprintf(l_header + n, LHDR_SZ - n, "define %s @%s(",
+        n += snprintf(l_header + n, LHDR_SZ - n, "define %s%s @%s(", lnk,
                       l_type(tb, sizeof tb, &srt), l_q(fname));
     } else {
-        n += snprintf(l_header + n, LHDR_SZ - n, "define %s @%s(",
+        n += snprintf(l_header + n, LHDR_SZ - n, "define %s%s @%s(", lnk,
                       l_type(tb, sizeof tb, ret), l_q(fname));
     }
     idx = 0;
@@ -3182,6 +3196,189 @@ static int l_all_zero(const unsigned char *p, int n)
     return 1;
 }
 
+/* A relocation slot of a data section that can go straight into the
+   initializer.  The object file then carries a real absolute relocation and
+   nothing has to be patched at start-up -- which is what a freestanding
+   target needs: a kernel never runs llvm.global_ctors, so a slot that only a
+   constructor fills in stays zero there. */
+typedef struct LSlot {
+    unsigned long off;
+    int size;
+    char *expr;                 /* tcc_strdup'ed target address */
+} LSlot;
+
+/* One piece of an initializer: a run of bytes, or a relocation slot. */
+typedef struct LMember {
+    int off;
+    int len;
+    int zero;
+    const char *expr;           /* non-NULL: relocation slot of len bytes */
+} LMember;
+
+/* A run of bytes inside a data section. */
+typedef struct LRun {
+    int off, len, zero;
+} LRun;
+
+/* Byte size of an absolute relocation, 0 when this back-end cannot express it
+   as an initializer. */
+static int l_reloc_size(int type)
+{
+    if (type == R_X86_64_64)
+        return 8;
+    if (type == R_X86_64_32 || type == R_X86_64_32S)
+        return 4;
+    if (type == R_X86_64_16)
+        return 2;
+    if (type == R_X86_64_8)
+        return 1;
+    return 0;
+}
+
+/* The relocations of a data section, sorted by offset. */
+static int l_collect_slots(Section *s, LSlot **out)
+{
+    Section *rel = s ? s->reloc : NULL;
+    LSlot *v = NULL;
+    int n = 0, cap = 0, i, j;
+    unsigned long k;
+
+    *out = NULL;
+    if (l_arch_wasm())
+        /* a wasm module has no absolute address for a function: the back-end
+           refuses a ptrtoint of one in a static initializer, so the slots
+           stay zero and @__llvm_init fills them in (see the caller) */
+        return 0;
+    if (!rel || !rel->data_offset || s->sh_type == SHT_NOBITS)
+        return 0;
+    for (k = 0; k + sizeof(ElfW_Rel) <= rel->data_offset;
+         k += sizeof(ElfW_Rel)) {
+        ElfW_Rel *r = (ElfW_Rel *)(rel->data + k);
+        int size = l_reloc_size(ELFW(R_TYPE)(r->r_info));
+
+        if (!size)
+            continue;
+        if (r->r_offset + (unsigned long)size > s->data_offset)
+            continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            v = tcc_realloc(v, cap * sizeof *v);
+        }
+        v[n].off = (unsigned long)r->r_offset;
+        v[n].size = size;
+        v[n].expr = tcc_strdup(l_symref(ELFW(R_SYM)(r->r_info), r->r_addend));
+        n++;
+    }
+    /* the records come out of the front-end in no particular order */
+    for (i = 1; i < n; i++) {
+        LSlot t = v[i];
+
+        for (j = i; j > 0 && v[j - 1].off > t.off; j--)
+            v[j] = v[j - 1];
+        v[j] = t;
+    }
+    *out = v;
+    return n;
+}
+
+/* Interleave the byte runs with the relocation slots: every slot becomes its
+   own member so it can hold a pointer instead of eight zero bytes. */
+static int l_merge_members(LMember **out, LRun *runs, int nrun, int size,
+                           LSlot *slots, int nslot)
+{
+    LMember *v = NULL;
+    int n = 0, cap = 0, ri = 0, si = 0, pos = 0;
+
+    while (pos < size) {
+        while (ri < nrun && pos >= runs[ri].off + runs[ri].len)
+            ri++;
+        if (si < nslot && (unsigned long)pos == slots[si].off) {
+            if (n == cap) {
+                cap = cap ? cap * 2 : 8;
+                v = tcc_realloc(v, cap * sizeof *v);
+            }
+            v[n].off = pos;
+            v[n].len = slots[si].size;
+            v[n].zero = 0;
+            v[n].expr = slots[si].expr;
+            n++;
+            pos += slots[si].size;
+            si++;
+            continue;
+        }
+        if (ri >= nrun)
+            break;
+        {
+            int end = runs[ri].off + runs[ri].len;
+
+            if (si < nslot && (unsigned long)end > slots[si].off)
+                end = (int)slots[si].off;
+            if (end <= pos)
+                break;
+            if (n == cap) {
+                cap = cap ? cap * 2 : 8;
+                v = tcc_realloc(v, cap * sizeof *v);
+            }
+            v[n].off = pos;
+            v[n].len = end - pos;
+            v[n].zero = runs[ri].zero;
+            v[n].expr = NULL;
+            n++;
+            pos = end;
+        }
+    }
+    *out = v;
+    return n;
+}
+
+/* The packed struct form: byte runs and pointer slots side by side, so the
+   section stays one contiguous object that is still addressable by byte
+   offset (see l_symref / l_shndx_addr). */
+static void l_emit_members(FILE *f, int sec, const unsigned char *data,
+                           int dlen, LMember *mem, int nmem)
+{
+    int j, k;
+
+    fprintf(f, "@__llvm_d%d = internal global <{ ", sec);
+    for (j = 0; j < nmem; j++) {
+        if (j)
+            fprintf(f, ", ");
+        if (mem[j].expr)
+            fprintf(f, "i%d", mem[j].len * 8);
+        else
+            fprintf(f, "[%d x i8]", mem[j].len);
+    }
+    fprintf(f, " }> <{ ");
+    for (j = 0; j < nmem; j++) {
+        if (j)
+            fprintf(f, ", ");
+        if (mem[j].expr) {
+            int bits = mem[j].len * 8;
+
+            if (bits == 64)
+                fprintf(f, "i64 ptrtoint (ptr %s to i64)", mem[j].expr);
+            else
+                fprintf(f, "i%d trunc (i64 ptrtoint (ptr %s to i64) to i%d)",
+                        bits, mem[j].expr, bits);
+        } else if (mem[j].zero) {
+            fprintf(f, "[%d x i8] zeroinitializer", mem[j].len);
+        } else {
+            fprintf(f, "[%d x i8] c\"", mem[j].len);
+            for (k = 0; k < mem[j].len; k++) {
+                int o = mem[j].off + k;
+                unsigned char c = (o >= dlen) ? 0 : data[o];
+
+                if (c >= 32 && c < 127 && c != '"' && c != '\\')
+                    fputc(c, f);
+                else
+                    fprintf(f, "\\%02X", c);
+            }
+            fprintf(f, "\"");
+        }
+    }
+    fprintf(f, " }>, align 16\n");
+}
+
 ST_FUNC void llvm_reset(void)
 {
     int i;
@@ -3263,46 +3460,45 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         l_fatal("llvm output: variable length arrays are not supported");
     }
 
-    /* the pointer slots of the data sections are patched at load time: the
-       symbol table of the compiler is not relocatable at run time */
+    /* The pointer slots of the data sections are ordinary relocations in the
+       initializer now (l_collect_slots), so nothing has to run after load --
+       which is what a target with no C run-time needs: a kernel never runs
+       llvm.global_ctors.  A wasm module is the exception (see
+       l_collect_slots): there the slots keep the constructor path. */
     l_init.len = 0;
     if (l_init.data)
         l_init.data[0] = 0;
-    for (i = 1; i < s1->nb_sections; i++) {
-        Section *s = s1->sections[i], *rel = s ? s->reloc : NULL;
-        unsigned long k;
+    if (l_arch_wasm()) {
+        for (i = 1; i < s1->nb_sections; i++) {
+            Section *s = s1->sections[i], *rel = s ? s->reloc : NULL;
+            unsigned long k;
 
-        if (!l_data_section(s) || !rel || !rel->data_offset)
-            continue;
-        for (k = 0; k + sizeof(ElfW_Rel) <= rel->data_offset;
-             k += sizeof(ElfW_Rel)) {
-            ElfW_Rel *r = (ElfW_Rel *)(rel->data + k);
-            int type = ELFW(R_TYPE)(r->r_info);
-            int idx = ELFW(R_SYM)(r->r_info);
-            long long addend = r->r_addend;
-            int size = type == R_X86_64_64 ? 8
-                : (type == R_X86_64_32 || type == R_X86_64_32S) ? 4
-                : type == R_X86_64_16 ? 2
-                : type == R_X86_64_8 ? 1 : 0;
-            const char *tgt;
-
-            if (!size)
+            if (!l_data_section(s) || !rel || !rel->data_offset)
                 continue;
-            tgt = l_symref(idx, addend);
-            if (size == 8)
-                lb_printf(&l_init,
-                          "  store i64 ptrtoint (ptr %s to i64), ptr "
-                          "getelementptr inbounds (i8, ptr @__llvm_d%d, i64 %lu),"
-                          " align 1\n",
-                          tgt, s->sh_num, (unsigned long)r->r_offset);
-            else
-                lb_printf(&l_init,
-                          "  store i%d trunc (i64 ptrtoint (ptr %s to i64) "
-                          "to i%d), ptr getelementptr inbounds (i8, ptr "
-                          "@__llvm_d%d, i64 %lu), align 1\n",
-                          size * 8, tgt, size * 8, s->sh_num,
-                          (unsigned long)r->r_offset);
-            l_init_used = 1;
+            for (k = 0; k + sizeof(ElfW_Rel) <= rel->data_offset;
+                 k += sizeof(ElfW_Rel)) {
+                ElfW_Rel *r = (ElfW_Rel *)(rel->data + k);
+                int size = l_reloc_size(ELFW(R_TYPE)(r->r_info));
+                const char *tgt;
+
+                if (!size)
+                    continue;
+                tgt = l_symref(ELFW(R_SYM)(r->r_info), r->r_addend);
+                if (size == 8)
+                    lb_printf(&l_init,
+                              "  store i64 ptrtoint (ptr %s to i64), ptr "
+                              "getelementptr inbounds (i8, ptr @__llvm_d%d, i64 %lu),"
+                              " align 1\n",
+                              tgt, s->sh_num, (unsigned long)r->r_offset);
+                else
+                    lb_printf(&l_init,
+                              "  store i%d trunc (i64 ptrtoint (ptr %s to i64) "
+                              "to i%d), ptr getelementptr inbounds (i8, ptr "
+                              "@__llvm_d%d, i64 %lu), align 1\n",
+                              size * 8, tgt, size * 8, s->sh_num,
+                              (unsigned long)r->r_offset);
+                l_init_used = 1;
+            }
         }
     }
 
@@ -3392,14 +3588,18 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
     /* one byte array per allocated data section */
     for (i = 1; i < s1->nb_sections; i++) {
         Section *s = s1->sections[i];
-        int size;
+        LSlot *slots = NULL;
+        int nslot, size;
 
         if (!l_data_section(s))
             continue;
         size = s->data_offset ? (int)s->data_offset : 1;
-        if (s->sh_type == SHT_NOBITS || l_all_zero(s->data, s->data_offset)) {
+        nslot = l_collect_slots(s, &slots);
+        if (s->sh_type == SHT_NOBITS
+            || (nslot == 0 && l_all_zero(s->data, s->data_offset))) {
             fprintf(f, "@__llvm_d%d = internal global [%d x i8] "
                        "zeroinitializer, align 16\n", i, size);
+            tcc_free(slots);
             continue;
         }
         /* Long all-zero stretches are emitted as separate zeroinitializer
@@ -3409,7 +3609,7 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
            stays a single contiguous object that is still addressable by byte
            offset (see l_symref / l_shndx_addr). */
         {
-            struct { int off, len, zero; } *runs = NULL;
+            LRun *runs = NULL;
             int nrun = 0, rcap = 0, pos = 0, split = 0;
 
 #define L_ZB(k) ((k) >= (int)s->data_offset || s->data[k] == 0)
@@ -3460,7 +3660,14 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
                 if (runs[j].zero)
                     split = 1;
 
-            if (!split) {
+            if (nslot != 0) {
+                LMember *mem = NULL;
+                int nmem = l_merge_members(&mem, runs, nrun, size, slots,
+                                           nslot);
+
+                l_emit_members(f, i, s->data, (int)s->data_offset, mem, nmem);
+                tcc_free(mem);
+            } else if (!split) {
                 /* no long zero stretch: keep the single-array form */
                 fprintf(f, "@__llvm_d%d = internal global [%d x i8] c\"", i,
                         size);
@@ -3504,6 +3711,9 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
 #undef L_ZB
 #undef L_PUSH
         }
+        for (j = 0; j < nslot; j++)
+            tcc_free(slots[j].expr);
+        tcc_free(slots);
     }
 
     /* the globals other translation units can see keep their linker name */
@@ -3547,8 +3757,16 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
                 dup = 1;
         if (dup)
             continue;
-        fprintf(f, "@%s = weak alias i64, ptr @%s\n",
-                l_q(a->plain), l_q(a->target));
+        {
+            /* an alias cannot have weaker linkage than its aliasee: a static
+               method (STB_LOCAL) needs an internal alias, not a weak one */
+            int ti = l_find_name(a->target);
+
+            fprintf(f, "@%s = %salias i64, ptr @%s\n", l_q(a->plain),
+                    ti && ELFW(ST_BIND)(l_esym(ti)->st_info) == STB_LOCAL
+                        ? "internal " : "weak ",
+                    l_q(a->target));
+        }
     }
 
     /* what the module imports */
@@ -3619,7 +3837,7 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         }
     }
 
-    /* the constructor that patches the data sections */
+    /* the constructor that patches the data sections (wasm only) */
     if (l_init_used) {
         fprintf(f, "\ndefine internal void @__llvm_init() {\n");
         fprintf(f, "%s", initf.data);

@@ -57,6 +57,8 @@ include(CTest)
 
 set(C6_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include("${C6_MODULE_DIR}/C6Options.cmake")
+# .pc / find_package 包配置 / LD_LIBRARY_PATH 的共用机制（c6 与 c6c 都走它）
+include("${C6_MODULE_DIR}/C6Metadata.cmake")
 include("${C6_MODULE_DIR}/C6Tcc.cmake")
 include("${C6_MODULE_DIR}/C6Build.cmake")
 include("${C6_MODULE_DIR}/C6C.cmake")

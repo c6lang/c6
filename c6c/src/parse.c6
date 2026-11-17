@@ -926,6 +926,9 @@ static u32 BLOCK_VAL;
 static u32 BLOCK_TY;
 static int BLOCK_HAS;
 static u32 METHOD_SELF_TY;  /* 结构体内方法：接收者类型（0 = 普通函数） */
+/* 方法体入口那一层作用域。模板实例的体是在实例化点展开的，那里能看见
+ * 调用方函数的局部量——裸字段名会被同名局部量遮住（见 sym_in_method_scope）。 */
+static Scope *METHOD_SCOPE_BASE;
 static u32 CUR_RET_TY;      /* 当前函数的返回类型（return 要按它转换） */
 /* 聚合按值返回的"结果槽"（**只给 C99 输出后端**用）：C 的语义是调用者提供
  * 位置、被调方写进去；C99 后端以前返回的是被调方帧里那个临时对象的地址，
@@ -959,6 +962,21 @@ static int agg_ret_abi(u32 fty, u32 rty)
     return 1;
 }
 static u32 ty_promote(u32 ty);
+/* `sizeof("a" "b" …)`：括号里是一串（至少一个）相邻字符串字面量、后面紧跟
+ * `)`。以前只认"恰好一个"字面量，拼接的（`sizeof("39°" "54'15\"N")`）掉进
+ * 表达式分支，拿到的是退化后的 `char *`，sizeof 变成 8——stdgeo 的
+ * `S(...)` 这类拼接字面量长度全错（DMS 的秒位被截掉，to_deg 少算 15 角秒）。 */
+static int sizeof_lit_run(void)
+{
+    int k = 1;
+
+    if (!pa_is_ch('(') || !pa_peek(1) || pa_peek(1)->kind != TK_STR)
+        return 0;
+    while (k < 64 && pa_peek(k) && pa_peek(k)->kind == TK_STR)
+        k++;
+    return pa_peek(k) && pa_peek(k)->kind == TK_PUNCT && tok_eq(pa_peek(k), ")");
+}
+
 static u32 gen_unary(void);
 static int parse_const_u64(u64 *out);
 static u32 cur_op_ty(void);
@@ -977,6 +995,31 @@ static u32 cplx_cmp(u8 cc, u32 a, u32 aty, u32 b, u32 bty);
 static u32 cplx_neg(u32 a, u32 cty);
 static u32 gen_int_lit(u64 c, u32 ty);
 static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty);
+
+typedef struct InitSave {
+    u32 n;
+    int trunc;
+    u32 cur;
+    u32 max;
+    u32 lvd;
+    u32 count;
+    int cntok;
+    u32 *off;
+    u32 *ty;
+    u32 *bits;
+    u32 *boff;
+    u32 *lvty;
+    u32 *lvoff;
+} InitSave;
+
+/* 复合字面量（`(Str){ … }`）可能出现在**另一个初始化器里**：
+ * `Str a[3] = { (Str){ … }, (Str){ … }, … }`。它内部的 gen_init_obj 会把全局
+ * 的叶子表（LF_）、游标（INIT_CUR / INIT_MAX）和层栈（LV_）整个重建，外面那个
+ * 初始化器接着走时游标已经指向别处——表现就是"只有第一个元素被写进去，剩下两个
+ * 被 skip_init_list 当成多余的值吞掉"（std-search2 的倒排统计因此对不上）。
+ * 进出各存/取一次，外面那个初始化器完全不受影响。 */
+static void init_save(InitSave *st);
+static void init_restore(InitSave *st);
 
 /* 上限可调：环境变量 C6C_MAX_ERRORS（默认 20），调大是为了能一次看清
  * 大文件（比如 tcc.h）里所有独立的错误点。 */
@@ -1426,6 +1469,32 @@ static void alias_register(const char *from, const char *to)
     NALIAS++;
 }
 
+/* 方法式函数的**短名 → 真名**别名。
+ *
+ * 声明那会儿结构体可能还只有个名字（`struct Bucket;`），发射名只能按源码
+ * 短名走，调用点也按它发过重定位；等到定义处结构体补齐了，发射名换成
+ * `<结构体>_<方法>`，旧的那条就悬着了（`static int poke(Bucket *b);` 先声明
+ * 后定义时，链接期报 `poke$2` 未定义）。
+ *
+ * 记账而不是当场接：`x64_alias_idx` 干的是**复制偏移**，定义处这会儿代码
+ * 还没生成，接过去的是 0 —— 引用会跳到地址 0（c6c 编 tcc 时 whole 程序
+ * 一启动就段错误，就是这条线踩的）。等所有 TU 解析完、代码都发出来，
+ * `alias_apply()` 里再接，那会儿偏移才是定下来的。
+ */
+#define METH_ALIAS_MAX 1024
+static u32 METH_ALIAS_FROM[METH_ALIAS_MAX];
+static u32 METH_ALIAS_TO[METH_ALIAS_MAX];
+static u32 NMETH_ALIAS;
+
+static void meth_alias_register(u32 from, u32 to)
+{
+    if (from == to || NMETH_ALIAS >= METH_ALIAS_MAX)
+        return;
+    METH_ALIAS_FROM[NMETH_ALIAS] = from;
+    METH_ALIAS_TO[NMETH_ALIAS] = to;
+    NMETH_ALIAS++;
+}
+
 static u32 gen_expr(void);
 static u32 gen_assign(void);
 static u32 value_of(u32 v);
@@ -1571,8 +1640,9 @@ static int agg_find_member(u32 ty, const char *name, u32 len)
         if (e->ty == ty) {
             for (i = 0; i < e->n; i++)
                 if (e->lens[i] == len && e->names[i] &&
-                    memcmp(e->names[i], name, len) == 0)
+                    memcmp(e->names[i], name, len) == 0) {
                     return (int)i;
+                }
             /* 同一个 type id 可能有多条名字表（布局相同、名字不同），继续找 */
         }
         j = e->next_same;
@@ -1641,6 +1711,42 @@ static int agg_find_promoted(u32 ty, const char *nm, u32 len, u32 *mty, u32 *mof
         }
     }
     return 0;
+}
+
+/* `s` 是不是方法**自己的**作用域里声明的？
+ *
+ * 模板实例的体在实例化点（往往是别的函数的声明中间）展开，那时调用方的
+ * 局部量、形参都在作用域链上。方法体里的裸名字本该指向接收者的成员，可
+ * `sym_find` 会先撞上调用方的同名局部量：
+ *
+ *     struct DIter@T { Deque@T *d; int i; }   方法体里裸写 d / i
+ *     void tour_deque(void) { @Deque@int d = ...; int i = 0; }
+ *     foreach (int x = d->iter())             实例在这里展开
+ *
+ * 于是 `i++` 改的是 tour_deque 的循环变量、`has()` 读的是调用方的 `i`：
+ * std-tour 的 deque 迭代永远是第一个元素（sum 恒等于 6）。
+ *
+ * 判断方法：从当前作用域往上走到方法入口那一层，看这个符号到底登记在哪个
+ * 作用域的链表里。链表里有 = 方法自己的（形参/局部量/`self`），没有 = 外层
+ * 函数的，调用方该让位给接收者的成员。 */
+static int sym_in_method_scope(Sym *s)
+{
+    Scope *sc = SCOPE;
+
+    if (!s)
+        return 1;
+    if (!METHOD_SCOPE_BASE)
+        return 1;
+    for (;;) {
+        Sym *p = sc ? sc->head : NULL;
+
+        for (; p; p = p->scope_next)
+            if (p == s)
+                return 1;
+        if (sc == METHOD_SCOPE_BASE || !sc || !sc->up)
+            return 0;
+        sc = sc->up;
+    }
 }
 
 /* 字符族判断：插值只接受"能当文本看"的切片/指针。`@char` 这种托管文本
@@ -2971,11 +3077,18 @@ static int hex_val(int c)
 }
 
 /* 解码一个转义序列：*pp 指向反斜杠之后，返回字节值并推进 *pp。 */
+/* 上一次 esc_decode 解出来的是不是**码点**（`\uXXXX` / `\UXXXXXXXX`）。
+ * `\x41` / `\101` 是**字节**转义，值 >= 0x80 也只能写进一个字节——把它们
+ * 当码点再 UTF-8 编码会把 `"\xde"` 变成两个字节（踩过：std/encoding/hexdump
+ * 的用例就是拿它拼二进制数据，结果 0xde 变成了 0xc3 0x9e）。 */
+static int ESC_IS_UCN;
+
 static u32 esc_decode(const char **pp, const char *end)
 {
     const char *p = *pp;
     u32 v = 0;
 
+    ESC_IS_UCN = 0;
     if (p >= end)
         return 0;
     switch (*p) {
@@ -2992,6 +3105,8 @@ static u32 esc_decode(const char **pp, const char *end)
         /* 通用字符名：\uXXXX（4 位）/ \UXXXXXXXX（8 位）→ 码点 */
         int want = (*p == 'u') ? 4 : 8;
         int k = 0;
+
+        ESC_IS_UCN = 1;
 
         p++;
         for (k = 0; k < want && p < end && hex_val((u8)*p) >= 0; k++) {
@@ -5120,7 +5235,18 @@ static u32 tmpl_inst(Tmpl *t, const u32 *args)
         memcpy(inst_nm_sv, TMPL_INST_NM, sizeof(inst_nm_sv));
         memcpy(TMPL_INST_NM, nm, sizeof(TMPL_INST_NM));
         TMPL_INST_NM[sizeof(TMPL_INST_NM) - 1] = 0;
-        ty = parse_struct_body(cid, tag, t->is_union);
+        /* 外层可能正走在"只登记签名"的那一遍里（模板 A 的方法签名里用到
+         * 模板 B 的实例）：B 的体必须在这里一次展开完。外层的第二遍不会
+         * 再重放 B —— `tmpl_inst` 的缓存直接短路返回，于是 B 的方法只剩
+         * 声明、没有定义，链接期报 `<实例名>_<方法>` 未定义（std 的
+         * `Vect@T.iter()` 返回 `Iter@T`，`Iter_int_has` 就是这么丢的）。 */
+        {
+            int sig_sv = PA_SIG_ONLY;
+
+            PA_SIG_ONLY = 0;
+            ty = parse_struct_body(cid, tag, t->is_union);
+            PA_SIG_ONLY = sig_sv;
+        }
         memcpy(TMPL_INST_NM, inst_nm_sv, sizeof(inst_nm_sv));
         PA_TMPL_BODY = tmpl_body_sv;
         tmpl_restore_state(&tmpl_sv);
@@ -6383,7 +6509,7 @@ static u32 parse_enum_spec(void)
             if (pa_accept_ch('='))
                 val = (u32)(i32)const_expr();
             s = sym_add(nm, k, ty_int(), SC_ENUMC);
-            s->val = (i64)(val ? (val | ebase) : 0u);
+            s->val = (i64)(i32)(val ? (val | ebase) : 0u);
             {
                 /* 裸名也登记一份；已经存在就不覆盖，改成"毒化"——两个枚举
                  * 都有这个成员名，裸用就是歧义。 */
@@ -6391,7 +6517,7 @@ static u32 parse_enum_spec(void)
 
                 if (!bs) {
                     bs = sym_add(bare, bt->len, ty_int(), SC_ENUMC);
-                    bs->val = (i64)(val ? (val | ebase) : 0u);
+                    bs->val = (i64)(i32)(val ? (val | ebase) : 0u);
                 } else if ((u32)bs->val != (val ? (val | ebase) : 0u)) {
                     /* 同名但值不同：两个枚举真的都有这个成员 */
                     poison_add(bare, bt->len);
@@ -6419,7 +6545,30 @@ static u32 parse_enum_spec(void)
                 pa_error("redeclaration of '%s'", nm);
         }
         s = sym_add(nm, k, ty_int(), SC_ENUMC);
-        s->val = (i64)(val ? (val | ebase) : 0u);
+        s->val = (i64)(i32)(val ? (val | ebase) : 0u);
+        if (ebase && pa_cur() && mod_of_file((u32)pa_cur()->file)) {
+            const char *mpA = mod_path(mod_of_file((u32)pa_cur()->file));
+            char qA[320] = {0};
+            u32 wA = 0;
+            u32 jA = 0;
+
+            if (mpA) {
+                for (jA = 0; mpA[jA] && wA + 2 < 300; jA++)
+                    if (mpA[jA] == '.') { qA[wA++] = '_'; qA[wA++] = '_'; }
+                    else if (wA + 1 < 300) qA[wA++] = mpA[jA];
+                qA[wA++] = '_'; qA[wA++] = '_';
+                if (wA + k < 316) {
+                    Sym *sqA = NULL;
+
+                    memcpy(qA + wA, tok_data(t), k);
+                    wA += k;
+                    sqA = sym_add(qA, wA, ty_int(), SC_ENUMC);
+                    /* 和裸名那次**同一个表达式**：`OK = 0` 不能加基址
+                     * （tests/err_ids.c6 的"0 永远是「没有错误」"）。 */
+                    sqA->val = (i64)(i32)(val ? (val | ebase) : 0u);
+                }
+            }
+        }
         /* 有标签就再登记一份限定名 `Tag.名字`（`enum Color { GREEN }` 之后
          * 也能写 `Color.GREEN`）；同名已存在就不覆盖。 */
         if (etaglen && etaglen + k + 2 < sizeof(nm)) {
@@ -6433,7 +6582,7 @@ static u32 parse_enum_spec(void)
             if (!sym_find(qn, qk)) {
                 Sym *qs = sym_add(qn, qk, ty_int(), SC_ENUMC);
 
-                qs->val = (i64)(val ? (val | ebase) : 0u);
+                qs->val = (i64)(i32)(val ? (val | ebase) : 0u);
             }
         }
         val++;
@@ -6889,9 +7038,27 @@ static u32 parse_closure_type(void)
     return ty_closure(ty_func(rty, pts, np, variadic));
 }
 
+/* 形参表里**不发**"隐式 int"告警：tcc 的 type-defaults-to-int 只对缺类型的
+ * 声明发（decl() 的 oldint），对形参表里的裸标识符（K&R `int f(a, b)`）和
+ * 省略号都不告警——实测 `tcc kr.c` 零告警。c6c 的 parse_param_list 会把
+ * `...` 和 K&R 裸标识符喂给 parse_typespec 兜底成 int（幻影形参，nparams
+ * 不自增、无实害），有了告警之后这条旧路径每条变参原型都多一行噪声
+ * （c6c/include/stdio.h 的 23-26 曾让 tests2 全线飘红）。 */
+static int PA_NO_II_WARN;
+
+/* 隐式 int 的**待定告警**：parse_typespec 兜底成 int 时先记一笔，等声明符
+ * 解析完再看最终类型告警——tcc 的 warning 在 decl() 里只对**非函数**声明发
+ * （`} else if (oldint)` 前面是 VT_FUNC 分支），所以 `f();` / `f(){}` 不告警、
+ * `n;` 告警（tests2/60_errors_and_warnings 的 "f(); // don't warn" 逐字要它）。
+ * 由 gen_decl_from_spec / gen_local_decl 在 parse_declarator 之后消费。 */
+static int PA_II_PENDING;
+
 static u32 parse_typespec(void)
 {
     u32 base = 0;
+
+    /* 每条新声明重新计：上一笔待定告警由声明收尾处消费（见 PA_II_PENDING） */
+    PA_II_PENDING = 0;
     int nlong = 0;
     int nshort = 0;
     int uns = 0;
@@ -7400,31 +7567,15 @@ static u32 parse_typespec(void)
         saw_complex = 0;
     }
     if (!base) {
-        /* C TU 里不带类型说明符的声明按隐式 int 处理，但要发 tcc 口径的
-         * warning（tests2/102_alignas.expect 与 60_errors_and_warnings.expect
-         * 都要它）；c6 源码总是显式类型，不要打噪声。
-         *
-         * 判据一：`!base` 不等于"没写说明符"。`int`、`unsigned long`、
-         * `signed short` 这些只由修饰符组成的写法，base 也是走到下面这串 if
-         * 才补出来的，得靠 saw_int（见过 int/long/short/unsigned/signed 之一）
-         * 分辨。只看 `!base` 的话每个 `int f(...)`、每个 `unsigned long x;`
-         * 都算"隐式 int"——一条 C TU 上固定刷 218 条（bundled 头里的声明），
-         * tests2 的输出比对整片判"不符"，stderr 也不再干净。
-         *
-         * 判据二：只有**对象声明**才告警，而且必须真的站在声明符上。tcc 的
-         * 告警只挂在 decl() 的对象分支上：函数声明/定义、旧式（K&R）形参表、
-         * 强制转换里的类型名都不发——60_errors_and_warnings.c 的
-         * test_default_int_type 就把 `n;`（warn）和 `f();`（don't warn）并排
-         * 摆着。用"名字后面跟 `;` `=` `,` `[`"来认对象声明符，顺带把变参
-         * 原型里那个会问一次类型的 `...`（`int printf(const char *fmt, ...)`）
-         * 和 `(int(ATTR *)(void))` 这类转换类型名挡在外面。 */
-        if (!in_c6_tu() && !saw_int && pa_cur()->kind == TK_IDENT) {
-            Tok *nx = pa_peek(1);
-            if (nx->kind == TK_PUNCT
-                && (tok_eq(nx, ";") || tok_eq(nx, "=") || tok_eq(nx, ",")
-                    || tok_eq(nx, "[")))
-                pa_warn_tcc("type defaults to int");
-        }
+        /* 只有**完全不带类型说明符**（`x;`、`_Alignas(16) i3;`）才是隐式 int，
+         * 要发 tcc 口径的 warning（tests2/102_alignas.expect 与
+         * 60_errors_and_warnings.expect 逐字要它）。`unsigned` / `long` /
+         * `unsigned long` 这类组合也走本分支——但那只是在选宽度（saw_int 已
+         * 置位），不是隐式 int；多打一条就把整个 TU 的输出全污染了（stddef.h
+         * 的 `typedef unsigned long size_t;` 曾让 tests2 118 条全红）。
+         * c6 源码总是显式类型，不打噪声。 */
+        if (!saw_int && !in_c6_tu() && !PA_NO_II_WARN)
+            PA_II_PENDING = 1;
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
         else if (nlong == 1)
@@ -7704,8 +7855,12 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
     int own_layer = d->own_params_taken ? 0 : 1;
     int save_knr = d->knr;
     int save_variadic = d->variadic;
+    int save_nowarn = PA_NO_II_WARN;
     u32 r = 0;
 
+    /* 见 PA_NO_II_WARN：形参表里 `...` / K&R 裸标识符走 parse_typespec 的
+     * 隐式 int 兜底是合法旧路径，不许告警。 */
+    PA_NO_II_WARN = 1;
     d->own_params_taken = 1;
     /* 声明符对象可能被复用，`...` 的标记不能从上一个声明符漏进来 */
     d->variadic = 0;
@@ -7734,6 +7889,15 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
             skip_paren_group();
             r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
             goto fin;
+        }
+        /* `...` 是**一个** token，不是形参。必须在 parse_typespec 之前拦下来：
+         * 它在说明符位置没有类型，会被当成"隐式 int 的形参"，于是每个变参
+         * 原型都多一条 `type defaults to int` 警告——c6c 自己的 stdio.h 就有
+         * 4 条、unistd.h 还有，把 `-test` 那批"stderr 干净"的检查全打挂了。 */
+        if (pa_is_punct("...")) {
+            pa_advance();
+            d->variadic = 1;
+            break;
         }
         pt = parse_typespec();
         if (!pt)
@@ -7792,6 +7956,7 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
     pa_expect_ch(')');
     r = ty_func(fnret, d->ptype + base_n, d->nparams - base_n, (u32)d->variadic);
 fin:
+    PA_NO_II_WARN = save_nowarn;
     if (!own_layer) {
         /* 不是自己那层：用完就退回，别把返回类型/形参类型里的形参名字
          * 混进这个函数定义的形参表里。 */
@@ -9163,14 +9328,15 @@ static u32 str_lit_data(void)
         nk->ncp = 0;
         while (i + 1 < t->len) {
             u32 ch = 0;
-            int from_esc = 0;
+            int esc_ucn = 0;        /* \u / \U：码点，窄字面量要重新编码 */
+            int src_utf8 = 0;       /* 源码里直接写的 UTF-8：解成码点后再编码回去 */
 
             if (s[i] == '\\') {
                 const char *p = s + i + 1;
 
                 ch = esc_decode(&p, s + t->len);
+                esc_ucn = ESC_IS_UCN;
                 i = (u32)(p - s);
-                from_esc = 1;
             } else {
                 ch = (u32)(u8)s[i];
                 i++;
@@ -9186,10 +9352,10 @@ static u32 str_lit_data(void)
                         i++;
                     }
                     ch = acc;
-                    from_esc = 1;
+                    src_utf8 = 1;
                 }
             }
-            if (kind == 0 && from_esc && ch >= 0x80) {
+            if (kind == 0 && (esc_ucn || src_utf8) && ch >= 0x80) {
                 /* 窄字面量里的非 ASCII 码点按 UTF-8 编码（\uXXXX 和源码里的
                  * UTF-8 字节都走这里） */
                 if (ch < 0x800) {
@@ -9205,6 +9371,8 @@ static u32 str_lit_data(void)
                     buf[n++] = (u8)(0x80 | ((ch >> 6) & 0x3F));
                     buf[n++] = (u8)(0x80 | (ch & 0x3F));
                 }
+                ((u32 *)nk->cps)[nk->ncp] = ch;
+                nk->ncp++;
             } else {
                 buf[n++] = (u8)(ch & 0xFF);
                 ((u32 *)nk->cps)[nk->ncp] = ch;
@@ -9400,6 +9568,9 @@ static u32 gen_call(Sym *fs)
     E_CALL_FALLIBLE = (fs && fs->fallible) ? 1 : 2;
     u32 args[16] = {0};
     u32 narg = 0;
+    u32 aty0[PA_ARG_MAX] = {0};   /* 实参**转换前**的类型（重载重选后要从原值重转） */
+    u32 av0[PA_ARG_MAX] = {0};    /* 实参转换前的值 */
+    u8 argfix[PA_ARG_MAX] = {0};  /* 走接口/切片/聚合特殊路径的实参不再动 */
 
     if (fs && drop_is_sym((u32)fs->val))
         pa_error("析构函数不能直接调用：最后一个引用放掉时它自己会跑（`p = NULL` 就够了）");
@@ -9420,6 +9591,7 @@ static u32 gen_call(Sym *fs)
                 u32 av = gen_assign();
                 u32 aty = cur_op_ty();
                 u32 pty = ty_func_param(fs->type, narg);
+                int special = 0;
 
                 if (ty_has_mgd(aty)) {
                     char dnm[160] = {0};
@@ -9449,6 +9621,8 @@ static u32 gen_call(Sym *fs)
                         mgdmask2 |= 1u << narg;
                     }
                 }
+                aty0[narg] = aty;
+                av0[narg] = av;
                 /* c6 切片形参 + 数组实参：隐式转成 `{ptr, len}`（两个机器字）。
                  * 拷进调用者的临时槽，再把地址当实参传（聚合按值传参的既有约定）。 */
                 {
@@ -9470,6 +9644,7 @@ static u32 gen_call(Sym *fs)
                                    ty_ptr(ty_void()));
                         av = ta2;
                         aty = pty;
+                        special = 1;
                     }
                 }
                 if (pty != 0 && ty_is_slice(pty) && ty_is_array(aty)) {
@@ -9486,6 +9661,7 @@ static u32 gen_call(Sym *fs)
                     irfn_push(&FN, IR_STORE, IRT_U64, a8, lv, 0, 0, 0);
                     av = taddr;
                     aty = pty;
+                    special = 1;
                 }
                 /* 实参按形参类型转换；没有原型（或落在变参部分）时做默认实参
                  * 提升：float → double，否则 printf("%f", f) 拿到 4 字节位模式。 */
@@ -9507,7 +9683,10 @@ static u32 gen_call(Sym *fs)
                     irfn_push(&FN, IR_ADDR, IRT_PTR, taddr, 0, 0, 0, X64_SLOT(tslot));
                     irfn_push(&FN, IR_COPY, IRT_U8, taddr, av, 0, 0, sz);
                     av = taddr;
+                    aty = pty;
+                    special = 1;
                 }
+                argfix[narg] = (u8)special;
                 args[narg] = av;
             }
             narg++;
@@ -9522,14 +9701,34 @@ static u32 gen_call(Sym *fs)
      * 类型注册的那一条覆盖掉。 */
     {
         Sym *fb = sym_find_fn(fs->name, fs->len, narg, a0ty);
+        Sym *fnew = fs;
 
         if (fb && fb != fs) {
-            fs = fb;
+            fnew = fb;
         } else if (narg > 0 && a0ty && ty_is_ptr(a0ty)) {
             Sym *mo = meth_find(ty_target(a0ty), fs->name, fs->len);
 
             if (mo && mo != fs && mo->is_func)
-                fs = mo;
+                fnew = mo;
+        }
+        if (fnew != fs) {
+            u32 k4 = 0;
+
+            /* 形参表换了：先前按旧原型转过的实参要按新的再转一遍。否则
+             * `init(&r, buf, 14, 0)`（endian 的 4 参数版）会先按同名 2 参数版
+             * 把 buf 当 `int` 截断，指针只剩低 32 位——std-util 的 endian
+             * 一段就是这么段错误的。 */
+            for (k4 = 0; k4 < narg && k4 < PA_ARG_MAX; k4++) {
+                u32 np4 = ty_func_param(fnew->type, k4);
+
+                if (!np4 || argfix[k4] || ty_is_agg(np4))
+                    continue;
+                if (aty0[k4] != np4)
+                    args[k4] = gen_convert(av0[k4], aty0[k4], np4);
+                else
+                    args[k4] = av0[k4];
+            }
+            fs = fnew;
         }
     }
     /* 少传的实参按 C 惯例补 0：不补的话，那个寄存器/栈槽留着上一个表达式的
@@ -9576,10 +9775,13 @@ static u32 gen_call(Sym *fs)
             irfn_push(&FN, IR_ARG, IRT_U64, 0, env2, 0, 0, 0);
             irfn_push(&FN, IR_ARG, IRT_U64, 0, nf, 0, 0, 1);
         }
+        /* 两个实参都要传：第二个是 `nogate`（`co` 语句处先跑到第一个挂起点，
+         * 不参与调度门）。以前这里紧接着被改回 `narg = 1`，第二个实参就没人
+         * 填，`__c6_co_new` 拿到寄存器里的垃圾——`std-https` 的 co 那两路就是
+         * 这么看到 `wfd=1 / bcap=4592989` 这种值的（第 290 轮）。 */
         irfn_push(&FN, IR_CALL, IRT_PTR, cov, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_new"));
         FN.ops[FN.n - 1].narg = 2;
-        FN.ops[FN.n - 1].narg = 1;
         irfn_push(&FN, IR_ARG, IRT_U64, 0, cov, 0, 0, 0);
         tsk2 = irfn_vreg(&FN);
         irfn_push(&FN, IR_CALL, IRT_PTR, tsk2, 0, 0, 0,
@@ -9924,9 +10126,13 @@ static u32 gen_postfix_ops(u32 v)
                 PEND_VSYM = vsy;
                 PEND_VDIM = vdim + 1;
             }
-            /* `h->arr[0]`：托管数组字段的元素也是托管引用（成员那一层已经把
-             * PEND_MGD 标上了，下标这层不能把它抹掉）。 */
-            if (pmgd)
+            /* `h->arr[0]` / `@T a[2]` 的 `a[i]`：**元素本身是引用**才是托管
+             * 赋值（基址是数组或切片、元素是指针）。`@char data` 这种"托管
+             * 指针指向普通标量"不算——`data[i] = 0` 若按托管赋值走，会先把
+             * 旧字符当指针 release 掉：strbuf.truncate 写结尾 NUL 时旧值是
+             * 'd' = 100，运行时按 `ptr - 头长` 取引用计数头，一写就段错误
+             * （std-tour / std-demo / std-kit 全挂在这一条上）。 */
+            if (pmgd && ty_is_ptr(elem) && (ty_is_array(bty) || ty_is_slice(bty)))
                 PEND_MGD = 1;
             v = off;
             continue;
@@ -10077,11 +10283,14 @@ static u32 gen_postfix_ops(u32 v)
                                                                    : "__c6_co_wait"))));
                 FN.ops[FN.n - 1].narg = 1;
                 if (m == 1) {
-                    /* done() = 状态等于 C6_CO_STATE_DONE(0) */
+                    /* done() = 状态等于 C6_CO_STATE_DONE（就是 -1，64 位全 1；
+                     * 别写成 0xFFFFFFFF——那是"没按 int 符号扩展"的旧值，
+                     * 运行时写进去的是真 -1，两边对不上 done() 永远给 0） */
                     u32 z2 = irfn_vreg(&FN);
                     u32 c2 = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_I64, z2, 0, 0, 0, 0xFFFFFFFFu);
+                    irfn_push(&FN, IR_CONSTK, IRT_I64, z2, 0, 0, 0,
+                              irfn_kconst(&FN, ~0ull));
                     irfn_push(&FN, IR_CMP, IRT_I64, c2, dv, z2, 0, 0);
                     FN.ops[FN.n - 1].flags = (u8)IRCC_EQ;
                     dv = c2;
@@ -10223,7 +10432,23 @@ static u32 gen_postfix_ops(u32 v)
                 /* s.m：左值就取地址；聚合**值**（函数返回的结构体、复合字面量）
                  * 在我们的约定里本来就是"用地址代表值"，直接当基址用。 */
                 if (!PEND_LVAL && ty_is_agg(GEN_TY)) {
-                    addr = v;
+                    /* 聚合值按约定"用地址代表"，但**函数返回的结构体**那个地址
+                     * 在**被调方的栈帧里**：方法调用糖把它当接收者指针传出去，
+                     * 被调方一进栈就把那块内存盖掉（`mkp().get()` 拿到垃圾，
+                     * 而 `mkp().x` 立刻读还是对的）。先拷进调用者的临时槽，
+                     * 再用它的地址。 */
+                    u32 asz = ty_size(GEN_TY);
+
+                    if (asz > 0 && asz <= 4096) {
+                        u32 aslot = frame_slots_for(asz);
+                        u32 aaddr = irfn_vreg(&FN);
+
+                        irfn_push(&FN, IR_ADDR, IRT_PTR, aaddr, 0, 0, 0, X64_SLOT(aslot));
+                        irfn_push(&FN, IR_COPY, IRT_U8, aaddr, v, 0, 0, asz);
+                        addr = aaddr;
+                    } else {
+                        addr = v;
+                    }
                     bty = GEN_TY;
                 } else if (!PEND_LVAL) {
                     /* 标量上的方法调用：`dec_parse(...).round(2)` 里接收者是个
@@ -10342,8 +10567,34 @@ static u32 gen_postfix_ops(u32 v)
                     if (pa_accept_ch('(')) {
                         if (!pa_accept_ch(')')) {
                             for (;;) {
+                                u32 av3 = gen_assign();
+                                u32 aty3 = cur_op_ty();
+                                u32 pty3 = ty_func_param(ms->type, narg);
+
+                                /* 实参按形参类型转换：`m.push(10)` 里 10 是 int、
+                                 * 形参是 double，不转就进通用寄存器，被调方从
+                                 * xmm0 读到的是 0（同一个调用写 `m.push(10.0)`
+                                 * 却完全正确，所以很难看出来）。 */
+                                if (pty3 && !ty_is_agg(pty3) && aty3 != pty3)
+                                    av3 = gen_convert(av3, aty3, pty3);
+                                /* 聚合实参要先落到自己的帧槽里再传。方法糖这条
+                                 * 路的实参是"先全求值、最后统一 IR_ARG"，聚合临时
+                                 * 量就活在被调用的实参暂存区上——外层的 CALL 一
+                                 * 铺参数就把它盖掉了（`b.f(str(t))` 里 f 读到
+                                 * 的 Str.data 是栈上垃圾，json/xml 就是这么坏的）。
+                                 * 普通调用是边求值边 IR_ARG，所以不受影响。 */
+                                if (pty3 && ty_is_agg(pty3) && ty_size(pty3) > 0) {
+                                    u32 sl3 = frame_slots_for(ty_size(pty3));
+                                    u32 sa3 = irfn_vreg(&FN);
+
+                                    irfn_push(&FN, IR_ADDR, IRT_PTR, sa3, 0, 0, 0,
+                                              X64_SLOT(sl3));
+                                    irfn_push(&FN, IR_COPY, IRT_U8, sa3, av3, 0, 0,
+                                              ty_size(pty3));
+                                    av3 = sa3;
+                                }
                                 if (narg < 16)
-                                    avs[narg++] = value_of(gen_assign());
+                                    avs[narg++] = value_of(av3);
                                 if (!pa_accept_ch(','))
                                     break;
                             }
@@ -10457,6 +10708,7 @@ static u32 gen_postfix_ops(u32 v)
                 v = addr;
                 continue;
             }
+
             a2 = addr;
             if (off) {
                 a2 = irfn_vreg(&FN);
@@ -10596,6 +10848,7 @@ static u32 gen_int_lit(u64 c, u32 ty)
 {
     u32 d = irfn_vreg(&FN);
     u32 irt = ir_ty_of(ty);
+
 
     if (c <= 0xFFFFFFFFULL)
         irfn_push(&FN, IR_CONST, irt, d, 0, 0, 0, (u32)c);
@@ -12067,8 +12320,7 @@ static u32 gen_postfix(void)
                         u32 dv = irfn_vreg(&FN);
 
 
-                        irfn_push(&FN, IR_CONST, IRT_U64, dv, 0, 0, 0,
-                                  (u32)qs->val);
+                        dv = gen_int_lit((u64)qs->val, ty_int());
                         GEN_TY = ty_int();
                         PEND_LVAL = 0;
                         PEND_BITS = 0;
@@ -12171,13 +12423,21 @@ static u32 gen_postfix(void)
                 pa_advance();
                 t = pa_cur();
             }
-            s = sym_find(tok_data(t), t->len);
+            /* 最长前缀那边已经命中了就别再拿裸名盖掉（第 271 轮：
+             * `std.data.json.PARSE` 命中 `std__data__json__PARSE` 之后，这一句
+             * 会换成裸名 `PARSE`，而裸名是各模块共享的一格，谁先登记谁留下）。 */
+            if (!s)
+                s = sym_find(tok_data(t), t->len);
         }
         /* 方法体里的裸名字先看接收者的成员：别的模块可能导出同名全局
          * （`std/core/fixed.c6` 的 `int cmp(Fix *self, Fix b)` 就让
          * std/container/pqueue.c6 的 `cmp` 成员在方法体里失效了）。
          * 形参/局部变量在更内层的作用域里，sym_find 会先找到，不受影响。 */
-        if (METHOD_SELF_TY && (!s || s->kind == SC_GLOBAL)) {
+        /* 裸名字：全局、没查到，或者查到的是**外层函数**的局部量/形参
+         * （实例化点上看得见它们，方法体里不该看见）——都按接收者的成员走。 */
+        if (METHOD_SELF_TY && (!s || s->kind == SC_GLOBAL
+                               || ((s->kind == SC_LOCAL || s->kind == SC_PARAM)
+                                   && !sym_in_method_scope(s)))) {
             u32 mty4 = 0;
             u32 moff4 = 0;
 
@@ -12242,10 +12502,29 @@ static u32 gen_postfix(void)
                         assign_ctx = 1;
                     if (PEND_LVAL && assign_ctx)
                         return rv;
-                    if (PEND_LVAL)
-                        rv = load_lval(rv, mty4);
-                    PEND_LVAL = 0;
-                    GEN_TY = mty4;
+                    if (PEND_LVAL) {
+                        /* 后缀链可能已经把类型走远了：裸 `d` 再接 `->head`
+                         * 之后该是 int，不是 `Deque@int *`。按链上留下的类型
+                         * 取值/回填，否则 `d->head + i` 会被当成指针加法算步长
+                         * （24 = sizeof(Deque@int)），下标永远是 0；元素宽度也
+                         * 跟着从 4 变 8（std-tour 的 deque 迭代永远吐第一个元素
+                         * 就是这么来的）。 */
+                        u32 cty5 = PEND_TY;
+
+                        /* 数组类型的成员不能取值，要**退化**成首元素地址
+                         * （`char *p() { return d; }` 里 d 是 char[N]：
+                         * load 出来的是 d[0] 那一个字节当指针，调用方拿到
+                         * 0x7a 这种数，std-demo 的 Buf 就是这么炸的）。 */
+                        if (ty_is_array(cty5)) {
+                            PEND_LVAL = 0;
+                            GEN_TY = ty_ptr(ty_target(cty5));
+                            return rv;
+                        }
+                        rv = load_lval(rv, cty5);
+                        PEND_LVAL = 0;
+                        GEN_TY = cty5;
+                        return rv;
+                    }
                     return rv;
                 }
             }
@@ -12396,8 +12675,9 @@ static u32 gen_postfix(void)
                          "'<enum>.%.*s'", (int)t->len, tok_data(t),
                          (int)t->len, tok_data(t));
             pa_advance();
-            d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, (u32)s->val);
+            /* 走 gen_int_lit：值可能超出 IR_CONST 的 32 位立即数（负数枚举常量
+             * 符号扩展后就是这样），那条路会改用 CONSTK。 */
+            d = gen_int_lit((u64)s->val, ty_int());
             GEN_TY = ty_int();
             return gen_postfix_ops(d);
         }
@@ -14032,6 +14312,16 @@ static u32 gen_unary(void)
             nv = irfn_vreg(&FN);
             irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), nv, old_v, one,
                       0, 0);
+            /* `++e` 的值是 e 的值（类型就是 e 的类型），所以窄于 8 字节的整数要
+             * 按宽度截断一次：否则 `u8 b = 255; ++b != 0` 会拿 256 去比（写回
+             * 时 store_lval 已经截过，这里漏的是**表达式值**）。AES-CTR 的
+             * counter 递增就靠 `++ctr[i] != 0` 判进位（std-cipher 红的就是它）。 */
+            if (ty_is_int(ty) && ty_size(ty) > 0 && ty_size(ty) < 8) {
+                u32 nt = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), nt, nv, 0, 0, 0);
+                nv = nt;
+            }
             if (bb)
                 store_lval_bits(addr, ty, bb, bb_off, nv);
             else
@@ -14116,8 +14406,7 @@ static u32 gen_unary(void)
                 ty = ty_tuple_chk(tys, tn);
             }
             pa_expect_ch(')');
-        } else if (!is_align && pa_is_ch('(') && pa_peek(1)->kind == TK_STR
-                   && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), ")")) {
+        } else if (!is_align && sizeof_lit_run()) {
             /* sizeof("abc") 同 sizeof "abc"：括号里就一个字符串字面量 */
             pa_advance();
             (void)str_lit_data();
@@ -14219,10 +14508,15 @@ static u32 gen_unary(void)
                 return gen_postfix_ops(av3);
             }
         }
+typedef struct InitSave InitSave;
+
         if (pa_is_ch('{')) {
             /* 复合字面量 (T){...}：在栈上开个临时对象，就地初始化，值是它的地址 */
             u32 slot = 0;
             u32 addr = irfn_vreg(&FN);
+            InitSave isv = { 0 };
+
+            init_save(&isv);
 
             if (ty_is_array(ty) && ty_size(ty) == 0) {
                 /* (int[]){...}：元素个数由初始化器决定，先按 1 KB 开，
@@ -14241,6 +14535,7 @@ static u32 gen_unary(void)
                 GEN_TY = ty_ptr(et);
                 /* 复合字面量是后缀表达式的一部分：`(int[]){7,8}[1]`、
                  * `(struct P){1,2}.y` 都要接着走后缀链（C99 6.5.2）。 */
+                init_restore(&isv);
                 return gen_postfix_ops(addr);
             }
             slot = frame_slots_for(ty_size(ty));
@@ -14251,6 +14546,7 @@ static u32 gen_unary(void)
             PEND_ADDR = addr;
             GEN_TY = ty_is_array(ty) ? ty_ptr(ty_target(ty)) : ty;
             /* 同上：复合字面量后面可以直接跟 `.成员`/`[下标]` */
+            init_restore(&isv);
             return gen_postfix_ops(addr);
         }
         v = gen_unary();
@@ -14528,14 +14824,13 @@ static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty)
          * 整数那边**不动**：c6c 自己有个约定，通用 `task` 句柄的 `t->val`
          * 是按 long 读出来的裸位模式，和浮点字面量比时正好按位对上；改成
          * 整数转浮点会把它算成 4.6e18（tests/async.c6 会挂）。 */
-        if (ty_is_float(aty))
-            a = gen_convert(a, aty, cty);
-        else
-            a = gen_cast_to(a, cty);
-        if (ty_is_float(bty))
-            b = gen_convert(b, bty, cty);
-        else
-            b = gen_cast_to(b, cty);
+        /* 整数那侧以前走 gen_cast_to（只砍整数高位），是给"通用 task 句柄的
+         * `t->val` 按位和浮点字面量比"留的偏门；副作用是 `double h; h > 1`
+         * 把 h 的**位模式**当整数和 1 比，恒为真——std-geo 的距离、包围盒判断
+         * 全错（`if (h > 1) h = 1` 把 haversine 结果夹成 1，距离恒为 20015 km）。
+         * 按标准语义把整数转成浮点再比。 */
+        a = gen_convert(a, aty, cty);
+        b = gen_convert(b, bty, cty);
     } else {
         a = gen_cast_to(a, cty);
         b = gen_cast_to(b, cty);
@@ -15379,6 +15674,11 @@ static u32 gen_assign(void)
                          "Allocate it with 'new' and hold it in '@%s'", dnm, dnm);
             }
             r = value_of(r);
+            /* `>>=` 在无符号左值上要逻辑右移。这里图省事一律记成 IR_SAR，
+             * 于是 `u64 v = ~0ull; v >>= 7;` 移完还是全 1（std 的
+             * `uvarint_encoded_len` 因此死循环，std-next 整个卡住）。 */
+            if (op == IR_SAR && !ty_is_signed(ty))
+                op = IR_SHR;
             if (op == 0) {
                 /* 托管引用赋值：先给新值加计数，再存，最后放掉旧值。
                  * 这个顺序让 `p = p` 净变化为 0（先 +1 后 -1）。 */
@@ -15984,6 +16284,7 @@ static int pa_is_compound_lit(void)
          * 的 RB_ROOT：(struct rb_root){ ((void *)0) , }）。 */
         int depth = 1;
         int q = 0;
+        int comma = 0;
 
         for (q = 1; q < PA_LOOK; q++) {
             Tok *t = pa_peek(q);
@@ -15997,8 +16298,15 @@ static int pa_is_compound_lit(void)
                 if (depth == 0) {
                     Tok *nx = pa_peek(q + 1);
 
+                    /* 元组类型 `(int, int){…}` 不归这里管：括号里有顶层逗号
+                     * 时交回下面那段（最终返回 0），让表达式那条路去建元组
+                     * 字面量——这里只会 parse 一个类型名，碰到逗号就散架。 */
+                    if (comma)
+                        return 0;
                     return nx->kind == TK_PUNCT && TOK_EQ(nx, "{");
                 }
+            } else if (tok_eq(t, ",") && depth == 1) {
+                comma = 1;
             }
         }
     }
@@ -17102,6 +17410,57 @@ static u32 LV_TY[INIT_LV_MAX];
 static u32 LV_OFF[INIT_LV_MAX];
 static u32 LV_DEPTH;
 
+static void init_save(InitSave *st)
+{
+    memset(st, 0, sizeof *st);
+    st->n = LF_N;
+    st->trunc = LF_TRUNC;
+    st->cur = INIT_CUR;
+    st->max = INIT_MAX;
+    st->lvd = LV_DEPTH;
+    st->count = INIT_COUNT;
+    st->cntok = INIT_CNT_OK;
+    if (LF_N > 0) {
+        st->off = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->ty = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->bits = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        st->boff = arena_alloc(&A_main, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->off, LF_OFF, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->ty, LF_TY, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->bits, LF_BITS, sizeof(u32) * (size_t)LF_N);
+        memcpy(st->boff, LF_BOFF, sizeof(u32) * (size_t)LF_N);
+    }
+    if (LV_DEPTH > 0) {
+        st->lvty = arena_alloc(&A_main, sizeof(u32) * (size_t)LV_DEPTH);
+        st->lvoff = arena_alloc(&A_main, sizeof(u32) * (size_t)LV_DEPTH);
+        memcpy(st->lvty, LV_TY, sizeof(u32) * (size_t)LV_DEPTH);
+        memcpy(st->lvoff, LV_OFF, sizeof(u32) * (size_t)LV_DEPTH);
+    }
+}
+
+static void init_restore(InitSave *st)
+{
+    u32 k = 0;
+
+    for (k = 0; k < st->n; k++) {
+        LF_OFF[k] = st->off[k];
+        LF_TY[k] = st->ty[k];
+        LF_BITS[k] = st->bits[k];
+        LF_BOFF[k] = st->boff[k];
+    }
+    for (k = 0; k < st->lvd; k++) {
+        LV_TY[k] = st->lvty[k];
+        LV_OFF[k] = st->lvoff[k];
+    }
+    LF_N = st->n;
+    LF_TRUNC = st->trunc;
+    INIT_CUR = st->cur;
+    INIT_MAX = st->max;
+    LV_DEPTH = st->lvd;
+    INIT_COUNT = st->count;
+    INIT_CNT_OK = st->cntok;
+}
+
 static int INIT_IS_GLOB;     /* 1 = 数据段初始化（goff），0 = 局部（addr vreg） */
 static u32 INIT_GOFF;
 static u32 INIT_ADDR;
@@ -17594,6 +17953,13 @@ static void init_brace(u32 ty, u32 off)
     LV_OFF[my] = off;
     LV_DEPTH = my + 1;
     init_body(my);
+    /* 嵌套的 `{…}`（结构体元素）只把游标推到末尾、**不走** `init_store`，
+     * 于是 `init_mark()` 没记账、`INIT_MAX` 一直是 0。不完整数组
+     * （`static struct E t[] = {…}`）的长度就是按 `INIT_MAX` 算的，
+     * 结果 `sizeof t` 是 0（std 的 mime 表靠 sizeof 数条目，一条都查不到）。
+     * 这里按本层写到的最后位置补一次记账。 */
+    if (INIT_CUR > INIT_MAX)
+        INIT_MAX = INIT_CUR;
     LV_DEPTH = my;
     pa_expect_ch('}');
     /* 零字节的聚合成员（`struct {} empty;`）不占叶子，游标要**停在原地**：
@@ -18610,6 +18976,7 @@ static void gen_one_local(u32 ty, Declarator *d)
             if (top && top->is_func && top->is_static) {
                 fs->is_static = 1;
                 fs->val = (i64)x64_sym(&X64, emit_name(tu_static_name(nm)));
+                X64.sym[(u32)fs->val].is_static = 1;
             } else {
                 fs->val = (i64)x64_sym(&X64, emit_name(nm));
             }
@@ -18950,6 +19317,10 @@ static void gen_local_decl(int need_semi)
         PA_MGD_PTR = base_mgd_ptr;
         PA_MGD_KIND = base_mgd_kind;
         ty = parse_declarator(base, &d);
+        /* 块作用域同理（`static n;` 这类隐式 int 声明） */
+        if (PA_II_PENDING && !d.is_func)
+            pa_warn_tcc("type defaults to int");
+        PA_II_PENDING = 0;
         PA_VLA_OK = 0;
         gen_one_local(ty, &d);
         dc = SAW_CLEANUP ? SAW_CLEANUP : base_cleanup;
@@ -20508,6 +20879,22 @@ static void gen_stmt(void)
              * （tests/tuple_async.c6 的嵌套 await 踩过）。 */
             if (!(CUR_TASK_TY && ty_is_agg(rty)))
                 v = value_of(v);
+            /* `return <实现对象>` 且返回类型是接口：struct → 接口的隐式
+             * 转换平时只在赋值/初始化那条路上做（store_conv），return 漏了，
+             * 于是函数直接把 4 字节的实现对象地址交出去，调用方按 16 字节
+             * 的 {self, vt} 拷走——vt 读到的是相邻数据，分派就跳野指针。
+             * 这里按赋值同一条路先物化出 {self, vt} 再返回。 */
+            if (TY_HAS_IFACE && NIFACE > 0 && ty_is_iface(CUR_RET_TY, NULL)
+                && ty_is_agg(rty) && !ty_is_iface(rty, NULL)) {
+                u32 rs = ty_size(CUR_RET_TY) ? ty_size(CUR_RET_TY) : 16;
+                u32 ra = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_ADDR, IRT_PTR, ra, 0, 0, 0,
+                          X64_SLOT(frame_slots_for(rs)));
+                store_conv(ra, CUR_RET_TY, v, rty);
+                v = ra;
+                rty = CUR_RET_TY;
+            }
             pa_expect_ch(';');
             /* 按**函数声明的返回类型**转换。少了这步，返回 signed char 的函数
              * 会把 0x80 原样带回去（调用方按 signed char 解释就是 +128），返回
@@ -21778,6 +22165,8 @@ static void pa_func_def(Sym *fn, Declarator *d)
     NSW = 0;
     NGLBL = 0;
     scope_enter();
+    /* 方法体（`METHOD_SELF_TY` 非 0）靠这个判断"裸名字是不是自己的" */
+    METHOD_SCOPE_BASE = SCOPE;
     /* 闭包体：捕获变量登记成"在环境对象里"的形参（slot 带标记位） */
     for (i = 0; i < FLCAP_N && i < FL_CAP_MAX; i++) {
         Sym *cp = sym_add(FLCAP_NAME[i], FLCAP_LEN[i], FLCAP_TY[i], SC_PARAM);
@@ -22425,8 +22814,12 @@ static void gen_one_global(u32 ty, Declarator *d)
     if (SCOPE && !SCOPE->up && PA_STATIC) {
         s->is_static = 1;
         s->val = (i64)x64_data_sym(&X64, tu_static_name(s->name), ELF_HDR + s->goff);
+        X64.sym[(u32)s->val].is_static = 1;
     } else {
         s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+        /* 块作用域的 static 局部（发射名 `<函数>.<N>`）也是本 TU 私有 */
+        if (PA_STATIC)
+            X64.sym[(u32)s->val].is_static = 1;
     }
     /* `s` 指向符号表里的槽：解析初始化器的过程中只要再 `sym_add` 一次
      * （字符串字面量、枚举、匿名聚合……），符号表就可能扩容搬家，`s` 就成了
@@ -23366,6 +23759,10 @@ static void gen_decl_from_spec(u32 base)
         PA_MGD_KIND = base_mgd_kind;
         PA_TLS = base_tls;
         ty = parse_declarator(base, &d);
+        /* tcc 口径：隐式 int 只对非函数声明告警（见 PA_II_PENDING）。 */
+        if (PA_II_PENDING && !d.is_func)
+            pa_warn_tcc("type defaults to int");
+        PA_II_PENDING = 0;
         /* `name __attribute__((alias("目标")))` / `name __asm__("目标")`：
          * 属性可能写在后缀（参数表 / 数组）之后，所以只能等声明符解析完再看。 */
         al = SAW_ALIAS ? SAW_ALIAS : SAW_ASMNAME;
@@ -23426,6 +23823,8 @@ static void gen_decl_from_spec(u32 base)
                         meth_add(s, self_ty2);
                     }
                     s->val = (i64)x64_sym(&X64, enf);
+                    if (fscope_static)
+                        X64.sym[(u32)s->val].is_static = 1;
                 }
                 /* `__attribute__((alias("target")))` / `__asm__("target")`：
                  * 这个名字只是 target 的另一个入口，没有自己的代码/存储。 */
@@ -23479,10 +23878,33 @@ static void gen_decl_from_spec(u32 base)
                         /* static 的函数名带 TU 后缀（见 tu_static_name）：
                          * 方法真名也得带，否则两个 TU 各自的同名 static 方法
                          * 会撞到同一个符号上。 */
-                        if (s->is_static)
-                            s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
-                        else
-                            s->val = (i64)x64_sym(&X64, emit_name(mn));
+                        {
+                            /* 前向声明那条已经按**短名**建过一条 ELF 符号，
+                             * 而且这之前的调用点（`poke(b)` 写在定义之前）已经
+                             * 按它发过重定位。这里要换成真名，就得把旧的那条
+                             * 也接到同一份代码上，否则那些引用永远悬着——
+                             * 链接期报的 `poke$2` 未定义就是这么来的。
+                             * 接的动作留到 `alias_apply()`（偏移定下来之后）。 */
+                            u32 old_val = (u32)s->val;
+                            const char *sn = s->is_static
+                                ? tu_static_name(s->name) : s->name;
+
+                            if (s->is_static)
+                                s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
+                            else
+                                s->val = (i64)x64_sym(&X64, emit_name(mn));
+                            if (s->is_static)
+                                X64.sym[(u32)s->val].is_static = 1;
+                            /* 只有"旧的那条确实是按短名建出来的"才记账：
+                             * 没建过符号时 s->val 也可能是 0，别把 0 号符号
+                             * （可能是别的函数）接过去。 */
+                            /* 声明那条的发射名是 `tu_static_name(nm)`，**不带**
+                             * 模块前缀（`s->val = x64_sym(&X64, enf)` 里那个
+                             * enf），所以这里按同一个口径比。 */
+                            if (old_val != (u32)s->val && X64.sym[old_val].name
+                                && strcmp(X64.sym[old_val].name, sn) == 0)
+                                meth_alias_register(old_val, (u32)s->val);
+                        }
                         if (s->len == 4 && memcmp(s->name, "drop", 4) == 0
                             && ty_func_nparams(ty) == 1) {
                             if (ty_func_ret(ty) != ty_void())
@@ -23782,6 +24204,15 @@ static void alias_apply(void)
         }
         x64_alias_idx(&X64, from, to);
     }
+    /* 方法式函数的前向声明：短名那条接到真名上。只声明没定义的不算错
+     * （真名本来就没定义，短名也没人引用），静悄悄跳过。 */
+    for (i = 0; i < NMETH_ALIAS; i++) {
+        u32 from = METH_ALIAS_FROM[i];
+        u32 to = METH_ALIAS_TO[i];
+
+        if (X64.sym[to].defined && !X64.sym[from].defined)
+            x64_alias_idx(&X64, from, to);
+    }
 }
 
 static int pa_finish(const char *out);
@@ -23827,7 +24258,7 @@ static int pa_finish(const char *out)
         diag_emit("c6c: 有未定义的外部符号，不写输出");
         return 1;
     }
-    if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC) {
+    if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC && !llvm_mode()) {
         diag_emit("c6c: 没有 main（可执行文件需要入口）");
         return 1;
     }
