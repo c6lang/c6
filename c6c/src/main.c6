@@ -750,6 +750,7 @@ static int parse_args(int argc, char **argv)
              * 注释）。默认不开——开了会让 glibc 头走 GNU 分支，偏离与 tcc
              * 的 -E 对齐口径。 */
             O.kernel_mode = 1;
+            PA_KERNEL_MODE = 1; /* 内核头的 C89 隐式 int 不诊断（parse.c6 前端标志） */
             /* 编内核时自带运行时（lib/rt.c6）一个字节都不能进来：它 include
              * 的是用户态那套头（stdio.h/stdlib.h/string.h…），而 -ffreestanding-
              * kernel 下只从内核树找头，于是立刻报一串"找不到头文件"。
