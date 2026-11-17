@@ -81,6 +81,8 @@ static void usage(FILE *fp)
     fprintf(fp,
         "用法：%s [选项] 文件...\n"
         "\n"
+        "工程管理子命令：c6c init|scan|build|test|run|help（详见 `c6c help`）\n"
+        "\n"
         "  -I 目录              头文件搜索路径（可多次）\n"
         "  -D 名字[=值]         预定义宏（可多次）\n"
         "  -U 名字              取消预定义\n"
@@ -896,6 +898,11 @@ int main(int argc, char **argv)
 
     if (argc > 0 && argv[0] && argv[0][0])
         progname = argv[0];
+    {
+        int pmrc = (argc >= 2) ? pm_dispatch(argc, argv) : PM_NOT_SUB;
+        if (pmrc != PM_NOT_SUB)
+            return pmrc;
+    }
     if (parse_args(argc, argv) < 0)
         return 2;
     if (O.nfiles == 0) {

@@ -56,5 +56,6 @@ typedef int64_t i64;
 #include "aout.c6"
 #include "dw.c6"
 #include "ld.c6"
+#include "pm.c6"
 #include "main.c6"
 #include "embed.c6"
