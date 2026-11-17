@@ -5823,3 +5823,29 @@ a=6,0,0 b=8,0,0           ← 再也没出来，但进程正常结束、也没�
 下一轮直接盯 `__c6_swapstack` 的保存/恢复：两条协程各自 mmap 一块栈，
 `c6c_co_resume` 把 rsp 换过去、`ret` 到挂起点。挂起时保存的 `rsp` 如果存进了
 **协程结构体的公共槽**（而不是各自的槽），第二次挂起就会把第一次的覆盖掉。
+
+### 第 301 轮：抓到了——`__c6_co_run` 里**同一个协程被恢复一百万次**
+
+在 `__c6_co_run` 主循环和 `c6_io` 的挂起点都打上 `C6C_DBG_SCH`，跑 `/tmp/cm9`：
+
+```
+[run] resume c=0xacfa300 task=0xacfa380 |[snd] fd=8
+[snd] await fd=8
+[sch] io park fd=8 ev=4 task=0xacfa380 blocked=0
+[run] resume c=0xacfa210 task=0xacfa290 |[run] resume c=0xacfa210 …（重复到 guard 上限）
+```
+
+`c=0xacfa210 / task=0xacfa290` 是**另一个**协程（a），它被**连续恢复**到
+`guard > 1000000` 才停。也就是说 `c6c_co_resume(c)` 这一**次**调用里，控制权
+在 main 和 a 之间来回倒了一百万次，`c6c_co_resume` 自己一直没返回：
+
+- a 在 `c6_io` 的 `while (waiting …) c6c_co_yield(self)` 里；
+- `c6c_co_yield` 把令牌交给 `resumer`（这里是 main）然后等自己的令牌；
+- main 从 `c6c_co_await_turn` 回来 → `c6c_co_resume` 返回 → 主循环下一轮又把
+  **同一个 a** 选出来（它 `waiting` 仍为 1 却不该被选）→ 再 give → a 又转一圈。
+
+修的方向有两个，下一轮挑一个试：
+1. `__c6_co_run` 的主循环选人时把 `waiting` 为真的**排除掉**（现在看起来它没被
+   排除干净，或者 `c6c_co_resume` 递归进来了）；
+2. `c6_io` 的 `while` 里在 yield 之前先把 `waiting` 清掉再睡，醒来由调度器置 1，
+   这样"谁在等"只有一个地方说了算。
