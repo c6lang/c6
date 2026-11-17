@@ -184,7 +184,9 @@ static void sa_pending_push(const char *orig, u32 olen, const char *mang)
 {
     if (SA_PEND_N >= SA_PEND_MAX)
         return;
-    SA_PEND_ORIG[SA_PEND_N] = orig;
+    /* 名字要**抄下来**：宏展开出来的 token 数据在缓冲区里，展开还在继续，
+     * 指针随时会被覆盖（register_nmi_handler 里 `fn##_na` 这种就是）。 */
+    SA_PEND_ORIG[SA_PEND_N] = arena_strndup(&A_main, orig, (size_t)olen);
     SA_PEND_ORIGL[SA_PEND_N] = olen;
     SA_PEND_MANG[SA_PEND_N] = mang;
     SA_PEND_N++;

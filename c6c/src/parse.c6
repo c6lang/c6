@@ -16260,6 +16260,36 @@ bad:
     glob_addr_skip_rest();
 }
 
+/* `("n")` / `(("n"))`：括号里只包着一个字符串字面量。返回括号层数（不是这种
+ * 形状就是 0），纯前瞻、只读。
+ * `const char *p = ("n");` 以前 `(` 直接落到常量表达式求值里，报"这里要一个
+ * 常量表达式"——内核 arch/x86/kernel/smp.c、cpu/mce/amd.c、fs/proc/*.c 等
+ * 8 个文件栽在这上面（register_nmi_handler 之类把字符串当宏实参传，展开出来
+ * 就是 `.name = ("smp_stop")`）。 */
+static u32 pa_str_paren_depth(void)
+{
+    u32 k = 0;
+    u32 depth = 0;
+
+    while (pa_peek(k)->kind == TK_PUNCT && TOK_EQ(pa_peek(k), "(")) {
+        k++;
+        depth++;
+    }
+    if (depth == 0 || pa_peek(k)->kind != TK_STR)
+        return 0;
+    k++;
+    {
+        u32 d = depth;
+
+        while (d-- > 0) {
+            if (!(pa_peek(k)->kind == TK_PUNCT && TOK_EQ(pa_peek(k), ")")))
+                return 0;
+            k++;
+        }
+    }
+    return depth;
+}
+
 static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 {
     if (ty_size(ty) == 0 && pa_skip_empty_compound())
@@ -16367,6 +16397,22 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             }
 
             gen_glob_obj(goff, et, off + eo);
+            return;
+        }
+    }
+    if (ty_is_ptr(ty) && pa_is_ch('(')) {
+        u32 d = pa_str_paren_depth();
+
+        if (d > 0) {
+            u32 so = 0;
+            u32 j = 0;
+
+            for (j = 0; j < d; j++)
+                pa_advance();          /* 左边的分组括号 */
+            so = str_lit_data();
+            glob_store(goff, off, ty, (u64)DATA_VA(so));
+            for (j = 0; j < d; j++)
+                pa_expect_ch(')');
             return;
         }
     }
