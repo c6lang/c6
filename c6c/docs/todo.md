@@ -5611,3 +5611,24 @@ examples/stdthread.c6 8/8 全绿（29 check / 0 failure）
 
 `std-box` / `std-term` / `std-thread` 一并补进 `regression-c6c.list`（91 条），
 CTest 96 个用例全过。下一步只剩 `std-https`。
+
+### 第 290 轮：`co` 调用点把 `__c6_co_new` 的第二个实参丢了
+
+`gen_postfix` 里 `co f(…)` 的发射是：搭实参块 `{thunk, 目标, 实参…}` →
+`__c6_co_new(env, nogate)` → `__c6_co_launch(co)`。但代码里 `narg = 2` 紧跟着
+又被改成 `narg = 1`，第二个实参 `nogate` 根本没人填，`__c6_co_new` 拿到的是
+寄存器里剩下的垃圾：
+
+```
+void *__c6_co_new(void *env, long nogate) { … c->nogate = nogate ? 1 : 0; … }
+```
+
+于是 `co` 出去的任务"到不到第一个挂起点"就看运气。`std-https` 的 co 那两路
+看到 `wfd=1 / bcap=4592989 / rbuf=0x1` 这种值，和这条对得上。
+
+已删掉那行覆盖（两行 `IR_ARG` 本来就都推了）。改完回归仍是 91 / 92（`std-https`
+还红，但在 co 段之前的 `task` 段是绿的），门禁 96 个 ctest + tests2 全过。
+
+下一轮：拿 `examples/stdhttps.c6` 里那两条 `co httpsa_get(&a, …)` 的形状继续缩
+（我写的 `/tmp/cm4` 复现卡在 `co` 的语法上前提上——`co` 的实参里不能直接出现
+类型转换，得照抄例子里那种纯左值写法）。
