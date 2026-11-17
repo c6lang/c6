@@ -5503,3 +5503,17 @@ run3 rc=124 : 同上
 "signal 在锁内 → 等待方在 unlock 之后才进 futex"那个经典丢唤醒窗口。
 
 挂死会让 CI 超时（比断言红更伤），所以没提交改动，回归仍 90 / 92。
+
+### 第 283 轮：最小 chan 复现写错了（n=0），先把状态记清楚
+
+想把 `chan` 的挂死降到最小复现：`/tmp/ch1.c6`（一个生产者线程 send 1..100 +
+主线程 recv）在 `c6c` 下五次全是 `n=0 sum=0`——说明我这个复现自己写错了
+（`Chan.init` 的实参/`close_chan` 的用法不对），不是运行时的问题。抄 API 之前
+先读 `std/container/chan.c6` 的 `init`/`close_chan` 签名再写。
+
+本轮结论回到第 282 轮那条：**把 pool1 的算法搬进 rt.c6 之后，sync 和 thread 两段
+都能过（`1..400 的和=80200`），只有 chan 段偶发挂死**，所以那版没进主干。
+
+接下来建议换个顺序：先把 `stdthread` 的 chan 段单独拆成一个用例（现在它和
+sync/thread 挤在一个 `test` 文件里，挂死时看不出来是哪一段），再决定是修 rt.c6
+还是修 `std/container/chan.c6` 的丢唤醒。
