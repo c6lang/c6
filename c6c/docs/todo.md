@@ -5430,3 +5430,22 @@ broadcast）还是挂死。`mx1` 里 `while (!READY && i < 1000)` 有次数上�
 main 每次 wait 前后），先看挂在哪一段；别再整块上，按 worker→锁→signal→main
 的顺序一格一格接。
 （改动已撤回，回归仍 90 / 92。）
+
+### 第 278 轮：真锁全部写出来并逐段验证过了，但 stdthread 卡在 thread 段
+
+这一轮把四种原语都换成 futex 版并**逐段**验证：
+
+- 互斥量 + 条件变量：`/tmp/mx1.c6` 通过（`[cv] wait enter/leave`），
+  `/tmp/mx2.c6` 两个线程各 1000 次加锁 `counter=2000`；
+- 信号量：`sync` 段的三条断言（try_wait / V / 计数）**全绿**；
+- 读写锁：`trywrlock` 补上之后 `sync: 有读者时写锁拿不到` 也过了；
+- 4 个线程直接 spawn 正常（`/tmp/sp4.c6`，`hits=4`）。
+
+但 `stdthread` 走到 `thread:` 段会**挂死**：`C6C_DBG_CV` 只看到 **2 个**
+`[cv] wait enter`（线程池起了 4 个 worker，只有 2 个进了等待），剩下的进不去。
+另外 `pthread_create` 里 mmap/spawn 失败那两条 `return -1` **没解锁**
+（`c6c_th_lock` 是全局自旋锁），虽然这次不像走到了那里，但那是真 bug。
+
+挂死比"跑完但断言红"更伤 CI，所以整块又撤回了（回归 90 / 92）。
+下一轮：先修那两条没解锁的 return，再在 `c6c_th_new()` 里打点看第 3、4 个
+worker 到底卡在哪一步。
