@@ -7,6 +7,29 @@
 
 ## 未发布
 
+### C 前端：Linux 7.4-rc3 真实构建集 **999/999 全部通过**
+
+把 c6c 当内核 C 前端推进到完整可用：`/tmp/real_c.txt`（`make -n` 抽出的
+1016 个真实参与编译的 `.c`）里，**999 个内核 TU**（`lib/`、`mm/`、`fs/`、
+`kernel/`、`arch/x86/`、`drivers/base/`…）在
+`-ffreestanding-kernel -nostdinc -include kconfig.h -include autoconf.h -D__KERNEL__`
+下全部零诊断产出 `.o`；剩余 17 个是 `scripts/mod/` 与 `tools/objtool/`
+宿主工具（用标准 libc / elf.h / fnmatch.h 另一套 include，kbuild 里由
+HOSTCC 编，不在内核 C 前端口径内）。
+
+这一轮补的洞：空指针常量按"值为 0 的整型常量表达式"判（`__is_constexpr()`
+不再恒 0，`struct_size()`/`DEFINE_FLEX()` 因此能编过）、
+`__builtin_memset/memmove` 内建不再被文本宏抢先、`(unsigned long)(&a[i])`
+地址常量、typedef 指针基类型下的函数指针声明符、区间设计符表达式下界、
+按需扩容的大初始化器缓冲区、设计符指针数组的长度计算、以及补齐
+`generated/uapi`、`arch/*/include/asm/trace` 等真实 include 路径。
+
+验收：
+- `cmake --build wt-out --target fast` → rc=0（前端回归 89 通过 / 0 失败；
+  c-testsuite 149/150；tests2 意外失败 0）
+- `cmake --build wt-out --target selfhost` → rc=0（fixpoint 逐字节相同）
+- `/tmp/kall2.sh $PWD/c6c/build/c6c` → **999 / 999 内核 TU**（17 宿主工具 out-of-scope）
+
 ### 验收：干净 chroot / Arch 打包环境下的四处假红
 
 在 Arch 容器里按 `c6-git` 的 `extra-x86_64-build` 流程（`check()` 就是裸 `ctest`）
