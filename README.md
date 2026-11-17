@@ -893,12 +893,14 @@ cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++
 
 ## 上游与许可
 
-仓库根的 [`LICENSE`](LICENSE) 就是许可全文（与 `tcc/COPYING` 逐字一致）：
-**LGPL-2.1**——c6 是 TinyCC 的分支，主编译器（`tcc/`，含 `tcc/c6` 与 `libtcc`）
-及其全部修改按 tcc 的原许可继承分发。例外是 [`c6c/`](c6c/)：它是用 c6 语言
-**自举重写**的编译器，不 `#include` `tcc/*.h`、不链接 `libtcc`、不复制 `tcc/`
-源码（`cmake --build build --target lint` 机器可查），按自己的
-[`c6c/LICENSE`](c6c/LICENSE)（**MIT**）分发。打包时许可证也随 flavour 走
-（c6 包带 LGPL、c6c 包带 MIT，见 `cmake/C6Install.cmake`）。
+仓库根的 [`LICENSE`](LICENSE) 是仓库的**主许可**：**MIT**（与
+[`c6c/LICENSE`](c6c/LICENSE) 同文）。仓库的主体现在是自举编译器
+[`c6c/`](c6c/)——用 c6 语言重写的编译器，不 `#include` `tcc/*.h`、不链接
+`libtcc`、不复制 `tcc/` 源码（`cmake --build build --target lint` 机器可查）。
+[`tcc/`](tcc/) 子目录是上游 TinyCC 的派生代码，**继续按上游的 LGPL-2.1
+分发**（见 [`tcc/COPYING`](tcc/COPYING)）——既有许可改不成 MIT；好在默认构建
+已不编译、不安装 tcc（见上文），它只作语料与参考实现留在仓库里。打包时许可
+证随 flavour 走：c6c 包带 MIT，显式 `-DC6_ENABLE_TCC=ON` 出的 c6 包带 LGPL
+（见 `cmake/C6Install.cmake`）。
 
 上游基线固定在 `2d3eea2`（`origin/mob`）。
