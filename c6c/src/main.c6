@@ -567,6 +567,8 @@ static int parse_args(int argc, char **argv)
             c99_set_mode();      /* C99 后端：-o 写的是 .c 源文件 */
         } else if (strcmp(a, "--emit-llvm") == 0) {
             llvm_set_mode();     /* LLVM IR 后端：-o 写的是 .ll */
+        } else if (strcmp(a, "--llvm-no-prefix") == 0) {
+            llvm_set_noprefix(); /* 符号不加 c6_ 前缀（对接 tcc 风格的 C 侧 ABI） */
         } else if (strcmp(a, "-nostdlib") == 0) {
             O.nostdlib = 1;
         } else if (a[0] == '-' && (a[1] == 'I' || a[1] == 'D' || a[1] == 'U'

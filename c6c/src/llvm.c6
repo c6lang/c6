@@ -23,6 +23,7 @@
 static FILE *LL_OUT;        /* 最终 .ll */
 static FILE *LL_FNOUT;      /* 函数体暂存（模块要先发数据块和声明） */
 static int LL_MODE;
+static int LL_NOPREFIX;
 static char LL_TMPNAME[512];
 
 #define LL_FN_MAX 8192
@@ -44,6 +45,10 @@ static int LL_TMP;          /* SSA 临时名计数器（每个函数清零） */
 
 static void llvm_set_mode(void) { LL_MODE = 1; }
 static int llvm_mode(void) { return LL_MODE; }
+static void llvm_set_noprefix(void) { LL_NOPREFIX = 1; }
+
+/* 和 tcc 的 --emit-llvm 对接时要能用裸符号名（rtos-c6 的 C 侧按原名调用）。 */
+static int llvm_noprefix(void) { return LL_NOPREFIX; }
 
 /* 符号名：ELF 符号可能是 `printf`、`a$b`、`.L1`，统一改成合法 LLVM 标识符。
  * 用户名字一律 `c6_` 前缀，内部辅助用具名 `__c6l_`，两边不会撞。 */
@@ -53,9 +58,11 @@ static void llvm_sym(u32 sym, char *buf, size_t n)
     size_t i = 0;
     size_t k = 0;
 
-    buf[k++] = 'c';
-    buf[k++] = '6';
-    buf[k++] = '_';
+    if (!LL_NOPREFIX) {
+        buf[k++] = 'c';
+        buf[k++] = '6';
+        buf[k++] = '_';
+    }
     for (i = 0; s[i] && k + 4 < n; i++) {
         char c = s[i];
 
@@ -897,7 +904,7 @@ static void llvm_blobs(FILE *cf)
         u32 j = 0;
 
         for (; t && t[j]; j++) {
-            if (t[j] == '_' && t[j + 1] == '_' && t[j + 2] == 'c' && t[j + 3] == '6'
+            if (!LL_NOPREFIX && t[j] == '_' && t[j + 1] == '_' && t[j + 2] == 'c' && t[j + 3] == '6'
                 && t[j + 4] == '_') {
                 if (k + 8 < sizeof(line)) {
                     line[k++] = 'c';
@@ -1117,8 +1124,8 @@ static int llvm_finish(const char *out)
     FILE *in = NULL;
     size_t got = 0;
 
-    if (!cf || !PA_MAIN) {
-        fprintf(stderr, "c6c: LLVM IR 后端：没有可用的入口\n");
+    if (!cf) {
+        fprintf(stderr, "c6c: 写不了 %s\n", out);
         return 1;
     }
     llvm_prologue(cf);
@@ -1149,30 +1156,33 @@ static int llvm_finish(const char *out)
     }
     remove(LL_TMPNAME);
 
-    /* 入口：构造器 → 真 main → 析构器（数据段已经是静态初值，不需要
-     * init_data；裸机不经过这里也能拿到正确的 vtable 指针）。 */
-    llvm_sym((u32)PA_MAIN->val, mn, sizeof(mn));
-    fprintf(cf, "define i32 @main(i32 %%argc, ptr %%argv) {\n");
-    for (i = 0; i < NCTOR; i++) {
-        char cn[256] = {0};
+    /* 入口包装：只有本模块里有 main 才发。逐文件 --emit-llvm 的裸机/内核
+     * TU 通常没有 main（入口在别的 .o 里），仍然要能出 IR——数据槽已经是
+     * 静态初值，不依赖这个包装去调运行期初始化。 */
+    if (PA_MAIN && !LL_NOPREFIX) {
+        llvm_sym((u32)PA_MAIN->val, mn, sizeof(mn));
+        fprintf(cf, "define i32 @main(i32 %%argc, ptr %%argv) {\n");
+        for (i = 0; i < NCTOR; i++) {
+            char cn[256] = {0};
 
-        llvm_sym(CTORS[i], cn, sizeof(cn));
-        fprintf(cf, "  %%c%u = bitcast ptr @%s to ptr\n", (unsigned)i, cn);
-        fprintf(cf, "  %%cr%u = call i64 %%c%u()\n", (unsigned)i, (unsigned)i);
-    }
-    fprintf(cf, "  %%a0 = sext i32 %%argc to i64\n");
-    fprintf(cf, "  %%a1 = ptrtoint ptr %%argv to i64\n");
-    fprintf(cf, "  %%mf = bitcast ptr @%s to ptr\n", mn);
-    fprintf(cf, "  %%rv = call i64 %%mf(i64 %%a0, i64 %%a1)\n");
-    for (i = 0; i < NDTOR; i++) {
-        char xn[256] = {0};
+            llvm_sym(CTORS[i], cn, sizeof(cn));
+            fprintf(cf, "  %%c%u = bitcast ptr @%s to ptr\n", (unsigned)i, cn);
+            fprintf(cf, "  %%cr%u = call i64 %%c%u()\n", (unsigned)i, (unsigned)i);
+        }
+        fprintf(cf, "  %%a0 = sext i32 %%argc to i64\n");
+        fprintf(cf, "  %%a1 = ptrtoint ptr %%argv to i64\n");
+        fprintf(cf, "  %%mf = bitcast ptr @%s to ptr\n", mn);
+        fprintf(cf, "  %%rv = call i64 %%mf(i64 %%a0, i64 %%a1)\n");
+        for (i = 0; i < NDTOR; i++) {
+            char xn[256] = {0};
 
-        llvm_sym(DTORS[i], xn, sizeof(xn));
-        fprintf(cf, "  %%d%u = bitcast ptr @%s to ptr\n", (unsigned)i, xn);
-        fprintf(cf, "  %%dr%u = call i64 %%d%u()\n", (unsigned)i, (unsigned)i);
+            llvm_sym(DTORS[i], xn, sizeof(xn));
+            fprintf(cf, "  %%d%u = bitcast ptr @%s to ptr\n", (unsigned)i, xn);
+            fprintf(cf, "  %%dr%u = call i64 %%d%u()\n", (unsigned)i, (unsigned)i);
+        }
+        fprintf(cf, "  %%rc = trunc i64 %%rv to i32\n");
+        fprintf(cf, "  ret i32 %%rc\n}\n");
     }
-    fprintf(cf, "  %%rc = trunc i64 %%rv to i32\n");
-    fprintf(cf, "  ret i32 %%rc\n}\n");
     fclose(cf);
     printf("c6c: %s（LLVM IR 后端，%u 个符号）\n", out, (unsigned)X64.nsym);
     return 0;
