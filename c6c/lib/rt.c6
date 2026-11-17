@@ -1076,8 +1076,13 @@ long __c6_co_run(void)
         bad += c6c_co_reap_done();      /* 跑完的 `co` 任务就地回收并计数 */
         if (guard++ > 1000000)
             break;
+        /* `blocked_on` 非空表示这个协程正在 `await` 另一个任务：唤醒它只会让它在
+         * `__c6_co_await` 的循环里再让一次，真正该跑的是它等的那个任务。
+         * 以前这里漏了这个条件：父子两条协程同时在册时，主循环每轮都挑到被挡住
+         * 的父任务并"恢复"它，子任务一直排不上队——实测同一个协程被恢复到 guard
+         * 上限（`examples/stdhttps.c6` 的 co 段、最小复现 `/tmp/cm9`）。 */
         for (c = C6_CO_ALL; c; c = c->next)
-            if (!c->done && !c->waiting) {
+            if (!c->done && !c->waiting && !c->blocked_on) {
                 c6c_co_resume(c);
                 break;
             }

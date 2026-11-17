@@ -5896,3 +5896,26 @@ c6c_co_poll_ready(-1)`。两个 co 都 `waiting` 时应该走到 poll，poll 立
 
 下一轮就在 `c6c_co_poll_ready` 里打一行（fd/events/revents/返回值），看它到底被调到
 没有、返回了什么。这是整条链上唯一还没直接观测过的一环。
+
+### 第 305 轮：`__c6_co_run` 主循环补上 `!blocked_on`，饿死问题解决（但没修好 std-https）
+
+`c6c_co_pump` 挑候选时的条件是 `!done && !waiting && !blocked_on`，而
+`__c6_co_run` 自己的主循环只看前两个。父子两条协程同时在册时（`await 某个 async
+调用` 会在父任务里建一个子任务），主循环每轮都挑到被挡住的父任务去"恢复"，子任务
+永远排不上队——这就是第 301 轮抓到的"同一个协程被恢复到 guard 上限"。
+
+补上 `&& !c->blocked_on` 之后，`/tmp/cm9` 里**两个子任务都能跑起来、也都能被唤醒**
+（以前只有一个跑、另一个连 `[snd]` 都不打）：
+
+```
+[req] before snd n=11 wfd=6 / wfd=8
+[snd] fd=6 await fd=6 / [snd] fd=8 await fd=8
+[snd] woke fd=8 / [snd] woke fd=6
+```
+
+但任务还是停在"子任务跑完之后父任务不往下走"，所以 `examples/stdhttps.c6` 仍是
+3 条红、回归仍是 91 / 92。也就是说这条修的是**饿死**，剩下的问题是
+`__c6_co_await` 等子任务结束时没被唤醒（子任务 `done` 之后父任务还挂在
+`blocked_on` 上）。
+
+门禁：96 个 ctest 全绿、tests2 意外失败 0。
