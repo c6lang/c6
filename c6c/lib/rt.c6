@@ -1753,6 +1753,15 @@ long strlen(const char *s)
     return c6c_strlen(s);
 }
 
+long strnlen(const char *s, unsigned long n)
+{
+    unsigned long i = 0;
+
+    while (i < n && s[i])
+        i++;
+    return (long)i;
+}
+
 char *strcpy(char *dst, const char *src)
 {
     long i = 0;
