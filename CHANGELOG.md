@@ -7,6 +7,22 @@
 
 ## 未发布
 
+### std-term 转绿（90 / 92）：`sigaction` / `sigprocmask` / `sigpending` 接上内核了
+
+这三个一直是空操作（"c6c 的运行时没有信号投递"），所以 `stdterm` 一装
+SIGUSR1 处理函数就被默认动作杀掉（rc=138）。现在：
+
+- `src/asmblob.c6` 加一段 12 字节的 `__c6_sigrestorer`（`mov $15,%eax; syscall`
+  = rt_sigreturn）——x86-64 内核要求置 SA_RESTORER 并给出这段地址，否则
+  rt_sigaction 直接 -EFAULT；
+- `rt.c6` 的 `sigaction` 把 glibc 布局（handler@0 / sa_mask@8 共 128 字节 /
+  sa_flags@136 / sa_restorer@144）翻成内核那份（handler@0 / flags@8 /
+  restorer@16 / mask@24），走 syscall 13；
+- `sigprocmask` 走 14，`sigpending` 走 127（内核只填 8 字节，剩下清零）。
+
+`stdterm: 45 check(s), 0 failure(s)`。
+
+
 ### std-box 转绿（89 / 92）：限定名命中之后不再被裸名盖掉
 
 两处一起改才通：
