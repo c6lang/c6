@@ -50,6 +50,10 @@ c6c_target(testflag ENV C6C=${C6C_BIN} COMMAND ./tests/test-flag.sh)
 c6c_target(ctest-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/run.sh
   COMMENT "c6c: ctest-c6c（前端/后端回归，tests/run.sh）")
 
+# --- 2.2b 工程管理子命令（init / scan / build / test / run）---
+c6c_target(pmtest ENV C6C=${C6C_BIN} COMMAND ./tests/pm-tests.sh
+  COMMENT "c6c: pmtest（c6c 工程管理子命令：扫描 / 清单 / build / test / run）")
+
 # --- 2.3 各后端 / 各特性的专项回归 ---
 c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)
 c6c_target(ldcheck ENV C6C=${C6C_BIN} COMMAND ./tests/ld-check.sh)

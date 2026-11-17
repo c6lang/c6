@@ -5,6 +5,47 @@
 > 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
 
+## 工程管理子命令（c6c init / scan / build / test / run）
+
+`c6c` 除了编译源码，还带一组**工程管理子命令**（参考 cargo / go 的做法，
+用 c6 自身实现，子命令在 `c6c/src/pm.c6`）。第一个参数是这些名字时进入管理
+模式，其余情况仍是普通编译器：
+
+```sh
+c6c scan              # 只扫描仓库：推断 name/version/kind、源文件、import、test 块
+c6c init [--force]    # 把扫描结果写成 c6c.yaml（已存在需 --force 覆盖）
+c6c build             # 按清单编译到 out（默认 build/<name>）
+c6c test              # 编译全部源文件并运行 `test "…" { }` 块
+c6c run [参数...]     # 先 build，再执行产物并把参数透传
+c6c help              # 子命令帮助
+```
+
+`init` 的扫描规则：递归遍历当前目录（跳过隐藏目录与 `build/`、`out/`、`dist/`、
+`target/`、`node_modules/`），收集 `.c6` / `.c` 源文件；有 `main()` 或只有
+`test` 块 → `kind: app` / `lib`；只有 `_start`（无 main）→ `kind: firmware`，
+并在 `flags` 里自动加 `-nostdlib`。`import a.b;` 会按 `a/b.c6` / `a/b.c`
+核对能否在仓库里找到，找不到的打到 stderr 作为提醒。版本号优先取仓库根的
+`VERSION`，否则 `0.1.0`。
+
+`c6c.yaml` 是受控子集（不依赖 `std/data/yaml.c6`，保持 c6c 单 TU 可自举）：
+
+```yaml
+name: hello
+version: 0.1.0
+kind: app            # app / lib / firmware
+out: build/hello
+sources:
+  - src/main.c6
+include:
+  - .
+flags:
+  - -b
+```
+
+ELF/BIN/HEX 生成、烧录与调试、打包安装与发布等子命令将按同一清单逐步接入；
+`c6c help` 始终打印当前可用列表。回归入口：`cmake --build build --target pmtest`
+（或 `ctest -R '^c6c-pm$'`）。
+
 ## 版本与发布号
 
 两个版本文件各管一件事，不要混用：

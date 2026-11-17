@@ -7,6 +7,22 @@
 
 ## 未发布
 
+### c6c 工程管子命令：init / scan / build / test / run
+
+参考 cargo / go 的做法给 `c6c` 加了子命令（实现在 `c6c/src/pm.c6`，用 c6 自身
+写、随 c6c 单 TU 自举；`c6c help` 列出当前可用的名字）：
+
+- `c6c scan` 递归扫描仓库：收集 `.c6` / `.c` 源文件，按 `main()` / `_start` /
+  `test "…"` 块推断 `kind: app / firmware / lib`，核对 `import a.b;` 是否有
+  对应源文件，版本号取仓库根的 `VERSION`；`c6c init` 把结果写成受控子集的
+  `c6c.yaml`（已存在需 `--force` 覆盖）。
+- `c6c build` / `test` / `run` 按清单编译、跑 test 块、执行产物；清单缺省时
+  退化为临时扫描并提示先 `init`；固件工程自动带 `-nostdlib`。
+- 打包安装、ELF/BIN/HEX、烧录调试与发布等子命令留待同一清单上继续接入。
+
+验证：`pmtest` 12/12（扫描、清单、build/test/run、覆盖保护、firmware 推断、
+原 CLI 不回归）；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
 c6c 已经能自举：宿主 C 编译器把 c6 写的编译器引导出来，再由它自己编自己
