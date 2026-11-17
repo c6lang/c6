@@ -5722,3 +5722,32 @@ callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之
 `await c6_io(h->rfd, …)` 和读写两个等待点混用。
 
 下一轮把这个再搬一次：`await c6_io(h->wfd, …)`，并且同一协程里**先写后读**。
+
+### 第 296 轮：找到 co 的真正触发条件——**被 await 的子任务自己会挂起**
+
+`/tmp/cm9` 把 httpsa 的形状搬全了（`H` 里放 `wfd/rfd/rbuf/bcap/blen`，
+`snd` 里 `await c6_io(h->wfd, C6_CO_EV_WRITE)` 再 `write`，`rcv` 里
+`await c6_io(h->rfd, C6_CO_EV_READ)` 再 `read`，`req` 里 `char buf[1200]`
+再 `await snd` → `await rcv`），两条 `co req(...)`，各自独立的 pipe：
+
+```
+[req] in h=…b2b0 wfd=6 rfd=9      ← a 的句柄全对
+[req] before snd n=11 wfd=6
+[req] in h=…b240 wfd=8 rfd=11     ← b 的句柄全对
+[req] before snd n=11 wfd=8
+[snd] fd=8                        ← 只有 b 进了 snd
+[snd] await fd=8
+a=6,0,0 b=8,0,0                   ← 两边都没跑完，但 co_run 正常返回
+```
+
+和前面几轮那些"能过"的复现相比，唯一没搬过的差别是：**被 `await` 的那个 async
+函数自己会挂起在 `await c6_io` 上**（`/tmp/cm7` 里 `snd` await 的 `tick` 是立刻
+返回的，所以没暴露）。也就是 `httpsa_request → httpsa_send → await c6_io` 这条链。
+
+`__c6_co_wait` 里 `while (!c->done && rounds < 1000) { if (!c6c_co_pump(c)) break; }`
+——`c6c_co_pump` 一旦返回 0（这一轮没推进）就 **break 出去**，紧接着无条件把任务的
+state 写成 DONE 并返回。孩子还挂在 `c6_io` 上时，父任务就会"以为它跑完了"继续往下
+走，或者干脆卡住。
+
+下一轮直接改这里：父任务等子任务时，把子任务的等待点（fd + 事件）接力给自己
+（或者把自己挂到子任务的 `waiter` 上），不要靠"泵一次不动就算完"。
