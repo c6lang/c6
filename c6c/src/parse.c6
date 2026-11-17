@@ -16178,6 +16178,47 @@ static void glob_addr_parse(u32 data_off, int amp, int num_first, int pclose)
                 break;
             }
         }
+    } else if (pa_is_ch('.') && ty_is_agg(ty)) {
+        /* 基对象是全局量、后面跟着**成员链**、最后一段是数组：数组退化成指向
+         * 首元素的指针，那是合法的地址常量（C99 6.6p9）。内核里到处都是——
+         *     .fdt          = &init_files.fdtab,
+         *     .close_on_exec= init_files.close_on_exec_init,   （自引用）
+         *     .data         = fontdata_8x16.data
+         * 以前这里一律报"取的是运行期的值"，fs/file.c、kernel/utsname_sysctl.c、
+         * lib/fonts/font_8x16.c 都栽在这上面。不是数组就还是运行期的值。 */
+        ga.pty = ty;
+        ga.has_pty = 1;
+        for (;;) {
+            if (pa_accept_ch('.')) {
+                Tok *mt = pa_cur();
+                u32 mty = 0;
+                u32 moff = 0;
+
+                if (mt->kind != TK_IDENT || !ty_is_agg(ga.pty)
+                    || !agg_find_promoted(ga.pty, tok_data(mt), mt->len, &mty, &moff)) {
+                    pa_error("'%.*s' 不是这个结构体/联合体的成员", (int)mt->len,
+                             tok_data(mt));
+                    goto bad;
+                }
+                if (AGG_FOUND_BITS != 0) {
+                    pa_error("位域没有地址（C99 6.5.3.2p1）");
+                    goto bad;
+                }
+                pa_advance();
+                ga.add += (i64)moff;
+                ga.pty = mty;
+            } else {
+                break;
+            }
+        }
+        if (!ty_is_array(ga.pty)) {
+            pa_error("'%.*s' 取的是运行期的值，不是地址常量：静态初始化的指针只能"
+                     "是全局对象/函数的地址加常量偏移（要地址请写 '&…'）",
+                     (int)t->len, tok_data(t));
+            goto bad;
+        }
+        ga.pty = ty_target(ga.pty);
+        ga.has_pty = 1;
     } else if (pa_is_ch('[') || pa_is_ch('.') || pa_is_punct("->") || pa_is_ch('(')) {
         /* `int *p = A[2];` / `s.m` / `f()`：取到的是运行期的值 */
         pa_error("'%.*s' 取的是运行期的值，不是地址常量：静态初始化的指针只能"
