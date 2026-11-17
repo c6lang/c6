@@ -17490,6 +17490,26 @@ static void init_body(u32 top)
                                       0, 0, esz);
                         }
                     }
+                } else if (pa_cur()->kind == TK_STR && ty_is_ptr(et)) {
+                    /* `[SMCA_CS ... SMCA_CS_V2] = "coherent_station"`：元素是
+                     * 指针时字符串字面量给的是它的**地址**，区间里每个元素
+                     * 都指向同一份数据（内核 arch/x86/kernel/cpu/mce/amd.c 的
+                     * smca_names[] 就是这么写的）。 */
+                    if (INIT_IS_GLOB) {
+                        u32 so = str_lit_data();
+                        u64 va = (u64)DATA_VA(so);
+
+                        for (k = lo; k <= hi && k < n; k++)
+                            glob_store(INIT_GOFF, boff + k * esz, et, va);
+                    } else {
+                        /* 局部数组：地址只能运行期算，先落到一个临时再逐元素存
+                         * （字符串字面量本身在数据段里，取的是它的符号地址）。 */
+                        u32 v = gen_string();
+                        u32 vty = GEN_TY;
+
+                        for (k = lo; k <= hi && k < n; k++)
+                            store_conv(gen_addr_off(INIT_ADDR, boff + k * esz), et, v, vty);
+                    }
                 } else if (pa_cur()->kind == TK_STR && ty_is_array(et)
                            && ty_size(ty_target(et)) == 1) {
                     /* `[0 ... 3] = "??"`：字符串填的是**整个元素子对象**，和花括号
