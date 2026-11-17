@@ -27,11 +27,20 @@ ELF writer 让 `.text`/`.data` 的 `sh_offset` 重叠；c6c 自链接器按自�
 重定位表填数据，运行时值正确，系统 `ld` 链接也对。所以不能拿
 `readelf -x` 当 c6c 产物正确性的判据。
 
-**完整内核二进制**目前仍产不出，但不是 C 前端的缺口：内核还有 1274 个
-`.S` 汇编、`arch/x86/kernel/vmlinux.lds.S` 链接脚本（c6c 不编译汇编、
-不支持 GNU ld 脚本），且 kbuild 的 `cc-version.sh` 不认 c6c；本机 host
-工具 objtool 还缺 libelf/gelf.h。c6c 承担的是 C→`.o` 这一层，这一层已
-验证可用。
+**完整可运行内核二进制目前产不出，根因是 c6c native 后端不支持内联汇编**
+（这是 C 前端的缺口，不是"只有汇编/ld 脚本"那么简单）。实测最小用例：
+`unsigned long rd(void){ asm volatile("rdtsc":"=a"(x)); … }` 和
+`asm volatile("wrmsr"::"c"(m),"a"(lo),"d"(hi))` 经 `c6c -c` 编出的 `.o`
+反汇编里**一条 `rdtsc`/`wrmsr` 指令都没有**——`rd()` 只剩栈帧操作加一次
+野内存读，`wrmsr()` 直接是空函数；gcc 对照正确生成 `0f 31`/`0f 30`。
+也就是说那 999 个"零诊断通过"的内核 `.o`，凡是含内联汇编的函数
+（`cpuid` 103 处、`inb/outb` 94 处、`rdtsc` 17 处、`swapgs`/`cli`/`sti`/
+`rdmsr`/`wrmsr` 等，分布在至少 22 个内核 TU）**语义都是错的**——
+零诊断只证明"语法/类型过了"，不证明"代码生成正确"。这是从"编译通过"
+到"内核能跑"之间真正的、尚未跨越的坎。
+
+其余是次要工程缺口（汇编阶段、ld 脚本、kbuild 集成、host 工具依赖），
+但即使全补上，不支持内联汇编的内核也跑不起来。
 
 ### C 前端：Linux 7.4-rc3 真实构建集 **999/999 全部通过**
 
