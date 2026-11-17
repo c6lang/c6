@@ -5704,3 +5704,21 @@ callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之
   这个形状）。
 
 下一步：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，直接看是不是换栈那一步踩的。
+
+### 第 295 轮：把 httpsa 的调用形状逐条搬进最小复现，**全对**
+
+对照 `httpsa` 的实际形状搭了三个复现，全部通过：
+
+| 复现 | 形状 | 结果 |
+|------|------|------|
+| `/tmp/cm6` | 7 个实参 + 一次 `await` + 两条并发 `co` | `a=21,106 b=210,1060` ✓ |
+| `/tmp/cm7` | 三层 async 嵌套（`get → req → snd`）、`req` 里 `char buf[1200]`、`snd` 里**循环 await** | `a=11,97 b=11,98` ✓ |
+| `/tmp/cm8` | 两条 `co` 都 `await c6_io(fd, C6_CO_EV_WRITE)` 往同一个 pipe 写 | `a=55,66 b=55,66 got=0011223344` ✓ |
+
+也就是说：多实参、深层嵌套、循环挂起、`await c6_io` 的挂起恢复、两个协程交替跑，
+这些 c6c 都是对的。`stdhttps` 的 co 那两路仍是 3 条红，说明触发条件还差一个我没
+搬过来的东西——最可能是 `httpsa_send` 里那句 `await c6_io(h->wfd, …)` 用的是
+**从结构体字段读出来的 fd**（我 cm8 用的是形参 `wfd`），以及 `httpsa_recv` 那边
+`await c6_io(h->rfd, …)` 和读写两个等待点混用。
+
+下一轮把这个再搬一次：`await c6_io(h->wfd, …)`，并且同一协程里**先写后读**。
