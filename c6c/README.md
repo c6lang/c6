@@ -472,7 +472,14 @@ cmake --build build --target regression-c6c         # 已全绿的那批（列�
 * selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
   仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
 
-当前基线（第 289 轮实测）：**91 / 92 全绿**，还差 1 个（`std-https`）。缺口分三类，都在
+当前基线（第 300 轮实测）：**91 / 92 全绿**，还差 1 个（`std-https`）。
+
+`std-https` 只挂在 co 那两路：`httpsa_request` → `await httpsa_send(...)`，而
+`httpsa_send` 里自己还有 `await c6_io(h->wfd, C6_CO_EV_WRITE)`。也就是说
+"**被 await 的 async 调用自己又挂在 fd 上**"这一层，co 调度器还接不住
+（最小复现 `/tmp/cm9`，见 `c6c/docs/todo.md` 第 296~300 轮）。同一个协程里
+直接 `await c6_io` 是正常的；`task`（spawn 出来的真线程）那一路也正常，
+所以 `examples/stdhttps.c6` 的 `task` 段是绿的，只有 `co` 段红。缺口分三类，都在
 `c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面（真信号投递、真 DNS、
 非阻塞 IO 的边角）；模板实例的身份与布局（同一个实例名在两个 TU 里会拿到两个类型 id，
 `Deque@T` 的成员类型在实例里会被解析错——`c6c/docs/todo.md` 第 215/216 轮
