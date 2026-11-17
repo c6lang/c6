@@ -5015,3 +5015,19 @@ checkout` 回去了。下一轮从叶子引擎那条 `store_conv(LF_TY[li], v, v
 （`gen_init_braced` / `init_save`-`init_restore` 那套，或者 `ty_is_agg(vty)` 的整块
 拷贝分支）就被处理掉了。下一轮从 `gen_init_obj` 里 `pa_is_ch('{')` 那个分叉开始，
 把走到哪条分支打出来，别再在叶子那边猜。改动已撤回。
+
+### 第 252 轮：找到了 `if (tty)` 那一段，但"唯一成员是切片"的条件没命中
+
+在 `ty_is_agg(vty)` 整块拷贝分支前面加打印，`/tmp/sp2.c6` 跑出来是：
+
+```
+[cp] tty=313 agg=1 vty=64 vagg=0 vptr=1     # tty = 聚合类型，vty 已经是退化后的指针
+```
+
+按这个线索在 `if (tty)` 里加了一段"聚合只有一个成员、那成员是切片、当前记号是数组
+变量 → 现搭 {ptr,len}"，**结果没变**（`braced_span` 还是 0）——也就是说
+`ty_member_n(tty) == 1 && ty_is_slice(ty_member(tty, 0))` 这个条件在这里不成立
+（313 这个类型要么成员数不是 1，要么成员的 `ty_is_slice` 为假）。下一轮先把
+`ty_member_n(tty)` 和 `ty_is_slice(ty_member(tty,0))` 打出来再看，别再盲改。
+
+三次尝试（叶子引擎、gen_init_obj 入口、这里）都没成，全部撤回；回归仍是 86 / 92。
