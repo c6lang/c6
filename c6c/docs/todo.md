@@ -5566,3 +5566,18 @@ run3: [fa] ran A=1 [fb] ran B=1 A=1 B=1     ← 只有这一次两边都对
 
 门禁：93 个 ctest 全过、tests2 意外失败 0；回归两次都是 90 / 92。
 下一个目标就是这个"五次挂两次"的 chan 竞态。
+
+### 第 287 轮：chan 竞态带打印就不复现，先记一笔
+
+给 `pthread_mutex_lock`/`pthread_cond_wait`/`pthread_cond_signal` 加
+`C6C_DBG_CV3` 打印（`getenv` 门控）后跑 `/tmp/ch8`，三次**全过**——又是典型的
+"带打印就不复现"。trace 里能看到 `[mx] lock=2`（有争抢时原子加会到 2，
+说明等待方确实在抢），`[cv] … wait seen=98 → signal=98 → 唤醒` 也都成对。
+
+也就是说现在的竞态窗口非常窄，靠加打印定位行不通了。下一步要么：
+1. 在 `rt.c6` 里维持一个**环形缓冲**记录最近 N 次锁/条件变量事件（不在热路径
+   上打印，挂死之后由 `SIGALRM`/超时那侧 dump）；
+2. 或者直接把 `std/container/chan.c6` 的 `send`/`recv` 改成"用信号量"——
+   但信号量现在还是空操作，得先把 sem 接上。
+
+更省事的方向可能是 (2)：`Chan` 本来就是个有界队列，用 sem 表达比 cond 简单。
