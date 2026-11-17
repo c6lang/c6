@@ -170,14 +170,22 @@ worker 抢一个累加器，和自然是乱的。
   归档、指纹和 staging 一起清。
 - `lock` 除源码外还锁 include / flags / link_flags / dev+release flags /
   pkg_formats / pkg_files / fw_formats；workspace 拒绝越界成员与未知子命令。
-- Cargo 元数据迁移只取 `[package]` 段；CI 的 c6c job 显式打开
-  `C6_ENABLE_TCC`（默认已为 OFF），文档同步当前 `VERSION` 与 `fast` 清单。
+- Cargo 元数据迁移只取 `[package]` 段；CI 的 c6c job 显式关闭
+  `C6_ENABLE_TCC` 并断言无 tcc 产物，文档同步当前 `VERSION` 与 `fast` 清单。
 
 第二轮交叉复核继续修掉：烧录模板展开的缓冲区越界、`install` / `package` 对
 绝对路径落点不一致、增量指纹漏掉源文件/头文件 mtime 与 `--manifest-path`
 清单、固件未配置 BIN/HEX 时永远重编、迁移输出的换行笔误、`list --json`
 与锁文件的字符串转义；测试侧修正 `--locked` 与 TGZ 的恒真断言，文档同步
 std/诊断/C99 等当前基线。
+
+c6c 自管清单的 `out` 由 `build/c6c-managed` 改为 `build/c6c`，版本同步到
+`0.6.3`，打包文件表同步；
+`pmtest` 的 dogfood 步骤用编译器副本引导，避免覆盖正在执行的二进制；验证完
+还原宿主编译器，绕开自举运行时不转发完整环境这一限制。顺带给所有 `execvp`
+用的 argv 数组补显式 NULL 终止（`{0}` 初始化在自编译产物里不可靠），修好
+自编译 c6c 链接固件时 `cc` 收到残留参数的问题。构建侧（含 CI 的 c6c job）
+显式 `C6_ENABLE_TCC=OFF` 并断言没有 `tcc/c6` / `libtcc`，自管构建不依赖 tcc。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
