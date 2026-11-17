@@ -169,9 +169,47 @@ static Sym *sym_find_ns(const char *name, u32 len, int ns)
     return NULL;
 }
 
+/* 静态局部在**自己的初始化器里**自引用：`static struct list_head y =
+ * LIST_HEAD_INIT(y);`（内核的 LIST_HEAD_INIT / __WORK_INITIALIZER 到处都是
+ * 这个形状）。这时候符号是按**改名后**的名字（`函数名.N`）登记的，原名要等
+ * gen_one_global 回来才挂上，初始化器里的 `&y` 就查不到。查不到时先看这张
+ * 待定表：名字直接指向源里的 token，待定项只活一次初始化的功夫。 */
+#define SA_PEND_MAX 8
+static const char *SA_PEND_ORIG[SA_PEND_MAX];
+static u32 SA_PEND_ORIGL[SA_PEND_MAX];
+static const char *SA_PEND_MANG[SA_PEND_MAX];
+static u32 SA_PEND_N;
+
+static void sa_pending_push(const char *orig, u32 olen, const char *mang)
+{
+    if (SA_PEND_N >= SA_PEND_MAX)
+        return;
+    SA_PEND_ORIG[SA_PEND_N] = orig;
+    SA_PEND_ORIGL[SA_PEND_N] = olen;
+    SA_PEND_MANG[SA_PEND_N] = mang;
+    SA_PEND_N++;
+}
+
+static void sa_pending_pop(void)
+{
+    if (SA_PEND_N)
+        SA_PEND_N--;
+}
+
 static Sym *sym_find(const char *name, u32 len)
 {
-    return sym_find_ns(name, len, 0);
+    Sym *s = sym_find_ns(name, len, 0);
+    u32 i = 0;
+
+    if (s)
+        return s;
+    for (i = SA_PEND_N; i > 0; i--) {
+        if (SA_PEND_ORIGL[i - 1] == len
+            && memcmp(SA_PEND_ORIG[i - 1], name, len) == 0)
+            return sym_find_ns(SA_PEND_MANG[i - 1],
+                               (u32)strlen(SA_PEND_MANG[i - 1]), 0);
+    }
+    return NULL;
 }
 
 static Sym *sym_find_tag(const char *name, u32 len)

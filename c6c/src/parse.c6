@@ -2972,6 +2972,8 @@ static i64 CONST_SYM_ADD;
  * **不是**强制转换——把枚举成员当类型名去 parse_typename，就会在 `-` 上
  * 报"这里要 ')'"。内核 include/linux/log2.h 的 bits_per() 正好这么用。 */
 static Sym *sym_find(const char *nm, u32 nl);
+static void sa_pending_push(const char *orig, u32 olen, const char *mang);
+static void sa_pending_pop(void);
 static int pa_is_enum_const(Tok *t)
 {
     Sym *s = 0;
@@ -18212,7 +18214,12 @@ static void gen_one_local(u32 ty, Declarator *d)
         snprintf(nm, 192, "%s.%u", FN.name ? FN.name : "static", NSTATIC++);
         sd.name = nm;
         sd.nlen = (u32)strlen(nm);
+        /* 初始化器里可能会**自引用**（`static struct list_head y =
+         * LIST_HEAD_INIT(y);`）：这时的符号只按改名后的 `nm` 存在，先把原名
+         * 挂上待定表，gen_one_global 回来再撤掉。 */
+        sa_pending_push(d->name, d->nlen, nm);
         gen_one_global(ty, &sd);
+        sa_pending_pop();
         gs = sym_find(nm, sd.nlen);
         if (!gs)
             return;
