@@ -5617,7 +5617,9 @@ static u32 parse_enum_spec(void)
                     memcpy(qA + wA, tok_data(t), k);
                     wA += k;
                     sqA = sym_add(qA, wA, ty_int(), SC_ENUMC);
-                    sqA->val = (i64)((i32)val | (i32)ebase);
+                    /* 和裸名那次**同一个表达式**：`OK = 0` 不能加基址
+                     * （tests/err_ids.c6 的"0 永远是「没有错误」"）。 */
+                    sqA->val = (i64)(i32)(val ? (val | ebase) : 0u);
                 }
             }
         }
@@ -10537,7 +10539,11 @@ static u32 gen_postfix(void)
                 pa_advance();
                 t = pa_cur();
             }
-            s = sym_find(tok_data(t), t->len);
+            /* 最长前缀那边已经命中了就别再拿裸名盖掉（第 271 轮：
+             * `std.data.json.PARSE` 命中 `std__data__json__PARSE` 之后，这一句
+             * 会换成裸名 `PARSE`，而裸名是各模块共享的一格，谁先登记谁留下）。 */
+            if (!s)
+                s = sym_find(tok_data(t), t->len);
         }
         /* 方法体里的裸名字先看接收者的成员：别的模块可能导出同名全局
          * （`std/core/fixed.c6` 的 `int cmp(Fix *self, Fix b)` 就让
