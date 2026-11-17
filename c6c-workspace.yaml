@@ -1,0 +1,4 @@
+# 仓库级 workspace：c6c workspace <build|test|check|clean|lock|list>
+# 当前只有 c6c 一个成员；新增子工程时在这里加一行即可。
+members:
+  - c6c

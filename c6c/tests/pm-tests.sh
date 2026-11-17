@@ -193,5 +193,83 @@ else
   bad "c6c 自身清单"
 fi
 
+# 11) lockfile：生成 / --locked 校验 / 漂移拒绝
+(cd "$WORK/app" && "$C6C" lock > lock.log 2>&1 && "$C6C" build --locked > locked.log 2>&1)
+if [ -f "$WORK/app/c6c.lock" ] && grep -q 'src/main.c6' "$WORK/app/c6c.lock"; then
+  ok "lock 生成含源文件"
+else
+  bad "lock 生成"
+fi
+if grep -q '已写入 c6c.lock' "$WORK/app/lock.log"; then ok "--locked 通过"; else bad "--locked 通过"; fi
+cp "$WORK/app/src/main.c6" "$WORK/app/src/main.c6.bak"
+printf '\n' >> "$WORK/app/src/main.c6"
+(cd "$WORK/app" && "$C6C" build --locked > drift.log 2>&1)
+if [ $? -eq 2 ] && grep -q '不符' "$WORK/app/drift.log"; then ok "--locked 拒绝漂移"; else bad "--locked 漂移"; fi
+mv "$WORK/app/src/main.c6.bak" "$WORK/app/src/main.c6"
+
+# 12) doctor：源文件 / import 诊断
+(cd "$WORK/app" && "$C6C" doctor > doctor.log 2>&1)
+if grep -q '源文件 2（缺失 0）' "$WORK/app/doctor.log"; then ok "doctor 诊断"; else bad "doctor 诊断"; fi
+
+# 13) 迁移：从 CMakeLists.txt / Cargo.toml 提取元数据
+mkdir -p "$WORK/imcmake" "$WORK/imcargo"
+cat > "$WORK/imcmake/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.20)
+project(hello VERSION 1.2.3 LANGUAGES C)
+add_executable(hello src/main.c6)
+EOF
+cat > "$WORK/imcargo/Cargo.toml" <<'EOF'
+[package]
+name = "cargohello"
+version = "2.0.1"
+description = "demo from cargo"
+license = "MIT"
+EOF
+(cd "$WORK/imcmake" && "$C6C" init --from=cmake > /dev/null 2>&1)
+(cd "$WORK/imcargo" && "$C6C" init --from=cargo > /dev/null 2>&1)
+if grep -q '^name: hello$' "$WORK/imcmake/c6c.yaml" && grep -q '^version: 1.2.3$' "$WORK/imcmake/c6c.yaml"; then
+  ok "CMake 元数据迁移"
+else
+  bad "CMake 元数据迁移"
+fi
+if grep -q '^name: cargohello$' "$WORK/imcargo/c6c.yaml" && grep -q '^pkg_desc: demo from cargo$' "$WORK/imcargo/c6c.yaml"; then
+  ok "Cargo 元数据迁移"
+else
+  bad "Cargo 元数据迁移"
+fi
+
+# 14) workspace：自动发现成员 + 逐成员执行
+mkdir -p "$WORK/ws/a" "$WORK/ws/b"
+cat > "$WORK/ws/a/c6c.yaml" <<'EOF'
+name: a
+version: 0.1.0
+kind: app
+out: build/a
+sources:
+EOF
+cat > "$WORK/ws/b/c6c.yml" <<'EOF'
+name: b
+version: 0.1.0
+kind: app
+out: build/b
+sources:
+EOF
+(cd "$WORK/ws" && "$C6C" workspace init > /dev/null 2>&1)
+if grep -q '  - a' "$WORK/ws/c6c-workspace.yaml" && grep -q '  - b' "$WORK/ws/c6c-workspace.yaml"; then
+  ok "workspace init 发现成员"
+else
+  bad "workspace init"
+fi
+(cd "$WORK/ws" && "$C6C" workspace doctor > ws.log 2>&1)
+if grep -q 'workspace \[a\]' "$WORK/ws/ws.log" && grep -q 'workspace \[b\]' "$WORK/ws/ws.log"; then
+  ok "workspace 逐成员执行"
+else
+  bad "workspace 逐成员执行"
+fi
+ROOT=$(cd "$SELF/.." && pwd)
+(cd "$ROOT" && "$C6C" workspace list > "$WORK/root-ws.log" 2>&1)
+if grep -q '^c6c$' "$WORK/root-ws.log"; then ok "仓库 workspace 配置"; else bad "仓库 workspace 配置"; fi
+if grep -q 'src/pm.c6' "$SELF/c6c.lock"; then ok "c6c.lock 覆盖 pm.c6"; else bad "c6c.lock 覆盖 pm.c6"; fi
+
 echo "c6c pm: 通过 $pass / 失败 $fail"
 [ "$fail" -eq 0 ]

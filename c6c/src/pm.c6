@@ -290,9 +290,9 @@ static void pm_scan(PmProject *p)
     snprintf(p->out, sizeof(p->out), "build/%s", p->name);
 }
 
-static void pm_check_imports(const PmProject *p)
+static int pm_check_imports(const PmProject *p)
 {
-    int i = 0, j = 0, found = 0;
+    int i = 0, j = 0, found = 0, missing = 0;
     for (i = 0; i < p->nimp; i++) {
         char want[PM_PATH] = {0};
         size_t k = 0;
@@ -313,10 +313,13 @@ static void pm_check_imports(const PmProject *p)
                 break;
             }
         }
-        if (!found)
-            fprintf(stderr, "c6c: init: import %s 没有在仓库里找到对应源文件（请用 -I 或补源文件）\n",
+        if (!found) {
+            fprintf(stderr, "c6c: import %s 没有在仓库里找到对应源文件（请用 -I 或补源文件）\n",
                     p->imp[i]);
+            missing++;
+        }
     }
+    return missing;
 }
 
 static void pm_print_scan(const PmProject *p)
@@ -380,6 +383,7 @@ static int pm_write_yaml(const PmProject *p, const char *path)
 
 static void pm_unquote(char *s);
 static int pm_spawn(char **av);
+int pm_dispatch(int argc, char **argv);
 
 /* 自己切行：c6c 不认识 strtok，自举时不能用它。 */
 static char *pm_next_line(char **cursor)
@@ -1099,11 +1103,409 @@ static void pm_list(const PmProject *p, int json)
         printf("%s\n", pm_rel(p->src[i]));
 }
 
+/* ---------------- lockfile：不依赖外部 registry，锁住源文件与元数据 ---------------- */
+
+static unsigned int pm_hash_file(const char *path)
+{
+    unsigned int h = 2166136261u;
+    FILE *fp = fopen(path, "rb");
+    int c = 0;
+    if (!fp)
+        return 0;
+    while ((c = fgetc(fp)) != EOF) {
+        h ^= (unsigned int)c;
+        h *= 16777619u;
+    }
+    fclose(fp);
+    return h;
+}
+
+static void pm_sort_sources(PmProject *p)
+{
+    int i = 0, j = 0;
+    for (i = 0; i < p->nsrc; i++) {
+        for (j = i + 1; j < p->nsrc; j++) {
+            if (strcmp(p->src[i], p->src[j]) > 0) {
+                char tmp[PM_PATH] = {0};
+                strcpy(tmp, p->src[i]);
+                strcpy(p->src[i], p->src[j]);
+                strcpy(p->src[j], tmp);
+            }
+        }
+    }
+}
+
+static void pm_add_src_unique(PmProject *p, const char *path)
+{
+    int i = 0;
+    if (p->nsrc >= PM_MAX_SRCS)
+        return;
+    for (i = 0; i < p->nsrc; i++) {
+        if (strcmp(p->src[i], path) == 0)
+            return;
+    }
+    strcpy(p->src[p->nsrc++], path);
+}
+
+/* c6c 是单 TU：清单里写一个 c6c.c6，但它 #include 了十几个模块；锁文件必须
+ * 把这些本地 include 也锁进去，否则改了 pm.c6 而 c6c.lock 还是绿的。 */
+static void pm_expand_includes(PmProject *p)
+{
+    char buf[PM_FILE_CAP] = {0};
+    int pass = 0, i = 0;
+    for (pass = 0; pass < 3; pass++) {
+        int before = p->nsrc;
+        for (i = 0; i < before; i++) {
+            const char *slash = strrchr(p->src[i], '/');
+            char dir[PM_PATH] = {0};
+            char *q = buf;
+            if (pm_read_file(p->src[i], buf, sizeof(buf)) < 0)
+                continue;
+            if (slash) {
+                int n = (int)(slash - p->src[i]);
+                if (n > 0 && n < (int)sizeof(dir)) {
+                    memcpy(dir, p->src[i], n);
+                    dir[n] = 0;
+                }
+            }
+            while ((q = strstr(q, "#include ")) != (char *)0) {
+                char name[256] = {0}, path[PM_PATH] = {0};
+                char *e = q + 9, *n = name;
+                struct stat st = {0};
+                if (*e != '"') { q = e; continue; }
+                e++;
+                while (*e && *e != '"' && n - name < (int)sizeof(name) - 1)
+                    *n++ = *e++;
+                *n = 0;
+                if (dir[0])
+                    snprintf(path, sizeof(path), "%s/%s", dir, name);
+                else
+                    snprintf(path, sizeof(path), "%s", name);
+                if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+                    pm_add_src_unique(p, path);
+                q = e;
+                if (!*q)
+                    break;
+            }
+        }
+        if (p->nsrc == before)
+            break;
+    }
+}
+
+static int pm_lock_text(const PmProject *p, char *buf, size_t cap)
+{
+    int i = 0, n = 0;
+    n = snprintf(buf, cap,
+        "{\n  \"name\": \"%s\",\n  \"version\": \"%s\",\n  \"kind\": \"%s\",\n"
+        "  \"sources\": [\n", p->name, p->version, p->kind);
+    for (i = 0; i < p->nsrc; i++) {
+        struct stat st = {0};
+        size_t sz = 0;
+        if (stat(p->src[i], &st) == 0)
+            sz = (size_t)st.st_size;
+        n += snprintf(buf + n, cap - (size_t)n,
+            "    [\"%s\", %u, \"%08x\"]%s\n", pm_rel(p->src[i]), (unsigned int)sz,
+            pm_hash_file(p->src[i]), i + 1 < p->nsrc ? "," : "");
+    }
+    n += snprintf(buf + n, cap - (size_t)n, "  ]\n}\n");
+    return n;
+}
+
+static int pm_lock_write(const PmProject *p)
+{
+    char text[65536] = {0};
+    PmProject copy = {0};
+    memcpy(&copy, p, sizeof(copy));
+    pm_expand_includes(&copy);
+    pm_sort_sources(&copy);
+    pm_lock_text(&copy, text, sizeof(text));
+    if (pm_write_text("c6c.lock", text))
+        return 1;
+    printf("c6c: lock: 已写入 c6c.lock（%d 个源文件，含本地 #include）\n", copy.nsrc);
+    return 0;
+}
+
+static int pm_lock_verify(const PmProject *p)
+{
+    char want[65536] = {0};
+    char got[65536] = {0};
+    PmProject copy = {0};
+    memcpy(&copy, p, sizeof(copy));
+    pm_expand_includes(&copy);
+    pm_sort_sources(&copy);
+    pm_lock_text(&copy, want, sizeof(want));
+    if (pm_read_file("c6c.lock", got, sizeof(got)) < 0) {
+        fprintf(stderr, "c6c: --locked 要求 c6c.lock（先跑 `c6c lock`）\n");
+        return 1;
+    }
+    if (strcmp(want, got) != 0) {
+        fprintf(stderr, "c6c: c6c.lock 与当前源文件不符（跑 `c6c lock` 更新）\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* ---------------- workspace：c6c-workspace.yaml ---------------- */
+
+typedef struct {
+    char member[32][PM_PATH];
+    int n;
+} PmWorkspace;
+
+static int pm_ws_load(PmWorkspace *ws, const char *path)
+{
+    char buf[65536] = {0};
+    char *q = buf, *line = (char *)0;
+    int section = 0;
+    memset(ws, 0, sizeof(*ws));
+    if (pm_read_file(path, buf, sizeof(buf)) < 0)
+        return -1;
+    while ((line = pm_next_line(&q)) != (char *)0) {
+        char t[PM_PATH] = {0};
+        size_t n = strlen(line);
+        if (n >= sizeof(t)) n = sizeof(t) - 1;
+        memcpy(t, line, n);
+        t[n] = 0;
+        pm_trim(t);
+        if (strcmp(t, "members:") == 0) {
+            section = 1;
+        } else if (t[0] == '-' && t[1] == ' ' && section == 1) {
+            char val[PM_PATH] = {0};
+            strcpy(val, t + 2);
+            pm_trim(val);
+            pm_unquote(val);
+            if (ws->n < 32)
+                strcpy(ws->member[ws->n++], val);
+        }
+    }
+    return 0;
+}
+
+static int pm_ws_init(void)
+{
+    DIR *d = opendir(".");
+    struct dirent *e = (struct dirent *)0;
+    FILE *fp = (FILE *)0;
+    PmWorkspace ws = {0};
+    int i = 0;
+    if (!d)
+        return 1;
+    while ((e = readdir(d)) != (struct dirent *)0) {
+        char mp[PM_PATH] = {0}, mp2[PM_PATH] = {0};
+        struct stat st = {0};
+        if (e->d_name[0] == '.' || strcmp(e->d_name, "build") == 0)
+            continue;
+        snprintf(mp, sizeof(mp), "%s/c6c.yaml", e->d_name);
+        snprintf(mp2, sizeof(mp2), "%s/c6c.yml", e->d_name);
+        if (stat(e->d_name, &st) == 0 && S_ISDIR(st.st_mode)
+            && (stat(mp, &st) == 0 || stat(mp2, &st) == 0)
+            && ws.n < 32)
+            strcpy(ws.member[ws.n++], e->d_name);
+    }
+    closedir(d);
+    fp = fopen("c6c-workspace.yaml", "wb");
+    if (!fp)
+        return 1;
+    fprintf(fp, "# 由 `c6c workspace init` 生成：c6c workspace <命令> 逐成员执行\n");
+    fprintf(fp, "members:\n");
+    for (i = 0; i < ws.n; i++)
+        fprintf(fp, "  - %s\n", ws.member[i]);
+    fclose(fp);
+    printf("c6c: workspace: 写入 c6c-workspace.yaml（%d 个成员）\n", ws.n);
+    return 0;
+}
+
+static int pm_workspace(const char *sub, const char *self, int force,
+                        int release, int dry, int locked)
+{
+    PmWorkspace ws = {0};
+    char cwd[PM_PATH] = {0};
+    char *av[8] = {(char *)0};
+    int i = 0, n = 0, rc = 0;
+    if (strcmp(sub, "init") == 0)
+        return pm_ws_init();
+    if (pm_ws_load(&ws, "c6c-workspace.yaml") != 0
+        && pm_ws_load(&ws, "c6c-workspace.yml") != 0) {
+        fprintf(stderr, "c6c: 没有 c6c-workspace.yaml（先跑 `c6c workspace init`）\n");
+        return 2;
+    }
+    if (strcmp(sub, "list") == 0) {
+        for (i = 0; i < ws.n; i++)
+            printf("%s\n", ws.member[i]);
+        return 0;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "c6c: workspace: 取不到当前目录\n");
+        return 2;
+    }
+    av[n++] = (char *)self;
+    av[n++] = (char *)sub;
+    if (force) av[n++] = (char *)"--force";
+    if (release) av[n++] = (char *)"--release";
+    if (dry) av[n++] = (char *)"--dry-run";
+    if (locked) av[n++] = (char *)"--locked";
+    for (i = 0; i < ws.n; i++) {
+        if (chdir(ws.member[i]) != 0) {
+            fprintf(stderr, "c6c: workspace: 进不了 %s\n", ws.member[i]);
+            chdir(cwd);
+            return 2;
+        }
+        printf("c6c: workspace [%s] $ c6c %s\n", ws.member[i], sub);
+        rc = pm_dispatch(n, av);
+        chdir(cwd);
+        if (rc != 0 && rc != PM_NOT_SUB)
+            return rc;
+    }
+    return 0;
+}
+
+/* ---------------- 迁移：从 CMakeLists.txt / Cargo.toml / Makefile 提取元数据 ---------------- */
+
+static void pm_kv_str(const char *line, const char *key, char *out, size_t cap)
+{
+    const char *p = strstr(line, key);
+    const char *v = (const char *)0;
+    size_t n = 0;
+    if (!p)
+        return;
+    v = strchr(p, '=');
+    if (!v)
+        return;
+    v++;
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v == '"' || *v == '\'') {
+        char quote = *v++;
+        while (v[n] && v[n] != quote && n + 1 < cap) {
+            out[n] = v[n];
+            n++;
+        }
+    } else {
+        while (v[n] && v[n] != ' ' && v[n] != '\t' && v[n] != '\r'
+               && v[n] != '\n' && n + 1 < cap) {
+            out[n] = v[n];
+            n++;
+        }
+    }
+    out[n] = 0;
+}
+
+static void pm_next_token(const char **q, char *out, size_t cap)
+{
+    const char *p = *q;
+    size_t n = 0;
+    while (*p == ' ' || *p == '\t' || *p == '(' || *p == ')')
+        p++;
+    while (*p && *p != ' ' && *p != '\t' && *p != ')' && n + 1 < cap) {
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+    *q = p;
+}
+
+static void pm_import_meta(PmProject *p, const char *from)
+{
+    char buf[65536] = {0};
+    char *q = buf, *line = (char *)0;
+    struct stat st = {0};
+    if (strcmp(from, "auto") == 0) {
+        if (stat("CMakeLists.txt", &st) == 0)
+            from = "cmake";
+        else if (stat("Cargo.toml", &st) == 0)
+            from = "cargo";
+        else if (stat("Makefile", &st) == 0)
+            from = "make";
+        else
+            return;
+    }
+    {
+        const char *src = strcmp(from, "cargo") == 0 ? "Cargo.toml"
+                        : (strcmp(from, "make") == 0 ? "Makefile" : "CMakeLists.txt");
+        if (pm_read_file(src, buf, sizeof(buf)) < 0)
+            return;
+    }
+    while ((line = pm_next_line(&q)) != (char *)0) {
+        char t[PM_PATH] = {0};
+        size_t n = strlen(line);
+        if (n >= sizeof(t)) n = sizeof(t) - 1;
+        memcpy(t, line, n);
+        t[n] = 0;
+        if (strcmp(from, "cmake") == 0) {
+            const char *pr = strstr(t, "project(");
+            if (pr) {
+                char tok[128] = {0};
+                const char *r = pr + 7;
+                pm_next_token(&r, tok, sizeof(tok));
+                if (tok[0]) strcpy(p->name, tok);
+                pm_next_token(&r, tok, sizeof(tok));
+                while (tok[0] && strcmp(tok, "VERSION") != 0)
+                    pm_next_token(&r, tok, sizeof(tok));
+                if (tok[0]) {
+                    pm_next_token(&r, tok, sizeof(tok));
+                    if (tok[0]) strcpy(p->version, tok);
+                }
+                break;
+            }
+        } else if (strcmp(from, "cargo") == 0) {
+            char v[256] = {0};
+            pm_kv_str(t, "name", v, sizeof(v));
+            pm_kv_str(t, "version", v, sizeof(v));
+            if (v[0]) strcpy(p->version, v);
+            pm_kv_str(t, "description", v, sizeof(v));
+            if (v[0]) strcpy(p->pkg_desc, v);
+            pm_kv_str(t, "license", v, sizeof(v));
+            if (v[0]) strcpy(p->pkg_license, v);
+        } else if (strcmp(from, "make") == 0) {
+            char v[256] = {0};
+            pm_kv_str(t, "NAME", v, sizeof(v));
+            if (v[0]) strcpy(p->name, v);
+            pm_kv_str(t, "VERSION", v, sizeof(v));
+            if (v[0]) strcpy(p->version, v);
+        }
+    }
+    if (strcmp(from, "cargo") == 0) {
+        /* 再读一遍取 [package].name（第一遍的 name 可能来自 [dependencies]） */
+        memset(buf, 0, sizeof(buf));
+        if (pm_read_file("Cargo.toml", buf, sizeof(buf)) >= 0) {
+            q = buf;
+            while ((line = pm_next_line(&q)) != (char *)0) {
+                char v[256] = {0};
+                if (strstr(line, "[package]")) {
+                    while ((line = pm_next_line(&q)) != (char *)0) {
+                        if (line[0] == '[') break;
+                        pm_kv_str(line, "name", v, sizeof(v));
+                        if (v[0]) { strcpy(p->name, v); break; }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    printf("c6c: init: 从 %s 迁移元数据 → name=%s version=%s\n", from, p->name, p->version);
+}
+
+static int pm_doctor(const PmProject *p)
+{
+    int i = 0, miss = 0, unresolved = 0;
+    struct stat st = {0};
+    for (i = 0; i < p->nsrc; i++) {
+        if (stat(p->src[i], &st) != 0) {
+            fprintf(stderr, "c6c: doctor: 源文件不存在：%s\n", p->src[i]);
+            miss++;
+        }
+    }
+    unresolved = pm_check_imports(p);
+    printf("c6c: doctor: 源文件 %d（缺失 %d），import %d（未解析 %d），kind=%s，out=%s\n",
+           p->nsrc, miss, p->nimp, unresolved, p->kind, p->out);
+    return (miss || unresolved) ? 1 : 0;
+}
+
 static void pm_help(void)
 {
     printf("用法：c6c <子命令> [参数]\n"
            "\n"
-           "  init [--force]  扫描当前仓库，生成 c6c.yaml\n"
+           "  init [--force] [--from=cmake|cargo|make|auto]  扫描仓库生成 c6c.yaml\n"
            "  scan            只打印扫描结果，不写文件\n"
            "  build [--release] [--force]  按清单编译（mtime 增量，可选 profile）\n"
            "  test            编译并运行全部 `test \"…\" { }` 块\n"
@@ -1113,6 +1515,9 @@ static void pm_help(void)
            "  check           只做语法检查（-fsyntax-only）\n"
            "  clean           只删本清单产物（不删整个 build/）\n"
            "  env / list      打印解析后的配置 / 源文件列表（list --json）\n"
+           "  lock            生成 c6c.lock（build --locked 校验源文件漂移）\n"
+           "  doctor          检查源文件 / import 是否齐全\n"
+           "  workspace <cmd> 多包：init / list / build / test / check / clean / lock\n"
            "  publish         打包 + SHA256SUMS，--tag 再打 v<version>\n"
            "  flash / monitor / debug  按 *_cmd 模板操作固件（--dry-run 预览）\n"
            "  help            打印本帮助\n"
@@ -1133,10 +1538,11 @@ int pm_dispatch(int argc, char **argv)
     const char *destdir = "pkg";
     const char *prefix = "/usr";
     const char *mpath = (const char *)0;
+    const char *from = "auto";
     char manifest[PM_PATH] = "c6c.yaml";
     char startcwd[PM_PATH] = {0};
     int dd_set = 0, px_set = 0, release = 0, json = 0;
-    int force = 0, dry = 0, tag = 0, i = 0;
+    int force = 0, dry = 0, tag = 0, locked = 0, i = 0;
     int rc = 0;
     if (getcwd(startcwd, sizeof(startcwd)) == 0)
         startcwd[0] = 0;
@@ -1162,11 +1568,16 @@ int pm_dispatch(int argc, char **argv)
             release = 0;
         else if (strcmp(argv[i], "--json") == 0)
             json = 1;
+        else if (strcmp(argv[i], "--locked") == 0)
+            locked = 1;
+        else if (strncmp(argv[i], "--from=", 7) == 0)
+            from = argv[i] + 7;
     }
 
     if (strcmp(cmd, "help") == 0)
         return 0;
-    if (strcmp(cmd, "scan") != 0 && strcmp(cmd, "init") != 0) {
+    if (strcmp(cmd, "scan") != 0 && strcmp(cmd, "init") != 0
+        && strcmp(cmd, "workspace") != 0) {
         if (mpath) {
             char dir[PM_PATH] = {0};
             const char *slash = strrchr(mpath, '/');
@@ -1198,7 +1609,7 @@ int pm_dispatch(int argc, char **argv)
     }
     if (strcmp(cmd, "scan") == 0) {
         pm_scan(&p);
-        pm_check_imports(&p);
+        (void)pm_check_imports(&p);
         pm_print_scan(&p);
         return 0;
     }
@@ -1209,12 +1620,15 @@ int pm_dispatch(int argc, char **argv)
             return 2;
         }
         pm_scan(&p);
-        pm_check_imports(&p);
+        pm_import_meta(&p, from);
+        (void)pm_check_imports(&p);
         pm_print_scan(&p);
         return pm_write_yaml(&p, "c6c.yaml");
     }
     if (strcmp(cmd, "build") == 0) {
         if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (locked && pm_lock_verify(&p) != 0)
             return 2;
         return pm_build(&p, self, force, release);
     }
@@ -1259,6 +1673,20 @@ int pm_dispatch(int argc, char **argv)
         if (pm_load(&p, manifest) != 0)
             return 2;
         return pm_publish(&p, tag, dry);
+    }
+    if (strcmp(cmd, "lock") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_lock_write(&p);
+    }
+    if (strcmp(cmd, "doctor") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_doctor(&p);
+    }
+    if (strcmp(cmd, "workspace") == 0) {
+        const char *sub = (argc >= 3) ? argv[2] : "list";
+        return pm_workspace(sub, self, force, release, dry, locked);
     }
     if (strcmp(cmd, "check") == 0) {
         if (pm_load(&p, manifest) != 0)
