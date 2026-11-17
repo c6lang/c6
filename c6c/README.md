@@ -1,5 +1,10 @@
 # c6c —— 用 c6 写的 c6 编译器
 
+[![CI](https://github.com/c6lang/c6/actions/workflows/ci.yml/badge.svg)](https://github.com/c6lang/c6/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/c6lang/c6)](https://github.com/c6lang/c6/releases)
+[![License](https://img.shields.io/github/license/c6lang/c6)](https://github.com/c6lang/c6)
+[![AUR package](https://repology.org/badge/version-for-repo/aur/c6.svg)](https://repology.org/project/c6/versions)
+
 自举、脱离 tcc、多后端（native x86-64 / C99 / LLVM IR）的 c6 编译器。
 
 本目录是**独立项目边界**：自己的构建入口（CMake target `c6c`，没有自己的 Makefile 了）、
@@ -103,7 +108,7 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 后端；`-o`、`-c`、`-E`、`-fsyntax-only`、`--emit-c`、`--emit-llvm` 都跟它互斥。
 回归：`cmake --build build --target runflag`。
 
-许可证：`LICENSE` 为 MIT，与 `tcc/`（LGPL-2.1）严格分离；若项目所有者另有安排，替换本文件即可。
+许可证：仓库根的 `LICENSE` 现在就是本文件的 MIT；与 `tcc/`（LGPL-2.1，见 `tcc/COPYING`）严格分离。
 
 ## 跑 `test "…" { }` 块：`-test`
 
