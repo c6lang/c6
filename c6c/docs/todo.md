@@ -5648,3 +5648,27 @@ void *__c6_co_new(void *env, long nogate) { … c->nogate = nogate ? 1 : 0; … 
 局部变量**（`HAsync *h` 在 `await` 之后被读成垃圾），而不是语法。下一轮直接对着
 `co` 任务的前缀/溢出布局查（`PA_CO_STMT` 那段），拿 `examples/stdhttps.c6` 当唯一
 复现。
+
+### 第 292 轮：co 那两路的实参是对的，坏在 `httpsa_request` 里面
+
+给 `httpsa_get` / `httpsa_request` 临时加了打印（都已撤回）：
+
+```
+[get] hp=0x7ffd…e860 h->wfd=6  h->bcap=512 host=a.example path=/1     ← a 入口对
+[get] hp=0x7ffd…e760 h->wfd=10 h->bcap=512 host=b.example path=/2     ← b 入口对
+[req] before h=0x7ffd…e760 wfd=10 n=55                                ← b 进 request 还对
+[req] before h=0x7ffd…e860 wfd=3108159 n=55                           ← a 进 request：指针对、内容坏
+```
+
+也就是说：**co 的任务实参传得没问题**，`httpsa_get` 收到的 `hp`/`host`/`path` 全对；
+坏的是 `httpsa_request` 里 `h` 指向的那块内存——`h` 这个**指针**还是原值（指向
+`main` 的栈），但 `*h` 被别的东西覆盖了（`wfd=3108159` 是 ASCII 味儿的垃圾）。
+
+`__c6_co_new` 那边也查了：11 个协程的 `stack` 各不相同（`0x7f9c2cfb4000`、
+`…cfa4000`、`…cf94000`…），所以不是"两个任务共用一块协程栈"。
+
+下一个怀疑点：协程**挂起时保存的寄存器**（`c6c_co_resume` 的 swap 只存了部分
+callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之后还要用 `h`，
+如果 `h` 被放在一个没被保存的寄存器里，恢复后就可能是别的任务留下的值。下一轮
+直接看 `__c6_swapstack` 存/取了哪几个寄存器，和 `x64` 后端"跨调用要活的变量"是否
+对得上。
