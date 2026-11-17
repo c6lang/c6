@@ -8,17 +8,17 @@
 #   check-all-perf  再加验收 (4) 的跑分与内存门槛
 #
 # fast 挪出去的都是"要重跑一整遍全量编译"的：selfhost + selftest（两遍 ~12 MB
-# 全量编译）、stdtest（377 个模块）、test + diagtest（120+ 用例与 316 条诊断）、
+# 全量编译）、stdtest（381 个模块）、test + diagtest（120+ 用例与 316 条诊断）、
 # c99test（51 条 gcc 差分，165 s）、build-tcc（编 tcc + 第三代 selfhost）。
 
 add_custom_target(fast
-  DEPENDS lint unit irtest hello ctest-c6c runflag testflag
+  DEPENDS lint unit irtest hello ctest-c6c runflag testflag pmtest
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2）")
 
 add_custom_target(check-all-c6c
-  DEPENDS unit irtest hello ctest-c6c runflag testflag
+  DEPENDS unit irtest hello ctest-c6c runflag testflag pmtest
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck a64check archcheck
           embedcheck pkgcheck selfhost selftest stdtest diagtest c99test
           c99suite llvmtest test-c6c build-tcc tests1-check tests2-check regression-c6c
@@ -59,6 +59,10 @@ if(BUILD_TESTING)
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
                    --target tests1-check)
   set_tests_properties(c6c-tests1 PROPERTIES LABELS "c6c" TIMEOUT 1800)
+
+  add_test(NAME c6c-pm
+           COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target pmtest)
+  set_tests_properties(c6c-pm PROPERTIES LABELS "c6c" TIMEOUT 600)
 
   add_test(NAME c6c-bench
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"

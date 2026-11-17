@@ -89,7 +89,9 @@ jobs:
   # 一条 `cmake --build build --target check-all-c6c` 覆盖验收 (1)(2)(3)：
   # 自举 fixpoint 逐字节、全部后端同一套用例、tests+std+诊断语料、c6c 编出上游
   # tcc 并让它跑 tests2（含**第三代 selfhost**：那个 tcc 再编一遍 tcc.c）。
-  # 引导编译器是仓库自己的 `tcc/c6`，所以先按常规方式构建一次。
+  # 这一条是 tcc 形态（stage0 = 仓库自己的 tcc/c6）；默认 C6_ENABLE_TCC=OFF，
+  # 所以这里必须显式打开，下面的 `ls tcc/c6` 才有意义；宿主 cc 那条路由
+  # no-tcc job 把守。
   # -------------------------------------------------------------------------
   c6c:
     name: c6c (c6 写的自举编译器)
@@ -113,6 +115,7 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
           ls -l c6c/build/c6c tcc/c6
@@ -189,7 +192,7 @@ jobs:
         run: cmake --build build-notcc --target selfhost
 
   # -------------------------------------------------------------------------
-  # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
+  # 完整回归矩阵（92 个 std-*、自举、freestanding、tests2 等）。
   # 手动触发或 v* tag 发布时运行；release 依赖本 job，tag 上不会被跳过。
   # -------------------------------------------------------------------------
   regression:
