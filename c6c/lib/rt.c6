@@ -2827,6 +2827,10 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
  * （踩过：C6C_RT 恰好在末尾，于是 getenv 永远找不到） */
 static char c6c_envbuf[65536] = {0};
 static long c6c_envlen;
+/* 自编译的 c6c 里 extern environ 只是一格零存储（parse.c6 的单镜像规则），
+ * 这里从 /proc/self/environ 建一张真正的指针表，execvp 才能传完整环境。 */
+extern char **environ;
+static char *c6c_envp[512] = {0};
 
 static void c6c_env_load(void)
 {
@@ -2852,6 +2856,16 @@ static void c6c_env_load(void)
     close(fd);
     c6c_envbuf[n] = 0;
     c6c_envlen = n ? n : -1;
+    {
+        long k = 0;
+        char *p = c6c_envbuf;
+        while (*p && k < (long)sizeof(c6c_envp) / (long)sizeof(c6c_envp[0]) - 1) {
+            c6c_envp[k++] = p;
+            p += strlen(p) + 1;
+        }
+        c6c_envp[k] = (char *)0;
+        environ = c6c_envp;
+    }
 }
 
 /* _SC_* 名字（和 Linux 的编号一致，include/unistd.h 里写的是同一套） */
@@ -4989,6 +5003,7 @@ int execvp(const char *file, char *const argv[])
     const char *p = 0;
     long r = 0;
 
+    c6c_env_load();
     if (!file || !*file) {
         errno = 2;                  /* ENOENT */
         return -1;

@@ -327,7 +327,7 @@ yay -Syu c6
 .
 ├── README.md           本文件：落地页与总索引
 ├── CHANGELOG.md        版本与特性变更史
-├── docs/               文档（入口：docs/README.md；随包装到 /usr/share/doc/c6/docs/）
+├── docs/               文档（入口：docs/README.md；随包装到 <datarootdir>/doc/<包名>/docs/）
 │   ├── manual/         语言手册：一个特性一篇，讲怎么用
 │   ├── reference/      规范与参考：语法、诊断码、命令行、后端
 │   ├── design/         设计文档与实现说明：讲为什么这么做

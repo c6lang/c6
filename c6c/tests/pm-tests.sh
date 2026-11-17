@@ -149,8 +149,28 @@ if [ -x "$SELF/build/c6c" ] && "$SELF/build/c6c" --version > /dev/null 2>&1; the
 else
   bad "c6c 清单自编"
 fi
-# 自编译二进制的自举运行时不转发完整环境（gcc 子进程会缺 liblto_plugin），
-# 后续用例继续用宿主 cc 引导的原编译器，避免把这条自举限制带进无关回归。
+# 自编译产物必须把完整环境传给子进程（environ 不再是一格零存储）
+mkdir -p "$WORK/fakebin" "$WORK/envfw"
+printf '#!/bin/sh\nprintf "ENVMARK=%s\\n" "$PATH"\nexit 0\n' > "$WORK/fakebin/cc"
+chmod +x "$WORK/fakebin/cc"
+printf 'void _start(void) { }\n' > "$WORK/envfw/start.c6"
+cat > "$WORK/envfw/c6c.yaml" <<'EOF'
+name: envfw
+version: 0.1.0
+kind: firmware
+out: build/envfw.elf
+sources:
+  - start.c6
+fw_formats:
+  - elf
+EOF
+(cd "$WORK/envfw" && PATH="$WORK/fakebin:$PATH" "$SELF/build/c6c" build > envfw.log 2>&1)
+if grep -q 'ENVMARK=' "$WORK/envfw/envfw.log"; then
+  ok "自编译 c6c 传递完整环境"
+else
+  bad "自编译环境"
+fi
+# 后续用例继续用宿主 cc 引导的原编译器，避免把自举产物带进无关回归。
 cp "$DOGFOOD_C6C" "$C6C" && chmod +x "$C6C"
 (cd "$SELF" && "$C6C" package > "$WORK/pkg.log" 2>&1)
 if grep -q 'c6c-0.6.3.tar.gz' "$WORK/pkg.log"; then ok "package 出 TGZ"; else bad "package 出 TGZ"; fi
@@ -487,6 +507,160 @@ if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["name"]
 else
   bad "list --json 转义"
 fi
+
+# 26) 多源文件固件：每个源各出一个对象，再一起链接
+mkdir -p "$WORK/fwmulti"
+cat > "$WORK/fwmulti/start.c6" <<'EOF'
+extern int uart_init(void);
+void _start(void) { uart_init(); }
+EOF
+cat > "$WORK/fwmulti/uart.c6" <<'EOF'
+int uart_init(void) { return 0; }
+EOF
+cat > "$WORK/fwmulti/c6c.yaml" <<'EOF'
+name: fwmulti
+version: 0.1.0
+kind: firmware
+out: build/fwmulti.elf
+sources:
+  - start.c6
+  - uart.c6
+fw_formats:
+  - elf
+EOF
+(cd "$WORK/fwmulti" && "$C6C" build > m1.log 2>&1 && "$C6C" build > m2.log 2>&1)
+if [ -f "$WORK/fwmulti/build/fwmulti.elf.0.o" ] \
+   && [ -f "$WORK/fwmulti/build/fwmulti.elf.1.o" ] \
+   && grep -q '已是最新' "$WORK/fwmulti/m2.log"; then
+  ok "多源文件固件增量正确"
+else
+  bad "多源文件固件"
+fi
+
+# 27) test/check 跟随清单 flags 与 profile
+mkdir -p "$WORK/flg"
+cat > "$WORK/flg/main.c6" <<'EOF'
+int main(void) { return VER - 42; }
+test "ver" { if (VER != 42) return err(1, "bad"); }
+EOF
+cat > "$WORK/flg/c6c.yaml" <<'EOF'
+name: flg
+version: 0.1.0
+kind: app
+out: build/flg
+sources:
+  - main.c6
+flags:
+  - -DVER=42
+EOF
+(cd "$WORK/flg" && "$C6C" test > t.log 2>&1 && "$C6C" check > c.log 2>&1)
+if [ $? -eq 0 ] && grep -q '0 failure' "$WORK/flg/t.log"; then
+  ok "test/check 使用清单 flags"
+else
+  bad "test/check flags"
+fi
+sed -i '/DVER=42/d' "$WORK/flg/c6c.yaml"
+(cd "$WORK/flg" && "$C6C" check > c2.log 2>&1)
+if [ $? -ne 0 ]; then
+  ok "check 失去 flags 后失败"
+else
+  bad "check 忽略 flags"
+fi
+
+# 28) include: 目录里的头文件变更也要触发重编
+mkdir -p "$WORK/incdir/src" "$WORK/incdir/include"
+printf '#define VER 7\n' > "$WORK/incdir/include/ver.h"
+printf '#include "ver.h"\nint main(void) { return VER - 7; }\n' > "$WORK/incdir/src/main.c6"
+cat > "$WORK/incdir/c6c.yaml" <<'EOF'
+name: incdir
+version: 0.1.0
+kind: app
+out: build/incdir
+sources:
+  - src/main.c6
+include:
+  - .
+  - include
+EOF
+(cd "$WORK/incdir" && "$C6C" build > i1.log 2>&1 && "$C6C" build > i2.log 2>&1)
+if grep -q '已是最新' "$WORK/incdir/i2.log"; then ok "include 目录头文件未变增量"; else bad "include 目录增量"; fi
+printf '#define VER 7 /* changed */\n' > "$WORK/incdir/include/ver.h"
+touch -d '2031-01-01 00:00:00' "$WORK/incdir/include/ver.h"
+(cd "$WORK/incdir" && "$C6C" build > i3.log 2>&1)
+if ! grep -q '已是最新' "$WORK/incdir/i3.log"; then ok "include 目录头文件变化触发重编"; else bad "include 目录头文件漏检"; fi
+
+# 29) import 路径按分段匹配，nota/b.c6 不算 a.b
+mkdir -p "$WORK/impbound/src/nota"
+printf 'import a.b;\n' > "$WORK/impbound/src/main.c6"
+printf 'int b(void) { return 0; }\n' > "$WORK/impbound/src/nota/b.c6"
+cat > "$WORK/impbound/c6c.yaml" <<'EOF'
+name: impbound
+version: 0.1.0
+kind: app
+out: build/impbound
+sources:
+  - src/main.c6
+  - src/nota/b.c6
+EOF
+(cd "$WORK/impbound" && "$C6C" doctor > d.log 2>&1)
+if [ $? -ne 0 ] && grep -q 'import a.b 没有' "$WORK/impbound/d.log"; then
+  ok "import 路径分段边界"
+else
+  bad "import 路径边界"
+fi
+
+# 30) 未知/误用选项必须报错
+(cd "$WORK/app" && "$C6C" build --releas > opt.log 2>&1)
+if [ $? -eq 2 ] && grep -q '未知选项 --releas' "$WORK/app/opt.log"; then
+  ok "拒绝未知选项"
+else
+  bad "未知选项"
+fi
+(cd "$WORK/app" && "$C6C" test --locked > opt2.log 2>&1)
+if [ $? -eq 2 ] && grep -q '只用于 build' "$WORK/app/opt2.log"; then
+  ok "拒绝误用 --locked"
+else
+  bad "误用 --locked"
+fi
+
+# 31) out 无斜杠时 run 也从当前目录执行
+mkdir -p "$WORK/noslash"
+printf 'int main(void) { return 0; }\n' > "$WORK/noslash/main.c6"
+printf 'name: noslash\nversion: 0.1.0\nkind: app\nout: hello\nsources:\n  - main.c6\n' > "$WORK/noslash/c6c.yaml"
+(cd "$WORK/noslash" && "$C6C" run > r.log 2>&1)
+if [ $? -eq 0 ] && [ -x "$WORK/noslash/hello" ]; then ok "run 解析无斜杠 out"; else bad "run 无斜杠 out"; fi
+
+# 32) 空 workspace 的未知子命令也要报错
+mkdir -p "$WORK/wsempty"
+printf 'members:\n' > "$WORK/wsempty/c6c-workspace.yaml"
+(cd "$WORK/wsempty" && "$C6C" workspace bogus > emptyws.log 2>&1)
+if [ $? -eq 2 ] && grep -q '未知子命令' "$WORK/wsempty/emptyws.log"; then
+  ok "空 workspace 拒绝未知子命令"
+else
+  bad "空 workspace 子命令"
+fi
+
+# 33) 子目录 scan 仍取仓库根 VERSION
+mkdir -p "$WORK/verroot/sub"
+printf '9.9.9\n' > "$WORK/verroot/VERSION"
+printf 'int main(void) { return 0; }\n' > "$WORK/verroot/sub/main.c6"
+(cd "$WORK/verroot/sub" && "$C6C" scan > s.log 2>&1)
+if grep -q 'version=9.9.9' "$WORK/verroot/sub/s.log"; then ok "scan 向上找 VERSION"; else bad "scan 版本"; fi
+
+# 34) 注释/字符串里的 _start / test 不算定义
+mkdir -p "$WORK/cmt"
+cat > "$WORK/cmt/main.c6" <<'EOF'
+// _start(void) { }
+/* int main(void) { } */
+const char *s = "test \" fake";
+EOF
+(cd "$WORK/cmt" && "$C6C" scan > cm.log 2>&1)
+if grep -q 'kind=app' "$WORK/cmt/cm.log"; then ok "扫描忽略注释与字符串"; else bad "扫描误判注释"; fi
+
+# 35) --manifest-path 绝对路径
+(cd /tmp && "$C6C" env --manifest-path="$WORK/app/c6c.yaml" > absman.log 2>&1)
+if grep -q '^name=app$' /tmp/absman.log; then ok "--manifest-path 绝对路径"; else bad "--manifest-path 绝对路径"; fi
+rm -f /tmp/absman.log
 
 echo "c6c pm: 通过 $pass / 失败 $fail"
 [ "$fail" -eq 0 ]
