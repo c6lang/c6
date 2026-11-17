@@ -1,8 +1,8 @@
 {
   "name": "c6c",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "kind": "app",
-  "out": "build/c6c-managed",
+  "out": "build/c6c",
   "include": [
     ".",
     "include"
@@ -19,7 +19,7 @@
     "tgz"
   ],
   "pkg_files": [
-    "build/c6c-managed:bin/c6c",
+    "build/c6c:bin/c6c",
     "lib/rt.c6:lib/c6/rt.c6",
     "include/stddef.h:lib/c6/include/stddef.h",
     "include/stdarg.h:lib/c6/include/stdarg.h",
@@ -34,7 +34,7 @@
     ["src/asmblob.c6", 10164, "af108489"],
     ["src/asmout.c6", 21273, "213529d2"],
     ["src/asmx.c6", 39263, "7fc023b8"],
-    ["src/c6c.c6", 1501, "620a1517"],
+    ["src/c6c.c6", 1501, "a4dc80d3"],
     ["src/c99.c6", 24288, "d9421bc6"],
     ["src/diag.c6", 3076, "0d68bdb9"],
     ["src/dw.c6", 10782, "278be54c"],
@@ -48,8 +48,8 @@
     ["src/main.c6", 45571, "8f258e72"],
     ["src/mod.c6", 6603, "3c797e0b"],
     ["src/obj.c6", 26649, "f3884129"],
-    ["src/parse.c6", 824849, "ea0576ef"],
-    ["src/pm.c6", 72969, "410f1466"],
+    ["src/parse.c6", 825204, "c2e5cf6a"],
+    ["src/pm.c6", 73533, "a3b46295"],
     ["src/pp.c6", 49466, "2337aba7"],
     ["src/src.c6", 15673, "a058d0d9"],
     ["src/sym.c6", 13320, "35dcb0a0"],

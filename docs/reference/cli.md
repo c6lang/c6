@@ -117,8 +117,9 @@ DESTDIR="${pkgdir}" c6c install --prefix=/usr
 可追加 `-T` 等）；随后按 `fw_formats` 用 `objcopy` 出 `.bin` / `.hex`。
 `flash` / `monitor` / `debug` 只是模板执行器，`--dry-run` 先预览命令。
 
-`c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编
-`build/c6c-managed`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链。
+`c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编到
+`build/c6c`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链；测试用
+编译器副本引导，避免覆盖正在执行的二进制。构建侧默认 `C6_ENABLE_TCC=OFF`。
 回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
 当前 56 项检查（54 项常规 + 2 项 DEB；缺 `dpkg-deb` 的环境跳过 2 项）。
 
@@ -128,7 +129,7 @@ DESTDIR="${pkgdir}" c6c install --prefix=/usr
 
 | 来源 | 是什么 | 谁在用 |
 |---|---|---|
-| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.2`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
+| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.3`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
 | `tcc/VERSION` | 内嵌上游 TinyCC 的**兼容版本**（`0.9.28rc`），跟着上游走 | `TCC_VERSION` 宏、`-dumpversion`、`c6 -v` 第二行、libtcc 命名与上游文档 |
 
 - 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的

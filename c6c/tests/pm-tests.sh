@@ -136,17 +136,24 @@ else
 fi
 
 # 8) dogfood：c6c/ 自己的 c6c.yaml（真正的工程配置，不是玩具用例）
+# 清单的 out 就是 build/c6c（当前编译器本体）。先用副本引导，避免覆盖正在
+# 执行的二进制（ETXTBSY）；后续步骤继续用重建出来的 $C6C。
 SELF=$(cd "$(dirname "$C6C")/.." && pwd)
+DOGFOOD_C6C="$WORK/c6c-dogfood"
+cp "$C6C" "$DOGFOOD_C6C" && chmod +x "$DOGFOOD_C6C"
 if [ -f "$SELF/c6c.yaml" ]; then ok "c6c/ 自带 c6c.yaml"; else bad "c6c.yaml 缺失"; fi
-(cd "$SELF" && "$C6C" build > /dev/null 2>&1 && "$C6C" build > "$WORK/inc.log" 2>&1)
+(cd "$SELF" && "$DOGFOOD_C6C" build > /dev/null 2>&1 && "$DOGFOOD_C6C" build > "$WORK/inc.log" 2>&1)
 if grep -q '已是最新' "$WORK/inc.log"; then ok "增量构建跳过重编"; else bad "增量构建"; fi
-if [ -x "$SELF/build/c6c-managed" ] && "$SELF/build/c6c-managed" --version > /dev/null 2>&1; then
+if [ -x "$SELF/build/c6c" ] && "$SELF/build/c6c" --version > /dev/null 2>&1; then
   ok "c6c 清单自编产物可用"
 else
   bad "c6c 清单自编"
 fi
+# 自编译二进制的自举运行时不转发完整环境（gcc 子进程会缺 liblto_plugin），
+# 后续用例继续用宿主 cc 引导的原编译器，避免把这条自举限制带进无关回归。
+cp "$DOGFOOD_C6C" "$C6C" && chmod +x "$C6C"
 (cd "$SELF" && "$C6C" package > "$WORK/pkg.log" 2>&1)
-if grep -q 'c6c-0.6.2.tar.gz' "$WORK/pkg.log"; then ok "package 出 TGZ"; else bad "package 出 TGZ"; fi
+if grep -q 'c6c-0.6.3.tar.gz' "$WORK/pkg.log"; then ok "package 出 TGZ"; else bad "package 出 TGZ"; fi
 (cd "$SELF" && "$C6C" install --destdir="$WORK/stage" > /dev/null 2>&1)
 if [ -x "$WORK/stage/usr/bin/c6c" ] && "$WORK/stage/usr/bin/c6c" --version > /dev/null 2>&1; then
   ok "install 安装可执行 c6c"
