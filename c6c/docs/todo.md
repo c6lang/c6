@@ -5218,3 +5218,21 @@ poll_ready(-1)；poll 不到就 break」——提前 break 的条件得再查（
 `__c6_co_run` 清空）。下一轮该打的是 `httpsa_get` 的返回值
 （`httpsa_request` 返回 -1 还是 3）以及 `a.attach()` 之后 `a.wfd/a.rfd` 是不是
 真的落到了 `HAsync`（`attach` 是普通方法，`co` 传进去的是 `&a`）。
+
+### 第 265 轮：`attach` 是对的，但 `co` 任务里看到的 `HAsync` 是垃圾
+
+在示例的 `attach` 之后打一行、再在 `httpsa_get` 里打一行：
+
+```
+DBG attach a=(6,7,512,0x7ffd2b587010) b=(10,11,512,0x7ffd2b586dd0)   ← 调用方：对
+[ha] get(b.example) -> -1 wfd=1 rfd=0 bcap=512 rbuf=0x7ffd601a6970     ← co 任务里：wfd/rfd=0
+[ha] get(a.example) -> -1 wfd=95 rfd=0 bcap=4592989 rbuf=0x1
+```
+
+`wfd/rfd` 在任务里是 0 或 95 这种垃圾，`bcap`=4592989——**传进 `co` 的那个
+`&a` 不是调用方的 `&a`**。而独立小程序里 `co` 传指针/字符串/6~7 个实参**都对**
+（`/tmp/co3.c6`~`co6.c6`），`await` 转发也对——所以差别在"跨模块 + 结构体更大"，
+或者 gcc 与 c6c 对 `HAsync` 这种 300 多字节结构体的按值传参口径不同。
+
+下一轮的最小复现要带上模块边界（`module demo.m;` 里定义 async，主文件 co 调用），
+在任务里打 `pv` 与调用方 `&a` 的差值。
