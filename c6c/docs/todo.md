@@ -5181,3 +5181,22 @@ std-demo（wordcount）从段错误变成通过；回归 87 → 88。
 前一个（`poison_add` 只在值不同时中毒，而这里值恰好相同 = 都没中毒），于是无论
 哪个模块先解析，最后一个模块的号段赢。真要修得先决定"同名成员到底能不能共享"。
 改动已撤回，回归 88 / 92、CI 绿。
+
+### 第 263 轮：std-https 的 `co` 任务里有**一路还没跑**，检查就已经做了
+
+在 `httpsa_request` 入口打打印，输出顺序是：
+
+```
+[ha] h=…fa84f260 method=GET host=example.com path=/async     # 同步那路（先跑的，正常）
+[ha] h=…fa84e080 method=GET host=b.example path=/2           # co 的第二路
+   ✗ 两路都是 200                                             # ← 检查在这里
+[ha] h=…fa84e180 method=GET host=a.example path=/1           # co 的第一路，晚了一步
+```
+
+也就是 `__c6_co_run()` 在 a 那路还没开跑时就返回了（`run=0`），于是 `a.status()`
+还是 0（读的是全零的 `HAsync`）。所以不是 `httpsa_get` 读坏了，是 **co 事件循环提前
+收工**。`rt.c6` 的 `__c6_co_run` 是「找一个不在等待的 resume；一个都没有就阻塞
+poll_ready(-1)；poll 不到就 break」——提前 break 的条件得再查（`c6c_co_reap_done`
+回收 detached 任务时会不会把还在排队的算成"没人等了"）。
+
+下一轮：在 `__c6_co_run` 里打每次循环的 `C6_CO_ALL` 长度 / waiting 位数 / poll 结果。
