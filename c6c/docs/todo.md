@@ -5373,3 +5373,20 @@ tests2 意外失败 0）全过。剩 `std-term` / `std-thread` / `std-https` 三
 所以更像是**编译器在 async 帧里写错了地方**（`await` 出现在循环里、函数有 7 个形参、
 又跨模块），而不是库的问题。下一步的最小复现：拿 `co5.c6` 那个能过的形状，把
 `inner` 改成"循环里 await 一个带 7 个形参的 async 函数，并在循环之后继续用 `pv` 的字段"。
+
+### 第 274 轮：std-thread 是**确定性**红的（8 次全红），不是偶发
+
+连跑 8 次：7 次 `stdthread: 29 check(s), 7 failure(s)`、1 次超时。失败点集中在
+sync（读写锁、信号量 try_wait/V）、thread（1..400 的和对不上，6502）、
+chan（和 5583）。根因很直接：`rt.c6` 里 `pthread_mutex_*` / `pthread_cond_*` /
+`sem_*` / `pthread_rwlock_*` **全是空操作**，而 `pthread_create` 是真起线程
+（clone）——空锁等于没锁，四个 worker 抢一个累加器自然是乱的。
+
+试着把它们换成 futex 版（另加了一个 32 位 CAS 的汇编 blob `__c6_cas32`）：
+互斥量按教科书的三态协议写、条件变量用"通知计数 + futex"、信号量用原子加减，
+编译都过，但 `stdthread` 和最小的 `mx1.c6` 都会**挂死**（`timeout` 124）。
+所以整块撤回了——宁可保持"红但能跑完"，也不要"挂死"。
+
+下一轮要做得先把最小复现跑通（两个线程各 1000 次 lock/unlock + 一次 cond 等待），
+顺序建议：先只上互斥量（cond 仍然是空操作但让它**不睡**，直接返回），确认
+`COUNTER == 2000` 且不挂；再单独上 cond。
