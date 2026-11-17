@@ -404,9 +404,13 @@ static void emit_one(const char *path)
  */
 static const char *const BUILTIN_DEFS =
     /* GCC 内建函数：按同名 libc 函数/普通写法展开。真实代码（尤其 tcc 自己的
-     * 测试）到处用 __builtin_*，逐个在 IR 里实现不划算，语义上它们就是这些。 */
-    "#define __builtin_memmove(a,b,c) memmove(a,b,c)\n"
-    "#define __builtin_memset(a,b,c) memset(a,b,c)\n"
+     * 测试）到处用 __builtin_*，逐个在 IR 里实现不划算，语义上它们就是这些。
+     *
+     * `__builtin_memcpy/memmove/memset` **不在这张表里**：它们是真正的内建
+     * （parse.c6 的 gen 里现造一个 extern 符号再发调用），不需要 TU 里先有
+     * 声明。写成文本宏就会抢在那条内建路径前面，把"没有 memcpy 声明"的 TU
+     * （内核 lib/zstd/common/zstd_deps.h 就是这么用 __builtin_memset 的）
+     * 变成"未声明的标识符"。tcc 的 -E 也把这三个名字原样留着。 */
     "#define __builtin_memcmp(a,b,c) memcmp(a,b,c)\n"
     "#define __builtin_strcpy(a,b) strcpy(a,b)\n"
     "#define __builtin_strncpy(a,b,c) strncpy(a,b,c)\n"
