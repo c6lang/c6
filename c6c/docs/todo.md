@@ -5344,3 +5344,15 @@ s = sym_find(tok_data(t), t->len);       // ← 无条件，把 best_sym 盖掉
 
 `stdbox: 59 check(s), 0 failure(s)`，回归 **89 / 92**，两边验收（93 个 ctest、
 tests2 意外失败 0）全过。剩 `std-term` / `std-thread` / `std-https` 三个。
+
+### 第 272 轮：std-term 转绿（90 / 92），信号真的接上内核了
+
+`sigaction`/`sigprocmask`/`sigpending` 原来都是空操作，`stdterm` 一装 SIGUSR1
+就被默认动作杀掉（rc=138 = 128+10）。现在：
+
+- `src/asmblob.c6` 加 `__c6_sigrestorer`（`mov $15,%eax; syscall`，12 字节）；
+- `sigaction` 把 glibc 布局翻成内核那份，置 SA_RESTORER，走 syscall 13；
+- `sigprocmask` 走 14，`sigpending` 走 127。
+
+`stdterm: 45 check(s), 0 failure(s)`，回归 **90 / 92**。剩 `std-thread`（协程/线程
+时序，10~25% 概率挂死）和 `std-https`（co 任务里看到的 `HAsync` 是垃圾）。
