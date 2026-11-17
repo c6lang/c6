@@ -108,11 +108,16 @@ jobs:
       # c6c 是 CMake 里的 `c6c` 目标（`cmake/C6C.cmake`），依赖 tcc-build 产出的
       # 引导编译器 tcc/c6；它挂在 ALL 上，所以这一句就把 c6 和 c6c 都编了。
       # c6c 要 `-B tcc` 那套 crt / libtcc1.a，也是 tcc-build 的产物。
+      #
+      # `C6_ENABLE_TCC=ON` 得显式写：0.6.3 起这个开关默认 `OFF`（交付物里不再有
+      # tcc），而这条作业恰恰要 tcc/c6 当引导编译器、要 tcc/ 当语料。不写就编不出
+      # tcc/c6，下面那句 `ls` 直接红——v0.6.3 的 c6c 作业就是这么挂的。
       - name: Configure and build (c6 + c6c)
         run: |
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
           ls -l c6c/build/c6c tcc/c6
