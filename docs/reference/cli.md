@@ -84,10 +84,12 @@ monitor_cmd:
 debug_cmd:
 ```
 
-**锁文件**：`c6c lock` 生成 `c6c.lock`（JSON：元数据 + 每个源文件的大小与
-FNV 校验和）。c6c 是单 TU 设计，锁文件会自动展开清单里 `src/c6c.c6` 的本地
-`#include`，把 `src/pm.c6` 等十几个模块一起锁住；`c6c build --locked` 在源文件
-漂移时直接失败，适合 CI 与可复现构建。
+**锁文件**：`c6c lock` 生成 `c6c.lock`（JSON：元数据 + `include` / `flags` /
+`link_flags` / `dev_flags` / `release_flags` / `pkg_formats` / `pkg_files` /
+`fw_formats` + 每个源文件的大小与 FNV 校验和）。c6c 是单 TU 设计，锁文件会
+自动展开清单里 `src/c6c.c6` 的本地 `#include`，把 `src/pm.c6` 等十几个模块
+一起锁住；`c6c build --locked` 在源文件**或构建配置**漂移时直接失败，适合 CI
+与可复现构建。
 
 **workspace**：仓库根的 `c6c-workspace.yaml` 用 `members:` 列出子包，
 `c6c workspace init` 会自动发现含 `c6c.yaml` / `c6c.yml` 的子目录；
@@ -118,7 +120,7 @@ DESTDIR="${pkgdir}" c6c install --prefix=/usr
 `c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编
 `build/c6c-managed`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链。
 回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
-当前 40 项检查。
+当前 56 项检查（54 项常规 + 2 项 DEB；缺 `dpkg-deb` 的环境跳过 2 项）。
 
 ## 版本与发布号
 
@@ -126,7 +128,7 @@ DESTDIR="${pkgdir}" c6c install --prefix=/usr
 
 | 来源 | 是什么 | 谁在用 |
 |---|---|---|
-| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.1.0`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
+| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.2`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
 | `tcc/VERSION` | 内嵌上游 TinyCC 的**兼容版本**（`0.9.28rc`），跟着上游走 | `TCC_VERSION` 宏、`-dumpversion`、`c6 -v` 第二行、libtcc 命名与上游文档 |
 
 - 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的
@@ -263,8 +265,8 @@ c6c 已能自举，tcc 只作语料与参考实现保留，需要 tcc 版 c6 时
 | `cmake --build build --target test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机（等价于 `ctest --test-dir build -L core -j N`） |
 | `cmake --build build --target check-all` | **提交/发布前跑这一条**：全部回归门禁用例（等价于 `ctest --test-dir build -L regression -LE aux -j N`）；每用例独占 `build/tests/<用例>/`，整组并发，fstest / tests2 / source-tree 三组用 `RESOURCE_LOCK` 互斥。`-DC6_CHECK_JOBS=1` 则整轮串行 |
 | `cmake --build build --target check-aux` | 单独跑 4 个 `aux` 用例（`check-tcc` / `ubcheck` / `safegate` / `bench-async`）；`bench-async` 需要 g++/rustc/go |
-| `cmake --build build --target fast` | **c6c 替换 c6 的快速门禁**（≈40 s）：`lint` + `unit`/`irtest`/`hello` + `ctest`/`runflag`/`testflag` + 外部语料 `c99suite`（c-testsuite 150 条）+ 上游 `tests1-check`/`tests2-check` + `llvmtest`。就是 CMake target `fast` 本身，不走 ctest |
-| `cmake --build build --target check-all-c6c` | **c6c 替换 c6 的全量门禁**（≈4 min）：`check-all-c6c` 覆盖的全量验收（自举 fixpoint / 三后端 / std 377 / tests / 诊断 / c99suite / `build-tcc` 编出 tcc 跑上游 tests2 + 第三代 selfhost）再加 `tests1-check`、`tests2-check` 两条上游闸门 |
+| `cmake --build build --target fast` | **c6c 替换 c6 的快速门禁**（≈40 s）：`lint` + `unit`/`irtest`/`hello`/`ctest-c6c` + `runflag`/`testflag`/`pmtest` + `objcheck`/`ldcheck`/`dyncheck`/`sharedcheck`/`printfcheck`/`esccheck`/`tmplcheck`/`bcheck`/`dbgcheck`/`asmcheck`/`a64check`/`archcheck`/`embedcheck`/`pkgcheck` + 外部语料 `c99suite`（c-testsuite 150 条）+ 上游 `tests1-check`/`tests2-check` + `llvmtest`。就是 CMake target `fast` 本身，不走 ctest |
+| `cmake --build build --target check-all-c6c` | **c6c 替换 c6 的全量门禁**（≈4 min）：`check-all-c6c` 覆盖的全量验收（自举 fixpoint / 三后端 / std 381 / tests / 诊断 / c99suite / `build-tcc` 编出 tcc 跑上游 tests2 + 第三代 selfhost）再加 `tests1-check`、`tests2-check` 两条上游闸门 |
 | `cmake --build build --target check-c6c` | 同一套 c6c 验收的 ctest 入口（`-R '^c6c-' -LE perf`，6 条用例；`check-c6c-perf` 再加性能/内存门槛） |
 
 ### 标准库

@@ -17,7 +17,8 @@
 
 ```sh
 cmake -S . -B build -DC6_ENABLE_TCC=OFF && cmake --build build --target c6c
-# 只要一个宿主 C 编译器：连 tcc 都不构建（默认 ON 时 stage0 是 tcc/c6）
+# 只要一个宿主 C 编译器：连 tcc 都不构建（默认，C6_ENABLE_TCC=OFF）
+# 显式 -DC6_ENABLE_TCC=ON 时 stage0 才是 tcc/c6
 ```
 
 `tcc/` 剩下的是"语料 + oracle"这一件事：`build-tcc` / `tests1-check` /
@@ -79,7 +80,7 @@ cmake --build build --target objcheck        # 只跑 -c 目标文件的回归
 
 | # | 要求 | 现状 |
 |---|---|---|
-| 1 | 自举 fixpoint 逐字节、tests+std+诊断、三后端同一套用例 | ✅ fixpoint 逐字节相同；前端 123/0 + 跑通 67/0、std 377/377、诊断 314/314、C99 32/32、LLVM 29/29 |
+| 1 | 自举 fixpoint 逐字节、tests+std+诊断、三后端同一套用例 | ✅ fixpoint 逐字节相同；前端 52/0 + c6c 回归 88/0、std 381/381、诊断 316/316、C99 51/51、LLVM 51/0 |
 | 2 | c6c 编出可用的 tcc，并由它跑通 tests2 与 selfhost | ✅ 那个 tcc 跑 tests2 118/144；**第三代 selfhost**（它再编一遍 tcc.c）出体 |
 | 3 | c6c 直接跑 tcc 上游用例 | 通过 **115/144**，其余是 7 条架构性 n/a（每条写死了卡点）、8 条上游只编不跑、14 条上游 expect 过期；**意外失败 0** |
 | 4 | native ≤135 ms、自编译 ≤100 ms、RSS ≤32 MB、线性度 ≤2.6x | ✅ **112 ms / 88 ms / 25 MB / 每行成本 0.39x** |

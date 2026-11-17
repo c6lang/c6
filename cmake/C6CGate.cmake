@@ -8,7 +8,7 @@
 #   check-all-perf  再加验收 (4) 的跑分与内存门槛
 #
 # fast 挪出去的都是"要重跑一整遍全量编译"的：selfhost + selftest（两遍 ~12 MB
-# 全量编译）、stdtest（377 个模块）、test + diagtest（120+ 用例与 316 条诊断）、
+# 全量编译）、stdtest（381 个模块）、test + diagtest（120+ 用例与 316 条诊断）、
 # c99test（51 条 gcc 差分，165 s）、build-tcc（编 tcc + 第三代 selfhost）。
 
 add_custom_target(fast
