@@ -15690,6 +15690,71 @@ static int sizeof_inner_type_end(void)
     return 0;
 }
 
+/* 复合字面量的类型里带 `[`（`(int[]){…}`、`(char[SIZE]){…}`）。只看不吃。
+ * 这类字面量的**值是指针**，和 `(struct s){…}`（值就是那个对象）不一样，
+ * 初始化器里要区别对待。 */
+static int pa_compound_lit_array_type(void)
+{
+    int depth = 1;
+    int q = 0;
+
+    if (!pa_is_ch('('))
+        return 0;
+    for (q = 1; q < PA_LOOK; q++) {
+        Tok *t = pa_peek(q);
+
+        if (t->kind != TK_PUNCT)
+            continue;
+        if (tok_eq(t, "(")) {
+            depth++;
+        } else if (tok_eq(t, "[")) {
+            if (depth == 1)
+                return 1;
+        } else if (tok_eq(t, ")")) {
+            depth--;
+            if (depth == 0)
+                return 0;
+        }
+    }
+    return 0;
+}
+
+/* `(char[]){"ab"}`：括号里是类型、花括号体只有一个字符串字面量。
+ * 只看不吃（gen_glob_compound_addr 用它决定要不要接这个初始化器）。 */
+static int pa_compound_lit_str_body(void)
+{
+    int depth = 1;
+    int q = 0;
+
+    if (!pa_is_ch('('))
+        return 0;
+    for (q = 1; q < PA_LOOK; q++) {
+        Tok *t = pa_peek(q);
+
+        if (t->kind != TK_PUNCT)
+            continue;
+        if (tok_eq(t, "(")) {
+            depth++;
+        } else if (tok_eq(t, ")")) {
+            depth--;
+            if (depth == 0) {
+                Tok *a = pa_peek(q + 2);
+
+                if (!(pa_peek(q + 1)->kind == TK_PUNCT
+                      && TOK_EQ(pa_peek(q + 1), "{")))
+                    return 0;
+                if (a->kind != TK_STR)
+                    return 0;
+                a = pa_peek(q + 3);
+                if (a->kind == TK_PUNCT && TOK_EQ(a, ","))
+                    a = pa_peek(q + 4);
+                return a->kind == TK_PUNCT && TOK_EQ(a, "}");
+            }
+        }
+    }
+    return 0;
+}
+
 static int pa_is_compound_lit(void)
 {
     int i = 0;
@@ -15779,14 +15844,18 @@ static u32 pa_take_paren_type_ex(u32 *ty_out)
     while (tykw_is_qual(pa_cur()))
         pa_advance();
     {
+        Declarator ad = {0};
         u32 t = parse_typespec();
 
-        if (ty_out) {
-            Declarator ad = {0};
-
-            t = parse_declarator(t, &ad);
+        /* 无条件走一遍声明符：`(char[4]){…}`、`(const u8[]){…}` 的 `[4]` / `[]`
+         * 就在这一段里被吃掉。以前只在调用方要类型时才 parse_declarator，
+         * 于是 `(char[4]){ 0 }` 的类型停在 `char`、游标停在 `[`，紧跟的 `{`
+         * 就报"这里要 '{'（当前是 '['）"——内核 include/linux/seq_buf.h:29 的
+         * DECLARE_SEQ_BUF、lib/packing_test.c:28、kernel/crash_core_test.c:133
+         * 都是数组类型的复合字面量。 */
+        t = parse_declarator(t, &ad);
+        if (ty_out)
             *ty_out = t;
-        }
     }
     while (pa_accept_ch(')'))
         ;
@@ -15832,15 +15901,26 @@ static int gen_glob_compound_addr(u32 data_off)
 
     if (!pa_is_compound_lit())
         return 0;
+    /* `(char[]){"ab"}`：花括号体只有一个字符串字面量。数组长度得从字面量
+     * 长度推，数顶层逗号只会给 1（短了会写坏后面的数据）。这种形状不接，
+     * 让调用方按"指针 + 花括号"处理——它取的地址就是字面量本身，内容
+     * 与长度完全一致。 */
+    if (pa_compound_lit_str_body())
+        return 0;
     ex = pa_take_paren_type_ex(&cty);
-    if (ty_is_array(cty) && ty_array_n(cty) == 0) {
-        /* `&(int[]){1,2}`：长度得数一遍初始化器才知道（同 gen_one_global
-         * 里 `T x[] = {…}` 那条路）——先把花括号体抓下来数顶层逗号，再把类型
-         * 定死、把体放回源栈，后面照常按 `{` 走。 */
+    if (ty_is_array(cty)) {
+        /* 数组类型的复合字面量一律先"抓下来再放回去"：`&(int[]){1,2}` 的长度
+         * 得数一遍初始化器才知道（同 gen_one_global 里 `T x[] = {…}` 那条路）。
+         * 显式带界的 `(char[4]){ 0 }` 也走同一条——不走的话匿名对象填出来的
+         * 字节会落到外层指针槽上（实测 `static char *g = (char[4]){1,2,3,4};`
+         * 编出来 g == 0x1）。 */
         Tok *body = arena_alloc(&A_main, (size_t)CAP_MAX * sizeof(Tok));
         u32 ncap = body_capture(body, CAP_MAX);
+        u32 n = ty_array_n(cty);
 
-        cty = ty_array(ty_target(cty), CAP_BOUND > 0 ? CAP_BOUND : 1);
+        if (n == 0)
+            n = CAP_BOUND > 0 ? CAP_BOUND : 1;
+        cty = ty_array(ty_target(cty), n);
         pa_src_push_back(body, ncap);
     }
     if (ty_size(cty) > 0) {
@@ -15849,6 +15929,10 @@ static int gen_glob_compound_addr(u32 data_off)
         u32 n = (u32)snprintf(nm, sizeof(nm), "__c6_cl_%u", (unsigned)NCL_LIT++);
         u32 sym = x64_data_sym(&X64, arena_strndup(&A_main, nm, n), ELF_HDR + soff);
 
+        /* 复合字面量经常嵌在别的花括号初始化器里（内核 include/linux/seq_buf.h:29
+         * 的 `DECLARE_SEQ_BUF` 就是顶层 `struct seq_buf s = { .buffer =
+         * (char[SIZE]){0}, .size = SIZE }`）。这一趟会重建叶子表 LF_*，而外层
+         * 正在遍历同一张表——所以 gen_glob_braced_new 自己进来先快照、出去还原。 */
         gen_glob_braced_new(soff, cty, 0);
         data_fixup_add(data_off, sym);
     } else {
@@ -16164,6 +16248,14 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
         code_lbl_fixup_add(goff + off, x64_cur_fnseq(&X64), l);
         return;
     }
+    /* `int *p = (int[]){1,2,3};`：文件作用域的复合字面量是静态存储期对象，
+     * 指针初始化器要的是它的**地址**，不是把花括号体按目标类型摊进指针槽。
+     * 以前这里不看复合字面量自己的类型，直接 `gen_glob_braced_new(goff, ty)`
+     * 摊平，于是 `static int *p = (int[]){ 1, 2, 3 };` 编出来 p == 1（读 p[0]
+     * 段错误）。内核 include/linux/seq_buf.h:29 的 DECLARE_SEQ_BUF 就是
+     * `.buffer = (char[SIZE]){ 0 }`。 */
+    if (ty_is_ptr(ty) && gen_glob_compound_addr(goff + off))
+        return;
     if (pa_is_compound_lit()) {
         u32 ex = pa_take_paren_type();
 
@@ -16842,6 +16934,86 @@ static u32 init_leaf_walk(u32 ty, u32 off, u32 bits, u32 boff, int collect)
  * 探不到再把二分区间收窄到剩下那一半。 */
 static u32 LF_HINT;
 
+/* 叶子表的快照栈。
+ *
+ * 复合字面量落在别人的花括号初始化器里时，它会**再进一次**花括号引擎，而
+ * 那一次一进来就 `LF_N = 0` 重建叶子表。外层这时正拿着同一张表往下走，
+ * 被冲掉以后接着找下一个成员就报"结构体没有成员"（内核
+ * include/linux/seq_buf.h:29 的 DECLARE_SEQ_BUF 正是这个形状）。所以进嵌套
+ * 之前把外层那一段抄下来，出来再贴回去。 */
+#define LF_SAVE_MAX 8
+typedef struct LfSave {
+    u32 n;
+    u32 hint;
+    int trunc;
+    u32 *off;
+    u32 *ty;
+    u32 *bits;
+    u32 *boff;
+    u32 lv_ty[INIT_LV_MAX];      /* 层级栈也要抄：外层还原了 LV_DEPTH 之后
+                                  * 还要按 LV_TY[LV_DEPTH-1] 找成员，内容被
+                                  * 嵌套那一趟盖掉就会找错类型 */
+    u32 lv_off[INIT_LV_MAX];
+} LfSave;
+static LfSave LF_SAVE[LF_SAVE_MAX];
+static u32 LF_SAVE_DEPTH;
+
+static void init_lf_save(void)
+{
+    LfSave *sv = NULL;
+    u32 i = 0;
+
+    if (LF_SAVE_DEPTH >= LF_SAVE_MAX)
+        return;
+    sv = &LF_SAVE[LF_SAVE_DEPTH++];
+    sv->n = LF_N;
+    sv->hint = LF_HINT;
+    sv->trunc = LF_TRUNC;
+    sv->off = NULL;
+    sv->ty = NULL;
+    sv->bits = NULL;
+    sv->boff = NULL;
+    for (i = 0; i < INIT_LV_MAX; i++) {
+        sv->lv_ty[i] = LV_TY[i];
+        sv->lv_off[i] = LV_OFF[i];
+    }
+    if (!LF_N)
+        return;
+    sv->off = arena_alloc(&A_main, (size_t)LF_N * sizeof(u32));
+    sv->ty = arena_alloc(&A_main, (size_t)LF_N * sizeof(u32));
+    sv->bits = arena_alloc(&A_main, (size_t)LF_N * sizeof(u32));
+    sv->boff = arena_alloc(&A_main, (size_t)LF_N * sizeof(u32));
+    for (i = 0; i < LF_N; i++) {
+        sv->off[i] = LF_OFF[i];
+        sv->ty[i] = LF_TY[i];
+        sv->bits[i] = LF_BITS[i];
+        sv->boff[i] = LF_BOFF[i];
+    }
+}
+
+static void init_lf_restore(void)
+{
+    LfSave *sv = NULL;
+    u32 i = 0;
+
+    if (!LF_SAVE_DEPTH)
+        return;
+    sv = &LF_SAVE[--LF_SAVE_DEPTH];
+    LF_N = sv->n;
+    LF_HINT = sv->hint;
+    LF_TRUNC = sv->trunc;
+    for (i = 0; i < INIT_LV_MAX; i++) {
+        LV_TY[i] = sv->lv_ty[i];
+        LV_OFF[i] = sv->lv_off[i];
+    }
+    for (i = 0; i < sv->n; i++) {
+        LF_OFF[i] = sv->off[i];
+        LF_TY[i] = sv->ty[i];
+        LF_BITS[i] = sv->bits[i];
+        LF_BOFF[i] = sv->boff[i];
+    }
+}
+
 static u32 init_leaf_at(u32 off)
 {
     u32 lo = 0;
@@ -17450,13 +17622,26 @@ static void init_body(u32 top)
         }
         if (pa_is_compound_lit()) {
             /* 目标子对象如果正好从游标开始，就照常按花括号填；否则它属于
-             * 一个零字节成员（`empty_s` 之类），没有字节要写。 */
+             * 一个零字节成员（`empty_s` 之类），没有字节要写。
+             *
+             * **指针叶子**在层级栈 LV_* 里没有自己的一层——`struct s v[] =
+             * { { (int[]){1,2}, 2 } }` 里栈里最深那层还是外层的 struct，直接
+             * 按它 `init_brace` 会把 `(int[]){1,2}` 的花括号体摊进第一个成员
+             * 的槽（实测 v[0].p == 1、v[0].n == 2）。所以先看叶子表：当前叶子
+             * 正好从最深那层的起点开始时，它就是复合字面量的目标。 */
             u32 d = top + 1;
             u32 tty = 0;
             u32 toff = 0;
             int hit = 0;
 
-            while (d < LV_DEPTH) {
+            if (pa_compound_lit_array_type() && INIT_CUR < LF_N
+                && ty_is_ptr(LF_TY[INIT_CUR])
+                && LV_DEPTH > 0 && LF_OFF[INIT_CUR] == LV_OFF[LV_DEPTH - 1]) {
+                tty = LF_TY[INIT_CUR];
+                toff = LF_OFF[INIT_CUR];
+                hit = 1;
+            }
+            while (!hit && d < LV_DEPTH) {
                 if (init_leaf_at(LV_OFF[d]) == INIT_CUR) {
                     tty = LV_TY[d];
                     toff = LV_OFF[d];
@@ -17465,7 +17650,20 @@ static void init_body(u32 top)
                 }
                 d++;
             }
-            if (hit) {
+            if (hit && ty_is_ptr(tty)) {
+                /* `struct s v[] = { { (int[]){1,2}, 2 }, … }`：指针子对象的值是
+                 * 复合字面量的**地址**，不能把花括号体摊进指针槽。 */
+                u32 last2 = 0;
+
+                if (INIT_IS_GLOB)
+                    gen_glob_obj(INIT_GOFF, tty, toff);
+                else
+                    gen_init_obj(INIT_ADDR, tty, toff);
+                last2 = init_leaf_at(toff + (ty_size(tty) ? ty_size(tty) : 1));
+                if (last2 > INIT_MAX)
+                    INIT_MAX = last2;
+                INIT_CUR = last2;
+            } else if (hit) {
                 u32 ex = pa_take_paren_type();
 
                 init_brace(tty, toff);
@@ -17589,12 +17787,14 @@ static void gen_glob_braced_new(u32 goff, u32 ty, u32 off)
     u32 save_depth = LV_DEPTH;
     u32 cnt = 0;
 
+    init_lf_save();
     LF_N = 0;
     LF_TRUNC = 0;
     LF_HINT = 0;
     (void)init_leaf_walk(ty, off, 0, 0, 1);
     if (LF_TRUNC) {
         INIT_CUR = save_cur;
+        init_lf_restore();
         pa_advance();                       /* 对象太大：退回旧实现 */
         gen_glob_braced(goff, ty, off);
         pa_expect_ch('}');
@@ -17615,6 +17815,7 @@ static void gen_glob_braced_new(u32 goff, u32 ty, u32 off)
     INIT_IS_GLOB = save_glob;
     INIT_GOFF = save_goff;
     LV_DEPTH = save_depth;
+    init_lf_restore();
 }
 
 static void gen_local_braced_new(u32 addr, u32 ty, u32 off)
@@ -17626,12 +17827,14 @@ static void gen_local_braced_new(u32 addr, u32 ty, u32 off)
     u32 save_depth = LV_DEPTH;
     u32 cnt = 0;
 
+    init_lf_save();
     LF_N = 0;
     LF_TRUNC = 0;
     LF_HINT = 0;
     (void)init_leaf_walk(ty, off, 0, 0, 1);
     if (LF_TRUNC) {
         INIT_CUR = save_cur;
+        init_lf_restore();
         pa_advance();                       /* 对象太大：退回旧实现 */
         gen_init_braced(addr, ty, off);
         pa_expect_ch('}');
@@ -17652,12 +17855,23 @@ static void gen_local_braced_new(u32 addr, u32 ty, u32 off)
     INIT_IS_GLOB = save_glob;
     INIT_ADDR = save_addr;
     LV_DEPTH = save_depth;
+    init_lf_restore();
 }
 
 static void gen_init_obj(u32 addr, u32 ty, u32 off)
 {
     if (ty_size(ty) == 0 && pa_skip_empty_compound())
         return;
+    /* `int *p = (int[]){5,6};`：块作用域的复合字面量是**自动存储期**对象，
+     * 长度和内容都得在运行期铺出来——交给表达式那条路（gen_assign）算地址再存。
+     * 以前这里不看复合字面量自己的类型、直接按目标类型摊平花括号体，
+     * `int *p = (int[]){5,6}` 编出来 p == 5（读 p[0] 段错误）。 */
+    if (ty_is_ptr(ty) && pa_is_compound_lit()) {
+        u32 cv = value_of(gen_assign());
+
+        store_conv(gen_addr_off(addr, off), ty, cv, GEN_TY);
+        return;
+    }
     if (pa_is_compound_lit()) {
         u32 ex = pa_take_paren_type();
 
