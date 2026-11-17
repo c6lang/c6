@@ -7,6 +7,26 @@
 
 ## 0.6.3 — 2026-11-17
 
+### 合并 main 后修复的两个兼容性回归
+
+把 main 合进内核前端分支之后，两处"各自都正确、合起来不兼容"的改动暴露出来：
+
+- **LLVM 数据段布局错位**：区间设计符 `[0 ... 3] = "wide"` 对指针元素逐元素
+  `glob_store()` 登记 C99 数据段重定位；随后 `[2] = "narrow"` 覆盖槽 2 时，
+  `glob_store()` 只清了 DFIX 重定位表、没清 C99 那张，于是同偏移留下两条。
+  native / C99 是"按顺序回填字节"，后写覆盖前写，无害；LLVM 后端改成静态
+  构造 `@__c6l_D` 后把每条重定位排成一个 `i64` 字段，多一条让后面的布局整体
+  后移 8 字节。让 `glob_store()` 同时清两张表（`c99_reloc_drop_range`）。
+- **内核 C89 隐式 int 误报**：main 补的 tcc 口径隐式 int 告警对内核
+  `trace_events.h` 的 `DECLARE_EVENT_CLASS` 宏展开字段（`tstruct;`）误报，57 个
+  内核 TU 从"零诊断"变成 FAIL。新增前端标志 `PA_KERNEL_MODE`，由
+  `-ffreestanding-kernel` 置位，隐式 int 检测点跳过它；非内核口径的告警文本
+  （tests2 的 `102_alignas.expect` / `60_errors_and_warnings.expect`）不变。
+
+验证：llvmtest 一致 **87 / 不一致 0**，内核真实构建集回到 **999/999**
+（17 个 host tools 仍 out-of-scope）。
+
+
 ### 回归 92 / 92 全绿：co 事件循环的 `blocked_on` 判断修好了
 
 `await 某个 async 调用` 会在父任务里建一个子任务，然后父任务 `blocked_on` 到它上面。

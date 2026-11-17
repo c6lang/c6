@@ -7046,6 +7046,12 @@ static u32 parse_closure_type(void)
  * （c6c/include/stdio.h 的 23-26 曾让 tests2 全线飘红）。 */
 static int PA_NO_II_WARN;
 
+/* `-ffreestanding-kernel` 下的内核头（include/trace/trace_events.h 的
+ * `tstruct;` 等）大量用 C89 风格的隐式 int，这是合法代码，不该走 tcc 口径
+ * 告警。Opts O 是 main.c6 里的 static，而 parse.c6 在它之前 include，
+ * 看不见 O；由 main.c6 识别 -ffreestanding-kernel 时把本标志一起置上。 */
+static int PA_KERNEL_MODE;
+
 /* 隐式 int 的**待定告警**：parse_typespec 兜底成 int 时先记一笔，等声明符
  * 解析完再看最终类型告警——tcc 的 warning 在 decl() 里只对**非函数**声明发
  * （`} else if (oldint)` 前面是 VT_FUNC 分支），所以 `f();` / `f(){}` 不告警、
@@ -7574,7 +7580,7 @@ static u32 parse_typespec(void)
          * 置位），不是隐式 int；多打一条就把整个 TU 的输出全污染了（stddef.h
          * 的 `typedef unsigned long size_t;` 曾让 tests2 118 条全红）。
          * c6 源码总是显式类型，不打噪声。 */
-        if (!saw_int && !in_c6_tu() && !PA_NO_II_WARN)
+        if (!saw_int && !in_c6_tu() && !PA_NO_II_WARN && !PA_KERNEL_MODE)
             PA_II_PENDING = 1;
         if (nlong >= 2)
             base = uns ? ty_ullong() : ty_llong();
@@ -15894,8 +15900,12 @@ static void glob_store(u32 goff, u32 off, u32 ty, u64 v)
         sz = 8;
     /* 这个位置后面被直接写了值，前面排队的重定位就作废了。重定位是最后统一
      * 打的补丁，不取消的话会反过来盖掉这里写的值：
-     * `{[0 ... 3] = &f, [1] = 0}` 里那个 0 就白写了。 */
+     * `{[0 ... 3] = &f, [1] = 0}` 里那个 0 就白写了。两张表都要清：DFIX 是
+     * 符号重定位，C99_RLOFF 是数据段内部地址（`[0 ... 3] = "wide"` 再被
+     * `[2] = "narrow"` 覆盖时，就会在槽 2 留下一条多余的 C99 重定位）。LLVM
+     * 后端把每条重定位排成一个 i64 字段，同偏移留两条会让后面的数据整体错位。 */
     data_fixup_drop_range(goff + off, goff + off + (sz ? sz : 1));
+    c99_reloc_drop_range(goff + off, goff + off + (sz ? sz : 1));
     for (i = 0; i < sz; i++)
         DATA_IMG.p[goff + off + i] = (u8)(v >> (8 * i));
     /* 指向数据段内部的绝对地址：C99 后端要按自己的基址重打一遍 */
