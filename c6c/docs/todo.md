@@ -5684,3 +5684,23 @@ callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之
 或者干脆在 `httpsa_get` 里（只有 co/task 两路会进）断下来再 `watch`。
 另一个更省事的办法：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，看是不是
 "换栈"这一步把它踩掉的。
+
+### 第 294 轮：排除了"7 个实参"和"协程栈太小"，还摸清了两条语法约束
+
+两件事：
+
+1. 用 `/tmp/cm6` 复现"7 个实参 + await + co"：**结果完全正确**
+   （`a=21,106 b=210,1060`），所以不是实参多了的问题；
+2. 把 `C6_CO_STACK` 从 64 KB 调到 256 KB 再跑 `examples/stdhttps.c6`：
+   还是那 3 条红，**不是协程栈溢出**。已改回 64 KB。
+
+顺带摸清了两条 c6c 的语法约束（之前 `co` 的最小复现一直编不过就是卡在这里）：
+
+- 模块文件必须放在 `<include 根>/<模块路径>.c6`，比如 `module demo.m;` 要写成
+  `demo/m.c6`，只放在 `-I` 根目录下**找不到**；
+- `async` 函数**不能是方法**：第一个形参是 `struct X *` 的普通函数会被当成方法，
+  所以 `async int go(S *a, S *b)` 报 "'async' functions cannot be methods"，
+  改成 `async int go(void *pv, S *a, S *b)` 才行（`httpsa_get(void *hp, …)` 正是
+  这个形状）。
+
+下一步：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，直接看是不是换栈那一步踩的。
