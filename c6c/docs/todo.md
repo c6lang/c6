@@ -5147,3 +5147,26 @@ std-demo（wordcount）从段错误变成通过；回归 87 → 88。
 
 所以下一轮要找的是"模块文件里的枚举到底由谁解析"——不是在 `parse_enum_spec`
 里加别名。改动已撤回，回归仍是 88 / 92、CI 绿。
+
+### 第 261 轮：八个 `enum Error` 里有六个拿到的是**同一个** ebase
+
+```
+1 [en] Error file=15 ebase=234881024
+1 [en] Error file=20 ebase=234881024
+1 [en] Error file=23 ebase=234881024
+1 [en] Error file=24 ebase=235847680
+1 [en] Error file=26 ebase=234881024
+1 [en] Error file=29 ebase=234881024
+1 [en] Error file=34 ebase=234881024
+1 [en] Error file=35 ebase=235114496
+```
+
+`parse_enum_spec` 里 `ebase = mod_err_base(mod_of_file(CUR_FILE->id))`——被 import
+的模块是**文本内联**的，`CUR_FILE` 还停在别处，于是六个模块的号段全等于 err 的
+（234881024 = 0x0E000000）。只有 file=24 / 35 两个拿到了自己的号段。
+
+这就是 std-box 两条 "报 PARSE" 的真正根因：同一个 `enum Error` 的成员在不同模块里
+拿到一样的号段，`r.error == std.data.csv.PARSE` 自然时对时错（取决于 CUR_FILE 当时
+指向谁）。修法不是加别名，是让"当前模块"跟着 `module X;` 那行走（新增 `CUR_MOD`，
+在 `pa_parse` 处理 module 语句时更新，枚举/模块级登记都用它，不再用 CUR_FILE）。
+改动已撤回，回归 88 / 92、CI 绿。
