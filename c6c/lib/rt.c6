@@ -2462,19 +2462,23 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
 }
 
 /* ---------- stdio ---------- */
-static char c6c_obuf[8192] = {0};
 
+
+/* printf/fprintf 各自在**栈上**开一块格式化缓冲：以前共用一张全局
+ * `c6c_obuf`，多线程同时打印时会把彼此的结果踩掉（实测 spawn 出去的两个
+ * 函数打出来的字符串会串，第 285 轮）。栈上 4 KB 对格式化输出够用。 */
 int printf(const char *fmt, ...)
 {
     va_list ap = {0};
     long n = 0;
+    char obuf[4096] = {0};
 
     va_start(ap, fmt);
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
     va_end(ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, 1, (long)c6c_obuf, n);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)obuf, n);
     return (int)n;
 }
 
@@ -2483,10 +2487,12 @@ int vfprintf(void *f, const char *fmt, va_list ap)
     long n = 0;
     long fd = (long)f;
 
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    char obuf[4096] = {0};
+
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)obuf, n);
     return (int)n;
 }
 
@@ -2500,13 +2506,14 @@ int fprintf(void *f, const char *fmt, ...)
     va_list ap = {0};
     long n = 0;
     long fd = (long)f;
+    char obuf[4096] = {0};
 
     va_start(ap, fmt);
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
     va_end(ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)obuf, n);
     return (int)n;
 }
 

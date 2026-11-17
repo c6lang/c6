@@ -7,6 +7,23 @@
 
 ## 未发布
 
+### printf/fprintf 改用栈上的格式化缓冲（多线程打印不再串行）
+
+`printf`/`fprintf`/`vfprintf`/`vprintf` 一直共用一张全局 `c6c_obuf` 做格式化，
+多线程同时打印时会把彼此的结果踩掉。最小复现（两个 `spawn` 各打一行）：
+
+```
+run1: [fa] ran A=1 [fa] ran A=1 A=1 B=1     ← 两个线程打出来的是同一行
+run2: [fb] ran B=1 [fb] ran B=1 A=1 B=1
+```
+
+tcc 版 c6 编出来三次都是对的，c6c 编出来三次里两次错，说明是 c6c 这条链上的
+问题。改成每次调用在**栈上**开 4 KB 缓冲后，五次全对。
+
+顺带把 `std-thread` 的 chan 段从"必挂"降到"五次挂两次"（`sum=5050` 能对，
+但还有别的竞态）。
+
+
 ### 互斥量和条件变量接上 futex（std-thread 的一部分）
 
 `pthread_mutex_*` / `pthread_cond_*` 一直是空操作（"单线程用不着锁"），可
