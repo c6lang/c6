@@ -20,6 +20,9 @@ c6c run [参数...]     # 先 build，再执行产物并把参数透传
 c6c package           # 按 pkg_files 装 staging 树，出 TGZ / DEB
 c6c install [--destdir=pkg] [--prefix=/usr]  # 按 pkg_files 安装（保留执行位）
 c6c publish [--tag]   # package + SHA256SUMS；--tag 再打 v<version>
+c6c check             # -fsyntax-only，只检查不落盘
+c6c clean [--dry-run] # 只删本清单产物（不删整个 build/）
+c6c env / list [--json]  # 解析后的配置 / 源文件列表
 c6c flash|monitor|debug [--dry-run]  # 按 *_cmd 模板操作固件
 c6c help              # 子命令帮助
 ```
@@ -52,6 +55,11 @@ flags:
 pkg_name: hello
 pkg_desc: hello from c6
 pkg_license: MIT
+# 发行版打包：DESTDIR="${pkgdir}" c6c install --prefix=/usr
+destdir: pkg            # install 默认落点；DESTDIR / --destdir 优先
+prefix: /usr            # PREFIX / --prefix 优先
+dev_flags:              # 默认 profile 的追加编译参数
+release_flags:          # --release 的追加编译参数
 pkg_formats:            # tgz / deb（deb 需要 dpkg-deb）
   - tgz
 pkg_files:              # "源:目标"，package/install 共用
@@ -71,6 +79,18 @@ monitor_cmd:
 debug_cmd:
 ```
 
+像 go 找 `go.mod` 一样，`c6c` 会从当前目录逐级向上找 `c6c.yaml` /
+`c6c.yml`；`--manifest-path=...` 可显式指定。发行版打包推荐用标准
+`DESTDIR` 写法（`pkg_files` 是 package 与 install 的单一来源）：
+
+```sh
+DESTDIR="${pkgdir}" c6c install --prefix=/usr
+# 等价于：c6c install --destdir="${pkgdir}" --prefix=/usr
+```
+
+`build --release` 用清单里的 `release_flags`（默认用 `dev_flags`）；
+`env` / `list --json` 便于脚本读取解析后的配置。
+
 固件构建是两阶段：c6c 只认 `main` 当 ELF 入口，所以 `_start` 工程先用
 `c6c -c` 出 ET_REL，再由宿主 `cc -nostdlib -Wl,-e,_start` 链接（`link_flags`
 可追加 `-T` 等）；随后按 `fw_formats` 用 `objcopy` 出 `.bin` / `.hex`。
@@ -79,7 +99,7 @@ debug_cmd:
 `c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编
 `build/c6c-managed`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链。
 回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
-当前 21 项检查。
+当前 30 项检查。
 
 ## 版本与发布号
 

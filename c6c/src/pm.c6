@@ -69,6 +69,13 @@ typedef struct {
     int ndebug;
     char link_flag[16][128];
     int nlink_flag;
+    /* cargo/go 习惯：安装落点 + profile（P5） */
+    char destdir[128];
+    char prefix[128];
+    char dev_flag[16][128];
+    int ndev_flag;
+    char rel_flag[16][128];
+    int nrel_flag;
 } PmProject;
 
 /* stage0（宿主 cc）没有 sys/wait.h 时不引整个头（c6c 自举的 #include 嵌套
@@ -88,6 +95,8 @@ static void pm_zero_project(PmProject *p)
     strcpy(p->kind, "app");
     strcpy(p->out, "");
     strcpy(p->pkg_license, "MIT");
+    strcpy(p->destdir, "pkg");
+    strcpy(p->prefix, "/usr");
     strcpy(p->pkg_fmt[0], "tgz");
     p->npkg_fmt = 1;
     strcpy(p->fw_fmt[0], "elf");
@@ -344,6 +353,9 @@ static int pm_write_yaml(const PmProject *p, const char *path)
         fprintf(fp, "  - %s\n", p->flag[i]);
     fprintf(fp, "pkg_name: %s\npkg_desc: %s\npkg_license: %s\n",
             p->pkg_name[0] ? p->pkg_name : p->name, p->pkg_desc, p->pkg_license);
+    fprintf(fp, "# install 默认落点；发行版可用 DESTDIR=\$pkgdir c6c install 覆盖\n");
+    fprintf(fp, "destdir: %s\nprefix: %s\n", p->destdir, p->prefix);
+    fprintf(fp, "dev_flags:\nrelease_flags:\n");
     fprintf(fp, "pkg_formats:\n");
     for (i = 0; i < p->npkg_fmt; i++)
         fprintf(fp, "  - %s\n", p->pkg_fmt[i]);
@@ -433,6 +445,10 @@ static int pm_load_yaml(const char *path, PmProject *p)
                 strcpy(p->debug[p->ndebug++], val);
             else if (section == 10 && p->nlink_flag < 16)
                 strcpy(p->link_flag[p->nlink_flag++], val);
+            else if (section == 11 && p->ndev_flag < 16)
+                strcpy(p->dev_flag[p->ndev_flag++], val);
+            else if (section == 12 && p->nrel_flag < 16)
+                strcpy(p->rel_flag[p->nrel_flag++], val);
         } else if (strncmp(t, "name:", 5) == 0) {
             strcpy(p->name, t + 5); pm_trim(p->name); section = 0;
         } else if (strncmp(t, "version:", 8) == 0) {
@@ -453,6 +469,10 @@ static int pm_load_yaml(const char *path, PmProject *p)
             strcpy(p->pkg_desc, t + 9); pm_trim(p->pkg_desc); section = 0;
         } else if (strncmp(t, "pkg_license:", 12) == 0) {
             strcpy(p->pkg_license, t + 12); pm_trim(p->pkg_license); section = 0;
+        } else if (strncmp(t, "destdir:", 8) == 0) {
+            strcpy(p->destdir, t + 8); pm_trim(p->destdir); section = 0;
+        } else if (strncmp(t, "prefix:", 7) == 0) {
+            strcpy(p->prefix, t + 7); pm_trim(p->prefix); section = 0;
         } else if (strcmp(t, "pkg_formats:") == 0) {
             section = 4;
         } else if (strcmp(t, "pkg_files:") == 0) {
@@ -467,6 +487,10 @@ static int pm_load_yaml(const char *path, PmProject *p)
             section = 9;
         } else if (strcmp(t, "link_flags:") == 0) {
             section = 10;
+        } else if (strcmp(t, "dev_flags:") == 0) {
+            section = 11;
+        } else if (strcmp(t, "release_flags:") == 0) {
+            section = 12;
         }
         line = pm_next_line(&q);
     }
@@ -644,16 +668,41 @@ static int pm_spawn(char **av)
     return pm_status(st);
 }
 
-static int pm_load(PmProject *p)
+/* go.mod 风格：从当前目录向上找 c6c.yaml，返回相对路径并停在清单所在目录。 */
+static int pm_find_up(char *buf, size_t cap)
+{
+    int up = 0, k = 0, j = 0;
+    struct stat st = {0};
+    const char *names[2] = {"c6c.yaml", "c6c.yml"};
+    for (;;) {
+        for (j = 0; j < 2; j++) {
+            if (stat(names[j], &st) == 0) {
+                size_t n = 0;
+                for (k = 0; k < up; k++) {
+                    if (n + 3 >= cap) return 0;
+                    memcpy(buf + n, "../", 3);
+                    n += 3;
+                }
+                snprintf(buf + n, cap - n, "%s", names[j]);
+                return 1;
+            }
+        }
+        if (up >= 8 || chdir("..") != 0)
+            return 0;
+        up++;
+    }
+}
+
+static int pm_load(PmProject *p, const char *manifest)
 {
     struct stat st = {0};
-    if (stat("c6c.yaml", &st) == 0) {
-        if (pm_load_yaml("c6c.yaml", p) == 0)
+    if (stat(manifest, &st) == 0) {
+        if (pm_load_yaml(manifest, p) == 0)
             return 0;
-        fprintf(stderr, "c6c: c6c.yaml 解析失败\n");
+        fprintf(stderr, "c6c: %s 解析失败\n", manifest);
         return 1;
     }
-    fprintf(stderr, "c6c: 当前目录没有 c6c.yaml，先用 `c6c init` 生成；本次按扫描结果构建\n");
+    fprintf(stderr, "c6c: 找不到 %s，先用 `c6c init` 生成；本次按扫描结果构建\n", manifest);
     pm_scan(p);
     return 0;
 }
@@ -701,7 +750,7 @@ static void pm_firmware_outputs(const PmProject *p)
     }
 }
 
-static int pm_build(PmProject *p, const char *self, int force)
+static int pm_build(PmProject *p, const char *self, int force, int release)
 {
     char *av[PM_MAX_ARGS] = {(char *)0};
     int n = 0, i = 0, rc = 0;
@@ -731,6 +780,10 @@ static int pm_build(PmProject *p, const char *self, int force)
     }
     for (i = 0; i < p->nflag && n + 1 < PM_MAX_ARGS; i++)
         av[n++] = p->flag[i];
+    for (i = 0; release ? 0 : i < p->ndev_flag && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->dev_flag[i];
+    for (i = 0; !release ? 0 : i < p->nrel_flag && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->rel_flag[i];
     for (i = 0; i < p->nsrc && n + 1 < PM_MAX_ARGS; i++)
         av[n++] = p->src[i];
     if (strcmp(p->kind, "firmware") == 0) {
@@ -751,6 +804,10 @@ static int pm_build(PmProject *p, const char *self, int force)
         }
         for (i = 0; i < p->nflag && k + 1 < PM_MAX_ARGS; i++)
             oa[k++] = p->flag[i];
+        for (i = 0; release ? 0 : i < p->ndev_flag && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->dev_flag[i];
+        for (i = 0; !release ? 0 : i < p->nrel_flag && k + 1 < PM_MAX_ARGS; i++)
+            oa[k++] = p->rel_flag[i];
         for (i = 0; i < p->nsrc && k + 1 < PM_MAX_ARGS; i++)
             oa[k++] = p->src[i];
         rc = pm_spawn(oa);
@@ -955,22 +1012,114 @@ static int pm_publish(const PmProject *p, int tag, int dry)
     return rc;
 }
 
+/* cargo check 风格：只做语法检查，不落盘。 */
+static int pm_check(const PmProject *p, const char *self)
+{
+    char *av[PM_MAX_ARGS] = {(char *)0};
+    int n = 0, i = 0;
+    av[n++] = (char *)self;
+    av[n++] = (char *)"-fsyntax-only";
+    for (i = 0; i < p->ninc && n + 2 < PM_MAX_ARGS; i++) {
+        av[n++] = (char *)"-I";
+        av[n++] = p->inc[i];
+    }
+    for (i = 0; i < p->nsrc && n + 1 < PM_MAX_ARGS; i++)
+        av[n++] = p->src[i];
+    av[n] = (char *)0;
+    return pm_spawn(av);
+}
+
+static void pm_rm_rf(const char *path)
+{
+    DIR *d = opendir(path);
+    struct dirent *e = (struct dirent *)0;
+    if (!d) {
+        unlink(path);
+        return;
+    }
+    while ((e = readdir(d)) != (struct dirent *)0) {
+        char child[PM_PATH] = {0};
+        struct stat st = {0};
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode))
+            pm_rm_rf(child);
+        else
+            unlink(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+/* 只清本清单产出的文件，不删整个 build/（c6c/ 的 build/c6c 还在用）。 */
+static int pm_clean(const PmProject *p, int dry)
+{
+    const char *sufs[4] = {"", ".o", ".bin", ".hex"};
+    char stage[PM_PATH] = {0};
+    int i = 0;
+    for (i = 0; i < 4; i++) {
+        char f[PM_PATH] = {0};
+        snprintf(f, sizeof(f), "%s%s", p->out, sufs[i]);
+        if (dry) {
+            printf("c6c: clean 预览：rm -f %s\n", f);
+        } else {
+            unlink(f);
+            printf("c6c: clean: %s\n", f);
+        }
+    }
+    snprintf(stage, sizeof(stage), "build/package/%s-%s",
+             p->pkg_name[0] ? p->pkg_name : p->name, p->version);
+    {
+        struct stat st = {0};
+        if (stat(stage, &st) != 0)
+            return 0;
+    }
+    if (dry)
+        printf("c6c: clean 预览：rm -rf %s\n", stage);
+    else
+        pm_rm_rf(stage);
+    return 0;
+}
+
+static void pm_list(const PmProject *p, int json)
+{
+    int i = 0;
+    if (json) {
+        printf("{\n  \"name\": \"%s\",\n  \"version\": \"%s\",\n"
+               "  \"kind\": \"%s\",\n  \"out\": \"%s\",\n  \"sources\": [",
+               p->name, p->version, p->kind, p->out);
+        for (i = 0; i < p->nsrc; i++)
+            printf("%s\"%s\"", i ? ", " : "", pm_rel(p->src[i]));
+        printf("]\n}\n");
+        return;
+    }
+    printf("%s %s (%s) -> %s\n", p->name, p->version, p->kind, p->out);
+    for (i = 0; i < p->nsrc; i++)
+        printf("%s\n", pm_rel(p->src[i]));
+}
+
 static void pm_help(void)
 {
     printf("用法：c6c <子命令> [参数]\n"
            "\n"
            "  init [--force]  扫描当前仓库，生成 c6c.yaml\n"
            "  scan            只打印扫描结果，不写文件\n"
-           "  build           按 c6c.yaml 编译到 out（默认 build/<name>）\n"
+           "  build [--release] [--force]  按清单编译（mtime 增量，可选 profile）\n"
            "  test            编译并运行全部 `test \"…\" { }` 块\n"
            "  run [参数...]   先 build，再用参数运行产物\n"
            "  package         按 pkg_files / pkg_formats 打包（tgz / deb）\n"
-           "  install         按 pkg_files 安装到 --destdir + --prefix\n"
+           "  install         按 pkg_files 安装；认 DESTDIR / PREFIX 环境变量\n"
+           "  check           只做语法检查（-fsyntax-only）\n"
+           "  clean           只删本清单产物（不删整个 build/）\n"
+           "  env / list      打印解析后的配置 / 源文件列表（list --json）\n"
            "  publish         打包 + SHA256SUMS，--tag 再打 v<version>\n"
            "  flash / monitor / debug  按 *_cmd 模板操作固件（--dry-run 预览）\n"
            "  help            打印本帮助\n"
            "\n"
-           "清单格式：name/version/kind/out + sources/include/flags 三个列表。\n"
+           "向上找 c6c.yaml（go.mod 风格）；--manifest-path=... 可显式指定。\n"
+           "清单格式：name/version/kind/out + sources/include/flags 三个列表，\n"
+           "另有 destdir/prefix、dev_flags/release_flags。\n"
            "kind 由 init 按 main() / _start / test 块推断：app / firmware / lib。\n"
            "固件默认带 -nostdlib，build 会用 objcopy 追加 BIN/HEX；烧录调试用\n"
            "清单里的 flash_cmd / monitor_cmd / debug_cmd 模板（{elf}/{bin}/{out}）。\n");
@@ -983,8 +1132,14 @@ int pm_dispatch(int argc, char **argv)
     const char *self = pm_self(argv[0]);
     const char *destdir = "pkg";
     const char *prefix = "/usr";
+    const char *mpath = (const char *)0;
+    char manifest[PM_PATH] = "c6c.yaml";
+    char startcwd[PM_PATH] = {0};
+    int dd_set = 0, px_set = 0, release = 0, json = 0;
     int force = 0, dry = 0, tag = 0, i = 0;
     int rc = 0;
+    if (getcwd(startcwd, sizeof(startcwd)) == 0)
+        startcwd[0] = 0;
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--force") == 0)
             force = 1;
@@ -992,15 +1147,54 @@ int pm_dispatch(int argc, char **argv)
             dry = 1;
         else if (strcmp(argv[i], "--tag") == 0)
             tag = 1;
-        else if (strncmp(argv[i], "--destdir=", 10) == 0)
+        else if (strncmp(argv[i], "--destdir=", 10) == 0) {
             destdir = argv[i] + 10;
-        else if (strncmp(argv[i], "--prefix=", 9) == 0)
+            dd_set = 1;
+        } else if (strncmp(argv[i], "--prefix=", 9) == 0) {
             prefix = argv[i] + 9;
+            px_set = 1;
+        } else if (strncmp(argv[i], "--manifest-path=", 16) == 0)
+            mpath = argv[i] + 16;
+        else if (strcmp(argv[i], "--release") == 0
+                 || strcmp(argv[i], "--profile=release") == 0)
+            release = 1;
+        else if (strcmp(argv[i], "--profile=dev") == 0)
+            release = 0;
+        else if (strcmp(argv[i], "--json") == 0)
+            json = 1;
     }
 
-    if (strcmp(cmd, "help") == 0) {
-        pm_help();
+    if (strcmp(cmd, "help") == 0)
         return 0;
+    if (strcmp(cmd, "scan") != 0 && strcmp(cmd, "init") != 0) {
+        if (mpath) {
+            char dir[PM_PATH] = {0};
+            const char *slash = strrchr(mpath, '/');
+            if (slash) {
+                int n = (int)(slash - mpath);
+                if (n > 0 && n < (int)sizeof(dir)) {
+                    memcpy(dir, mpath, n);
+                    dir[n] = 0;
+                    if (chdir(dir) != 0) {
+                        fprintf(stderr, "c6c: 进不了 %s\n", dir);
+                        return 2;
+                    }
+                }
+                snprintf(manifest, sizeof(manifest), "%s", slash + 1);
+            } else {
+                snprintf(manifest, sizeof(manifest), "%s", mpath);
+            }
+        } else if (!pm_find_up(manifest, sizeof(manifest))) {
+            /* 没有清单时退回普通编译语义：保持在原目录，pm_load 会临时扫描 */
+            if (startcwd[0])
+                chdir(startcwd);
+            snprintf(manifest, sizeof(manifest), "c6c.yaml");
+        } else {
+            /* find_up 已经 chdir 到清单所在目录，这里只留文件名 */
+            char *slash = strrchr(manifest, '/');
+            if (slash)
+                memmove(manifest, slash + 1, strlen(slash + 1) + 1);
+        }
     }
     if (strcmp(cmd, "scan") == 0) {
         pm_scan(&p);
@@ -1020,21 +1214,21 @@ int pm_dispatch(int argc, char **argv)
         return pm_write_yaml(&p, "c6c.yaml");
     }
     if (strcmp(cmd, "build") == 0) {
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
-        return pm_build(&p, self, force);
+        return pm_build(&p, self, force, release);
     }
     if (strcmp(cmd, "test") == 0) {
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
         return pm_test(&p, self);
     }
     if (strcmp(cmd, "run") == 0) {
         char *av[PM_MAX_ARGS] = {(char *)0};
         int i = 0;
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
-        rc = pm_build(&p, self, force);
+        rc = pm_build(&p, self, force, release);
         if (rc != 0)
             return rc;
         av[0] = p.out[0] ? p.out : "build/a.out";
@@ -1043,26 +1237,61 @@ int pm_dispatch(int argc, char **argv)
         return pm_spawn(av);
     }
     if (strcmp(cmd, "package") == 0) {
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
-        rc = pm_build(&p, self, force);
+        rc = pm_build(&p, self, force, release);
         return rc ? rc : pm_package(&p);
     }
     if (strcmp(cmd, "install") == 0) {
-        if (pm_load(&p) != 0)
+        const char *d = destdir, *pr = prefix;
+        const char *env_d = getenv("DESTDIR");
+        const char *env_p = getenv("PREFIX");
+        if (pm_load(&p, manifest) != 0)
             return 2;
-        rc = pm_build(&p, self, force);
-        return rc ? rc : pm_install(&p, destdir, prefix);
+        if (!dd_set)
+            d = env_d ? env_d : p.destdir;
+        if (!px_set)
+            pr = env_p ? env_p : p.prefix;
+        rc = pm_build(&p, self, force, release);
+        return rc ? rc : pm_install(&p, d, pr);
     }
     if (strcmp(cmd, "publish") == 0) {
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
         return pm_publish(&p, tag, dry);
+    }
+    if (strcmp(cmd, "check") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_check(&p, self);
+    }
+    if (strcmp(cmd, "clean") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        return pm_clean(&p, dry);
+    }
+    if (strcmp(cmd, "env") == 0) {
+        char cwd[PM_PATH] = {0};
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        if (getcwd(cwd, sizeof(cwd)))
+            strcat(cwd, "/");
+        printf("c6c_self=%s\nmanifest=%s%s\nname=%s\nversion=%s\n"
+               "kind=%s\nout=%s\ndestdir=%s\nprefix=%s\nprofile=%s\n",
+               self, cwd, manifest, p.name, p.version, p.kind, p.out,
+               p.destdir, p.prefix, release ? "release" : "dev");
+        return 0;
+    }
+    if (strcmp(cmd, "list") == 0) {
+        if (pm_load(&p, manifest) != 0)
+            return 2;
+        pm_list(&p, json);
+        return 0;
     }
     if (strcmp(cmd, "flash") == 0 || strcmp(cmd, "monitor") == 0
         || strcmp(cmd, "debug") == 0) {
         char bin[PM_PATH] = {0};
-        if (pm_load(&p) != 0)
+        if (pm_load(&p, manifest) != 0)
             return 2;
         snprintf(bin, sizeof(bin), "%s.bin", p.out);
         if (strcmp(cmd, "flash") == 0)
