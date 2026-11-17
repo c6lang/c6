@@ -2301,6 +2301,7 @@ static u32 parse_typename(void);
 static void gen_decl_from_spec(u32 base);
 static u32 gen_unary(void);
 static void init_skip_value(void);
+static void init_skip_expr(void);
 static void skip_attributes(void);
 static void skip_paren_group(void);
 /* 结构体成员里的 `_Static_assert(...)` 要用（定义在后面）。 */
@@ -16310,12 +16311,18 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 
             if (!ty_is_array(ty)) {
                 if (ty_member_n(ty) == 0) {
-                    pa_error("空的聚合类型不能这样初始化");
+                    /* 零字节的聚合当初始化目标：有些结构体在某些配置下就是
+                     * 空的（内核 include/linux/userfaultfd_k.h 的
+                     * `struct vm_userfaultfd_ctx {}`），拿它初始化没有字节要
+                     * 写，把初始化器跳过就行（gcc 一直接受
+                     * `struct empty x = {};` 和 `= 另一个 empty 对象`）。 */
+                    init_skip_expr();
                     return;
                 }
                 et = ty_member(ty, 0);
                 eo = ty_member_off(ty, 0);
             }
+
             gen_glob_obj(goff, et, off + eo);
             return;
         }
@@ -17275,6 +17282,31 @@ static void init_brace(u32 ty, u32 off)
     INIT_CUR = init_leaf_at(off + (ty_size(ty) ? ty_size(ty) : (ty_is_agg(ty) ? 0 : 1)));
 }
 
+/* 跳过当前**表达式**的值：停在 ','、';' 或 '}' 前。
+ * init_skip_value 只认花括号列表里的项（停在 ',' / '}'），用在声明级的
+ * 初始化器上会把分号乃至下一条语句一起吞掉。 */
+static void init_skip_expr(void)
+{
+    int depth = 0;
+    int n = 0;
+
+    while (pa_cur()->kind != TK_EOF && n < 100000) {
+        Tok *t = pa_cur();
+
+        if (depth == 0 && t->kind == TK_PUNCT
+            && (tok_eq(t, ",") || TOK_EQ(t, "}") || tok_eq(t, ";")))
+            return;
+        if (t->kind == TK_PUNCT) {
+            if (TOK_EQ(t, "{") || tok_eq(t, "(") || TOK_EQ(t, "["))
+                depth++;
+            else if (TOK_EQ(t, "}") || tok_eq(t, ")") || TOK_EQ(t, "]"))
+                depth--;
+        }
+        pa_advance();
+        n++;
+    }
+}
+
 /* 跳过当前项的值（指示符出错后用），停在 ',' 或 '}' 前 */
 static void init_skip_value(void)
 {
@@ -17947,12 +17979,18 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
 
             if (!ty_is_array(ty)) {
                 if (ty_member_n(ty) == 0) {
-                    pa_error("空的聚合类型不能这样初始化");
+                    /* 零字节的聚合当初始化目标：有些结构体在某些配置下就是
+                     * 空的（内核 include/linux/userfaultfd_k.h 的
+                     * `struct vm_userfaultfd_ctx {}`），拿它初始化没有字节要
+                     * 写，把初始化器跳过就行（gcc 一直接受
+                     * `struct empty x = {};` 和 `= 另一个 empty 对象`）。 */
+                    init_skip_expr();
                     return;
                 }
                 et = ty_member(ty, 0);
                 eo = ty_member_off(ty, 0);
             }
+
             /* `{0}` 落到"第一个叶子"是聚合（union/数组）时不能再走 store_conv：
              * 那会把标量当聚合指针整块 IR_COPY（从地址 0 读 16 字节）——tcc 的
              * `jmp_buf main_jb = {0}` 正是这样一进函数就段错误。局部聚合在声明时
