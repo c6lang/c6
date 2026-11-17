@@ -17490,6 +17490,29 @@ static void init_body(u32 top)
                                       0, 0, esz);
                         }
                     }
+                } else if (pa_cur()->kind == TK_STR && ty_is_array(et)
+                           && ty_size(ty_target(et)) == 1) {
+                    /* `[0 ... 3] = "??"`：字符串填的是**整个元素子对象**，和花括号
+                     * 里那个形状一样。内核 fs/proc/task_mmu.c 的
+                     *     static const char mnemonics[BITS_PER_LONG][3] = {
+                     *         [0 ... (BITS_PER_LONG-1)] = "??", …
+                     * 就栽在这里：值走到 const_expr，报"这里要一个常量表达式"。 */
+                    u32 blob = boff + lo * esz;
+
+                    if (INIT_IS_GLOB) {
+                        gen_glob_obj(INIT_GOFF, et, blob);
+                        for (k = lo + 1; k <= hi && k < n; k++)
+                            memcpy(DATA_IMG.p + INIT_GOFF + boff + k * esz,
+                                   DATA_IMG.p + INIT_GOFF + blob, (size_t)esz);
+                    } else {
+                        gen_init_obj(INIT_ADDR, et, blob);
+                        for (k = lo + 1; k <= hi && k < n; k++) {
+                            u32 dv = gen_addr_off(INIT_ADDR, boff + k * esz);
+                            u32 sv = gen_addr_off(INIT_ADDR, blob);
+
+                            irfn_push(&FN, IR_MEMCPY, IRT_VOID, dv, sv, 0, 0, esz);
+                        }
+                    }
                 } else if (INIT_IS_GLOB && pa_is_punct("&&") && pa_peek(1)->kind == TK_IDENT) {
                     /* `[0 ... 31] = &&l_bad`：每个元素一条「代码标号」重定位 */
                     u32 l = goto_label(tok_data(pa_peek(1)), pa_peek(1)->len);
@@ -17698,6 +17721,18 @@ static void init_body(u32 top)
                     break;
                 }
                 d++;
+            }
+            /* 花括号里直接一个字符串填**本层**数组：`char m[8] = { "abc" };`。
+             * init_sync 只会往**子对象**里钻（数组的元素是标量，钻不下去），
+             * 层栈里比本层深的位置没有数组可找，于是落到 const_expr 报
+             * "这里要一个常量表达式"。内核 fs/coredump.c 的 core_modes[]、
+             * fs/proc/task_mmu.c 的 mnemonics[][3] 都是这个形状。 */
+            if (!hit && ty_is_array(LV_TY[top])
+                && ty_size(ty_target(LV_TY[top])) == 1
+                && init_leaf_at(LV_OFF[top]) == INIT_CUR) {
+                tty = LV_TY[top];
+                toff = LV_OFF[top];
+                hit = 1;
             }
             if (hit) {
                 u32 last = 0;
@@ -21955,6 +21990,36 @@ static void gen_one_global(u32 ty, Declarator *d)
                (size_t)ty_size(ty) < (size_t)(WIDE_LIT ? n * 4 : n)
                ? (size_t)ty_size(ty) : (size_t)(WIDE_LIT ? n * 4 : n));
         return;
+    }
+    if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_ch('=')
+        && pa_peek(1)->kind == TK_PUNCT && TOK_EQ(pa_peek(1), "{")
+        && pa_peek(2)->kind == TK_STR
+        && !ty_is_ptr(ty_target(ty)) && ty_size(ty_target(ty)) == 1) {
+        /* `char s[] = { "abc" };`：长度按字面量定（C99 6.7.8p22），不是按
+         * 花括号体里的**条数**。body_capture 数出来是 1 条，于是数组被开成
+         * 1 个字符，`static char joined[] = { "file\npipe" "\nsocket" };`
+         * 只剩首字节（内核 fs/coredump.c 的 core_modes[] 正是这个形状）。 */
+        u32 k2 = 2;
+        u32 off = 0;
+        u32 n = 0;
+
+        while (pa_peek(k2)->kind == TK_STR)
+            k2++;
+        if (pa_peek(k2)->kind == TK_PUNCT && TOK_EQ(pa_peek(k2), "}")) {
+            pa_advance();              /* 吃掉 '=' */
+            pa_advance();              /* 吃掉 '{' */
+            off = str_lit_data();
+            n = STR_LIT_N + 1;
+            ty = ty_array(ty_target(ty), n);
+            s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
+            s->goff = data_alloc(ty_size(ty), ty_align_of(ty));
+            s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+            memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off,
+                   (size_t)ty_size(ty) < (size_t)(STR_LIT_ESZ * n)
+                   ? (size_t)ty_size(ty) : (size_t)(STR_LIT_ESZ * n));
+            pa_expect_ch('}');
+            return;
+        }
     }
     if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_ch('=')) {
         was_inc = 1;
