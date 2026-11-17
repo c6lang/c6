@@ -5069,3 +5069,23 @@ DBG a=0/0 b=0/0      # status / body_len，__c6_co_run() 返回 0（"跑完"了�
 独立小程序里两个 `co work(1)/(2)` 都执行了（`G=3`）。所以问题在
 `httpsa_get` 里那条 `await c6_io(fd, ...)` 的读写路径，或者 `HAsync.attach` 的
 参数。下一轮在 `httpsa_get` 里打每次 `await` 前后返回的字节数。
+
+### 第 256 轮：json **全部**解析失败，实参 Str 是栈上的垃圾
+
+`std-box` 的 `json: 解析失败` 不是某个文档写错，最小的 `{"a":1}`、`{}`、`1` 全都失败
+（`/tmp/js5.c6`）。在 `json_parse_at` 里打形参：
+
+```
+[json_at] len=1 data=0x7ffc8edd0340 c0=64 a=0x7ffc8edd06f0
+```
+
+`len` 是对的（1、2 都对），但 `data` 指向**栈**、首字节是 `64`（`'@'`），而且
+`"1"` 和 `"{}"` 两次拿到的是**同一个**地址——说明 `str((char *)t)` 这个实参没被真正
+求值/传进去，形参读到的是调用者栈上的残留。`jp_ws` 于是返回 `64`，`jp_value` 走到
+最后一个 `jp_fail(ps, PARSE, "不是合法的 JSON 值")`。
+
+同族的现象还有 std-conf 的 xml `attr`（第 246 轮：内联 `e.attr(conf_str(S("id")), &v)`
+返回 0、先赋局部变量就正常）。所以这条线索大概率是**一个**编译器 bug：带
+`!error` 返回值的函数、实参又是由调用构造出来的聚合临时量时，实参槽没填对。
+下一轮的最小复现就是它：`int f(Str s) !error`，调用 `x->f(str(p))`，在 f 里打
+`s.len/s.data`。改动已撤回，回归 86 / 92、CI 绿。
