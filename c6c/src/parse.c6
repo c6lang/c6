@@ -11107,13 +11107,22 @@ static u32 gen_postfix(void)
         b = value_of(gen_assign());
         pb_ty = GEN_TY;
         pa_expect_ch(',');
-        pty = parse_typename();
         {
-            /* 第三个实参是"结果地址"：表达式位置上的指针值。必须先把它
+            /* 第三个实参是"结果地址"：表达式位置上的**指针值**。必须先把它
              * 求出来（在下面重算 a/b 的转换**之前**取，位置才和源码一致），
              * 结果要靠它写回去——这不是可选的收尾，GCC 的语义就是
-             * "算出来、存进去、返回是否溢出"。 */
+             * "算出来、存进去、返回是否溢出"。
+             *
+             * 类型只能从这个表达式自己身上取，不能走 parse_typename：
+             * 实参是变量/形参的写法（内核 drivers/base/devres.c:108 的
+             * `check_add_overflow(sizeof(struct devres), size, tot_size)`）
+             * 在类型位置上会被当成类型名整个吃光，紧跟的 `)` 于是报
+             * "这里要一个表达式（当前是 ')'）"；`&d` 那条路虽然能过，
+             * 拿到的 pty 也不对——`unsigned long d; &d` 会按 int 判溢出，
+             * 实测 0xFFFFFFFFUL + 1 被判溢出，而 gcc 判不溢出。 */
             u32 pv = value_of(gen_assign());
+
+            pty = GEN_TY;
 
             pa_expect_ch(')');
             out_ty = ty_is_ptr(pty) ? ty_target(pty) : ty_int();
