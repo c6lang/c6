@@ -23,6 +23,7 @@ typedef struct X64Sym {
     u32 next_same;  /* 同桶的下一个符号（0 = 链尾） */
     u8 defined;     /* off==0 也可能是“第一个函数”，不能用 0 当哨兵 */
     u8 is_data;     /* 数据符号：off 是**镜像偏移**，不参与 code_off 平移 */
+    u8 is_static;   /* 文件作用域的 static：-c 出 .o 时是 STB_LOCAL，LLVM 发 internal */
 } X64Sym;
 
 /* 符号表按名字哈希分桶：原来每个符号都要线性扫一遍全表，4 万个全局变量
@@ -474,6 +475,7 @@ static u32 x64_sym(X64State *st, const char *name)
     st->sym[st->nsym].hash = h;
     st->sym[st->nsym].defined = 0;
     st->sym[st->nsym].is_data = 0;
+    st->sym[st->nsym].is_static = 0;
     {
         u32 b = h % X64_SYMB;
 
@@ -679,6 +681,7 @@ static void x64_alias_idx(X64State *st, u32 a, u32 b)
     st->sym[a].va = st->sym[b].va;
     st->sym[a].defined = 1;
     st->sym[a].is_data = st->sym[b].is_data;
+    st->sym[a].is_static = st->sym[b].is_static;
 }
 
 static void x64_func_end(X64State *st)
@@ -1505,6 +1508,7 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
                 /* ucomiss/ucomisd 之后 CF/ZF 的语义与无符号比较一致：
                  * 有序比较就用 ULT/ULE/UGT/UGE 那组 setcc（NaN 自然得 0）。 */
                 u8 cc = o.flags;
+                int nanfix = (cc == IRCC_EQ || cc == IRCC_NE);
 
                 if (cc >= IRCC_LT && cc <= IRCC_GE)
                     cc = (u8)(cc + 4);
@@ -1516,9 +1520,24 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
                 img_u8(st->im, 0x2E);
                 x_modrm(st->im, 2, 0, R_RBP);
                 img_u32(st->im, X64_SLOT(o.b));
-                img_u8(st->im, 0x0F);
-                img_u8(st->im, setcc);
-                x_modrm(st->im, 3, 0, R_RAX);
+                /* 相等/不等碰上 NaN（ucomisd 置"无序"：ZF=PF=CF=1）必须单独
+                 * 处理：`sete` 会给 1、`setne` 给 0，正好反了。`dv != dv` 是
+                 * printf 和 half 模块判 NaN 的唯一手段，反了这一条 NaN 就被
+                 * 当成普通数印成一串垃圾。EQ = setnp & sete，NE = setp | setne。 */
+                if (nanfix) {
+                    img_u8(st->im, 0x0F);
+                    img_u8(st->im, (u8)(cc == IRCC_EQ ? 0x9B : 0x9A));  /* setnp/setp al */
+                    x_modrm(st->im, 3, 0, R_RAX);
+                    img_u8(st->im, 0x0F);
+                    img_u8(st->im, setcc);                             /* sete/setne cl */
+                    x_modrm(st->im, 3, 0, R_RCX);
+                    img_u8(st->im, (u8)(cc == IRCC_EQ ? 0x20 : 0x08)); /* and/or al, cl */
+                    x_modrm(st->im, 3, R_RCX, R_RAX);
+                } else {
+                    img_u8(st->im, 0x0F);
+                    img_u8(st->im, setcc);
+                    x_modrm(st->im, 3, 0, R_RAX);
+                }
                 img_u8(st->im, 0x0F);
                 img_u8(st->im, 0xB6);
                 x_modrm(st->im, 3, R_RAX, R_RAX);

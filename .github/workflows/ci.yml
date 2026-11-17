@@ -53,9 +53,12 @@ jobs:
 
       - name: Configure
         run: |
+          # 这个 job 校验的是 tcc 形态（daily 矩阵 / libtcc 共享矩阵），
+          # 显式钉住：仓库默认已改为只构建 c6c（见 CHANGELOG 0.6.3）。
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DC6_TCC_SHARED_LIBTCC=${{ matrix.shared }} \
             -DBUILD_TESTING=ON
 
@@ -86,7 +89,9 @@ jobs:
   # 一条 `cmake --build build --target check-all-c6c` 覆盖验收 (1)(2)(3)：
   # 自举 fixpoint 逐字节、全部后端同一套用例、tests+std+诊断语料、c6c 编出上游
   # tcc 并让它跑 tests2（含**第三代 selfhost**：那个 tcc 再编一遍 tcc.c）。
-  # 引导编译器是仓库自己的 `tcc/c6`，所以先按常规方式构建一次。
+  # 默认形态（stage0 = 宿主 C 编译器，C6_ENABLE_TCC=OFF）：构建阶段不产出
+  # tcc/c6 / libtcc，只生成 tcc 的配置头供语料使用；显式 OFF 写在这里，
+  # 防止默认值将来被改动时这条 job 悄悄走回 tcc。
   # -------------------------------------------------------------------------
   c6c:
     name: c6c (c6 写的自举编译器)
@@ -102,17 +107,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake make gcc binutils texinfo perl pkgconf python3
 
-      # c6c 是 CMake 里的 `c6c` 目标（`cmake/C6C.cmake`），依赖 tcc-build 产出的
-      # 引导编译器 tcc/c6；它挂在 ALL 上，所以这一句就把 c6 和 c6c 都编了。
-      # c6c 要 `-B tcc` 那套 crt / libtcc1.a，也是 tcc-build 的产物。
+      # c6c 是 CMake 里的 `c6c` 目标（`cmake/C6C.cmake`），stage0 = 宿主 cc，
+      # `cmake --build build` 就会编出 c6c/build/c6c；不依赖任何 tcc 产物。
       - name: Configure and build (c6 + c6c)
         run: |
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=OFF \
             -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
-          ls -l c6c/build/c6c tcc/c6
+          ls -l c6c/build/c6c
+          test ! -e tcc/c6
+          test ! -e tcc/libtcc.a
+          test ! -e tcc/libtcc.so
 
       # 验收 (1)(2)(3)：自举 fixpoint 逐字节、三后端同一套语料、tests+std+诊断、
       # c6c 编出上游 tcc 并让它跑 tests2（含**第三代 selfhost**），外加 tcc 上游
@@ -186,7 +194,7 @@ jobs:
         run: cmake --build build-notcc --target selfhost
 
   # -------------------------------------------------------------------------
-  # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
+  # 完整回归矩阵（92 个 std-*、自举、freestanding、tests2 等）。
   # 手动触发或 v* tag 发布时运行；release 依赖本 job，tag 上不会被跳过。
   # -------------------------------------------------------------------------
   regression:
@@ -208,8 +216,9 @@ jobs:
             qemu-user qemu-system-x86 clang golang-go nodejs
       - name: Configure and build
         run: |
+          # 完整回归矩阵（-L regression）的被测编译器是 tcc/c6，显式钉住。
           cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr \
-            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=ON
+            -DCMAKE_INSTALL_LIBDIR=lib -DC6_ENABLE_TCC=ON -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
       # aux（check-tcc / ubcheck / safegate / bench-async）不属于回归门禁；
       # bench-async 需要 g++/rustc/go/uya，用 check-aux 在完整环境里单独跑。
@@ -290,9 +299,12 @@ jobs:
 
       - name: Configure
         run: |
+          # Release 里发的仍是 c6 包（tcc 形态），显式钉住；c6c 包由
+          # package-c6c job 单独产出验收。
           cmake -S . -B build-pkg \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_ENABLE_TCC=ON \
             -DC6_TCC_SHARED_LIBTCC=ON \
             -DBUILD_TESTING=OFF \
             -DC6_PACKAGE_RELEASE="${{ steps.meta.outputs.release }}"
@@ -347,7 +359,7 @@ jobs:
   # （装成 bin/c6 与 bin/c6c），库是 libc6c，运行时是自己的 lib/c6/rt.c6，
   # 文档在 share/doc/c6c。产物名 c6c-*，与上面的 c6 包互斥（Provides: c6 /
   # Conflicts: c6, tcc）。目前只上传为 CI artifact、不进 Release：默认交付物
-  # 仍是 tcc 版 c6，等 c6c 的能力缺口补齐再换（见 CHANGELOG「未发布」）。
+  # 仍是显式打开 C6_ENABLE_TCC=ON 的 c6 包；默认构建/包是 c6c（见 CHANGELOG 0.6.3）。
   # -------------------------------------------------------------------------
   package-c6c:
     name: package c6c-only (${{ matrix.generator }})

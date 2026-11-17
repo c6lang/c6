@@ -54,6 +54,13 @@ static SrcFile *CUR_FILE;
 static char DATE_BUF[16] = {0};      /* "Mmm dd yyyy" */
 static char TIME_BUF[16] = {0};      /* "hh:mm:ss"   */      /* 最近打开的文件源：__FILE__/__LINE__ 与合成 token 用 */
 
+/* **最外层**宏展开的调用点（file id + off）。宏体里的 __LINE__/__FILE__ 要
+ * 报调用点而不是 #define 那一行——tests2/129_scopes 的 CHECK 宏就是在函数体
+ * 里展开 `__FILE__:__LINE__`，expect 逐行要调用点行号（10/11/12…）。只看
+ * 最外层：嵌套宏的展开结果里 out->hs 非空，不会覆盖调用点（和 gcc 一致）。 */
+static u32 PP_INVOKE_FILE;
+static u32 PP_INVOKE_OFF;
+
 /* 实参草稿池：宏调用期间有效，调用返回就回卷（严格 LIFO，嵌套安全）。
  * 为什么单独一个池：实参只活在一次展开里，而展开结果要活到被消费完。
  * 不这么做的话每层宏调用都会向 arena 要几个小数组，tcc.c 能吃掉几十 MB。 */
@@ -1438,8 +1445,11 @@ static int pp_next(Tok *out)
             goto have_macro;
         }
         if (TOK_EQ(out, "__LINE__")) {
+            /* 宏体里的 __LINE__ 报**调用点**（out->hs 非空 = 来自展开） */
+            u32 lf = out->hs ? PP_INVOKE_FILE : out->file;
+            u32 lo = out->hs ? PP_INVOKE_OFF : out->off;
             char *buf = arena_alloc(&A_main, 24);
-            int n = snprintf(buf, 24, "%u", src_line_of(file_by_id(out->file), out->off));
+            int n = snprintf(buf, 24, "%u", src_line_of(file_by_id(lf), lo));
             *out = tok_syn(TK_NUM, buf, (u32)n, CUR_FILE, 0);
             return TK_NUM;
         }
@@ -1461,7 +1471,7 @@ static int pp_next(Tok *out)
             return TK_STR;
         }
         if (TOK_EQ(out, "__FILE__")) {
-            SrcFile *f = file_by_id(out->file);
+            SrcFile *f = file_by_id(out->hs ? PP_INVOKE_FILE : out->file);
             const char *fn = src_path_of(f);
             size_t len = strlen(fn) + 3;
             char *buf = arena_alloc(&A_main, len);
@@ -1481,6 +1491,11 @@ have_macro:
             Hide *nh = hide_cons(m, hs);
             {
                 u32 em = exp_mark();
+                /* 最外层展开的调用点：宏体里的 __LINE__/__FILE__ 用它 */
+                if (!out->hs) {
+                    PP_INVOKE_FILE = out->file;
+                    PP_INVOKE_OFF = out->off;
+                }
                 expand_macro(m, NULL, NULL, 0, &ex, &exn);
                 for (q = 0; q < exn; q++)
                     ex[q].hs = ex[q].hs ? hide_union(nh, (Hide *)ex[q].hs) : nh;
@@ -1597,6 +1612,12 @@ have_macro:
             }
             nh = hide_cons(m, hide_and(hs, hs_close));
             u32 em = exp_mark();
+            /* 最外层展开的调用点（见 PP_INVOKE_FILE）：函数宏名后面已经吃过
+             * 实参表，但 out 仍是宏名那个 token，位置就是调用点。 */
+            if (!out->hs) {
+                PP_INVOKE_FILE = out->file;
+                PP_INVOKE_OFF = out->off;
+            }
             expand_macro(m, args, argn, nargs, &ex, &exn);
             /* 关键：不能无脑覆盖 token 原有的隐藏集。实参预展开来的 token 身上
              * 带着“我已经是 m0 展开出来的”这个信息（如自引用宏），覆盖掉就会

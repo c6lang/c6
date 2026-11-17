@@ -215,7 +215,7 @@ static void aso_compile(X64State *st, IrFn *f, u32 func_sym)
     if (func_sym < X64.nsym) {
         const char *nm = X64.sym[func_sym].name;
 
-        if (nm && nm[0] != '.' && !strchr(nm, '$')) {
+        if (nm && nm[0] != '.' && !strchr(nm, '$') && !X64.sym[func_sym].is_static) {
             aso_emit("\t.globl\t");
             aso_emit_symname(nm);
             aso_emit("\n");
@@ -608,7 +608,7 @@ static void aso_write_data(void)
     for (i = 0; i < nsorted; i++) {
         X64Sym *s = &X64.sym[sorted[i]];
 
-        if (s->name[0] == '.' || strchr(s->name, '$'))
+        if (s->name[0] == '.' || strchr(s->name, '$') || s->is_static)
             continue;
         aso_emit("\t.globl\t");
         aso_emit_symname(s->name);

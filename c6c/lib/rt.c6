@@ -15,6 +15,30 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+
+/* `errno` 是每进程一个整数（<errno.h> 里是 `extern int errno;`）。rt.c6 是
+ * 被塞进每个 TU 最前面的前置代码，所以这里给一个 weak 定义：单 TU 程序只有
+ * 一份，多 TU 链接时也不会撞成"重复定义"。
+ *
+ * 为什么需要它：裸 syscall 包装一直只返回 -errno、**不设 errno**，于是按
+ * `errno == EINPROGRESS` / `EAGAIN` / `EINTR` 分支的代码（std/net/tcp.c6 的
+ * 非阻塞 connect 就是）永远走"失败"那条路。现在 c6c_sys* 在返回负数时顺手把
+ * errno 设成同一个值——返回值口径不变（仍是 -errno），errno 也终于是对的。 */
+#ifdef errno
+/* 系统的 <errno.h>（glibc / musl）把 errno 做成了宏 `(*__errno_location())`：
+ * 那种情况下用系统那份线程安全的 errno，这里不要再定义第二个。tcc 那套
+ * 构建走的就是这条路，定义重复会直接编不过。 */
+#else
+__attribute__((weak)) int errno = 0;
+#endif
+
+static long c6c_sys_errno(long r)
+{
+    if (r < 0 && r > -4096)
+        errno = (int)(-r);
+    return r;
+}
 
 /* ---------- 系统调用 ---------- */
 #define C6C_SYS_READ 0
@@ -51,27 +75,27 @@
 
 static long c6c_sys1(long nr, long a)
 {
-    return __builtin_syscall(nr, a);
+    return c6c_sys_errno(__builtin_syscall(nr, a));
 }
 
 static long c6c_sys2(long nr, long a, long b)
 {
-    return __builtin_syscall(nr, a, b);
+    return c6c_sys_errno(__builtin_syscall(nr, a, b));
 }
 
 static long c6c_sys3(long nr, long a, long b, long c)
 {
-    return __builtin_syscall(nr, a, b, c);
+    return c6c_sys_errno(__builtin_syscall(nr, a, b, c));
 }
 
 static long c6c_sys4(long nr, long a, long b, long c, long d)
 {
-    return __builtin_syscall(nr, a, b, c, d);
+    return c6c_sys_errno(__builtin_syscall(nr, a, b, c, d));
 }
 
 static long c6c_sys6(long nr, long a, long b, long c, long d, long e, long f)
 {
-    return __builtin_syscall(nr, a, b, c, d, e, f);
+    return c6c_sys_errno(__builtin_syscall(nr, a, b, c, d, e, f));
 }
 
 /* ---------- 基本 I/O ---------- */
@@ -1071,11 +1095,27 @@ long __c6_co_run(void)
         bad += c6c_co_reap_done();      /* 跑完的 `co` 任务就地回收并计数 */
         if (guard++ > 1000000)
             break;
-        for (c = C6_CO_ALL; c; c = c->next)
-            if (!c->done && !c->waiting) {
-                c6c_co_resume(c);
-                break;
+        /* `blocked_on` 非空表示这个协程正在 `await` 另一个任务：唤醒它只会让它在
+         * `__c6_co_await` 的循环里再让一次，真正该跑的是它等的那个任务。
+         * 以前这里漏了这个条件：父子两条协程同时在册时，主循环每轮都挑到被挡住
+         * 的父任务并"恢复"它，子任务一直排不上队——实测同一个协程被恢复到 guard
+         * 上限（`examples/stdhttps.c6` 的 co 段、最小复现 `/tmp/cm9`）。 */
+        for (c = C6_CO_ALL; c; c = c->next) {
+            C6Co *t = 0;
+
+            if (c->done || c->waiting)
+                continue;
+            /* `blocked_on` 只在"等的那个任务还没结束"时才跳过。以前这里无条件
+             * 跳过 blocked_on 的协程，被等的任务一结束父任务就再也没人叫醒它；
+             * 不跳过又会在父任务上空转（第 301 轮实测恢复到 guard 上限）。 */
+            if (c->blocked_on) {
+                t = c6c_co_find(c->blocked_on);
+                if (t && !t->done)
+                    continue;
             }
+            c6c_co_resume(c);
+            break;
+        }
         if (c)
             continue;
         if (c6c_co_poll_ready(-1) <= 0)
@@ -1417,8 +1457,12 @@ int pthread_create(unsigned long *th, const void *attr, void *(*fn)(void *), voi
     }
     st = (void *)c6c_sys6(C6C_SYS_MMAP, 0, C6C_TH_STACK, 3,
                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
-    if ((long)st < 0 && (long)st > -4096)
+    /* 失败也要把全局自旋锁放掉：`c6c_th_lock` 是**全局**的，漏一次
+     * 整个进程里后面每一次 pthread_create 都会在那儿空转（第 278 轮）。 */
+    if ((long)st < 0 && (long)st > -4096) {
+        c6c_th_unlock();
         return -1;
+    }
     sp = ((unsigned long)st + C6C_TH_STACK) / 16ul * 16ul - 16ul;
     C6C_THS[i].fn = fn;
     C6C_THS[i].arg = arg;
@@ -1429,8 +1473,12 @@ int pthread_create(unsigned long *th, const void *attr, void *(*fn)(void *), voi
     tid = __c6_th_spawn(C6C_CLONE_VM | C6C_CLONE_FS | C6C_CLONE_FILES
                         | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM,
                         (void *)sp, (void *)(long)i);
-    if (tid < 0)
+    if (tid < 0) {
+        C6C_THS[i].stack = 0;          /* 槽位还回去，别让它一直占着 */
+        c6c_sys6(C6C_SYS_MUNMAP, (long)st, C6C_TH_STACK, 0, 0, 0, 0);
+        c6c_th_unlock();
         return -1;
+    }
     C6C_THS[i].tid = (unsigned long)tid;
     if (th)
         *th = (unsigned long)&C6C_THS[i];
@@ -1974,6 +2022,91 @@ static void c6c_pad(char *out, long cap, long *n, long width, char pc)
     }
 }
 
+/* 四舍五入到整数，但**正好 .5 时取偶**——glibc 的默认舍入口径（printf("%.0f", 2.5)
+ * 印 "2"，printf("%.1f", 2.25) 印 "2.2"）。用 (long)(t + 0.5) 会一路进位到 3 / 2.3，
+ * 和 glibc 对不上。 */
+static double c6c_round_even(double t)
+{
+    unsigned long fl = (unsigned long)t;      /* 调用方保证 t < 2^64 */
+    double frac = t - (double)fl;
+
+    if (frac > 0.5)
+        return (double)fl + 1.0;
+    if (frac < 0.5)
+        return (double)fl;
+    if (fl != (fl / 2ul) * 2ul)               /* 正好 .5：取偶 */
+        return (double)fl + 1.0;
+    return (double)fl;
+}
+
+/* 整数部分的精确展开（1e19 以上 u64 装不下）。double 的整数部分就是
+ * `尾数 << 指数`，最多一千来位，用 10^9 进制的小 bignum 反复乘 2 就能算全——
+ * `printf("%f", 1e300)` 在 glibc 下就是把这 300 位一位不差地印出来。 */
+#define C6C_BIG_LIMB 40
+static long c6c_fmt_big(char *buf, double dv)
+{
+    unsigned long bits = *(unsigned long *)&dv;
+    long be = (long)((bits >> 52) & 0x7ffl);
+    unsigned long m = bits & 0xffffffffffffful;
+    long e = 0;
+    unsigned int limb[C6C_BIG_LIMB] = {0};
+    long nl = 1;
+    long i = 0;
+    long n = 0;
+    char tmp[16] = {0};
+    unsigned long v = 0;
+
+    if (be == 0)
+        return 0;                          /* 次正规数：整数部分就是 0 */
+    m = m | 0x10000000000000ul;            /* 补上隐含的 1 */
+    e = be - 1075;                         /* value = m * 2^e */
+    if (e < 0) {                           /* 整数部分 = m >> -e */
+        long sh = -e;
+
+        if (sh >= 53)
+            return 0;
+        m = m >> sh;
+        e = 0;
+    }
+    v = m % 1000000000ul;
+    limb[0] = (unsigned int)v;
+    m = m / 1000000000ul;
+    while (m) {
+        limb[nl] = (unsigned int)(m % 1000000000ul);
+        nl++;
+        m = m / 1000000000ul;
+    }
+    while (e > 0) {
+        unsigned long carry = 0;
+
+        for (i = 0; i < nl; i++) {
+            unsigned long t = (unsigned long)limb[i] * 2ul + carry;
+
+            limb[i] = (unsigned int)(t % 1000000000ul);
+            carry = t / 1000000000ul;
+        }
+        if (carry && nl < C6C_BIG_LIMB) {
+            limb[nl] = (unsigned int)carry;
+            nl++;
+        }
+        e--;
+    }
+    for (i = nl - 1; i >= 0; i--) {
+        long fl = 0;
+        long k = 0;
+
+        if (i == nl - 1) {
+            fl = c6c_utoa(tmp, (unsigned long)limb[i], 10, 0, 1);
+        } else {
+            fl = c6c_utoa(tmp, (unsigned long)limb[i], 10, 0, 9);
+        }
+        for (k = 0; k < fl; k++)
+            buf[n + k] = tmp[k];
+        n = n + fl;
+    }
+    return n;
+}
+
 /* 浮点 → 文本：%f/%e/%g（conv 只收小写）。返回值是 body 的长度，*sign 是符号字符
  * （0 表示不需要符号）。dv 的位模式从 va_arg 按 8 字节整型取出——本地约定里
  * double 就是走整型寄存器传的，所以变参函数里也能拿到。 */
@@ -1997,7 +2130,8 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         body[2] = 'n';
         return 3;
     }
-    if (dv < 0) {
+    /* -0.0：`dv < 0` 对它为假，但符号位是 1（glibc 印的是 -0.000000） */
+    if (dv < 0 || (dv == 0.0 && ((*(unsigned long *)&dv) >> 63) != 0)) {
         *sign = '-';
         dv = -dv;
     }
@@ -2036,6 +2170,21 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
     }
     for (k = 0; k < p; k++)
         sc = sc * 10;
+    if (conv == 'f' && dv >= 18446744073709551616.0) {
+        /* 2^64 以上：u64 装不下整数部分，改走精确展开。这个量级的 double 步长
+         * 已经大于 1，小数部分恒为 0，按精度补零即可。 */
+        len = c6c_fmt_big(body, dv);
+        if (p > 0) {
+            body[len] = '.';
+            len++;
+            for (k = 0; k < p; k++)
+                body[len + k] = '0';
+            len = len + p;
+        } else if (alt) {
+            body[len] = '.';
+            len++;
+        }
+    } else {
     /* 整数部分和小数部分分开算：整体乘 10^p 会超 53 位精度，
      * 1234567890123.0 会印成 ...000064（踩过） */
     if (dv < 18446744073709551616.0) {        /* 2^64：u64 装得下的都要取整数部分 */
@@ -2047,7 +2196,7 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         double t = (dv - (double)ip) * (double)sc;
 
         if (t < 18446744073709551615.0)
-            uval = (unsigned long)(t + 0.5);
+            uval = (unsigned long)c6c_round_even(t);
         else
             uval = 0;
     }
@@ -2074,11 +2223,20 @@ static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, c
         body[len] = '.';
         len++;
     }
-    if (is_g && !alt) {                           /* %g 去掉尾零 */
-        while (len > 1 && body[len - 1] == '0')
-            len--;
-        if (len > 1 && body[len - 1] == '.')
-            len--;
+    }
+    if (is_g && !alt) {                           /* %g 去掉**小数部分**的尾零 */
+        long dot = -1;
+
+        /* 只在小数点存在时才剥——否则 100000 会被剥成 "1"（踩过） */
+        for (k = 0; k < len; k++)
+            if (body[k] == '.')
+                dot = k;
+        if (dot >= 0) {
+            while (len > dot + 1 && body[len - 1] == '0')
+                len--;
+            if (len == dot + 1)
+                len--;                            /* 去掉孤零零的小数点 */
+        }
     }
     if (conv == 'e') {
         long e2 = exp10 < 0 ? -exp10 : exp10;
@@ -2231,6 +2389,10 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
 
             *(unsigned long *)&dv = raw;
             bodylen = c6c_fmt_double(body, dv, lc, prec < 0 ? 6 : prec, alt, &sign);
+            if (!sign && plus)
+                sign = '+';               /* %+f：glibc 也这么印 */
+            else if (!sign && space)
+                sign = ' ';
             if (conv >= 'A' && conv <= 'Z') {
                 /* %E / %G：小写生成，最后整段转大写 */
                 for (k = 0; k < bodylen; k++)
@@ -2285,14 +2447,17 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
             }
             if (prec < 0)
                 prec = 1;
-            bodylen = c6c_utoa(body, v, base, upper, prec);
+            if (prec == 0 && v == 0)
+                bodylen = 0;              /* %.0d 的 0 什么都不印（glibc 口径） */
+            else
+                bodylen = c6c_utoa(body, v, base, upper, prec);
             if (neg)
                 sign = '-';
             else if (plus)
                 sign = '+';
             else if (space)
                 sign = ' ';
-            if (alt && base == 16) {
+            if (alt && base == 16 && v != 0) {   /* %#x 的 0 也不加 0x */
                 prefix[0] = '0';
                 prefix[1] = upper ? 'X' : 'x';
                 plen = 2;
@@ -2341,19 +2506,23 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
 }
 
 /* ---------- stdio ---------- */
-static char c6c_obuf[8192] = {0};
 
+
+/* printf/fprintf 各自在**栈上**开一块格式化缓冲：以前共用一张全局
+ * `c6c_obuf`，多线程同时打印时会把彼此的结果踩掉（实测 spawn 出去的两个
+ * 函数打出来的字符串会串，第 285 轮）。栈上 4 KB 对格式化输出够用。 */
 int printf(const char *fmt, ...)
 {
     va_list ap = {0};
     long n = 0;
+    char obuf[4096] = {0};
 
     va_start(ap, fmt);
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
     va_end(ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, 1, (long)c6c_obuf, n);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)obuf, n);
     return (int)n;
 }
 
@@ -2362,10 +2531,12 @@ int vfprintf(void *f, const char *fmt, va_list ap)
     long n = 0;
     long fd = (long)f;
 
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    char obuf[4096] = {0};
+
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)obuf, n);
     return (int)n;
 }
 
@@ -2379,13 +2550,14 @@ int fprintf(void *f, const char *fmt, ...)
     va_list ap = {0};
     long n = 0;
     long fd = (long)f;
+    char obuf[4096] = {0};
 
     va_start(ap, fmt);
-    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    n = c6c_vfmt(obuf, (long)sizeof(obuf), fmt, ap);
     va_end(ap);
-    if (n > (long)sizeof(c6c_obuf) - 1)
-        n = (long)sizeof(c6c_obuf) - 1;
-    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    if (n > (long)sizeof(obuf) - 1)
+        n = (long)sizeof(obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)obuf, n);
     return (int)n;
 }
 
@@ -2683,6 +2855,10 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
  * （踩过：C6C_RT 恰好在末尾，于是 getenv 永远找不到） */
 static char c6c_envbuf[65536] = {0};
 static long c6c_envlen;
+/* 自编译的 c6c 里 extern environ 只是一格零存储（parse.c6 的单镜像规则），
+ * 这里从 /proc/self/environ 建一张真正的指针表，execvp 才能传完整环境。 */
+extern char **environ;
+static char *c6c_envp[512] = {0};
 
 static void c6c_env_load(void)
 {
@@ -2708,6 +2884,16 @@ static void c6c_env_load(void)
     close(fd);
     c6c_envbuf[n] = 0;
     c6c_envlen = n ? n : -1;
+    {
+        long k = 0;
+        char *p = c6c_envbuf;
+        while (*p && k < (long)sizeof(c6c_envp) / (long)sizeof(c6c_envp[0]) - 1) {
+            c6c_envp[k++] = p;
+            p += strlen(p) + 1;
+        }
+        c6c_envp[k] = (char *)0;
+        environ = c6c_envp;
+    }
 }
 
 /* _SC_* 名字（和 Linux 的编号一致，include/unistd.h 里写的是同一套） */
@@ -3142,6 +3328,145 @@ int mkstemp(char *tmpl)
     return fd < 0 ? -1 : fd;
 }
 
+/* ---------- 网络 / 等待：socket 家族、poll、uname、rmdir、tcgetattr ----------
+ *
+ * 这几个名字以前是 tcc 链的 libc 给的；c6c 自带运行时顶上去之后，std/net、
+ * std/async、std/term、std/sys、std/fsx 那几组用例编译到链接期就报「未定义的
+ * 符号」。实现都是薄壳：系统调用号 + 内核结构体的布局（Linux x86-64 那份），
+ * 和别处的 syscall 包装一个口径——原样返回内核的返回值（负数就是 -errno），
+ * 不做 errno 转换（rt.c6 没有全局 errno）。
+ *
+ * **全部 `weak`**：std 里 `Chan.send` / `ACancel.poll` 那种同名全局函数是
+ * 程序自己的强定义，链接时该盖掉这里的弱定义（tcc 走 libc.so.6 时靠的是
+ * ELF 符号覆盖，效果一样）。没被覆盖时，这里的实现兜住 libc 那一侧。
+ */
+#define C6C_SYS_POLL        7
+#define C6C_SYS_SOCKET      41
+#define C6C_SYS_CONNECT     42
+#define C6C_SYS_ACCEPT      43
+#define C6C_SYS_SENDTO      44
+#define C6C_SYS_RECVFROM    45
+#define C6C_SYS_SHUTDOWN    48
+#define C6C_SYS_BIND        49
+#define C6C_SYS_LISTEN      50
+#define C6C_SYS_GETSOCKNAME 51
+#define C6C_SYS_GETPEERNAME 52
+#define C6C_SYS_SOCKETPAIR  53
+#define C6C_SYS_SETSOCKOPT  54
+#define C6C_SYS_GETSOCKOPT  55
+#define C6C_SYS_UNAME       63
+#define C6C_SYS_RMDIR       84
+
+__attribute__((weak)) int poll(void *fds, unsigned long nfds, int timeout)
+{
+    return (int)c6c_sys3(C6C_SYS_POLL, (long)fds, (long)nfds, (long)timeout);
+}
+
+__attribute__((weak)) int nanosleep(const void *req, void *rem)
+{
+    return (int)c6c_sys2(C6C_SYS_NANOSLEEP, (long)req, (long)rem);
+}
+
+__attribute__((weak)) int rmdir(const char *path)
+{
+    return (int)c6c_sys1(C6C_SYS_RMDIR, (long)path);
+}
+
+/* 内核的 struct utsname：6 个 65 字节的字段，顺序固定 */
+__attribute__((weak)) int uname(void *buf)
+{
+    return (int)c6c_sys1(C6C_SYS_UNAME, (long)buf);
+}
+
+/* 终端属性：TCGETS 原样交给 ioctl（调用方给 struct termios *，这一层不看内容） */
+__attribute__((weak)) int tcgetattr(int fd, void *t)
+{
+    return (int)ioctl(fd, C6C_TCGETS, t);
+}
+
+__attribute__((weak)) int socket(int domain, int type, int proto)
+{
+    return (int)c6c_sys3(C6C_SYS_SOCKET, domain, type, proto);
+}
+
+__attribute__((weak)) int bind(int fd, const void *addr, unsigned int len)
+{
+    return (int)c6c_sys3(C6C_SYS_BIND, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int listen(int fd, int backlog)
+{
+    return (int)c6c_sys2(C6C_SYS_LISTEN, fd, backlog);
+}
+
+__attribute__((weak)) int accept(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_ACCEPT, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int connect(int fd, const void *addr, unsigned int len)
+{
+    return (int)c6c_sys3(C6C_SYS_CONNECT, fd, (long)addr, (long)len);
+}
+
+/* send / recv 就是 sendto / recvfrom 去掉地址那一半 */
+__attribute__((weak)) long send(int fd, const void *buf, unsigned long n, int flags)
+{
+    return c6c_sys4(C6C_SYS_SENDTO, fd, (long)buf, (long)n, (long)flags);
+}
+
+__attribute__((weak)) long recv(int fd, void *buf, unsigned long n, int flags)
+{
+    return c6c_sys4(C6C_SYS_RECVFROM, fd, (long)buf, (long)n, (long)flags);
+}
+
+__attribute__((weak)) long sendto(int fd, const void *buf, unsigned long n, int flags,
+                                 const void *addr, unsigned int len)
+{
+    return c6c_sys6(C6C_SYS_SENDTO, fd, (long)buf, (long)n, (long)flags, (long)addr,
+                    (long)len);
+}
+
+__attribute__((weak)) long recvfrom(int fd, void *buf, unsigned long n, int flags,
+                                   void *addr, unsigned int *len)
+{
+    return c6c_sys6(C6C_SYS_RECVFROM, fd, (long)buf, (long)n, (long)flags, (long)addr,
+                    (long)len);
+}
+
+__attribute__((weak)) int setsockopt(int fd, int level, int opt, const void *val,
+                                     unsigned int len)
+{
+    /* 没有 c6c_sys5，用 6 参那个补一个 0：内核只读它定义的参数个数，多余的不看 */
+    return (int)c6c_sys6(C6C_SYS_SETSOCKOPT, fd, level, opt, (long)val, (long)len, 0);
+}
+
+__attribute__((weak)) int getsockopt(int fd, int level, int opt, void *val,
+                                     unsigned int *len)
+{
+    return (int)c6c_sys6(C6C_SYS_GETSOCKOPT, fd, level, opt, (long)val, (long)len, 0);
+}
+
+__attribute__((weak)) int getsockname(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_GETSOCKNAME, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int getpeername(int fd, void *addr, unsigned int *len)
+{
+    return (int)c6c_sys3(C6C_SYS_GETPEERNAME, fd, (long)addr, (long)len);
+}
+
+__attribute__((weak)) int socketpair(int domain, int type, int proto, int *sv)
+{
+    return (int)c6c_sys4(C6C_SYS_SOCKETPAIR, domain, type, proto, (long)sv);
+}
+
+__attribute__((weak)) int shutdown(int fd, int how)
+{
+    return (int)c6c_sys2(C6C_SYS_SHUTDOWN, fd, how);
+}
+
 static int c6c_setenv_find(const char *name, long nl)
 {
     int i = 0;
@@ -3487,15 +3812,79 @@ void __assert_fail(const char *expr, const char *file, unsigned int line, const 
 int pthread_condattr_init(void *a) { (void)a; return 0; }
 int pthread_condattr_destroy(void *a) { (void)a; return 0; }
 int pthread_condattr_setpshared(void *a, int v) { (void)a; (void)v; return 0; }
-int pthread_cond_init(void *c, const void *a) { (void)c; (void)a; return 0; }
-int pthread_cond_destroy(void *c) { (void)c; return 0; }
-int pthread_cond_wait(void *c, void *m) { (void)c; (void)m; return 0; }
-int pthread_cond_signal(void *c) { (void)c; return 0; }
-int pthread_cond_broadcast(void *c) { (void)c; return 0; }
-int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
+/* 条件变量：第一个 int 当通知计数。 */
+#define C6C_FUTEX_WAIT 0
+#define C6C_FUTEX_WAKE 1
+
+static long c6c_futex(void *p, int op, int val)
+{
+    return c6c_sys6(202, (long)p, (long)op, (long)val, 0L, 0L, 0L);
+}
+
+/* 互斥量：第一个 long 当状态（0 空闲 / 1 占用）。获取用原子加，拿不到就
+ * 还回去再睡——和 /tmp/pool1.c6 里验证过的那版一致（第 282 轮）。 */
+int pthread_mutex_init(void *m, const void *a) { (void)a; if (m) *(long *)m = 0; return 0; }
 int pthread_mutex_destroy(void *m) { (void)m; return 0; }
-int pthread_mutex_lock(void *m) { (void)m; return 0; }
-int pthread_mutex_unlock(void *m) { (void)m; return 0; }
+
+/* 互斥量：第一个 long 当状态（0 空闲 / 1 占用）。取锁用 8 字节原子交换，拿到
+ * 的一定是 0；没拿到就睡到这个字变 0 再重试。
+ *
+ * 这里**不能**用"原子加 1、出 1 就拿到"的写法：两个线程同时抢时计数会加到 2，
+ * 谁都没拿到，又各自减回去，等待方就会永远等在一个非 0 的值上（第 289 轮实测
+ * cond+mutex 的握手 6 次挂 3 次就是这个原因）。交换出来的值只有 0/1，没有歧义。 */
+int pthread_mutex_lock(void *m)
+{
+    if (!m)
+        return -1;
+    for (;;) {
+        if (__c6_xchg8(m, 1) == 0)
+            return 0;
+        while (*(volatile long *)m != 0)
+            c6c_futex(m, C6C_FUTEX_WAIT, 1);
+    }
+}
+
+int pthread_mutex_unlock(void *m)
+{
+    if (!m)
+        return -1;
+    *(volatile long *)m = 0;
+    c6c_futex(m, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
+int pthread_cond_init(void *c, const void *a) { (void)a; if (c) *(int *)c = 0; return 0; }
+int pthread_cond_destroy(void *c) { (void)c; return 0; }
+int pthread_cond_wait(void *c, void *m)
+{
+    int seen = 0;
+
+    if (!c || !m)
+        return -1;
+    seen = *(volatile int *)c;
+    pthread_mutex_unlock(m);
+    while (*(volatile int *)c == seen)
+        c6c_futex(c, C6C_FUTEX_WAIT, seen);
+    pthread_mutex_lock(m);
+    return 0;
+}
+int pthread_cond_signal(void *c)
+{
+    if (!c)
+        return -1;
+    __c6_atomic_inc((long *)c);
+    c6c_futex(c, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+int pthread_cond_broadcast(void *c)
+{
+    if (!c)
+        return -1;
+    __c6_atomic_inc((long *)c);
+    c6c_futex(c, C6C_FUTEX_WAKE, 0x3fffffff);
+    return 0;
+}
+
 int pthread_attr_init(void *a) { (void)a; return 0; }
 int pthread_attr_destroy(void *a) { (void)a; return 0; }
 
@@ -3521,11 +3910,1178 @@ int unlink(const char *path)
     return (int)r;
 }
 
+/* chdir：一条 syscall（80）。getcwd 在上面那条 syscall（79）里。 */
+int chdir(const char *path)
+{
+    return (int)c6c_sys1(80 /* chdir */, (long)path);
+}
+
+/* 字节序：x86-64 是小端，所以 ntoh* / hton* 就是字节交换。
+ * 它们平时是 <arpa/inet.h> 里的宏，但 std/net 那几个模块是按**函数**调用的
+ * （tcc 链的 libc 里有同名符号），所以这里给真函数。 */
+unsigned short ntohs(unsigned short v)
+{
+    return (unsigned short)(((v >> 8) & 0xffu) | ((v << 8) & 0xff00u));
+}
+
+unsigned short htons(unsigned short v)
+{
+    return ntohs(v);
+}
+
+unsigned int ntohl(unsigned int v)
+{
+    return ((v >> 24) & 0xffu) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u)
+           | ((v << 24) & 0xff000000u);
+}
+
+unsigned int htonl(unsigned int v)
+{
+    return ntohl(v);
+}
+
+/* struct termios（Linux x86-64）：4 个 unsigned + c_line + c_cc[32]（一共 60 字节）。
+ * 只在 cfmakeraw 里用到，所以用一个私有镜像结构，免得和 <termios.h> 的定义撞车。 */
+typedef struct C6CTermios {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[32];
+} C6CTermios;
+
+/* cfmakeraw：glibc 那套位掩码的等价值（std/term 的 raw 模式要靠它） */
+void cfmakeraw(void *t)
+{
+    C6CTermios *tt = (C6CTermios *)t;
+
+    if (!tt)
+        return;
+    tt->c_iflag &= ~(0x1u | 0x2u | 0x8u | 0x20u | 0x40u | 0x80u | 0x100u | 0x400u);
+    tt->c_oflag &= ~0x1u;                   /* OPOST */
+    tt->c_lflag &= ~(0x1u | 0x2u | 0x8u | 0x40u | 0x8000u);
+    tt->c_cflag &= ~(0x30u | 0x100u);       /* CSIZE | PARENB */
+    tt->c_cflag |= 0x30u;                   /* CS8 */
+    tt->c_cc[6] = 1;                        /* VMIN */
+    tt->c_cc[5] = 0;                        /* VTIME */
+}
+
+int sysinfo(void *info)
+{
+    return (int)c6c_sys1(99 /* sysinfo */, (long)info);
+}
+
+/* mkfifo：x86-64 上没有独立的 syscall，走 mknod(133)。 */
+int mkfifo(const char *path, unsigned int mode)
+{
+    return (int)c6c_sys3(133 /* mknod */, (long)path, (long)0x1000u, (long)mode);
+}
+
+int fsync(int fd)
+{
+    return (int)c6c_sys1(74 /* fsync */, fd);
+}
+
+int ftruncate(int fd, long len)
+{
+    return (int)c6c_sys2(77 /* ftruncate */, fd, len);
+}
+
+
+/* ---------- 第二批：目录、资源用量、终端设置、线程身份、名字解析 ----------
+ *
+ * 和上一批一个口径：薄壳 + 原样返回内核的返回值（负数就是 -errno）。凡是
+ * 「进程里可能已经有同名强定义」的（pthread_*、getaddrinfo 家族）都标 weak。
+ * 这一批点的是 std/fsx、std/ub、std/sys、std/term、std/thread、std/wire 那几组
+ * 用例——它们的 test 块以前全靠 tcc 链的 libc 提供这些符号。
+ */
+
+/* 目录：自己 decode getdents64（217）。内核的记录布局正好是 glibc
+ * `struct dirent` 的前 19 字节（ino 8 / off 8 / reclen 2 / type 1）+ 名字，
+ * 所以把一条记录拷进静态缓冲就能原样交给调用方。`DIR *` 出去的其实是
+ * 下面这个 C6CDir（rt.c6 不 include <dirent.h>：系统头里那个 DIR 是不透明的，
+ * 跟自己定义的会撞名，而链接器只看符号名，类型不一致无所谓）。 */
+#define C6C_SYS_GETDENTS64 217
+#define C6C_O_DIRECTORY 0x10000
+#define C6C_O_CLOEXEC 0x80000
+
+typedef struct C6CDirEnt {
+    unsigned long d_ino;
+    long d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[256];
+} C6CDirEnt;
+
+typedef struct C6CDir {
+    int fd;
+    long pos;
+    long len;
+    char buf[4096];
+} C6CDir;
+
+static C6CDirEnt C6C_DE;
+
+void *opendir(const char *path)
+{
+    C6CDir *d = 0;
+    int fd = (int)open(path, C6C_O_DIRECTORY | C6C_O_CLOEXEC, 0);
+
+    if (fd < 0)
+        return 0;
+    d = (C6CDir *)malloc(sizeof(C6CDir));
+    if (!d) {
+        close(fd);
+        return 0;
+    }
+    d->fd = fd;
+    d->pos = 0;
+    d->len = 0;
+    return (void *)d;
+}
+
+/* 一次 getdents64 读 4 KiB，逐条解码；`.` 与 `..` 照常返回（glibc 也返回） */
+void *readdir(void *dir)
+{
+    C6CDir *d = (C6CDir *)dir;
+    unsigned char *rec = 0;
+    long r = 0;
+    long i = 0;
+    unsigned short rl = 0;
+
+    if (!d)
+        return 0;
+    for (;;) {
+        if (d->pos >= d->len) {
+            r = c6c_sys3(C6C_SYS_GETDENTS64, d->fd, (long)d->buf, (long)sizeof(d->buf));
+            if (r <= 0)
+                return 0;
+            d->pos = 0;
+            d->len = r;
+        }
+        rec = (unsigned char *)d->buf + d->pos;
+        rl = *(unsigned short *)(rec + 16);
+        if (rl == 0) {
+            d->pos = d->len;
+            return 0;
+        }
+        d->pos += (long)rl;
+        C6C_DE.d_ino = *(unsigned long *)rec;
+        C6C_DE.d_off = *(long *)(rec + 8);
+        C6C_DE.d_reclen = rl;
+        C6C_DE.d_type = rec[18];
+        i = 0;
+        while (i < 255 && rec[19 + i]) {
+            C6C_DE.d_name[i] = (char)rec[19 + i];
+            i++;
+        }
+        C6C_DE.d_name[i] = 0;
+        return (void *)&C6C_DE;
+    }
+}
+
+int closedir(void *dir)
+{
+    C6CDir *d = (C6CDir *)dir;
+
+    if (!d)
+        return -1;
+    close(d->fd);
+    free(d);
+    return 0;
+}
+
+void rewinddir(void *dir)
+{
+    C6CDir *d = (C6CDir *)dir;
+
+    if (!d)
+        return;
+    d->pos = 0;
+    d->len = 0;
+    (void)c6c_sys3(8 /* lseek */, d->fd, 0, 0);
+}
+
+int getrusage(int who, void *usage)
+{
+    return (int)c6c_sys2(98 /* getrusage */, who, (long)usage);
+}
+
+/* tcsetattr：TCSANOW / TCSADRAIN / TCSAFLUSH 就是 TCGETS 之后的三个请求号 */
+int tcsetattr(int fd, int actions, const void *t)
+{
+    unsigned long req = C6C_TCGETS + 1u;
+
+    if (actions == 1)
+        req = C6C_TCGETS + 2u;          /* TCSETSW */
+    else if (actions == 2)
+        req = C6C_TCGETS + 3u;          /* TCSETSF */
+    return (int)ioctl(fd, req, (void *)t);
+}
+
+int tcflush(int fd, int queue)
+{
+    return (int)ioctl(fd, 0x540Bu + (unsigned long)(queue & 3), 0);
+}
+
+int tcdrain(int fd)
+{
+    return (int)ioctl(fd, 0x5409u, 0);
+}
+
+/* 线程身份：gettid（186）。pthread_create 建的线程有自己的 tid，返回它就和
+ * /proc/self/task/<tid>/ 对得上（`pthread_setname_np` 走的就是那条路）。 */
+unsigned long pthread_self(void)
+{
+    return (unsigned long)c6c_sys1(186 /* gettid */, 0);
+}
+
+int pthread_equal(unsigned long a, unsigned long b)
+{
+    return a == b;
+}
+
+int pthread_detach(unsigned long th)
+{
+    (void)th;
+    return 0;
+}
+
+int pthread_mutex_trylock(void *m)
+{
+    (void)m;
+    return 0;
+}
+
+int pthread_mutex_timedlock(void *m, const void *abstime)
+{
+    (void)m;
+    (void)abstime;
+    return 0;
+}
+
+int pthread_once(void *once, void (*fn)(void))
+{
+    static int done = 0;
+
+    if (!once)
+        return -1;
+    if (done)
+        return 0;
+    done = 1;
+    if (fn)
+        fn();
+    return 0;
+}
+
+int pthread_key_create(unsigned int *key, void (*dtor)(void *))
+{
+    static unsigned int next = 1;
+
+    (void)dtor;
+    if (!key)
+        return -1;
+    *key = next++;
+    return 0;
+}
+
+int pthread_setspecific(unsigned int key, const void *val)
+{
+    (void)key;
+    (void)val;
+    return 0;
+}
+
+void *pthread_getspecific(unsigned int key)
+{
+    (void)key;
+    return 0;
+}
+
+/* 线程名：自己的线程走 prctl(PR_SET_NAME=15)；别的线程写
+ * /proc/self/task/<tid>/comm（glibc 也是这么干的）。写不成返回 -1。 */
+int pthread_setname_np(unsigned long th, const char *name)
+{
+    char path[64] = { 0 };
+    int fd = 0;
+    int r = 0;
+
+    if (!name)
+        return -1;
+    if (th == 0 || th == pthread_self())
+        return (int)c6c_sys6(157 /* prctl */, 15, (long)name, 0, 0, 0, 0) < 0 ? -1 : 0;
+    snprintf(path, sizeof(path), "/proc/self/task/%lu/comm", th);
+    fd = (int)open(path, 1 /* O_WRONLY */, 0);
+    if (fd < 0)
+        return -1;
+    r = (int)write(fd, name, strlen(name));
+    close(fd);
+    return r < 0 ? -1 : 0;
+}
+
+int pthread_getname_np(unsigned long th, char *buf, unsigned long len)
+{
+    char path[64] = { 0 };
+    int fd = 0;
+    long r = 0;
+
+    if (!buf || len == 0)
+        return -1;
+    if (th == 0 || th == pthread_self())
+        return (int)c6c_sys6(157 /* prctl */, 16 /* PR_GET_NAME */, (long)buf, 0, 0, 0, 0)
+                       < 0
+                   ? -1
+                   : 0;
+    snprintf(path, sizeof(path), "/proc/self/task/%lu/comm", th);
+    fd = (int)open(path, 0 /* O_RDONLY */, 0);
+    if (fd < 0)
+        return -1;
+    r = (long)read(fd, buf, (long)len - 1);
+    close(fd);
+    if (r < 0)
+        return -1;
+    buf[r] = 0;
+    while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r'))
+        buf[--r] = 0;
+    return 0;
+}
+
+int sched_yield(void)
+{
+    return (int)c6c_sys1(24 /* sched_yield */, 0);
+}
+
+/* ---------- 名字解析：getaddrinfo 家族 ----------
+ *
+ * **只做能离线做对的部分**：数字点分 IPv4、`localhost`、以及数字或常见名字的
+ * 端口（http/https/ssh/domain）。真的域名不走 DNS——返回 `EAI_NONAME(-2)`，
+ * 让调用方拿到明确的失败，而不是假装解析出一个地址。结构体按 glibc 的 ABI
+ * 摆（`struct addrinfo` 48 字节、`struct sockaddr_in` 16 字节）：调用方包含的
+ * 是系统 <netdb.h>，布局必须一致。 */
+#define C6C_AF_INET 2
+#define C6C_AF_INET6 10
+#define C6C_AF_UNSPEC 0
+#define C6C_SOCK_STREAM 1
+#define C6C_SOCK_DGRAM 2
+#define C6C_IPPROTO_TCP 6
+#define C6C_IPPROTO_UDP 17
+#define C6C_AI_PASSIVE 1
+#define C6C_AI_CANONNAME 2
+#define C6C_AI_NUMERICHOST 4
+#define C6C_EAI_NONAME (-2)
+#define C6C_EAI_MEMORY (-10)
+#define C6C_EAI_SERVICE (-8)
+#define C6C_EAI_FAMILY (-6)
+
+typedef struct C6CAddrInfo {
+    int ai_flags;
+    int ai_family;
+    int ai_socktype;
+    int ai_protocol;
+    unsigned int ai_addrlen;
+    void *ai_addr;
+    char *ai_canonname;
+    struct C6CAddrInfo *ai_next;
+} C6CAddrInfo;
+
+static int c6c_parse_ipv4(const char *s, unsigned long *out)
+{
+    unsigned long v = 0;
+    int part = 0;
+    int digits = 0;
+    int i = 0;
+
+    if (!s)
+        return 0;
+    while (part < 4) {
+        unsigned long b = 0;
+
+        digits = 0;
+        while (s[i] >= '0' && s[i] <= '9') {
+            b = b * 10 + (unsigned long)(s[i] - '0');
+            if (b > 255)
+                return 0;
+            i++;
+            digits++;
+        }
+        if (digits == 0)
+            return 0;
+        v = (v << 8) | b;
+        part++;
+        if (part < 4) {
+            if (s[i] != '.')
+                return 0;
+            i++;
+        }
+    }
+    if (s[i] != 0)
+        return 0;
+    *out = v;
+    return 1;
+}
+
+static int c6c_parse_port(const char *s, unsigned int *out)
+{
+    static const char *names[4] = { "http", "https", "ssh", "domain" };
+    static const unsigned int ports[4] = { 80u, 443u, 22u, 53u };
+    int i = 0;
+    int k = 0;
+    unsigned long v = 0;
+
+    if (!s || !*s)
+        return 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (unsigned long)(s[i] - '0');
+        if (v > 65535ul)
+            return 0;
+        i++;
+    }
+    if (s[i] != 0) {
+        /* 名字端口：只认这几个常见的，别的一律算"服务不存在" */
+        for (k = 0; k < 4; k++)
+            if (strcmp(s, names[k]) == 0)
+                v = (unsigned long)ports[k];
+        if (v == 0)
+            return 0;
+    }
+    *out = (unsigned int)v;
+    return 1;
+}
+
+int getaddrinfo(const char *node, const char *service, const void *hints, void **res)
+{
+    const C6CAddrInfo *h = (const C6CAddrInfo *)hints;
+    C6CAddrInfo *ai = 0;
+    unsigned char *sin = 0;
+    unsigned long addr = 0;
+    unsigned int port = 0;
+    int family = C6C_AF_UNSPEC;
+    int socktype = 0;
+    int flags = 0;
+    int is_any = 0;
+
+    if (!res)
+        return C6C_EAI_NONAME;
+    *res = 0;
+    if (h) {
+        family = h->ai_family;
+        socktype = h->ai_socktype;
+        flags = h->ai_flags;
+    }
+    if (family != C6C_AF_UNSPEC && family != C6C_AF_INET)
+        return C6C_EAI_FAMILY;
+    if (service && !c6c_parse_port(service, &port))
+        return C6C_EAI_SERVICE;
+    if (!node || !*node) {
+        is_any = 1;
+        addr = 0;
+    } else if (c6c_parse_ipv4(node, &addr)) {
+        /* 数字地址：直接用 */
+    } else if (strcmp(node, "localhost") == 0) {
+        addr = 0x7f000001ul;
+    } else {
+        return C6C_EAI_NONAME;
+    }
+    if (is_any && (flags & C6C_AI_PASSIVE) == 0)
+        addr = 0x7f000001ul;            /* 没给 node 又要主动连接 → 回环 */
+    ai = (C6CAddrInfo *)calloc(sizeof(C6CAddrInfo) + 16, 1);
+    if (!ai)
+        return C6C_EAI_MEMORY;
+    sin = (unsigned char *)ai + sizeof(C6CAddrInfo);
+    *(unsigned short *)(sin + 0) = (unsigned short)C6C_AF_INET;   /* sin_family */
+    *(unsigned short *)(sin + 2) = (unsigned short)((port >> 8) | ((port & 0xffu) << 8));
+    *(unsigned int *)(sin + 4) = (unsigned int)ntohl((unsigned int)addr);
+    if (socktype == 0 || socktype == C6C_SOCK_STREAM) {
+        ai->ai_socktype = C6C_SOCK_STREAM;
+        ai->ai_protocol = C6C_IPPROTO_TCP;
+    } else if (socktype == C6C_SOCK_DGRAM) {
+        ai->ai_socktype = C6C_SOCK_DGRAM;
+        ai->ai_protocol = C6C_IPPROTO_UDP;
+    } else {
+        free(ai);
+        return C6C_EAI_SERVICE;
+    }
+    ai->ai_flags = flags;
+    ai->ai_family = C6C_AF_INET;
+    ai->ai_addrlen = 16;
+    ai->ai_addr = sin;
+    ai->ai_next = 0;
+    *res = (void *)ai;
+    return 0;
+}
+
+void freeaddrinfo(void *res)
+{
+    C6CAddrInfo *ai = (C6CAddrInfo *)res;
+
+    while (ai) {
+        C6CAddrInfo *n = ai->ai_next;
+
+        free(ai);
+        ai = n;
+    }
+}
+
+const char *gai_strerror(int e)
+{
+    if (e == 0)
+        return "no error";
+    if (e == C6C_EAI_NONAME)
+        return "name not known（c6c 的 getaddrinfo 只认数字地址与 localhost）";
+    if (e == C6C_EAI_MEMORY)
+        return "out of memory";
+    if (e == C6C_EAI_SERVICE)
+        return "service not supported";
+    if (e == C6C_EAI_FAMILY)
+        return "address family not supported";
+    return "unknown error";
+}
+
+unsigned int inet_addr(const char *s)
+{
+    unsigned long v = 0;
+
+    if (!c6c_parse_ipv4(s, &v))
+        return 0xffffffffu;
+    return ntohl((unsigned int)v);
+}
+
+char *inet_ntoa(unsigned int addr)
+{
+    static char buf[16];
+    unsigned char *p = (unsigned char *)&addr;
+
+    snprintf(buf, sizeof(buf), "%u.%u.%u.%u", (unsigned int)p[0], (unsigned int)p[1],
+             (unsigned int)p[2], (unsigned int)p[3]);
+    return buf;
+}
+
+int inet_pton(int af, const char *src, void *dst)
+{
+    unsigned long v = 0;
+
+    if (af != C6C_AF_INET || !dst)
+        return 0;
+    if (!c6c_parse_ipv4(src, &v))
+        return 0;
+    *(unsigned int *)dst = ntohl((unsigned int)v);
+    return 1;
+}
+
+const char *inet_ntop(int af, const void *src, char *dst, unsigned int size)
+{
+    unsigned int addr = 0;
+    char tmp[16] = { 0 };
+    int n = 0;
+
+    if (af != C6C_AF_INET || !src || !dst)
+        return 0;
+    addr = *(const unsigned int *)src;
+    snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", (unsigned int)(addr & 0xffu),
+             (unsigned int)((addr >> 8) & 0xffu), (unsigned int)((addr >> 16) & 0xffu),
+             (unsigned int)((addr >> 24) & 0xffu));
+    n = (int)strlen(tmp) + 1;
+    if (size < (unsigned int)n)
+        return 0;
+    memcpy(dst, tmp, (unsigned long)n);
+    return dst;
+}
+
+/* getnameinfo：解析器这一层只拿它把对端地址写成人能看的样子
+ * （std/net/udp.c6 传 NI_NUMERICHOST，只要数字形式）。所以这里只做数字：
+ * IPv4 借上面的 inet_ntop，IPv6 手写 8 组十六进制（不做 `::` 压缩）；
+ * 要 PTR 反查得真 resolver，rt.c6 没有——返回 -2（EAI_NONAME）比编个假名字诚实。
+ *
+ * rt.c6 不包含系统头，sockaddr 的布局按 Linux x86_64 手算：
+ *   sockaddr_in  { u16 family; u16 port_be; u8 addr[4]; }
+ *   sockaddr_in6 { u16 family; u16 port_be; u32 flow; u8 addr[16]; u32 scope; }
+ * 家族号 AF_INET = 2、AF_INET6 = 10；返回值是 glibc 的 EAI_*（0 = 成功，
+ * -6 = EAI_FAMILY，-12 = EAI_OVERFLOW）。 */
+int getnameinfo(const void *sa, unsigned int salen, char *host,
+                unsigned int hostlen, char *serv, unsigned int servlen, int flags)
+{
+    const unsigned char *p = (const unsigned char *)sa;
+    unsigned int fam = 0;
+
+    (void)salen;
+    (void)flags;
+    if (!sa)
+        return -2;                      /* EAI_NONAME */
+    fam = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+    if (host && hostlen) {
+        if (fam == 2) {                 /* AF_INET */
+            if (!inet_ntop(2, p + 4, host, hostlen))
+                return -12;             /* EAI_OVERFLOW */
+        } else if (fam == 10) {         /* AF_INET6：8 组 %x，冒号隔开 */
+            char t[64] = {0};
+            unsigned int i = 0, off = 0;
+
+            for (i = 0; i < 8; i++) {
+                unsigned int g = ((unsigned int)p[8 + i * 2] << 8)
+                    | (unsigned int)p[9 + i * 2];
+                int w = snprintf(t + off, sizeof t - off, i ? ":%x" : "%x", g);
+
+                if (w <= 0 || off + (unsigned int)w >= sizeof t)
+                    return -12;
+                off += (unsigned int)w;
+            }
+            if (off + 1 > hostlen)
+                return -12;
+            memcpy(host, t, (unsigned long)off + 1);
+        } else {
+            return -6;                  /* EAI_FAMILY */
+        }
+    }
+    if (serv && servlen) {
+        char t[16] = {0};
+        unsigned int port = ((unsigned int)p[2] << 8) | (unsigned int)p[3];
+        int w = snprintf(t, sizeof t, "%u", port);
+
+        if (w <= 0 || (unsigned int)w + 1 > servlen)
+            return -12;
+        memcpy(serv, t, (unsigned long)w + 1);
+    }
+    return 0;
+}
+
+/* 第二批发现在链文件、fcntl、口令库、信号集上的那几条：同一批用例（std/fsx、
+ * std/ub、std/sys、std/term、std/wire）下一层缺的符号。 */
+int symlink(const char *target, const char *path)
+{
+    return (int)c6c_sys2(88 /* symlink */, (long)target, (long)path);
+}
+
+int link(const char *old_path, const char *new_path)
+{
+    return (int)c6c_sys2(86 /* link */, (long)old_path, (long)new_path);
+}
+
+long readlink(const char *path, char *buf, unsigned long size)
+{
+    return c6c_sys3(89 /* readlink */, (long)path, (long)buf, (long)size);
+}
+
+/* fcntl：三个参数的内核接口（fcntl(fd, cmd, arg)）。声明成定参而不是
+ * `...`：调用方多传的那个参数照样落在同一个寄存器里，而 c6c 的 rt.c6 不需要
+ * 为了一个可变形参去动 ABI。 */
+long fcntl(int fd, int cmd, long arg)
+{
+    return c6c_sys3(72 /* fcntl */, fd, cmd, arg);
+}
+
+/* 口令库：解析 /etc/passwd 的一行。只认 uid 这一个入口（getpwuid），
+ * 找到就填静态结构体里的几个指针（都指向静态缓冲），找不到返回 0。 */
+typedef struct C6CPasswd {
+    char *pw_name;
+    char *pw_passwd;
+    unsigned int pw_uid;
+    unsigned int pw_gid;
+    char *pw_gecos;
+    char *pw_dir;
+    char *pw_shell;
+} C6CPasswd;
+
+static C6CPasswd C6C_PW;
+static char C6C_PWBUF[1024];
+
+
+static char *c6c_pw_field(char *line, int *pos)
+{
+    char *start = line + *pos;
+    int i = *pos;
+
+    while (line[i] && line[i] != ':' && line[i] != '\n')
+        i++;
+    if (line[i])
+        line[i++] = 0;
+    *pos = i;
+    return start;
+}
+
+/* 组库：/etc/group 的一行 = name:passwd:gid:member1,member2,...。
+ * `struct group` 按 glibc 的 ABI 摆（两个指针 + 32 位 gid + char **gr_mem），
+ * gr_mem 指进静态数组，成员名就地切开。 */
+typedef struct C6CGroup {
+    char *gr_name;
+    char *gr_passwd;
+    unsigned int gr_gid;
+    char **gr_mem;
+} C6CGroup;
+
+static C6CGroup C6C_GR;
+static char C6C_GRBUF[1024];
+static char *C6C_GRMEM[33];
+
+/* 切成员列表：逗号分隔，就地写 0，最多 32 个（glibc 也是这么多） */
+static void c6c_gr_mem(char *list)
+{
+    int n = 0;
+    int i = 0;
+
+    while (list[i] && n < 32) {
+        C6C_GRMEM[n++] = list + i;
+        while (list[i] && list[i] != ',' && list[i] != '\n')
+            i++;
+        if (list[i])
+            list[i++] = 0;
+    }
+    C6C_GRMEM[n] = 0;
+    C6C_GR.gr_mem = C6C_GRMEM;
+}
+
+void *getgrgid(unsigned int gid)
+{
+    FILE *f = fopen("/etc/group", "r");
+    char line[512] = { 0 };
+
+    if (!f)
+        return 0;
+    while (fgets(line, (int)sizeof(line), f)) {
+        int pos = 0;
+        char *p = 0;
+        char *sgid = 0;
+        unsigned long v = 0;
+        int i = 0;
+
+        snprintf(C6C_GRBUF, sizeof(C6C_GRBUF), "%s", line);
+        p = C6C_GRBUF;
+        while (*p && *p != '\n')
+            p++;
+        *p = 0;
+        C6C_GR.gr_name = c6c_pw_field(C6C_GRBUF, &pos);
+        C6C_GR.gr_passwd = c6c_pw_field(C6C_GRBUF, &pos);
+        sgid = c6c_pw_field(C6C_GRBUF, &pos);
+        while (sgid[i] >= '0' && sgid[i] <= '9') {
+            v = v * 10 + (unsigned long)(sgid[i] - '0');
+            i++;
+        }
+        if (i == 0 || v != (unsigned long)gid)
+            continue;
+        C6C_GR.gr_gid = gid;
+        c6c_gr_mem(C6C_GRBUF + pos);
+        fclose(f);
+        return (void *)&C6C_GR;
+    }
+    fclose(f);
+    return 0;
+}
+
+/* 把 C6C_PWBUF 里那条（已经被 c6c_pw_field 切开的）记录填进 C6C_PW */
+static void *c6c_pw_fill(void)
+{
+    int pos = 0;
+    char *name = c6c_pw_field(C6C_PWBUF, &pos);
+    char *pass = c6c_pw_field(C6C_PWBUF, &pos);
+    char *suid = c6c_pw_field(C6C_PWBUF, &pos);
+    char *sgid = c6c_pw_field(C6C_PWBUF, &pos);
+
+    C6C_PW.pw_name = name;
+    C6C_PW.pw_passwd = pass;
+    C6C_PW.pw_uid = (unsigned int)strtoul(suid, 0, 10);
+    C6C_PW.pw_gid = (unsigned int)strtoul(sgid, 0, 10);
+    C6C_PW.pw_gecos = c6c_pw_field(C6C_PWBUF, &pos);
+    C6C_PW.pw_dir = c6c_pw_field(C6C_PWBUF, &pos);
+    C6C_PW.pw_shell = c6c_pw_field(C6C_PWBUF, &pos);
+    return (void *)&C6C_PW;
+}
+
+/* 返回 struct passwd *（按 glibc 的 ABI 摆：两个指针 + 两个 32 位 id +
+ * 三个指针）。字段都指进静态缓冲，下一次调用会覆盖上一次的结果——glibc 也是
+ * 这个口径。找不到返回 0。 */
+void *getpwuid(unsigned int uid)
+{
+    FILE *f = fopen("/etc/passwd", "r");
+    char line[512] = { 0 };
+
+    if (!f)
+        return 0;
+    while (fgets(line, (int)sizeof(line), f)) {
+        int pos = 0;
+        unsigned long v = 0;
+        int i = 0;
+        char *p = 0;
+        char *suid = 0;
+
+        snprintf(C6C_PWBUF, sizeof(C6C_PWBUF), "%s", line);
+        p = C6C_PWBUF;
+        while (*p && *p != '\n')
+            p++;
+        *p = 0;
+        (void)c6c_pw_field(C6C_PWBUF, &pos);           /* name */
+        (void)c6c_pw_field(C6C_PWBUF, &pos);           /* passwd */
+        suid = c6c_pw_field(C6C_PWBUF, &pos);
+        while (suid[i] >= '0' && suid[i] <= '9') {
+            v = v * 10 + (unsigned long)(suid[i] - '0');
+            i++;
+        }
+        if (i == 0 || v != (unsigned long)uid)
+            continue;
+        fclose(f);
+        return c6c_pw_fill();
+    }
+    fclose(f);
+    return 0;
+}
+
+/* 按名字查（getpwnam）：同一份 /etc/passwd，只是比较第一栏 */
+void *getpwnam(const char *name)
+{
+    FILE *f = fopen("/etc/passwd", "r");
+    char line[512] = { 0 };
+
+    if (!f || !name)
+        return 0;
+    while (fgets(line, (int)sizeof(line), f)) {
+        int pos = 0;
+        char *p = 0;
+        char *n = 0;
+
+        snprintf(C6C_PWBUF, sizeof(C6C_PWBUF), "%s", line);
+        p = C6C_PWBUF;
+        while (*p && *p != '\n')
+            p++;
+        *p = 0;
+        n = c6c_pw_field(C6C_PWBUF, &pos);
+        if (strcmp(n, name) != 0)
+            continue;
+        fclose(f);
+        return c6c_pw_fill();
+    }
+    fclose(f);
+    return 0;
+}
+
+/* 信号集：glibc 的 sigset_t 是 1024 位的位图（128 字节），这几个就是位操作。
+ * 注意 sigprocmask / sigaction 仍是空操作（rt.c6 没有信号投递），所以
+ * "集合里有没有这一位"能被如实回答，但屏蔽/处理动作不会真生效。 */
+int sigemptyset(void *set)
+{
+    if (!set)
+        return -1;
+    memset(set, 0, 128);
+    return 0;
+}
+
+int sigfillset(void *set)
+{
+    if (!set)
+        return -1;
+    memset(set, 0xff, 128);
+    return 0;
+}
+
+int sigaddset(void *set, int s)
+{
+    if (!set || s < 1 || s > 1024)
+        return -1;
+    ((unsigned char *)set)[(s - 1) >> 3] |= (unsigned char)(1u << ((s - 1) & 7));
+    return 0;
+}
+
+int sigdelset(void *set, int s)
+{
+    if (!set || s < 1 || s > 1024)
+        return -1;
+    ((unsigned char *)set)[(s - 1) >> 3] &= (unsigned char)~(1u << ((s - 1) & 7));
+    return 0;
+}
+
+int sigismember(const void *set, int s)
+{
+    if (!set || s < 1 || s > 1024)
+        return -1;
+    return (((const unsigned char *)set)[(s - 1) >> 3] >> ((s - 1) & 7)) & 1;
+}
+
+int pthread_cond_timedwait(void *c, void *m, const void *abstime)
+{
+    (void)c;
+    (void)m;
+    (void)abstime;
+    return 0;
+}
+
+int msync(void *addr, unsigned long len, int flags)
+{
+    return (int)c6c_sys3(26 /* msync */, (long)addr, (long)len, flags);
+}
+
+/* rt_sigpending(set, sigsetsize)：内核只填前 8 字节（x86-64 的 sigset 是
+ * 64 位），glibc 的 sigset_t 是 128 字节，剩下的清零。 */
+int sigpending(void *set)
+{
+    unsigned long k = 0;
+    long r = 0;
+
+    if (!set)
+        return -1;
+    r = c6c_sys2(127 /* rt_sigpending */, (long)&k, 8L);
+    if (r != 0)
+        return (int)r;
+    memset(set, 0, 128);
+    *(unsigned long *)set = k;
+    return 0;
+}
+
+/* 读写锁：字节 0..8 当自旋锁（xchg），偏移 8 是读者数，偏移 12 是写者标记。
+ * 自旋锁只用来保护"检查条件 + 改计数"这一小段，睡之前一定先放掉。
+ * 用 xchg 是因为 c6c 的运行时里已经有一个可用的 8 字节原子交换，不必再引 CAS。 */
+static void c6c_rw_spin(void *l)
+{
+    while (__c6_xchg8(l, 1) != 0)
+        ;
+}
+
+static void c6c_rw_unspin(void *l)
+{
+    *(volatile long *)l = 0;
+}
+
+int pthread_rwlock_init(void *l, const void *a)
+{
+    (void)a;
+    if (l) {
+        *(long *)l = 0;
+        *(int *)((char *)l + 8) = 0;
+        *(int *)((char *)l + 12) = 0;
+    }
+    return 0;
+}
+
+int pthread_rwlock_destroy(void *l)
+{
+    (void)l;
+    return 0;
+}
+
+int pthread_rwlock_rdlock(void *l)
+{
+    if (!l)
+        return -1;
+    for (;;) {
+        c6c_rw_spin(l);
+        if (*(int *)((char *)l + 12) == 0) {
+            *(int *)((char *)l + 8) += 1;
+            c6c_rw_unspin(l);
+            return 0;
+        }
+        c6c_rw_unspin(l);
+        while (*(volatile int *)((char *)l + 12) != 0)
+            c6c_futex(l, C6C_FUTEX_WAIT, *(volatile int *)((char *)l + 12));
+    }
+}
+
+int pthread_rwlock_wrlock(void *l)
+{
+    if (!l)
+        return -1;
+    for (;;) {
+        c6c_rw_spin(l);
+        if (*(int *)((char *)l + 12) == 0 && *(int *)((char *)l + 8) == 0) {
+            *(int *)((char *)l + 12) = 1;
+            c6c_rw_unspin(l);
+            return 0;
+        }
+        c6c_rw_unspin(l);
+        while (*(volatile int *)((char *)l + 12) != 0 || *(volatile int *)((char *)l + 8) != 0)
+            c6c_futex(l, C6C_FUTEX_WAIT, *(volatile int *)((char *)l + 12) | *(volatile int *)((char *)l + 8));
+    }
+}
+
+int pthread_rwlock_unlock(void *l)
+{
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) != 0)
+        *(int *)((char *)l + 12) = 0;
+    else if (*(int *)((char *)l + 8) > 0)
+        *(int *)((char *)l + 8) -= 1;
+    c6c_rw_unspin(l);
+    c6c_futex(l, C6C_FUTEX_WAKE, 0x3fffffff);
+    return 0;
+}
+
+int pthread_rwlock_tryrdlock(void *l)
+{
+    int ok = 0;
+
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) == 0) {
+        *(int *)((char *)l + 8) += 1;
+        ok = 1;
+    }
+    c6c_rw_unspin(l);
+    return ok ? 0 : -1;
+}
+
+int pthread_rwlock_trywrlock(void *l)
+{
+    int ok = 0;
+
+    if (!l)
+        return -1;
+    c6c_rw_spin(l);
+    if (*(int *)((char *)l + 12) == 0 && *(int *)((char *)l + 8) == 0) {
+        *(int *)((char *)l + 12) = 1;
+        ok = 1;
+    }
+    c6c_rw_unspin(l);
+    return ok ? 0 : -1;
+}
+
+/* 屏障 / 自旋锁：rt.c6 的线程实现没有屏障语义，这里如实退化（init/destroy
+ * 返回 0，wait 直接过）——单线程用例成立，多线程要靠调用方自己的同步。 */
+int pthread_barrier_init(void *b, const void *a, unsigned int n)
+{
+    (void)b;
+    (void)a;
+    (void)n;
+    return 0;
+}
+
+int pthread_barrier_destroy(void *b)
+{
+    (void)b;
+    return 0;
+}
+
+int pthread_barrier_wait(void *b)
+{
+    (void)b;
+    return 0;
+}
+
+int pthread_spin_init(void *l, int pshared)
+{
+    (void)l;
+    (void)pshared;
+    return 0;
+}
+
+int pthread_spin_destroy(void *l)
+{
+    (void)l;
+    return 0;
+}
+
+int pthread_spin_lock(void *l)
+{
+    (void)l;
+    return 0;
+}
+
+int pthread_spin_unlock(void *l)
+{
+    (void)l;
+    return 0;
+}
+
+int pthread_attr_setstacksize(void *a, unsigned long size)
+{
+    (void)a;
+    (void)size;
+    return 0;
+}
+
+int pthread_attr_setdetachstate(void *a, int v)
+{
+    (void)a;
+    (void)v;
+    return 0;
+}
+
+/* stdio 的错误/EOF 标志：rt.c6 的 FILE 就是 fd，没有标志位可读，
+ * 所以这三个只能给出"没有错误、还没到 EOF"（`fileno` 倒是准确的）。
+ * 以 `feof` 为循环条件的代码在 c6c 默认运行时下会一直读到 read 返回 0，
+ * 因此这里如实说明，而不是假装有状态。 */
+int ferror(void *f)
+{
+    (void)f;
+    return 0;
+}
+
+int feof(void *f)
+{
+    (void)f;
+    return 0;
+}
+
+void clearerr(void *f)
+{
+    (void)f;
+}
+
+int fileno(void *f)
+{
+    return (int)(long)f;
+}
+
+/* execvp：execve 不查 PATH，得自己按 PATH 一个个试。以前直接 syscall
+ * execve，于是 `execvp("sh", argv)` 永远 ENOENT——std-sys 的 pty 用例起不来
+ * 子进程（子进程 127 退出、一个字都没输出）。失败时按 C 的约定写 errno
+ * 返回 -1（syscall 返回的是负的 errno 本身）。 */
 int execvp(const char *file, char *const argv[])
 {
-    long r = c6c_sys3(59 /* execve */, (long)file, (long)argv, (long)environ);
+    char buf[1024] = {0};
+    const char *path = 0;
+    const char *p = 0;
+    long r = 0;
 
-    return (int)r;
+    c6c_env_load();
+    if (!file || !*file) {
+        errno = 2;                  /* ENOENT */
+        return -1;
+    }
+    if (strchr(file, '/')) {        /* 带斜杠：不查 PATH */
+        r = c6c_sys3(59 /* execve */, (long)file, (long)argv, (long)environ);
+        if (r < 0) {
+            errno = (int)-r;
+            return -1;
+        }
+        return (int)r;
+    }
+    path = getenv("PATH");
+    if (!path || !*path)
+        path = "/bin:/usr/bin";
+    p = path;
+    {
+        int last = 2;               /* 一路都没找到 → ENOENT */
+
+        for (;;) {
+            const char *e = strchr(p, ':');
+            long dl = e ? (long)(e - p) : (long)strlen(p);
+            long fl = (long)strlen(file);
+
+            if (dl + fl + 2 <= (long)sizeof buf) {
+                long i = 0;
+
+                if (dl == 0) {      /* PATH 里的空项按 POSIX 就是当前目录 */
+                    memcpy(buf, file, (size_t)fl);
+                    i = fl;
+                } else {
+                    memcpy(buf, p, (size_t)dl);
+                    buf[dl] = '/';
+                    memcpy(buf + dl + 1, file, (size_t)fl);
+                    i = dl + 1 + fl;
+                }
+                buf[i] = 0;
+                r = c6c_sys3(59 /* execve */, (long)buf, (long)argv,
+                             (long)environ);
+                if (r >= 0)
+                    return (int)r;
+                last = (int)-r;     /* EACCES/ENOEXEC 之类：记下来继续找 */
+            }
+            if (!e)
+                break;
+            p = e + 1;
+        }
+        errno = last;
+    }
+    return -1;
 }
 
 /* realpath：相对路径按 cwd 展开、折叠 "." / ".." / 多余斜杠，最后确认文件存在。
@@ -3668,17 +5224,118 @@ void *dlsym(void *h, const char *name) { (void)h; (void)name; return 0; }
 int dlclose(void *h) { (void)h; return 0; }
 char *dlerror(void) { return (char *)"dynamic loading is not available"; }
 
-/* 信号：c6c 的运行时没有信号投递 */
-int sigemptyset(void *set) { (void)set; return 0; }
-int sigaddset(void *set, int s) { (void)set; (void)s; return 0; }
-int sigprocmask(int how, const void *set, void *old) { (void)how; (void)set; (void)old; return 0; }
-int sigaction(int s, const void *act, void *old) { (void)s; (void)act; (void)old; return 0; }
+/* 信号：这两条走内核 syscall，装的是**内核**那份 struct sigaction
+ * （x86-64：handler@0、flags@8、restorer@16、mask@24），而调用方拿到的是
+ * glibc 的布局（handler@0、sa_mask@8 共 128 字节、sa_flags@136、
+ * sa_restorer@144）——所以两边逐字段翻。
+ *
+ * SA_RESTORER(0x04000000) 必须置上并给出 __c6_sigrestorer（rt_sigreturn 的
+ * 那 7 条指令，见 src/asmblob.c6），否则内核返回 -EFAULT。
+ * SIG_IGN(1) 不需要 restorer；SIGKILL/SIGSTOP 的 mask 被内核忽略。 */
+void __c6_sigrestorer(void);
+
+#define C6C_SA_RESTORER 0x04000000ul
+
+int sigaction(int s, const void *act, void *old)
+{
+    unsigned long kact[4] = { 0, 0, 0, 0 };
+    unsigned long kold[4] = { 0, 0, 0, 0 };
+    long r = 0;
+
+    if (act) {
+        unsigned long h = *(const unsigned long *)act;
+        unsigned long fl = (unsigned long)*(const unsigned int *)((const char *)act + 136);
+        unsigned long mk = *(const unsigned long *)((const char *)act + 8);
+
+        if (h != 1ul)
+            fl |= C6C_SA_RESTORER;
+        kact[0] = h;
+        kact[1] = fl;
+        kact[2] = (unsigned long)(void *)__c6_sigrestorer;
+        kact[3] = mk;
+    }
+    r = c6c_sys4(13, (long)s, act ? (long)kact : 0L, old ? (long)kold : 0L, 8L);
+    if (r == 0 && old) {
+        *(unsigned long *)old = kold[0];
+        *(unsigned long *)((char *)old + 8) = kold[3];
+        *(unsigned int *)((char *)old + 136) = (unsigned int)kold[1];
+        *(unsigned long *)((char *)old + 144) = kold[2];
+    }
+    return (int)r;
+}
+
+int sigprocmask(int how, const void *set, void *old)
+{
+    unsigned long ks = set ? *(const unsigned long *)set : 0ul;
+    unsigned long ko = 0;
+
+    long r = c6c_sys4(14, (long)how, set ? (long)&ks : 0L,
+                      old ? (long)&ko : 0L, 8L);
+
+    if (r == 0 && old)
+        *(unsigned long *)old = ko;
+    return (int)r;
+}
 
 /* 信号量：单线程，空操作 */
-int sem_init(void *s, int pshared, unsigned int v) { (void)s; (void)pshared; (void)v; return 0; }
-int sem_wait(void *s) { (void)s; return 0; }
-int sem_post(void *s) { (void)s; return 0; }
+/* 信号量：第一个 int 当计数。glibc 的 sem_t 只有 32 字节，这里只用前 4 个。
+ * wait 用原子减——减完还是 >= 0 说明本来就有一张"票"，直接拿到；减成负数就
+ * 说明没票，原地睡到计数变正（睡之前把值读出来交给 futex 做比较，避免丢唤醒）。 */
+int sem_init(void *s, int pshared, unsigned int v)
+{
+    (void)pshared;
+    if (s)
+        *(int *)s = (int)v;
+    return 0;
+}
+
+int sem_wait(void *s)
+{
+    if (!s)
+        return -1;
+    for (;;) {
+        if (__c6_atomic_dec(s) >= 0)
+            return 0;
+        __c6_atomic_inc(s);
+        while (*(volatile int *)s <= 0)
+            c6c_futex(s, C6C_FUTEX_WAIT, *(volatile int *)s);
+    }
+}
+
+int sem_post(void *s)
+{
+    if (!s)
+        return -1;
+    __c6_atomic_inc(s);
+    c6c_futex(s, C6C_FUTEX_WAKE, 1);
+    return 0;
+}
+
 int sem_destroy(void *s) { (void)s; return 0; }
+/* 信号量这几个也是空操作（rt.c6 的 sem_* 没有计数），trywait/timedwait 一律
+ * "拿到了"，getvalue 给 0——调用方按返回值分支的逻辑在单线程用例里成立。 */
+int sem_trywait(void *s)
+{
+    if (!s)
+        return -1;
+    for (;;) {
+        int v = *(volatile int *)s;
+
+        if (v <= 0)
+            return -1;
+        if (__c6_atomic_dec(s) >= 0)
+            return 0;
+        __c6_atomic_inc(s);
+        return -1;
+    }
+}
+int sem_timedwait(void *s, const void *abstime) { (void)s; (void)abstime; return 0; }
+int sem_getvalue(void *s, int *v)
+{
+    if (v)
+        *v = s ? *(volatile int *)s : 0;
+    return 0;
+}
 
 /* longjmp：没有可恢复的栈上下文（要保存 rsp/rip），明确退出而不是静默错走 */
 int _setjmp(void *buf) { (void)buf; return 0; }
@@ -3989,6 +5646,43 @@ double log1p(double x) { return log(1.0 + x); }
 double asinh(double x) { return log(x + sqrt(x * x + 1.0)); }
 double acosh(double x) { return log(x + sqrt(x * x - 1.0)); }
 double atanh(double x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
+
+/* `-lm` 那一族的补丁：`atan2` 以前缺，std/geo 的用例就卡在链接期。剩下几个
+ * 是同一个面（log2/exp2/copysign/fdim/nextafter）——都是能精确写出来的，
+ * 不靠查表，也没有"近似到多少位"的模糊地带。 */
+double atan2(double y, double x)
+{
+    if (x > 0.0)
+        return atan(y / x);
+    if (x < 0.0)
+        return y >= 0.0 ? atan(y / x) + C6C_PI : atan(y / x) - C6C_PI;
+    if (y > 0.0)
+        return C6C_PI / 2.0;
+    if (y < 0.0)
+        return -C6C_PI / 2.0;
+    return 0.0;
+}
+
+double exp2(double x) { return exp(x * 0.69314718055994530942); }
+double fdim(double x, double y) { return x > y ? x - y : 0.0; }
+
+/* nextafter：按 IEEE-754 的位模式做，不碰数值 */
+double nextafter(double x, double y)
+{
+    unsigned long xi = *(unsigned long *)&x;
+
+    if (x == y)
+        return y;
+    if (x == 0.0) {
+        xi = 1ul;
+        return y > 0.0 ? *(double *)&xi : -*(double *)&xi;
+    }
+    if ((x < y) == (x > 0.0))
+        xi++;
+    else
+        xi--;
+    return *(double *)&xi;
+}
 
 /* ---- -test 运行器：和 tcc 的 native 运行器（tccrun.c 的 tcc_run_tests）同一套
  * 输出协议 ----

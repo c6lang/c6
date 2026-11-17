@@ -2,8 +2,22 @@
 
 > **状态**：现行参考 · **索引**：[文档索引](../README.md) · **测试细节**：[manual/testing.md](../manual/testing.md) · **C99 后端**：[c99-backend.md](c99-backend.md)
 >
-> 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
+> 一句话：默认编译器 `c6c` 的选项速查（显式 `C6_ENABLE_TCC=ON` 时才有 `tcc/c6`） + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
+
+## 工程管理子命令（速查）
+
+完整规范（清单字段、锁文件、workspace、固件、安装落点）在
+[c6c/docs/management.md](../../c6c/docs/management.md)（仓库内链接；安装包只带
+`docs/` 与根 `README.md` / `CHANGELOG.md`），本页只列名字：
+
+`c6c scan` / `init` / `build` / `test` / `run` / `package` / `install` /
+`publish` / `check` / `clean` / `env` / `list` / `lock` / `doctor` /
+`workspace` / `flash` / `monitor` / `debug` / `help`。
+
+第一个参数是这些名字时进入工程管理，其余情况仍是普通编译器。
+回归入口：`cmake --build build --target pmtest`；当前 70 项检查（68 常规 +
+2 DEB，缺 `dpkg-deb` 时跳过 2 项）。
 
 ## 版本与发布号
 
@@ -11,7 +25,7 @@
 
 | 来源 | 是什么 | 谁在用 |
 |---|---|---|
-| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.1.0`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
+| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.3`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
 | `tcc/VERSION` | 内嵌上游 TinyCC 的**兼容版本**（`0.9.28rc`），跟着上游走 | `TCC_VERSION` 宏、`-dumpversion`、`c6 -v` 第二行、libtcc 命名与上游文档 |
 
 - 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的
@@ -51,7 +65,7 @@
 
 | 选项 | 作用 |
 |---|---|
-| `-B tcc` | 让未安装的编译器找到自己的 `libtcc1.a` 与运行时头文件（几乎每条命令都要带） |
+| `-B DIR` | 覆盖运行时查找目录；c6c 按 `argv[0]` 自己找 `lib/c6/`，装好的或树内构建的都不用带（带上也兼容 tcc 习惯） |
 | `-run file.c6 [...]` | 编译并立刻运行，不落盘 |
 | `-c` / `-o FILE` | 只编译 / 指定输出 |
 | `-I DIR` / `-D` / `-U` | include 路径与宏 |
@@ -64,10 +78,10 @@
 典型命令：
 
 ```sh
-./tcc/c6 -B tcc -run examples/err_demo.c6                 # 直接跑
-./tcc/c6 -B tcc -test tests/defer.c6                      # 跑 test 块
-./tcc/c6 -B tcc -c -emit-header geo/shape.h geo/shape.c6  # 导出 C 头文件
-./tcc/c6 -B tcc -o out.c prog.c6 && cc -std=c99 -o prog out.c   # C99 后端
+./c6c/build/c6c -run examples/err_demo.c6                 # 直接跑
+./c6c/build/c6c -test tests/defer.c6                      # 跑 test 块
+./c6c/build/c6c -c -emit-header geo/shape.h geo/shape.c6  # 导出 C 头文件
+./c6c/build/c6c -o out.c prog.c6 && cc -std=c99 -o prog out.c   # C99 后端
 ```
 
 ## CMake 构建目标与 CTest 用例
@@ -89,7 +103,7 @@ CMake 内置目标。
 | 目标 | 作用 |
 |---|---|
 | `cmake -S . -B build` | 在构建目录生成 `config.mak` / `config.h` / `config.texi`（配置期对源码树零写入；构建期 `tcc-config` 每次比对并按需同步、清理旧目标文件，不联网） |
-| `cmake --build build` | 扩展模式构建（`EXTRA-DEFS=-DC6_EXT`），产物 `tcc/c6` |
+| `cmake --build build` | 默认构建（`C6_ENABLE_TCC=OFF`），产物 `c6c/build/c6c`；显式 `-DC6_ENABLE_TCC=ON` 才同时构建 `tcc/c6` |
 | `cmake --build build --target build-plain` | 上游模式构建（不定义 `C6_EXT`），用来验证「扩展关闭零行为变化」 |
 | `cmake --build build --target check-tcc` | 检查 `tcc/` 源码是否完整 |
 | `cmake --build build --target c6-clean` | 清理构建产物与自举产物 |
@@ -106,20 +120,21 @@ c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DO
 `<datarootdir>/doc/tcc`）。文档里指向 `examples/` / `tests/` 源码的链接只在
 仓库内有效，安装包里不携带源码。
 
-自举编译器 c6c 默认也随安装走：`C6_INSTALL_C6C`（默认 `ON`，只在
-`C6_ENABLE_TCC=ON` 时有意义）把它装成 `bin/c6c`，与 tcc 版 `c6` 并存；
-`C6_ENABLE_TCC=OFF` 时它本身就是 `bin/c6`，另外留一个同内容的 `bin/c6c`。
+自举编译器 c6c 默认随安装走：`C6_INSTALL_C6C`（默认 `ON`）把它装成 `bin/c6c`，
+另留一个同内容的 `bin/c6` 兼容别名（`C6_ENABLE_TCC=ON` 时 `bin/c6` 让给 tcc 版，
+c6c 只剩 `bin/c6c`）。默认形态下不构建 tcc（`C6_ENABLE_TCC` 默认 `OFF`）：
+c6c 已能自举，tcc 只作语料与参考实现保留，需要 tcc 版 c6 时显式打开。
 两种配置都装 `<libdir>/c6/include/`（c6c 的自带头文件 `stddef.h` / `stdarg.h` /
 `stdint.h` …，**不进** `<prefix>/include`，免得盖掉宿主程序的系统头文件）与
 `<libdir>/c6/rt.c6`（编译时拼进 TU 的运行时源码）。c6c 按 `argv[0]` 推自己的目录
 去找这两样，所以二进制与它们必须成套出现——只装二进制的话它连一个 hello 都编不
 出来，只会报「找不到自带运行时 lib/rt.c6」。
 
-安装包也分两种 flavour：`C6_ENABLE_TCC=ON` 出 `c6` 包（tcc 版编译器 + `libtcc`），
-`C6_ENABLE_TCC=OFF` 出 `c6c` 包（自举编译器 + `libc6c`，没有一行 tcc）。包名与
-文档落点由 `C6_PACKAGE_NAME` 决定，留空时按 flavour 取 `c6` / `c6c`（所以 c6c 包的
-文档在 `share/doc/c6c/`，许可证是 c6c 的 MIT）。两种包装的是同一批路径，
-`Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。
+安装包也分两种 flavour：默认（`C6_ENABLE_TCC=OFF`）出 `c6c` 包（自举编译器 +
+`libc6c`，没有一行 tcc，文档在 `share/doc/c6c/`，许可证是 c6c 的 MIT）；
+显式 `-DC6_ENABLE_TCC=ON` 时出 `c6` 包（tcc 版编译器 + `libtcc`）。包名与
+文档落点由 `C6_PACKAGE_NAME` 决定，留空时按 flavour 取 `c6c` / `c6`。两种包
+装的是同一批路径，`Provides` / `Conflicts` 让它们互斥，同一个系统只能装一个。
 
 `tcc/` 里的目标文件全部依赖一份标志记录 `tcc/.c6-flags`（内容是本轮编译用的
 `CC` / `CFLAGS` / `DEFINES` / `LDFLAGS` / `LIBS`）。标志一变（切换 `build` /
@@ -147,8 +162,8 @@ c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DO
 | `cmake --build build --target test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机（等价于 `ctest --test-dir build -L core -j N`） |
 | `cmake --build build --target check-all` | **提交/发布前跑这一条**：全部回归门禁用例（等价于 `ctest --test-dir build -L regression -LE aux -j N`）；每用例独占 `build/tests/<用例>/`，整组并发，fstest / tests2 / source-tree 三组用 `RESOURCE_LOCK` 互斥。`-DC6_CHECK_JOBS=1` 则整轮串行 |
 | `cmake --build build --target check-aux` | 单独跑 4 个 `aux` 用例（`check-tcc` / `ubcheck` / `safegate` / `bench-async`）；`bench-async` 需要 g++/rustc/go |
-| `cmake --build build --target fast` | **c6c 替换 c6 的快速门禁**（≈40 s）：`lint` + `unit`/`irtest`/`hello` + `ctest`/`runflag`/`testflag` + 外部语料 `c99suite`（c-testsuite 150 条）+ 上游 `tests1-check`/`tests2-check` + `llvmtest`。就是 CMake target `fast` 本身，不走 ctest |
-| `cmake --build build --target check-all-c6c` | **c6c 替换 c6 的全量门禁**（≈4 min）：`check-all-c6c` 覆盖的全量验收（自举 fixpoint / 三后端 / std 377 / tests / 诊断 / c99suite / `build-tcc` 编出 tcc 跑上游 tests2 + 第三代 selfhost）再加 `tests1-check`、`tests2-check` 两条上游闸门 |
+| `cmake --build build --target fast` | **c6c 替换 c6 的快速门禁**（≈40 s）：`lint` + `unit`/`irtest`/`hello`/`ctest-c6c` + `runflag`/`testflag`/`pmtest` + `objcheck`/`ldcheck`/`dyncheck`/`sharedcheck`/`printfcheck`/`esccheck`/`tmplcheck`/`bcheck`/`dbgcheck`/`asmcheck`/`a64check`/`archcheck`/`embedcheck`/`pkgcheck` + 外部语料 `c99suite`（c-testsuite 150 条）+ 上游 `tests1-check`/`tests2-check` + `llvmtest`。就是 CMake target `fast` 本身，不走 ctest |
+| `cmake --build build --target check-all-c6c` | **c6c 替换 c6 的全量门禁**（≈4 min）：`check-all-c6c` 覆盖的全量验收（自举 fixpoint / 三后端 / std 381 / tests / 诊断 / c99suite / `build-tcc` 编出 tcc 跑上游 tests2 + 第三代 selfhost）再加 `tests1-check`、`tests2-check` 两条上游闸门 |
 | `cmake --build build --target check-c6c` | 同一套 c6c 验收的 ctest 入口（`-R '^c6c-' -LE perf`，6 条用例；`check-c6c-perf` 再加性能/内存门槛） |
 
 ### 标准库

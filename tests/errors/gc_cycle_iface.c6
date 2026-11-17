@@ -1,0 +1,84 @@
+/* c6 编译期诊断：多态（interface）参与引用图时的环检测边界
+ *
+ * 运行（仓库根目录）：
+ *   tests/run-tests.sh errors/gc_cycle_iface
+ *
+ * 环检测看的是**类型图上的 `@T` 边**（含数组、含按值嵌入），而 `interface`
+ * 值在运行期是 `{ void *self, const void *vt }`：`self` 是裸指针，不计数，
+ * 所以接口值本身不产生边。见 docs/design/gc-design.md §8.5。
+ *
+ * 本用例钉住两件事：
+ *   1. 环由 `@T` 边串起来时**照常报错**，哪怕环上的类型是实现接口的、方法
+ *      走 vtable 分派、或者是被按值嵌入的实现者；
+ *   2. 环只在运行期**经由接口值闭合**时报不出来 —— 接口值的 `self` 在类型层
+ *      是 `void *`，对应的默认分支必须能编译并正常运行。
+ */
+struct A;
+struct B;
+
+interface Hook { int hook(); }
+
+/* 实现者自己持有一个 @A：A 与它之间的强边照常进图 */
+struct P { @A a; };
+int hook(struct P *self) { return 0; }
+
+// EXPECT cycle_mutual: error: reference cycle: P -a-> A -b-> PB -p-> P
+// EXPECT cycle_array: error: reference cycle: A -kids-> A
+// EXPECT cycle_embed: error: reference cycle: P -a-> A -b-> EmbB -p-> P
+
+#if defined cycle_mutual
+/* A -> PB -> P -> A：三条边全是 @T，P 只是「实现了接口」的实现者，
+ * 虚分派不改变类型图 */
+struct PB { @P p; };
+struct A { @PB b; };
+int main(void)
+{
+    return 0;
+}
+#elif defined cycle_array
+/* 接口实现者的数组元素也是强边 */
+struct A { @A kids[4]; };
+int hook(struct A *self) { return 0; }
+int main(void)
+{
+    return 0;
+}
+#elif defined cycle_embed
+/* 嵌入边：B 按值嵌入实现者 P（C6_GCK_EMBED），A 再 @B —— 闭环照样成立 */
+struct EmbB { struct P p; };
+struct A { @EmbB b; };
+int main(void)
+{
+    return 0;
+}
+#else
+/* 默认分支：环只在运行期经由接口值闭合。
+ *
+ *   struct Root { Hook n; }        Root 的对象里存一个接口值
+ *   接口值的 self 指向 Root 自己   => 对象的强引用环 Root -> Root
+ *
+ * 类型图上 Root 没有任何 @T 字段，所以这里**不报错**；接口值不计数，这条
+ * 环由那批 @T 字段决定生命周期，把那些边写成 weak/own 仍然是正解。
+ * 同时验证接口值本身不多加引用：装进接口、调用、作用域退出后计数回基线。 */
+struct Node { int v; };
+struct Root { Hook n; @Node node; };
+int hook(struct Root *self) { return self->node->v; }
+
+int main(void)
+{
+    unsigned long base = __c6_gc_live();
+    {
+        @Node n = new Node;
+        @Root r = new Root;
+
+        n->v = 7;
+        r->node = n;
+        {
+            Hook h = *r;        /* 接口值只是拷贝 self + vtable */
+            if (h.hook() != 7)
+                return 1;
+        }
+    }
+    return __c6_gc_live() == base ? 0 : 2;
+}
+#endif

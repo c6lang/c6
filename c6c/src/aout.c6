@@ -209,7 +209,7 @@ static void aout_compile(X64State *st, IrFn *f, u32 func_sym)
     if (func_sym < X64.nsym) {
         const char *nm = X64.sym[func_sym].name;
 
-        if (nm && nm[0] != '.' && !strchr(nm, '$')) {
+        if (nm && nm[0] != '.' && !strchr(nm, '$') && !X64.sym[func_sym].is_static) {
             aout_emit("\t.globl\t");
             aout_symname(nm);
             aout_emit("\n");
@@ -589,7 +589,7 @@ static void aout_write_data(void)
             off++;
         }
         aout_emit("\t.p2align 3\n");
-        if (s->name[0] != '.' && !strchr(s->name, '$')) {
+        if (s->name[0] != '.' && !strchr(s->name, '$') && !s->is_static) {
             aout_emit("\t.globl\t");
             aout_symname(s->name);
             aout_emit("\n");

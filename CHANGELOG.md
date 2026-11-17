@@ -5,7 +5,826 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
-## 未发布
+## 0.6.3 — 2026-11-17
+
+### 回归 92 / 92 全绿：co 事件循环的 `blocked_on` 判断修好了
+
+`await 某个 async 调用` 会在父任务里建一个子任务，然后父任务 `blocked_on` 到它上面。
+`__c6_co_run` 的主循环对这个字段一直处理错：无条件跳过 → 子任务结束后没人叫醒父任务
+（`std-https` 的 co 段卡在这）；无条件恢复 → 父任务空转，实测同一个协程被恢复到
+guard 上限一百万次。修正为「只在等的那个任务**还没结束**时才跳过」。
+
+结果：
+
+- `examples/stdhttps.c6` **25 check / 0 failure**，`std-https` 从此进
+  `regression-c6c.list`（92 条），CTest **97 个用例全绿**；
+- 回归基线连跑两次都是 **92 / 92**；
+- `tests2-check` 意外失败 0。
+
+顺带记一下这条 bug 的形状，免得下次再踩：`co` 任务跑在自己的 mmap 栈上、靠执行权
+令牌串行，父子任务互相等待时必须让"最能推进的那个"先跑——单看 `waiting` 不够。
+
+
+### co 事件循环补上 `blocked_on` 过滤（去掉协程饿死）
+
+`__c6_co_run` 的主循环挑候选时漏了 `!blocked_on`（`c6c_co_pump` 里是有的）：父子
+两条协程同时在册时，每轮都挑到正 `await` 子任务的父任务去恢复，子任务永远排不上
+队，实测同一个协程被恢复到 guard 上限。补上之后父子都能跑、都能被唤醒；`await`
+结束后父任务仍不往下走的问题还在（`std-https` 的 co 段仍红，回归 91 / 92）。
+
+
+### 互斥量改用原子交换：cond/mutex 握手的丢唤醒修掉了（回归 91 / 92）
+
+上一批把互斥量写成"原子加 1、出 1 就拿到"，看着能用其实有洞：两个线程同时抢时
+计数会加到 2，谁都没拿到、又各自减回去，等待方就可能永远等在一个非 0 的值上。
+最小复现（一个 mutex + 两个 cond 的有界队列）6 次挂 3 次。
+
+改成用 8 字节原子交换（`__c6_xchg8`）取锁——拿到的一定是 0，只有 0/1 两种状态，
+没有歧义；放锁直接写 0 再唤醒。复现从 6 次挂 3 次变成 10 次全过，`stdthread`
+从"跑完才有 0 失败"变成**连跑 8 次全绿**（29 check / 0 failure）。
+
+- 回归连跑三次都是 **91 / 92**（只剩 `std-https`）；
+- `std-box`、`std-term`、`std-thread` 三个用例补进 `regression-c6c.list`，
+  表里 **91** 条、CTest **96** 个用例全过。
+
+
+### 信号量、读写锁接上真实现（std-thread 的最好成绩：91 / 92）
+
+接着上一批的互斥量/条件变量，把 `sem_*` 和 `pthread_rwlock_*` 也从空操作换成
+真实现：
+
+- 信号量用第一个 `int` 当计数，`sem_wait` 原子减、减成负数就还回去睡到计数变正
+  （futex 比较用读到的那个值，丢不掉唤醒）；`sem_trywait`/`sem_getvalue` 跟着补上；
+- 读写锁用字节 0..8 当自旋锁（`__c6_xchg8`）、偏移 8 存读者数、偏移 12 存写者
+  标记；`rdlock`/`wrlock`/`tryrdlock`/`trywrlock`/`unlock` 都在自旋锁里改计数，
+  睡之前一定先放掉自旋锁。
+
+效果：`stdthread` 的 29 条断言在**跑完的那些次里全过**（`sync`/`thread`/`chan`
+三段都对，`1..400 的和=80200`、`chan 和=5050`）。回归单次最高到 **91 / 92**。
+
+**已知问题**：`chan` 段仍会偶发挂死（实测 4 次里 2 次 `rc=124`），所以连跑两次
+会看到 91/92 和 90/92 交替。这一例不在 `regression-c6c.list` 里，门禁不受影响。
+
+
+### printf/fprintf 改用栈上的格式化缓冲（多线程打印不再串行）
+
+`printf`/`fprintf`/`vfprintf`/`vprintf` 一直共用一张全局 `c6c_obuf` 做格式化，
+多线程同时打印时会把彼此的结果踩掉。最小复现（两个 `spawn` 各打一行）：
+
+```
+run1: [fa] ran A=1 [fa] ran A=1 A=1 B=1     ← 两个线程打出来的是同一行
+run2: [fb] ran B=1 [fb] ran B=1 A=1 B=1
+```
+
+tcc 版 c6 编出来三次都是对的，c6c 编出来三次里两次错，说明是 c6c 这条链上的
+问题。改成每次调用在**栈上**开 4 KB 缓冲后，五次全对。
+
+顺带把 `std-thread` 的 chan 段从"必挂"降到"五次挂两次"（`sum=5050` 能对，
+但还有别的竞态）。
+
+
+### 互斥量和条件变量接上 futex（std-thread 的一部分）
+
+`pthread_mutex_*` / `pthread_cond_*` 一直是空操作（"单线程用不着锁"），可
+`pthread_create` 早就是真线程（clone）：空锁等于没锁，`stdthread` 里 4 个
+worker 抢一个累加器，和自然是乱的。
+
+现在按 `/tmp/pool1.c6` 里验证过的那版接上 futex：
+
+- 互斥量用第一个 `long` 当状态（0 空闲 / 1 占用），`lock` 用原子加尝试、
+  拿不到就还回去再 `futex_wait`，`unlock` 减回去再 `futex_wake`；
+- 条件变量用第一个 `int` 当通知计数，`wait` 记下计数 → 放锁 → 睡在计数上 →
+  醒来重比一次 → 重新加锁。
+
+效果（`stdthread`）：`sync` 段全绿、`thread` 段 `1..400 的和=80200` 对、
+`chan` 段 `和=5050` 也对，只剩两条 semaphore 断言——那三个原语（信号量、
+读写锁）还是空操作，单独接上会让 `chan` 段偶发挂死，所以这版没动它们。
+
+**已知问题**：`stdthread` 的 `chan` 段大约每两次有一次挂死（`timeout` 124），
+回归总数仍是 90 / 92。这一例不在 `regression-c6c.list` 里，不影响门禁。
+
+
+### `pthread_create` 失败时不再漏放全局线程锁
+
+`c6c_th_lock()` 是全局自旋锁，而 mmap 失败、clone 失败两条 `return -1`
+没放锁——只要失败一次，进程里后面每一次 `pthread_create` 都会在那儿空转
+（stdthread 的线程池起 4 个 worker，实测只有 2 个进了 `cond_wait`）。
+现在两条失败路径都放锁；clone 失败那条还把槽位还回去并 munmap 掉已分配的栈。
+
+顺带记在 `c6c/docs/todo.md` 里的：这四种同步原语（互斥量 / 条件变量 /
+信号量 / 读写锁）的 futex 版已经逐段验证可用（`stdthread` 的 sync 段全绿），
+但线程池那一段还会挂死，所以整块没进这版。
+
+
+### c6c 工程管子命令：init / scan / build / test / run
+
+参考 cargo / go 的做法给 `c6c` 加了子命令（实现在 `c6c/src/pm.c6`，用 c6 自身
+写、随 c6c 单 TU 自举；`c6c help` 列出当前可用的名字）：
+
+- `c6c scan` 递归扫描仓库：收集 `.c6` / `.c` 源文件，按 `main()` / `_start` /
+  `test "…"` 块推断 `kind: app / firmware / lib`，核对 `import a.b;` 是否有
+  对应源文件，版本号取仓库根的 `VERSION`；`c6c init` 把结果写成受控子集的
+  `c6c.yaml`（已存在需 `--force` 覆盖）。
+- `c6c build` / `test` / `run` 按清单编译、跑 test 块、执行产物；清单缺省时
+  退化为临时扫描并提示先 `init`；固件工程自动带 `-nostdlib`。
+- `package` / `install` / `publish` 共用 `pkg_files`：TGZ / DEB 打包、带执行位
+  的安装、`SHA256SUMS` 与可选 `v<version>` tag；`build` 按 mtime 增量。
+- 固件：`_start` 工程走「c6c -c → cc -nostdlib 链接」两阶段，`fw_formats` 用
+  objcopy 出 ELF/BIN/HEX；`flash` / `monitor` / `debug` 按清单中的命令模板
+  执行（`{elf}` / `{bin}` 等占位符展开，`--dry-run` 可预览）。
+- `c6c/c6c.yaml` 是 c6c 自身的工程配置（dogfood）：`pmtest` 真跑它的自编、
+  打包与 staged install。
+- 取 cargo/go 的长处：从当前目录向上找 `c6c.yaml` / `c6c.yml`（go.mod 风格），
+  `--manifest-path=` 显式指定；`build --release` + `dev_flags` / `release_flags`
+  两档 profile；`check`（-fsyntax-only）、`clean`（只删本清单产物）、`env` /
+  `list --json`（脚本可读）。
+- 清单新增 `destdir` / `prefix` 安装落点，`install` 认标准 `DESTDIR` /
+  `PREFIX` 环境变量（命令行 > 环境变量 > 清单），发行版可直接
+  `DESTDIR="${pkgdir}" c6c install --prefix=/usr`。
+
+- `c6c lock` 生成 `c6c.lock`（元数据 + 源文件大小/FNV 校验和，自动展开本地
+  `#include`），`build --locked` 检测漂移；`c6c doctor` 报告缺失源文件与未解析
+  import。
+- `workspace`：仓库根 `c6c-workspace.yaml` 的 `members:` 列出子包，`c6c workspace
+  init` 自动发现，`workspace build|test|check|clean|lock|list` 逐成员执行；
+  本仓库已自带一份（成员 c6c）。
+- `c6c init --from=cmake|cargo|make|auto` 从既有工程的 `project()` / `[package]`
+  提取 name/version/description/license 等元数据，便于迁移。
+
+验证：`pmtest` 70 项（68 常规 + 2 DEB；无 `dpkg-deb` 时 68/68，跳过 2 项）；
+`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+
+### c6c 工程管理交叉审计修复
+
+多 agent 交叉验证后又补了一轮边界与一致性修复：
+
+- `help` 真正打印帮助；清单 `sources:` 也走 `pm_add_src()`，`doctor` 的 import
+  统计在清单模式下不再恒为 0；`run` 不再把 `--release` 等构建选项透传给产物。
+- 构建指纹纳入 profile / flags / include / link_flags / 清单 mtime；固件把
+  `.o` / `.bin` / `.hex` 的缺失与 `objcopy` 失败都算作需要重编。
+- `pm_spawn()` 补 fork/exec 错误与 EINTR；`rm_rf()` 用 `lstat`，不跟随符号
+  链接；清单字段全部带界复制，未知顶层键不再污染上一个列表。
+- `package` 先清 staging、拒绝 `pkg_files` 里的 `..`/绝对路径、DEB control
+  带 `License`，TGZ 排除 `DEBIAN/`，任一格式失败不再被后一个成功覆盖。
+- `publish` 先 build，SHA256SUMS 覆盖 TGZ/DEB 且不经过 `sh -c`；`clean` 连
+  归档、指纹和 staging 一起清。
+- `lock` 除源码外还锁 include / flags / link_flags / dev+release flags /
+  pkg_formats / pkg_files / fw_formats；workspace 拒绝越界成员与未知子命令。
+- Cargo 元数据迁移只取 `[package]` 段；CI 的 c6c job 显式关闭
+  `C6_ENABLE_TCC` 并断言无 tcc 产物，文档同步当前 `VERSION` 与 `fast` 清单。
+
+第二轮交叉复核继续修掉：烧录模板展开的缓冲区越界、`install` / `package` 对
+绝对路径落点不一致、增量指纹漏掉源文件/头文件 mtime 与 `--manifest-path`
+清单、固件未配置 BIN/HEX 时永远重编、迁移输出的换行笔误、`list --json`
+与锁文件的字符串转义；测试侧修正 `--locked` 与 TGZ 的恒真断言，文档同步
+std/诊断/C99 等当前基线。
+
+c6c 自管清单的 `out` 由 `build/c6c-managed` 改为 `build/c6c`，版本同步到
+`0.6.3`，打包文件表同步；
+`pmtest` 的 dogfood 步骤用编译器副本引导，避免覆盖正在执行的二进制；验证完
+还原宿主编译器，绕开自举运行时不转发完整环境这一限制。顺带给所有 `execvp`
+用的 argv 数组补显式 NULL 终止（`{0}` 初始化在自编译产物里不可靠），修好
+自编译 c6c 链接固件时 `cc` 收到残留参数的问题。构建侧（含 CI 的 c6c job）
+显式 `C6_ENABLE_TCC=OFF` 并断言没有 `tcc/c6` / `libtcc`，自管构建不依赖 tcc。
+
+第三轮审计继续补齐：多源文件固件各自 `-c` 再一起链接、`test` / `check`
+跟随清单 flags 与 profile、`include:` 目录头文件进入指纹与锁文件、import
+按目录分段匹配、严格拒绝未知/误用选项、`run` 执行无斜杠 `out`、空
+workspace 的未知子命令、子目录 `scan` 向上找 `VERSION`、扫描忽略注释与
+字符串里的伪定义、`--manifest-path` 绝对路径。运行时 `environ` 从
+`/proc/self/environ` 建表，自编译 c6c 的子进程不再丢环境。工程管理规范
+迁到 `c6c/docs/management.md` 作为单一事实源，`docs/reference/cli.md`
+只留速查并回链；`c6c/docs/plan.md` / `todo.md` 标记为历史文档。
+
+### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
+
+c6c 已经能自举：宿主 C 编译器把 c6 写的编译器引导出来，再由它自己编自己
+（fixpoint 逐字节一致）。仓库要发行的编译器就是 c6c，tcc 不再是交付物——但
+`tcc/` 的源码还不能删：tests1 / tests2 / c-testsuite 把它当**语料**直接编给
+c6c（那份源码 `#include "config.h"`），差分与 perf 用例拿它当**参考实现**。
+这两个角色都不需要把 tcc 产品编出来，默认编它只会拖慢每次构建，所以把
+`C6_ENABLE_TCC` 的默认值翻成 `OFF`：
+
+- 默认 configure / build / install / cpack 只处理 c6c（装成 `bin/c6c`，另留
+  兼容别名 `bin/c6`；包名 `c6c`，许可证 c6c 的 MIT）。tcc 的 `config.mak` /
+  `config.h` 仍会生成（语料要用），但不编译、不安装；
+- 需要旧的 tcc 版 `c6`（`libtcc`、`std-*` 全量回归矩阵、交叉安装、wasm 目标）
+  时显式 `-DC6_ENABLE_TCC=ON`，该路径的代码原样保留、配置验证通过；
+- CI 里假设 tcc 形态的 job（daily 矩阵、tag 上的完整回归、Release 包）显式传
+  `-DC6_ENABLE_TCC=ON`，行为不变；c6c-only 由 no-tcc job 把守。
+
+### std-term 转绿（90 / 92）：`sigaction` / `sigprocmask` / `sigpending` 接上内核了
+
+这三个一直是空操作（"c6c 的运行时没有信号投递"），所以 `stdterm` 一装
+SIGUSR1 处理函数就被默认动作杀掉（rc=138）。现在：
+
+- `src/asmblob.c6` 加一段 12 字节的 `__c6_sigrestorer`（`mov $15,%eax; syscall`
+  = rt_sigreturn）——x86-64 内核要求置 SA_RESTORER 并给出这段地址，否则
+  rt_sigaction 直接 -EFAULT；
+- `rt.c6` 的 `sigaction` 把 glibc 布局（handler@0 / sa_mask@8 共 128 字节 /
+  sa_flags@136 / sa_restorer@144）翻成内核那份（handler@0 / flags@8 /
+  restorer@16 / mask@24），走 syscall 13；
+- `sigprocmask` 走 14，`sigpending` 走 127（内核只填 8 字节，剩下清零）。
+
+`stdterm: 45 check(s), 0 failure(s)`。
+
+
+### std-box 转绿（89 / 92）：限定名命中之后不再被裸名盖掉
+
+两处一起改才通：
+
+1. `enum Error` 的成员按 `std__data__json__PARSE` 再登记一份（值用和裸名**同一个
+   表达式**，`OK = 0` 那种不能加基址，否则 `tests/err_ids.c6` 会红）；
+2. `gen_postfix` 里限定名解析完了还有一句无条件的 `s = sym_find(裸名)`，把刚命中
+   的 `best_sym` 盖回共享的裸名格——加个 `if (!s)`。
+
+### 模块错误码表的成员可以按「模块前缀 + 成员」解析了
+
+`enum Error { INVAL = 1, … }` 的成员现在除了短名和 `Error.名字`，还会按
+`std__data__csv__PARSE` 这种形式再登记一份。限定名 `std.data.csv.PARSE` 走
+「最长前缀」那圈，拼不出命中时会退化到**裸名** `PARSE`——而裸名是各模块共享的
+一格，谁先登记谁留下（std-box 的 `csv: 未闭合引号报 PARSE` 就是这么红的）。
+
+注意**带 `= 值`** 的成员走的是 `parse_enum_spec` 最后那条公共路径，不在"不带值"
+那条分支上——前几次把这个登记加在错的分支上，所以一直没生效。
+
+回归用例数不变（std-box 里 csv 那条已经对了，json 那条还红），但限定名的解析
+从"看谁先登记"变成了"看模块"，是个纯正确性的改动。
+
+### 方法体里数组类型的成员不退化：回归 87 → 88 / 92
+
+`struct G@(N) { char d[N]; char *p() { return d; } }` 里 `g.p()` 返回的是
+`d[0]` 那一个字节当指针（`0x7a` = `'z'`），而不是 `&d[0]`。方法体读自己成员的
+那条回落路径最后无条件 `load_lval(...)`，数组不该取值、该退化成首元素地址
+（和普通表达式里的数组退化一致）。
+
+`std.text.fmt` 的 `Buf@(N)` 正好是这个形状（`char data[N]` + `cstr()`），于是
+`cstr()` 返回 NULL，`examples/wordcount.c6`（std-demo）在第一个 `printf` 前的
+`o->write(...)` 处就段错误了。
+
+### 方法调用糖里的聚合实参没落到自己的帧槽：回归 86 → 87 / 92
+
+`b.f(str(t))` 里被调方收到的 `Str.data` 是栈上垃圾（`len` 却是对的），
+`std.data.json` 于是**任何**输入都解析失败（`{"a":1}`、`{}`、`1` 全挂，
+`jp_ws` 读到的首字节是 `'@'`），`std-conf` 的 xml `attr` 也一样。
+
+原因是方法糖这条路的实参"先全部求值、最后统一发 `IR_ARG`"，聚合临时量活在
+被调用方的实参暂存区上——外层 `CALL` 一铺参数就把它盖掉了。普通调用是边求值
+边 `IR_ARG`，所以同样写法的普通调用是对的（`noerr(&b, str(t))` ✓、
+`b.noerr(loc)` ✓、`b.noerr(S("{}"))` ✓，只有 `b.noerr(str(t))` ✗）。
+
+修法是聚合实参先 `IR_COPY` 到自己的帧槽再传。
+
+### `++`/`--` 的表达式值没按窄类型回绕：回归 85 → 86 / 92
+
+`u8 b = 255; ++b != 0` 在 c6c 下不成立——写回的 `b` 是 0（`store_lval` 截断了），
+但 `++b` 这个**表达式的值**留的是 64 位的 256。C 的规矩是 `++e` 的值类型就是 `e`
+的类型，所以要按宽度截一次。AES-CTR 的 counter 递增就靠
+`if (++ctr[i] != 0) break;` 判进位，进位判不出来于是第二块 keystream 全错
+（std-cipher 的 SP 800-38A 向量）。
+
+修法是在前缀 `++/--` 的下降里、写完回存之后按 `ty_size(ty) < 8` 补一条
+`IR_TRUNC`（和 `gen_bin2` 里那条回绕同一个套路）。
+
+### 复合字面量前瞻少算一层括号 + `getnameinfo`：回归 84 → 85 / 92
+
+`pa_is_compound_lit()` 的第一段从 `q = 1` 开始数括号深度，`peek(0)` 那个开括号
+没进计数，于是 `(int){…}` 的深度一路是负的、永远等不到 0——第一段等于白扫一遍
+16 个 token 再退到下面那段通用扫描。副作用是 `((T){ … })` 这种**套着括号的复合
+字面量**在初始化/实参位置上解析错位：`P p = (P){ (int)2 };` 后面跟一句
+`Str s = ((Str){ … });` 会报 `这里要 '}'`（std-client 就卡在这儿）。把深度从
+`peek(0)` 算起就对了。
+
+修完解析，std-client 又缺 `getnameinfo`（`std/net/udp.c6` 用它把对端地址写成
+数字形式）。`rt.c6` 里补上：IPv4 走现成的 `inet_ntop`，IPv6 手写 8 组十六进制
+（不做 `::` 压缩），服务名只出端口号；PTR 反查要真 resolver，这里没有，返回
+`EAI_NONAME` 而不是编个假名字。
+
+### 文档：记下一个复合字面量的解析错位
+
+`h2((P){ (int)2 }, ((Str){ S("a") }))` 这种"前一个复合字面量里带强转、后一个
+复合字面量套着括号"的写法会让 c6c 少认一个 `)`，报 `这里要 '}'`。最小复现、
+试过哪些变体、哪些不成立（不是第 226 轮那个初始化器游标问题）都写进了
+`c6c/docs/todo.md` 第 231 轮。本轮没有改代码。
+
+### `execvp` 真的按 PATH 找程序：回归 83 → 84 / 92
+
+`c6c/lib/rt.c6` 里的 `execvp` 原来只是一条 `execve` 系统调用——`execve`
+不查 PATH，于是 `execvp("sh", argv)` 永远 `ENOENT`。`std/os/pty.c6` 的
+`pty_spawn()` 用它起子进程，结果子进程一上来就 127 退出、一个字都没输出
+（`std-sys` 的 pty 段两条断言全挂）。
+
+改成 POSIX 的行为：名字里带 `/` 就直接 `execve`；否则按 `PATH` 逐段拼
+`目录/名字` 试，空项算当前目录，全试完把最后那个 errno 交出去。顺带把
+"syscall 返回负 errno" 翻成 `errno = -r; return -1`——以前直接把负数当返回值
+给调用方，`errno` 一直是 0。
+
+### 浮点 `==` / `!=` 认 NaN：回归 81 → 83 / 92
+
+x64 后端的浮点比较把 `EQ`/`NE` 直接交给 `sete`/`setne`。`ucomisd` 碰上 NaN
+是"无序"（ZF=PF=CF=1），于是 `NaN == NaN` 给 1、`NaN != NaN` 给 0——正好反了。
+
+`dv != dv` 是仓库里判 NaN 的**唯一**手段（`printf("%g")` 的
+`c6c_fmt_double`、`half` 模块的 `double_to_half` 都靠它），所以只要能编出
+NaN，格式化就会走整数分支，把 NaN 的位模式印成一串垃圾
+（`-9223372036854775809.92…`）。
+
+修法：`EQ` 用 `setnp & sete`，`NE` 用 `setp | setne`；有序比较
+（`<`/`<=`/`>`/`>=`）本来就是"无序给 0"，不用动。C99 后端把这几个运算直接
+写成 C 的比较，天然正确，不用改。
+
+`std-bin2` 的 fp16 NaN 判定、`std-kit` 的 nan / -inf 拼写与解析一并绿了。
+
+**还没管的**：`aout.c6`（aarch64 汇编文本后端）和 `asmout.c6`（x86 汇编文本
+后端）的 `IR_CMP` 一律 `cmp` 整数，浮点比较整个是错的——它们目前只跑
+`-S` 冒烟，等哪天真要拿它们出可执行产物再补。
+
+### 枚举常量按 64 位物化：回归 80 → 81 / 92
+
+`enum { M = -2147483647 - 1 }` 这个常量本身没问题，但用到表达式里就变成
+`+2147483648`：
+
+```c
+long long a = (long long)M;   /* 得到 2147483648 */
+long long b = M;              /* 同上 */
+```
+
+两处都坏了：
+- 定义时 `s->val` 存的是 `(i64)0x80000000`，没按 `int` 符号扩展（枚举常量的
+  类型就是 `int`）；
+- 物化时用的是 `IR_CONST`，它的立即数只有 32 位，符号扩展后的
+  `0xFFFFFFFF80000000` 被截回 `0x80000000`。
+
+第一条补 `(i32)` 转换；第二条改成走 `gen_int_lit()`——它在值超过 32 位时自动
+改用 `CONSTK`（64 位常量池），这正是给 `unsigned long long` 大常量用的那条路。
+
+顺带修了同一类的一处**硬编码**：`t->done()` 原来拿状态跟 `0xFFFFFFFF` 比
+（就是"没符号扩展的 -1"），运行时写进去的是真 -1，两边对不上，`wait()` 之后
+`done()` 永远给 0（`tests/task_method.c6` 里有三个用例盯着这个）。现在按 64 位
+全 1 比。
+
+影响：`std/core/fixed.c6` 的 `sat_i64` 拿 `I32_MIN` 比较恒假，定点数一加就饱和，
+`stdembed` 的 fixed / sqrt / 加法饱和全错。
+
+### 重载选中之后按新原型重转实参：回归 79 → 80 / 92
+
+同一个名字在两个模块里各有一个重载时（`std/core/endian.c6` 的
+`init(EndianReader *, const unsigned char *, int, int)` 和
+`std/text/collate.c6` 的 `init(Collator *, int)`），普通调用先按名字拿到一个
+符号，**实参就已经按它的原型转好了**；等实参表读完，`sym_find_fn` 才按形参
+个数和首参类型把被调方换成对的那一个。
+
+结果 `init(&r, buf, 14, 0)` 里的 `buf` 先被当成 `int` 截断（`Collator_init`
+的第 2 个形参），指针只剩低 32 位，`std-util` 的 endian 一段直接段错误。方法
+语法糖那条路本来就按接收者类型找，不受影响，所以 `r.init(buf, 14, 0)` 一直是
+对的。
+
+修法：记下每个实参**转换前**的值和类型，被调方换掉之后按新原型重转一遍（走
+接口 / 切片 / 聚合特殊路径的实参打标记跳过，它们已经换成了临时槽地址）。
+
+### 复合字面量不再改写外层初始化器的游标：回归 77 → 79 / 92
+
+```c
+Str d[3] = { (Str){ S("go") }, (Str){ S("fast") }, (Str){ S("car") } };
+```
+
+只有 `d[0]` 被写进去，`d[1]`、`d[2]` 是零。`(Str){…}` 是复合字面量，它内部的
+`gen_init_obj` 会把全局的叶子表（`LF_*`）、游标（`INIT_CUR`/`INIT_MAX`）和层栈
+（`LV_*`）整个重建；回到外层初始化器时游标已经指向别处，`init_body` 的
+"游标走完了"判断立刻成立，剩下两个元素被 `skip_init_list` 当成多余的值吞掉。
+
+修法是进出各存/取一次（`init_save`/`init_restore`，能省则省：只在表非空时拷贝
+用到的前缀）。纯整数结构体的元素、`(Str){ sa }` 这种没有内层花括号的写法本来就是
+对的，出问题的只有"内层还有一层 `{…}`"。
+
+`std-search2` 的倒排索引因此对得上（`terms()` 6 → 4），`std-cli` 的 proc 表也一
+起绿了。
+
+### 方法调用糖的实参按形参类型转换：回归 74 → 77 / 92
+
+`m.push(10)` 里 10 是 `int`、形参是 `double`：普通调用那条路会按原型做
+`gen_convert`，方法调用糖（`x.m(...)` → `m(&x, ...)`）直接把 `gen_assign()` 的
+结果塞进实参表。整数就这么进了通用寄存器，被调方从 `xmm0` 读到 **0**——而同一个
+调用写成 `m.push(10.0)` 完全正常，所以这个 bug 极难从现象上看出来：
+
+```c
+m.push(10);    /* SMA 永远是 0 */
+m.push(10.0);  /* 10 ✓ */
+```
+
+`std.core.moving` 的 `push`/`ema_push` 因此整条滑动窗口统计全归零
+（SMA、EMA、`last()`），std-color 的 `Conv.to`、std-geo2 的垂足/距离也靠带
+`double` 形参的方法糖。
+
+- 新增全绿：`std-color` / `std-geo2` / `std-stats`
+- 74 → 77 / 92，无回退
+
+### 返回的结构体当接收者时先落地：回归 73 → 74 / 92
+
+`mkp().method()` / `mkp().member` 里那个"聚合值用地址代表"的地址，是**被调方帧里
+的**：方法调用糖把接收者指针传出去，被调方一进栈就把那块内存盖掉。
+
+```c
+struct P { int x, y; };
+static P mkp(void) { P p = { 7, 9 }; return p; }
+static int get(P *s) { return s->x; }
+...
+mkp().get()      /* 1614765856，垃圾 */
+mkp().x          /* 7 —— 立刻读还在，所以这个 bug 很隐蔽 */
+```
+
+`rat_make(1, 3).add(rat_make(1, 6))` 因此永远是 `1/3`（`add` 读到的接收者是垃圾，
+但恰好还是 1/3 的形状），`big_from_i64(255).format_base(...)` 打出 `0`。
+
+在 `.`/`->` 接收者处把这种临时聚合值先 `IR_COPY` 进调用者的临时槽、再用槽地址
+（和"聚合按值传参"那条既有做法一致）。
+
+- `std-num` 全绿（bignum 的 `255 = 0xff`、rational 的 `1/3 + 1/6 = 1/2`）
+- 73 → 74 / 92，无回退
+
+### 无符号左值的 `>>=` 改成逻辑右移：回归 71 → 73 / 92
+
+复合赋值里的 `>>=` 一律记成 `IR_SAR`（算术右移），于是**无符号**左值也是带着符号
+位右移：`unsigned long long v = ~0ull; v >>= 7;` 移完还是全 `1`，`v >>= 1` 从
+`8000…` 变成 `c000…`。普通的 `v = v >> 7` 走的是另一条路（按 `ty_is_signed` 选
+`IR_SHR`/`IR_SAR`），一直是对的。
+
+`std.encoding.varint` 的 `uvarint_encoded_len` 就是 `while (v >= 0x80) v >>= 7;`，
+碰上 `0xffffffffffffffff` 直接死循环——`std-next` 打完标题就卡住（`std-more` 同理，
+它是回归里唯一"跑不完"而不是"跑不对"的两个用例）。
+
+按左值类型的符号性选 op 后：
+
+- `std-more` / `std-next` 全绿
+- 71 → 73 / 92，无回退
+
+### 拼接字符串字面量的 sizeof：回归 66 → 71 / 92
+
+`sizeof("a" "bc")` 一直算成 **8**（指针大小）——`sizeof` 里"括号中是一个字符串
+字面量"那条判据只认**恰好一个** `TK_STR`，拼接形式掉进表达式分支，拿到的是
+退化后的 `char *`。`sizeof("ab")` 是 3 ✓，`sizeof("ab" "cd")` 就是 8 ✗。
+
+std 里 `#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })` 这种
+把长度和字面量写在一起的宏全中招：拼接字面量的切片长度被截成 7（8-1），后面的
+字符就丢了——`dms_parse(S("39°" "54'15\"N"))` 只读到 `39°54`，`to_deg()` 少算
+15 角秒；`std-text` / `std-textan` 的一堆换行/宽度断言同理。
+
+判据改成"括号里是一串相邻字面量、后面紧跟 `)`"（`sizeof_lit_run`）：
+
+- 新增全绿：`std-clean` / `std-form` / `std-geo` / `std-text` / `std-textan`
+- 66 → 71 / 92，无回退
+
+### 结构体数组的 sizeof 不再为 0：回归 64 → 66 / 92
+
+`static struct E t[] = { … };` 这种"不完整数组 + 结构体元素"的声明，长度一直
+没按初始化器补出来（`sizeof t` 是 0）。`init_count_of` 打印出来是
+`lpe=2 max=0 cur=6`：叶子数、元素叶子数都对，游标也走到了 6，但 `INIT_MAX`
+（"填过的最大叶子"）一直是 0 —— 嵌套的 `{…}` 只推游标、**不走** `init_store`，
+`init_mark()` 没被调到。`init_brace` 收尾时按本层写到的最后位置补一次记账即可。
+
+std 里凡是"表 + `sizeof 表 / sizeof 表[0]`"数条目、元素又是结构体的模块都数成
+0（`std.net.mime` 的扩展名表最典型，一张表一条都查不到）：
+
+- `std-web` / `std-serve` 全绿（mime 的大小写、多重扩展名断言）
+- 64 → 66 / 92，无回退
+
+### 浮点与整数比较按标准语义转换：回归 59 → 64 / 92
+
+`double h; ...; if (h > 1) h = 1;` 里 `h > 1` **恒为真**：`gen_cmp3` 的浮点分支
+把整数那一侧只做了 `gen_cast_to`（按位截断），没转成浮点，于是拿 `h` 的位模式
+（0x3F7C…）当整数和 1 比。那条偏门是给"通用 `task` 句柄的 `t->val` 按位和浮点
+字面量比"留的。
+
+两边都按标准语义转成公共浮点宽度之后：
+
+- std-geo 的 haversine 结果不再被 `if (h > 1)` 夹成 1（北京→上海 20015 km →
+  1067 km），包围盒、geohash 一并归位
+- 新增全绿：`std-audio2` / `std-font` / `std-legacy` / `std-math2` / `std-packet`
+- `tests/async.c6` 里那处"`t->val` 和 double 字面量比"改成显式 union 还原位模式
+  （旧写法依赖的正是被修掉的那条偏门），`test-c6c` 仍 66/1/0
+- 59 → 64 / 92，无回退
+
+### 裸字段接后缀链之后按链尾的类型算：回归 58 → 59 / 92
+
+方法体里的裸字段（接收者的成员）解析完之后还要走 `gen_postfix_ops` 把
+`->next` / `[...]` 接上去；那条路走完，收尾仍然按**成员本身**的类型取值和
+回填 `GEN_TY`：
+
+```
+T next() { T x = d->data[(d->head + i) % d->cap]; }
+```
+
+`d` 是 `Deque@T *`，`d->head` 已经是 `int`，可收尾时还拿 `Deque@int *` 去
+`load_lval`（8 字节）并把 `GEN_TY` 设回指针类型——于是 `d->head + i` 被当成
+指针加法，步长取 `sizeof(Deque@int) = 24`，下标 `(head + i*24) % cap` 恒等于 0：
+deque 迭代永远返回第一个元素（std-tour 的 `sum` 恒为 6）。
+
+修法：收尾按 `PEND_TY`（后缀链留下的类型）取值/回填；链上一个后缀都没接时
+它本来就等于成员类型，行为不变。
+
+- `std-tour` 全绿（73 条断言），58 → 59 / 92，无回退
+
+### 方法体里的裸名字不再被实例化点的局部量遮住：回归 57 → 58 / 92
+
+模板实例的体是在**实例化点**展开的，那里调用方函数的局部量都在作用域链上。
+方法体里裸写的成员名（`i++`、`d->n`）本该指向接收者的字段，可 `sym_find`
+先撞上调用方的同名局部量：
+
+```
+struct DIter@T { Deque@T *d; int i; ... }     /* 方法体里裸写 d / i */
+void tour_deque(void) { @Deque@int d = ...; int i = 0; ... }
+foreach (int x = d->iter())                   /* 实例在这里展开 */
+```
+
+于是 `i++` 改的是 `tour_deque` 的循环变量、`has()` 读的也是它——std-tour 的
+deque 迭代永远吐第一个元素（`sum` 恒为 6）。`It@T` 里 `b->n` 那种同样中招：
+读的是调用方局部量 `b` 的拷贝（局部量是值，取成员读到的全是 0）。
+
+修法：给方法体记一个作用域边界（`METHOD_SCOPE_BASE`，`pa_func_def` 里
+`scope_enter()` 之后），裸名字查到的符号如果**不在这条链上**（登记在更外层的
+作用域里，即调用方的局部量），就按接收者的成员走；方法自己的形参/局部量
+照旧遮蔽字段。
+
+- 新增全绿：`std-net`；`std-tour` 的迭代器 `i` 从"永不推进"变成正常推进
+- 回归 57 → 58 / 92，无回退（`trend`：连 tcc 侧用例都没动）
+- 剩下的 deque 断言是另一回事：`Deque@T` 的成员在实例里被解析成了 `T` 的
+  指针（下标 stride 变成 `i * 24`），记在 `c6c/docs/todo.md` 第 216 轮
+
+### 下标赋值不再把普通标量当托管引用：std-tour 从段错误到 73 条断言
+
+`data[i] = 0` 里 `data` 是 `@char`（托管指针）时，下标这层的 `PEND_MGD`
+沿用了"托管引用"的标记，赋值就按托管引用走：**先取旧值当指针 release，再存**。
+旧值是那个字节本身——`strbuf.truncate` 写结尾 NUL 时旧值是 `'d'`（100），
+运行时拿 `100 - 头长 = 60` 当引用计数头，`lock xadd` 直接段错误。std-tour 的
+第一段 `strbuf` 就挂在这里。
+
+判据收窄成"基址是数组/切片**且元素是指针**（元素本身是引用）才把标记传给元素"。
+第一版按"成员 kind 2（引用数组）"判，`tests/foreach_iter` 的局部 `@MNode a[2]`
+就掉了——局部引用数组没有成员 kind，元素照样是托管引用：
+
+```
+std-tour   段错误 → 73 check(s), 1 failure(s)（只剩 deque 迭代顺序）
+std-kit    段错误 → 跑过 num 段，崩在后面（下一个问题）
+foreach_iter  局部 @T a[2] 的 a[i] = v 仍是托管赋值（第一版判据漏了这条）
+```
+
+新增回归口径不变（三居用例还没全绿），所以基线仍是 57 / 92。
+
+### 跨 TU 的模板/方法符号：回归 52 → 57 / 92
+
+`std-*` 里有一整类用例挂在「未定义的符号」上，名字分两副面孔：`p_atom$2`
+这种带 TU 后缀的，和 `std__container__vec__Iter_int_has` 这种带模块前缀的。
+查下来是同一个区域的两处：
+
+- **方法式函数的前向声明**（`static int poke(Bucket *b);` 先声明、后面才定义）：
+  声明时按短名建了一条 ELF 符号，调用点已经按它发过重定位；定义时发射名换成
+  `<接收者>_<方法>`（再套模块前缀 / TU 后缀），旧的那条就悬空了。定义处现在
+  记一笔账（`meth_alias_register`），等所有 TU 解析完、代码都发出来了，
+  由 `alias_apply()` 统一接到真名上——**不能当场接**：`x64_alias_idx` 复制的是
+  偏移，定义处这会儿代码还没生成，接过去的是 0（先按当场接写的第一版就让
+  c6c 编出来的 tcc 一启动就段错误：tests2 从 118 掉到 0）。这一处收掉了 `std-async3`
+  （`co_step$2`）、`std-ub`（`ps_typespec$2`）、`std-text`（`p_atom$2`）、
+  `std-box`（`jp_value$2`）、`std-mw`（`take_n`）、`std-more`（`next_set`）、
+  `std-mesh`（`next`）、`std-docs`（`add_irregular`）。
+- **嵌套的模板实例化**：模板 A 的方法签名里出现 `B@T`，A 的"只登记签名"那一遍
+  就会把 B 实例化（只有签名）；外层第二遍重放同样的实参时缓存直接短路，B 的
+  方法体再没机会展开。现在嵌套实例在自己的那一遍里一次展开完
+  （`PA_SIG_ONLY` 在嵌套重放期间清零）。`Vect@T.iter()` 返回 `Iter@T` 正是这个
+  形状，`std-demo`/`std-kit`/`std-tour` 从"链接不上"变成"能跑但段错误"——
+  离全绿还差运行期那一步（实例身份/布局），留到下一轮。
+- 新 check：`tmplcheck`（两 TU 的模块 fixture：编译链接、无未定义符号、跑对结果、
+  模块 `-c` 单编）。
+- CI 稳定：`tests/thread.c6` 的两处空转上界从 20M 提到 200M。同一份二进制本地
+  20/20 通过，CI 的 2 vCPU runner（cfs quota）上线程可能整段时间没被调度上，
+  `thread` 因此报过一次"跑不通"。`run-tests.sh` 现在还会把跑不通用例的最后几行
+  输出捎到 stderr，CI 上不用再猜。
+- 回归：52 → 57 / 92（`std-async3`、`std-docs`、`std-mesh`、`std-mw`、`std-ub`），
+  没有一条从绿变红。
+### 构建：c6 与 c6c 的安装元数据收敛到 `cmake/C6Metadata.cmake`
+
+- `.pc` 生成、`find_package(...)` 包配置、`LD_LIBRARY_PATH` 注入三件事原本各自
+  在多个模块里重复：`.pc` 的 `${pcfiledir}` 前缀反推写过一遍又一遍，包配置的四
+  件套（`configure_package_config_file` + `write_basic_package_version_file` +
+  `configure_file(Targets)` + `install`）在 `C6LibraryConfig.cmake` 与
+  `C6CInstall.cmake` 各有一份 30 行样板，执行构建树的 c6 要补的环境变量在
+  `C6Testing.cmake` / `C6Wasm.cmake` / `C6C.cmake` 写了三遍。现在统一成
+  `c6_ld_env()` / `c6_pcfile_prefix()` / `c6_install_pc()` /
+  `c6_install_cmake_package()` 四个函数。
+- 四个 pkgconf 包（`c6` / `c6lib` / `libtcc` / `c6c`）共用 `cmake/c6.pc.in`，
+  **删掉** `cmake/c6c.pc.in`；`tccdir=` 行与"变量"注释参数化，c6c 不再输出无意义
+  的 `tccdir=`。`c6.pc` / `c6lib.pc` / `libtcc.pc` 的输出与改造前逐字节相同。
+- 并发数不再算两遍：`C6C.cmake` 直接复用 `C6Options.cmake` 的 `C6_TCC_JOBS`。
+- `check-install` / `pkgcheck` 里的落点变量（`C6_PACKAGE_DIR`、
+  `C6C_PACKAGE_DIR`）显式保留，未生成包配置时留空值。
+- 验证：`pkgcheck` 10/10、`check-install` 通过、`check-all-c6c` 全绿（fixpoint
+  逐字节相同、std 381/0、tests2 117/0 意外失败、c-testsuite 149/150 且 0 失败、
+  前端回归 52/0、c6c 回归 52/0）；ON（tcc 引导）与 OFF（宿主 cc 引导）都
+  configure + build 通过。
+
+### 安装：c6c 有了自己的 `find_package(c6c)` 与 `c6c.pc`；`C6C.cmake` 拆成五个模块
+
+- **c6c 的包元数据**：此前无论哪种 flavour，安装树里只有 `c6.pc` / `c6lib.pc` /
+  `libtcc.pc` 与 `find_package(c6)`（c6c 包下还得写 `pkgconf --libs c6`），c6c
+  自己没有名字。现在装 c6c 就同时给：
+  - `find_package(c6c COMPONENTS compiler libc6c)` → `c6c::compiler`（`bin/c6c`）、
+    `c6c::libc6c`（静态，默认）/ `c6c::libc6c_shared`；变量 `c6c_EXECUTABLE`、
+    `c6c_LIBC6C_STATIC` / `_SHARED`、`c6c_INCLUDE_DIR`、`c6c_VERSION`；
+  - `c6c.pc`（`pkgconf --cflags --libs c6c` → `-lc6c`，`--variable=c6c` 给编译器路径）。
+  c6 那套名字照旧安装、不冲突：`c6.pc` 在两种 flavour 下内容不同，`c6c.pc` 只
+  描述自举编译器本身（`cmake/C6CInstall.cmake` 里有取舍说明）。
+- **`cmake/C6C.cmake` 417 行拆成五个模块**（顶层 include 不变，target 名与行为
+  逐个保持）：`C6C.cmake`（总控：路径/工具/`_c6c_ld_env`/源码 GLOB/llc 发现）、
+  `C6CBuild.cmake`（c6c / c6c-opt / libc6c 与 stage0 两条路）、
+  `C6CCheck.cmake`（`c6c_target()` + 全部验收 target）、`C6CGate.cmake`（fast /
+  check-all-c6c / check-all-perf / CTest / check-c6c）、`C6CInstall.cmake`（库与头
+  文件安装 + 上面那套包元数据）。
+- 顺带抽出 `c6_pcfile_prefix()`（`cmake/C6Options.cmake`）：`.pc` 的 `prefix` 用
+  `${pcfiledir}` 反推，`c6.pc` / `c6c.pc` 共用一条算法，不再各写一遍。
+- 契约测试同步：`pkgcheck` 从 7/7 扩到 **10/10**（安装树含 `c6c.pc` 与
+  `lib/cmake/c6c/*`、`find_package(c6c COMPONENTS compiler libc6c)` 的消费方真编
+  真跑、`pkgconf c6c` 的旗子 `-Wall -Werror` 编得过）；`check-install` 在默认
+  flavour 下也验 `c6c.pc` 的 `prefix` 重定位与 `find_package(c6c)` 消费方。
+- 验证：`pkgcheck` 10/10、`check-install` 通过、`tests2-check` 117/0 意外失败、
+  `testflag` 19/0、`regression-c6c` 52/0、`diagtest` 316/0；ON（tcc）与 OFF（宿主
+  CC 引导）两种 flavour 都能 configure + build。
+
+### 修复：隐式 int 告警只在"非函数声明"发；宏体里的 `__LINE__`/`__FILE__` 报调用点
+
+- `parse_typespec` 的隐式 int 告警收缩到 tcc 的真实口径：形参表里不发
+  （`int f(int x, ...)` 的省略号、K&R `int f(a, b)` 的裸标识符都走
+  `parse_typespec` 的兜底旧路径，实测 tcc 零告警），并且延迟到声明符解析完、
+  只对**非函数**声明发（tcc `decl()` 的 `else if (oldint)` 前面是 VT_FUNC
+  分支）——`f();` / `f(){}` 不告警。此前 `c6c/include/stdio.h` 的变参原型
+  每条多一行 `type defaults to int`，tests2 118 条全红、`testflag` 的
+  "stderr 干净 / 过滤空 / 没有 test 块"三条同因挂掉。
+- `pp.c6`：宏展开时记下**最外层**调用点的 file/off，宏体里的 `__LINE__` /
+  `__FILE__` 用它而不是 `#define` 那一行（tests2/129_scopes 的 `myassert`
+  宏在函数体里展开，expect 逐行要调用点行号）。
+- `tcc-na.txt` 补两条架构性 n/a 并写死卡点：`102_alignas`（`_Alignas` 只
+  解析不落地，全局布局与 `__alignof__` 都不认用户对齐）、`129_scopes`
+  （`__LINE__` 已修，剩下 `sizeof(enum{…})` 常量泄漏到外层块、两块遮蔽与
+  静态初始化的作用域语义差）。
+- 验证：tests2 记分板 117 通过 / 10 n/a / 0 意外失败；testflag 19/0；
+  前端回归 52/0；c6c 回归 47/0；编译期诊断 316 报错 / 0 漏报。
+
+### 格式化与二进制转义对齐 glibc：回归 47 → 52 / 92
+
+两条"看起来无关"的线，其实是同一类事：**文本输出和字节字面量的口径**。它们
+在 std 的用例里表现为"自检就差一两条"，很难顺着错误信息找到根。
+
+- `c6c/lib/rt.c6` 的 `c6c_vfmt` / `c6c_fmt_double` 逐项对齐 glibc：
+  `%.0d` 的 0 什么都不印（不是 `0`）、`%#x` 的值 0 不加 `0x`、浮点也认 `+`/空格
+  标志、正好 `.5` 时**取偶**（`%.0f` 的 2.5 → `2`，`%.1f` 的 2.25 → `2.2`）、
+  `%g` 只剥小数部分的尾零（`100000` 曾被剥成 `1`）、`-0.0` 靠符号位认出来、
+  `%f` 的整数部分超过 2^64 时走小 bignum 精确展开（`printf("%f", 1e20)` 一位不差）。
+  `c6c/tests/printf-matrix.c` + `printfcheck` 把 68 条格式钉死：同一份源码用宿主
+  `cc` 和 c6c 各跑一遍逐行 diff。
+- `c6c/src/parse.c6`：窄字面量里**只有** `\u`/`\U` 和源码里直接写的 UTF-8 才该
+  重新编码，`\xNN`/`\NNN` 是**字节**转义。此前凡是解出来 >= 0x80 的都当码点又
+  UTF-8 编码了一遍——`"\xde"` 变成 `0xc3 0x9e` 两个字节，拿字符串拼二进制数据
+  的 std 用例（hexdump/数据库/图形/词表/协议）全被带偏。`esccheck` 钉 16 条。
+- 回归：47 → 52 / 92（`std-db`、`std-gfx`、`std-pack`、`std-proto2`、`std-words`），
+  没有一条从绿变红。
+- 已知没动的：`float_lit_bits` 的十进制→double 还差 1 ulp（`1e300` 的位模式末位
+  与 glibc 不同），这是解析侧正确舍入的问题，不是打印侧。
+- 顺带：`...` 在声明符的形参表里被当成"隐式 int 的形参"，每个变参原型都多一条
+  `type defaults to int` 警告（c6c 自己的 `stdio.h` 4 条、`unistd.h` 还有）。在
+  `parse_typespec` 之前把省略号拦下来，编译干净了，`testflag` 的"全部通过时
+  stderr 干净 / 过滤空 / 没有 test 块"三条也一起转绿（16/3 → 19/0）——CI 的
+  `c6c-check-all` 就是被这三条挂着的。
+
+### 许可：仓库根新增 `LICENSE`（LGPL-2.1，逐字继承 tcc）
+
+- `tcc/COPYING`（LGPL-2.1 全文）逐字复制为根 `LICENSE`：c6 是 TinyCC 的分支，
+  主编译器（`tcc/`）及其修改按 tcc 原许可继承；GitHub 许可识别与 README 的
+  License 徽章从此有据可依。`c6c/` 是自举重写、不复制 tcc 源码，仍按自己的
+  MIT（`c6c/LICENSE`）；打包侧许可随 flavour 分发（`cmake/C6Install.cmake`），
+  仓库根 `LICENSE` 也作为总许可声明随两种包安装；README「上游与许可」一节
+  同步双许可作用域。
+
+### 修复：tests2 全线飘红（隐式 int 告警误伤 `unsigned` 组合）与记分板死因点名
+
+- `parse_typespec` 的隐式 int warning（tcc 口径 `type defaults to int`，为
+  tests2/102_alignas 补的）原先挂在 `if (!base)` 分支上——该分支同时也是
+  `unsigned` / `long` / `unsigned long` 这类**只选宽度**的组合的必经之路，
+  于是 `stddef.h` 的 `typedef unsigned long size_t;` 也被当隐式 int 告警：
+  每个 TU 的每个头文件 `unsigned` 族声明都多一条 warning（00_assignment 多
+  220 行、101_cleanup 多 65797 行），tests2 118 条全红，`testflag` 的
+  "stderr 干净 / 过滤空 / 没有 test 块"三条也被同一噪声打挂。改为只在
+  `!saw_int`（完全不带类型说明符的真隐式 int）且非 c6 TU 时告警。
+- `c6c/tests/tcc-tests2.sh` 完善错误提示：运行期超时/被信号杀死的用例不再
+  只留 shell 一句 "Segmentation fault"，退出码被接住后在汇总里逐条点名
+  （`运行期被信号 11 杀死（139=SIGSEGV…）`）；判定口径不变（上游只比输出），
+  FAIL 结论的 diff 预览从 2 行加到 3 行。
+
+### `-l<name>` 收下 + 数学/组库/线程同步的边角：回归 45 → 47 / 92
+
+- `c6c/src/main.c6` 接受 `-l<name>`（`-lm` 最常见）并**不生效**：c6c 的产物是
+  静态的，libc/libm 的常用面由 `c6c/lib/rt.c6` 自带；真缺符号时链接期照旧报
+  「未定义的符号」，不会变成运行时炸。此前整批用例挂在「未知选项 '-lm'」上。
+- `c6c/lib/rt.c6`：补 `atan2`（std/geo 卡在它）、`exp2`、`fdim`、`nextafter`；
+  `getgrgid`（解析 `/etc/group`，`struct group` 按 glibc ABI 摆）；
+  `sem_trywait`/`sem_timedwait`/`sem_getvalue`、`pthread_rwlock_tryrdlock`/
+  `trywrlock`、`pthread_barrier_*`、`pthread_spin_*`。
+- 回归：45 → 47 / 92（新增 `std-linalg`、`std-math3`，无回退）。`std-sys` /
+  `std-thread` / `std-geo` 从"链不上"变成"跑起来但自检有差"。
+
+### 运行时第二批 + `errno`：回归 42 → 45 / 92
+
+- `c6c/src/main.c6` 预定义 `_GNU_SOURCE 1`（和 tcc 一个口径）：glibc 把
+  `pthread_setname_np`、`cfmakeraw`、`strsignal` 这些藏在 `__USE_GNU` 后面，
+  不开就「未声明的标识符」。
+- `c6c/lib/rt.c6` 补第二批（能弱定义的一律 `weak`）：`opendir`/`readdir`/
+  `closedir`/`rewinddir`（自己 decode `getdents64`）、`getrusage`、
+  `tcsetattr`/`tcflush`/`tcdrain`、`pthread_self`（`gettid`）/`equal`/`detach`/
+  `once`/`key_create`/`setspecific`/`getspecific`/`mutex_trylock`/`timedlock`/
+  `cond_timedwait`/`rwlock_*`/`attr_setstacksize`/`setdetachstate`/
+  `setname_np`（自己走 `prctl`，别的线程写 `/proc/self/task/<tid>/comm`）/
+  `getname_np`、`sched_yield`、`symlink`/`link`/`readlink`/`fcntl`/`msync`、
+  `getpwuid`/`getpwnam`、真的 `sigset_t` 位操作（`sigemptyset`/`sigfillset`/
+  `sigaddset`/`sigdelset`/`sigismember`）、`sigpending`、
+  `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`inet_addr`/`inet_ntoa`/
+  `inet_pton`/`inet_ntop`（只认数字地址与 `localhost`，真域名如实返回
+  `EAI_NONAME`）、`ferror`/`feof`/`clearerr`/`fileno`。
+- **`errno` 真的会设了**：六个 `c6c_sys*` 薄壳统一在返回负数时
+  `errno = -r`（返回值口径不变）。在这之前按 `errno == EINPROGRESS`/`EAGAIN`/
+  `EINTR` 分支的代码永远走失败那条路——`std/net/tcp.c6` 的非阻塞 connect 就是
+  这么被卡死的。`errno` 的定义按 `#ifdef errno` 分岔：系统 `<errno.h>` 是宏
+  （`(*__errno_location())`）时用系统那份，c6c 自己的 `<errno.h>` 下给一个
+  `weak` 定义。
+- 回归：42 → 45 / 92，新增 `std-fsx` / `std-h2` / `std-wire` 全绿，没有回退。
+
+### 回归换编译器跑：`C6_CC` + c6c 侧 42 个用例
+
+- `tests/regression.sh` 的被测编译器从写死的 `$C6_TCC_DIR/c6` 改成 `$C6_CC`
+  （默认值不变），98 处调用点统一替换；selfhost / c99selfhost 那几个拿 tcc
+  **源码**自举的用例仍直接用 `$C6_TCC_DIR/c6`。于是 `C6_CC=c6c/build/c6c
+  tests/regression.sh <用例>` 就整批换编译器跑。
+- `c6c/tests/regression-c6c.list` 是「c6c 已经跑绿」的单一数据源，
+  `c6c/tests/regression-c6c.sh` 跑这张表（`--all` 跑全部 std-* 量基线，也可以
+  点名几个），CMake 目标 `cmake --build build --target regression-c6c`。
+- `C6_ENABLE_TCC=OFF` 的构建不再一个回归用例都不注册：`cmake/C6Testing.cmake`
+  把这张表注册成 CTest 用例（label `regression-c6c`，同时带 `c6c`）。
+- `c6c/lib/rt.c6` 补了一批 POSIX 面，全部 `weak`（程序里同名强定义会盖掉，
+  对应 tcc 走 libc.so.6 时的符号覆盖）：`poll` `nanosleep` `uname` `rmdir`
+  `tcgetattr` `chdir` `sysinfo` `mkfifo` `fsync` `ftruncate`、
+  `ntohs`/`ntohl`/`htons`/`htonl`、`cfmakeraw`，以及整族 socket（`socket`
+  `bind` `listen` `accept` `connect` `send` `recv` `sendto` `recvfrom`
+  `setsockopt` `getsockopt` `getsockname` `getpeername` `socketpair` `shutdown`）。
+- 实测基线 38 → 42 / 92（新增 `std-async` / `std-async2` / `std-async5` /
+  `std-crypto`）；缺口四类与下一轮顺序写在 `c6c/docs/todo.md` 第 209 轮。
+
+### 共享库：`c6c -shared`（ET_DYN）
+
+- `c6c -shared a.o b.o -o libx.so` 出共享库：`ET_DYN`、基址 0（VA 就是段内偏移，
+  加载基址由 ld.so 选）、没有入口与 `PT_INTERP`、程序头 4 个。输入必须是 `.o`
+  （`-shared lib.c6` 直接报错）；`-fPIC` / `-fpic` 收下不报错——native 后端出来的
+  代码本来就位置无关（全局地址走 `lea rip+rel32` + 重定位），不需要另一套 PIC
+  代码生成。
+- `c6c/src/ld.c6`：`LD_BASE_VA` 从宏改成变量（静态 `0x400000` / 共享 `0`），新增
+  `LD_SHARED` 开关；共享模式下跳过「找 `main`」「合成 `_start`」「把 ctor/dtor
+  补进 `_start` 的 call」三步。数据里的绝对地址（字符串指针、初始化器、
+  `.init_array` 的函数指针）变成 `.rela.dyn` 的 `R_X86_64_RELATIVE`（`ld_apply`
+  记账 → `ld_dyn_plan` 定尺寸 → 落盘时逐条写）。定义的全局/弱符号进 `.dynsym`
+  （函数 `STT_FUNC`、数据 `STT_OBJECT`，`st_shndx` 按 `.text`/`.data`/`.bss` 填），
+  名字进 `.dynstr`，`DT_SONAME` = 输出文件名，`DT_INIT_ARRAY`/`DT_FINI_ARRAY`
+  让 `__attribute__((constructor))` 在 `dlopen` 那一刻就跑。
+- 产物末尾补一张 16 项**节头表**（`.text` / `.rodata` / `.dynstr` / `.dynsym` /
+  `.hash` / `.rela.plt` / `.plt` / `.rela.dyn` / `.got.plt` / `.data` /
+  `.init_array` / `.fini_array` / `.bss` / `.dynamic` / `.shstrtab`）：ld.so 不看
+  它，但 GNU ld 把 `.so` 当**输入**时只认节头（没有就 `file in wrong format`），
+  `readelf --dyn-syms` / `nm -D` 也靠它。
+- 修好一处一直错着的 SysV `.hash`：`nchain` 少写一个字、`chain` 每位写成 `j+2`
+  （应为 `j+1`）。静态可执行文件没人查这张表所以从没露馅，`dlopen` 一上来
+  `dlsym` 就返回 NULL。
+- 边界如实拒绝：共享库里的外部**数据**符号（`extern int optind;`）要走 GOT
+  间接寻址，这一版还没做，直接报错而不是悄悄写 0；外部函数照旧走 PLT。
+- 新增回归 `c6c/tests/shared-check.sh`（19 条，`cmake --build build --target
+  sharedcheck`）：`ET_DYN` / 入口 0 / 无 `PT_INTERP` / 程序头 4 个 / `DT_SONAME` /
+  `DT_INIT_ARRAY` / `RELATIVE` / 节头表齐全 / 导出符号 `T`+`D` /
+  `dlopen`+`dlsym` 真调通且数据读写一致 / 构造器在 `dlopen` 时跑 /
+  `cc -L … -l` 直接链也能跑 / 源文件与外部数据符号两条边界 / `-fPIC` 收下且
+  默认仍是 `ET_EXEC`。
+
+### 嵌入 API：`tcc_*` 兼容面补齐
+
+- `c6c/include/tcc-compat.h` 以前只声明 13 个 `tcc_*`，现在与 tcc 公开嵌入头对齐
+  （23 个 + 回调 typedef）：`tcc_set_error_func`（诊断整行交给回调）、
+  `tcc_add_sysinclude_path`（等价 `-I`）、`tcc_list_symbols`（镜像里的符号与 VA）、
+  `tcc_set_lib_path`（认 `<dir>/lib/rt.c6` 与 `<dir>/rt.c6`）都是真实现；
+  `tcc_set_realloc` / `tcc_set_backtrace_func` 收下不动（arena 不可换、没有 `-b` 的
+  运行期）；`tcc_add_library_path` / `tcc_add_library` / `tcc_add_symbol` 返回 -1 并把
+  原因写进 `c6_strerror`（链接器没有 `-L`/`-l`、宿主地址注入要 JIT 重定位）。
+  `tcc_relocate` 改成变参，一参数的新写法与老的两参数写法都收。
+- `c6c/src/diag.c6` 新增 `diag_emit`：`diag_error`/`diag_warn` 与解析器的 `pa_error`、
+  `pa_warn_tcc`（含「错误太多，停止」和「N 个错误，不写输出」那两行）全部改走它，
+  所以设了回调之后编译诊断不再漏到 stderr；没设回调时输出字节与以前一致。
+- 新增进程级守卫：同一个 `C6State` 编第二次一直是被拒的，但换一个新 state 再编会在
+  `x64_sym` 里段错误（前端/后端/符号表都是文件级全局量）。现在同样如实拒绝，并提示
+  「多次编译请每个编译 fork 一个子进程」。
+- `c6c/tests/embed-check.sh` 的兼容面用例按 stage 分进程跑（`tcc_set_error_func` /
+  系统头目录 + 列符号 / 如实拒绝的三件 / `tcc_set_lib_path` 真的换掉运行时），
+  6 条 → 10 条，全绿。
 
 ### 产物正确性对拍：c6c 与 gcc 语义等价（非机器码逐字节）
 
@@ -434,7 +1253,7 @@ HOSTCC 编，不在内核 C 前端口径内）。
 - `make -C c6c check-all` 一条命令：自举 fixpoint 逐字节相同、tests 前端 124/0 +
   跑通 67/0、std 377/377、编译期诊断 316/316、C99 51/51、LLVM 51/51、
   c-testsuite 闸门绿、c6c 编出的 tcc 跑 tests2 通过 118。
-- 文档：`c6c/docs/acceptance.md` 新增"语言层 C99 的收官状态"，`docs/todo.md`
+- 文档：`c6c/docs/acceptance.md` 新增"语言层 C99 的收官状态"，`c6c/docs/todo.md`
   把每一类修复和**仍然不支持**的形态都记了卡点。`d4c9dba`
 
 ### 仍然不支持（明确报错，不是静默算错）

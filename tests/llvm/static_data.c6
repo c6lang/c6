@@ -1,0 +1,56 @@
+/* 回归：静态指针初始化器必须是**真正的静态初始化**。
+ *
+ * 以前的 LLVM IR 后端把数据段发射成一串字节，指针槽留 0，再靠一个
+ * @__llvm_init（挂在 llvm.global_ctors 上）在启动时补进去。带 C 运行时的
+ * 程序看不出问题；裸机/内核不跑构造函数，槽位就一直是 0，取出来是野指针
+ * （c6LOS 从 ISO 起 Alpine 时就是栽在这上面：函数内 static 的 argv 表）。
+ *
+ * os_main 由 tests/llvm/bare_start.c 的裸 _start 调用，链接时不带任何 C
+ * 运行时 —— 构造函数根本不会跑。所以这个用例在修好之前必然失败。
+ */
+static const char *const g_tab[] = { "g-alpha", "g-beta", "g-gamma" };
+
+static const char *g_pick(int i)
+{
+    return g_tab[i];
+}
+
+/* 函数内 static：c6LOS 踩到的正是这种 */
+static const char *l_pick(int i)
+{
+    static const char *const l_tab[] = { "l-alpha", "l-beta" };
+
+    return l_tab[i];
+}
+
+static int str_is(const char *s, const char *w)
+{
+    if (s == (const char *)0) {
+        return 0;
+    }
+    while (*w != '\0') {
+        if (*s != *w) {
+            return 0;
+        }
+        s = s + 1;
+        w = w + 1;
+    }
+    return (*s == '\0');
+}
+
+int os_main(void)
+{
+    if (!str_is(g_pick(0), "g-alpha")) {
+        return 1;
+    }
+    if (!str_is(g_pick(2), "g-gamma")) {
+        return 2;
+    }
+    if (!str_is(l_pick(0), "l-alpha")) {
+        return 3;
+    }
+    if (!str_is(l_pick(1), "l-beta")) {
+        return 4;
+    }
+    return 0;
+}

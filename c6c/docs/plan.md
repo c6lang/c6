@@ -2,6 +2,8 @@
 
 > **状态**：P0（立项） · **索引**：[README](../README.md) · **设计**：[design.md](design.md) · **清单**：[todo.md](todo.md)
 >
+> **历史立项文档**：命令入口与当前验收以 [README](../README.md) 和 [acceptance.md](acceptance.md) 为准；本文件里的 `make c6c-*` 入口已废弃，保留作决策依据。
+>
 > 一句话：用 c6 写一个编译器，先编自己、再编用户代码；三种输出（native / C99 / LLVM IR）
 > 共用**一次 lowering**；速度与内存按第 3 节的实测基线定死门槛，不靠感觉。
 

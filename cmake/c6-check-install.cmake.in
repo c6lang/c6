@@ -8,7 +8,9 @@
 #   3. 用暂存树里的 c6Config.cmake 配置、编译并运行一个 find_package(c6)
 #      消费方（真的链接 c6::libtcc），再验证不存在的版本会被拒绝；
 #   4. 用暂存树里的 c6.pc 跑 pkgconf 典型查询，并校验 prefix 随 DESTDIR
-#      重定位。
+#      重定位；
+#   5. c6c 也有自己的名字：c6c.pc 的 pkgconf 查询与 prefix 重定位，
+#      以及 find_package(c6c COMPONENTS compiler libc6c) 的消费方。
 # 生成的目录都在 CMake 构建目录里，不会污染源码树。
 
 set(_c6_bin "@CMAKE_CURRENT_BINARY_DIR@")
@@ -27,6 +29,8 @@ set(_c6_tccdir "@C6_TCCDIR_REL@")
 set(_c6_c6docdir "@C6_C6_DOCDIR_REL@")
 set(_c6_have_docs "@C6_INSTALL_DOCS@")
 set(_c6_have_c6c "@C6_INSTALL_C6C@")
+set(_c6_have_c6lib "@C6_INSTALL_C6LIB@")
+set(_c6_c6c_packagedir "@C6C_PACKAGE_DIR@")
 set(_c6_src "@CMAKE_CURRENT_SOURCE_DIR@")
 set(_c6_exe_suf "@C6_TCC_EXESUF@")
 set(_c6_lib "@C6_LIBTCC_FILENAME@")
@@ -168,6 +172,115 @@ int main(void)
       "check-install: c6c 编出的程序退出码 ${_r}（应为 91）\n${_out}\n${_err}")
   endif()
   message(STATUS "check-install: c6c 编译运行 -> 退出码 91")
+endif()
+
+# c6c 的 pkgconf 名：和 c6 并列的第二个包（自举编译器 + libc6c）。装 c6c 却
+# 只给 c6.pc，下游只能靠"c6 其实就是 c6c"这种口耳相传的知识去猜。
+if(_c6_have_c6c STREQUAL "ON" AND _c6_have_pc)
+  set(_c6_c6c_pc_dir "${_c6_root}/${_c6_pkgconfig}")
+  if(NOT EXISTS "${_c6_c6c_pc_dir}/c6c.pc")
+    message(FATAL_ERROR "check-install: 安装树里缺 ${_c6_c6c_pc_dir}/c6c.pc")
+  endif()
+  find_program(_c6_c6c_pkgconf NAMES pkgconf pkg-config)
+  if(_c6_c6c_pkgconf)
+    foreach(_c6_c6c_pc_args IN ITEMS
+        "--modversion;c6c"
+        "--cflags;--libs;c6c")
+      execute_process(
+        COMMAND "${_c6_cmake}" -E env "PKG_CONFIG_PATH=${_c6_c6c_pc_dir}"
+                "${_c6_c6c_pkgconf}" ${_c6_c6c_pc_args}
+        RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+      if(NOT _r EQUAL 0)
+        message(FATAL_ERROR
+          "check-install: pkgconf ${_c6_c6c_pc_args} 失败 (${_r})\n${_err}")
+      endif()
+      message(STATUS "check-install: pkgconf ${_c6_c6c_pc_args} -> ${_out}")
+    endforeach()
+    execute_process(
+      COMMAND "${_c6_cmake}" -E env "PKG_CONFIG_PATH=${_c6_c6c_pc_dir}"
+              "${_c6_c6c_pkgconf}" --variable=prefix c6c
+      RESULT_VARIABLE _r OUTPUT_VARIABLE _c6c_pc_prefix
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_VARIABLE _err)
+    if(NOT _r EQUAL 0)
+      message(FATAL_ERROR
+        "check-install: pkgconf --variable=prefix c6c 失败 (${_r})\n${_err}")
+    endif()
+    get_filename_component(_c6c_pc_prefix "${_c6c_pc_prefix}" ABSOLUTE)
+    get_filename_component(_c6_root_abs2 "${_c6_root}" ABSOLUTE)
+    if(NOT _c6c_pc_prefix STREQUAL _c6_root_abs2)
+      message(FATAL_ERROR
+        "check-install: c6c.pc 的 prefix 未随 DESTDIR 重定位："
+        "${_c6c_pc_prefix} != ${_c6_root_abs2}")
+    endif()
+    message(STATUS "check-install: pkgconf c6c prefix -> ${_c6c_pc_prefix}")
+  endif()
+endif()
+
+# find_package(c6c)：c6c 有自己的命名空间（c6c::compiler / c6c::libc6c），
+# 不靠 c6::libtcc 那条兼容路径也能被下游正常消费。
+if(_c6_have_c6c STREQUAL "ON" AND _c6_have_cmake_pkg AND _c6_c6c_packagedir)
+  set(_c6_c6c_config_dir "${_c6_root}/${_c6_c6c_packagedir}")
+  foreach(_f IN ITEMS
+      "${_c6_c6c_config_dir}/c6cConfig.cmake"
+      "${_c6_c6c_config_dir}/c6cConfigVersion.cmake"
+      "${_c6_c6c_config_dir}/c6cTargets.cmake")
+    if(NOT EXISTS "${_f}")
+      message(FATAL_ERROR "check-install: 安装树里缺 ${_f}")
+    endif()
+  endforeach()
+
+  set(_c6_c6c_components "compiler")
+  if(_c6_have_c6lib STREQUAL "ON")
+    string(APPEND _c6_c6c_components " libc6c")
+  endif()
+  file(MAKE_DIRECTORY "${_c6_consumer}/c6c")
+  file(WRITE "${_c6_consumer}/c6c/CMakeLists.txt"
+"cmake_minimum_required(VERSION 3.18)
+project(c6c-consumer LANGUAGES C)
+find_package(c6c REQUIRED COMPONENTS ${_c6_c6c_components})
+if(NOT TARGET c6c::compiler)
+  message(FATAL_ERROR \"c6cConfig 没有给出 c6c::compiler\")
+endif()
+add_executable(c6c-consumer main.c)
+target_link_libraries(c6c-consumer PRIVATE c6c::libc6c)
+")
+  file(WRITE "${_c6_consumer}/c6c/main.c"
+"#include <c6lib.h>
+#include <stdio.h>
+int main(void)
+{
+    C6State *s = c6_new();
+    if (!s) { fprintf(stderr, \"c6_new() failed\\n\"); return 1; }
+    c6_delete(s);
+    puts(\"c6c lib ok\");
+    return 0;
+}
+")
+  execute_process(
+    COMMAND "${_c6_cmake}" -S "${_c6_consumer}/c6c" -B "${_c6_consumer}/c6c/build"
+            "-Dc6c_DIR=${_c6_c6c_config_dir}" "-DCMAKE_C_COMPILER=${_c6_cc}"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR
+      "check-install: c6c 消费方 configure 失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  execute_process(
+    COMMAND "${_c6_cmake}" --build "${_c6_consumer}/c6c/build"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR
+      "check-install: c6c 消费方编译失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  if(_c6_have_c6lib STREQUAL "ON")
+    execute_process(
+      COMMAND ${_c6_run_env} "${_c6_consumer}/c6c/build/c6c-consumer"
+      RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+    if(NOT _r EQUAL 0)
+      message(FATAL_ERROR
+        "check-install: c6c 消费方运行失败 (${_r})\n${_out}\n${_err}")
+    endif()
+    message(STATUS "check-install: find_package(c6c) 消费方运行 -> ${_out}")
+  endif()
 endif()
 
 if(_c6_have_pc)
