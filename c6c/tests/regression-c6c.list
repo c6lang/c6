@@ -99,3 +99,6 @@ std-util
 std-web
 std-wire
 std-words
+std-box
+std-term
+std-thread
