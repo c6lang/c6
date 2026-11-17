@@ -16207,6 +16207,7 @@ static void gen_one_local(u32 ty, Declarator *d)
             if (top && top->is_func && top->is_static) {
                 fs->is_static = 1;
                 fs->val = (i64)x64_sym(&X64, emit_name(tu_static_name(nm)));
+                X64.sym[(u32)fs->val].is_static = 1;
             } else {
                 fs->val = (i64)x64_sym(&X64, emit_name(nm));
             }
@@ -18028,6 +18029,22 @@ static void gen_stmt(void)
              * （tests/tuple_async.c6 的嵌套 await 踩过）。 */
             if (!(CUR_TASK_TY && ty_is_agg(rty)))
                 v = value_of(v);
+            /* `return <实现对象>` 且返回类型是接口：struct → 接口的隐式
+             * 转换平时只在赋值/初始化那条路上做（store_conv），return 漏了，
+             * 于是函数直接把 4 字节的实现对象地址交出去，调用方按 16 字节
+             * 的 {self, vt} 拷走——vt 读到的是相邻数据，分派就跳野指针。
+             * 这里按赋值同一条路先物化出 {self, vt} 再返回。 */
+            if (TY_HAS_IFACE && NIFACE > 0 && ty_is_iface(CUR_RET_TY, NULL)
+                && ty_is_agg(rty) && !ty_is_iface(rty, NULL)) {
+                u32 rs = ty_size(CUR_RET_TY) ? ty_size(CUR_RET_TY) : 16;
+                u32 ra = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_ADDR, IRT_PTR, ra, 0, 0, 0,
+                          X64_SLOT(frame_slots_for(rs)));
+                store_conv(ra, CUR_RET_TY, v, rty);
+                v = ra;
+                rty = CUR_RET_TY;
+            }
             pa_expect_ch(';');
             /* 按**函数声明的返回类型**转换。少了这步，返回 signed char 的函数
              * 会把 0x80 原样带回去（调用方按 signed char 解释就是 +128），返回
@@ -19889,8 +19906,12 @@ static void gen_one_global(u32 ty, Declarator *d)
     if (SCOPE && !SCOPE->up && PA_STATIC) {
         s->is_static = 1;
         s->val = (i64)x64_data_sym(&X64, tu_static_name(s->name), ELF_HDR + s->goff);
+        X64.sym[(u32)s->val].is_static = 1;
     } else {
         s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+        /* 块作用域的 static 局部（发射名 `<函数>.<N>`）也是本 TU 私有 */
+        if (PA_STATIC)
+            X64.sym[(u32)s->val].is_static = 1;
     }
     /* `s` 指向符号表里的槽：解析初始化器的过程中只要再 `sym_add` 一次
      * （字符串字面量、枚举、匿名聚合……），符号表就可能扩容搬家，`s` 就成了
@@ -20830,6 +20851,8 @@ static void gen_decl_from_spec(u32 base)
                         meth_add(s, self_ty2);
                     }
                     s->val = (i64)x64_sym(&X64, enf);
+                    if (fscope_static)
+                        X64.sym[(u32)s->val].is_static = 1;
                 }
                 /* `__attribute__((alias("target")))` / `__asm__("target")`：
                  * 这个名字只是 target 的另一个入口，没有自己的代码/存储。 */
@@ -20898,6 +20921,8 @@ static void gen_decl_from_spec(u32 base)
                                 s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
                             else
                                 s->val = (i64)x64_sym(&X64, emit_name(mn));
+                            if (s->is_static)
+                                X64.sym[(u32)s->val].is_static = 1;
                             /* 只有"旧的那条确实是按短名建出来的"才记账：
                              * 没建过符号时 s->val 也可能是 0，别把 0 号符号
                              * （可能是别的函数）接过去。 */

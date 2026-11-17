@@ -2316,7 +2316,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType *ftype = &func_sym->type;
     CType *ret = &ftype->ref->type;
     Sym *s;
-    const char *fname;
+    const char *fname, *lnk = "";
     char tb[1024], pb[1024];
     int idx, size, align, n = 0, np = 0, is_vararg, i;
     int ret_struct, small_sret = 0, hidden_sret;
@@ -2333,6 +2333,15 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         && func_sym->c < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))
         && l_name_ok(l_esym_name(func_sym->c)))
         fname = l_esym_name(func_sym->c);
+    /* A function whose Elf symbol is STB_LOCAL was declared 'static' in the
+       source: the module has to keep that private, or two translation units
+       with a same-named static helper collide at link time ("multiple
+       definition").  This is the LLVM counterpart of c99_is_static_fn(). */
+    if (func_sym->c > 0
+        && func_sym->c < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))
+        && strcmp(fname, "main") != 0
+        && ELFW(ST_BIND)(l_esym(func_sym->c)->st_info) == STB_LOCAL)
+        lnk = "internal ";
     l_skip_fn = 0;
     if (!strcmp(fname, "main")) {
         if (tcc_state && tcc_state->c6_test_mode)
@@ -2364,13 +2373,14 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     if (hidden_sret) {
         l_type(tb, sizeof tb, ret);
         n += snprintf(l_header + n, LHDR_SZ - n,
-                      "define void @%s(ptr sret(%s) %%aret", l_q(fname), tb);
+                      "define %svoid @%s(ptr sret(%s) %%aret", lnk,
+                      l_q(fname), tb);
         np = 1;
     } else if (small_sret) {
-        n += snprintf(l_header + n, LHDR_SZ - n, "define %s @%s(",
+        n += snprintf(l_header + n, LHDR_SZ - n, "define %s%s @%s(", lnk,
                       l_type(tb, sizeof tb, &srt), l_q(fname));
     } else {
-        n += snprintf(l_header + n, LHDR_SZ - n, "define %s @%s(",
+        n += snprintf(l_header + n, LHDR_SZ - n, "define %s%s @%s(", lnk,
                       l_type(tb, sizeof tb, ret), l_q(fname));
     }
     idx = 0;
@@ -3747,8 +3757,16 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
                 dup = 1;
         if (dup)
             continue;
-        fprintf(f, "@%s = weak alias i64, ptr @%s\n",
-                l_q(a->plain), l_q(a->target));
+        {
+            /* an alias cannot have weaker linkage than its aliasee: a static
+               method (STB_LOCAL) needs an internal alias, not a weak one */
+            int ti = l_find_name(a->target);
+
+            fprintf(f, "@%s = %salias i64, ptr @%s\n", l_q(a->plain),
+                    ti && ELFW(ST_BIND)(l_esym(ti)->st_info) == STB_LOCAL
+                        ? "internal " : "weak ",
+                    l_q(a->target));
+        }
     }
 
     /* what the module imports */
