@@ -5632,3 +5632,19 @@ void *__c6_co_new(void *env, long nogate) { … c->nogate = nogate ? 1 : 0; … 
 下一轮：拿 `examples/stdhttps.c6` 里那两条 `co httpsa_get(&a, …)` 的形状继续缩
 （我写的 `/tmp/cm4` 复现卡在 `co` 的语法上前提上——`co` 的实参里不能直接出现
 类型转换，得照抄例子里那种纯左值写法）。
+
+### 第 291 轮：`co` 的最小复现卡在"标识符可见性"上，不再往下钻
+
+`co f(…)` 的软关键字判定在 `parse_stmt` 里：`co` + `标识符` + `(` 才算，之后要求
+`GEN_TY` 是 `thread` 或 `task*`，否则报"'co' 的操作数必须是一次 async 调用"。
+
+我用 `/tmp/cm5`（`demo.m` 里 `async int fill(void*, const char*, const char*)`，
+`main.c6` 里两条 `co fill(…)`）复现，报的却是 `这里要 ';'（当前是 '('）` —— 说明
+`fill` 在这个位置**根本没被认成标识符**（当成声明了），所以软关键字那条路没走到。
+第 288 轮的 `/tmp/cm3`（同样的模块结构、实参是 `void*/C*/int`）是能编过的，差别只在
+形参类型和函数体里有 `char buf[512]` + 一次 `await`。
+
+不再往这个方向钻：`examples/stdhttps.c6` 本身是能编过的，说明问题在**任务前缀里的
+局部变量**（`HAsync *h` 在 `await` 之后被读成垃圾），而不是语法。下一轮直接对着
+`co` 任务的前缀/溢出布局查（`PA_CO_STMT` 那段），拿 `examples/stdhttps.c6` 当唯一
+复现。
