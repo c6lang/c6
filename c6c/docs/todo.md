@@ -5672,3 +5672,15 @@ callee-saved 寄存器）——`httpsa_request` 在 `await httpsa_send(...)` 之
 如果 `h` 被放在一个没被保存的寄存器里，恢复后就可能是别的任务留下的值。下一轮
 直接看 `__c6_swapstack` 存/取了哪几个寄存器，和 `x64` 后端"跨调用要活的变量"是否
 对得上。
+
+### 第 293 轮：gdb 上没抓到写手，先把"下一步怎么抓"写清楚
+
+想用硬件观察点抓谁写了 `HAsync` 第一个字：`break httpsa_request` →
+`set $hp = $rdi` → `watch *(long*)$hp` → `continue`。跑完没有命中——因为
+`httpsa_request` 在**同步那一路**也被调用，断点停在了第一个（那次是对的），
+观察点挂在了错的地址上。而且 c6c 的输出没有 DWARF，只能用寄存器/符号。
+
+下一步这么抓：`break httpsa_request` 后先 `ignore 1 N`（N = 前几次同步调用），
+或者干脆在 `httpsa_get` 里（只有 co/task 两路会进）断下来再 `watch`。
+另一个更省事的办法：在 `c6c_co_resume` 的 swap 前后各读一次 `*h`，看是不是
+"换栈"这一步把它踩掉的。
