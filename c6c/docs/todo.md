@@ -5095,3 +5095,24 @@ DBG a=0/0 b=0/0      # status / body_len，__c6_co_run() 返回 0（"跑完"了�
 见 CHANGELOG。json 现在能正确解析（`1`/`{}`/`[]`/`"x"`/`true` 的 kind 都对），
 std-conf 从红变绿（回归 86 → 87）。std-box 仍红在 csv 那半，std-demo 仍红在
 数组→切片（第 250-254 轮那条）。
+
+### 第 258 轮：两个模块的同名枚举常量 —— 裸名共享一格，限定名退化成裸名
+
+最小复现（`/tmp/q1.c6`，链 csv + err 两个模块）：
+
+```c
+printf("%d\n", (int)std.data.csv.PARSE);    // 234991623 = 0x0E01B007（csv 自己的）✓
+printf("%d\n", (int)std.core.err.PARSE);    // 234991623 ✗ 也成了 csv 的（应该是 0x0E000007）
+```
+
+也就是说 `std.core.err.PARSE` 并没有定位到 err 那个枚举成员，而是退回了**裸名**
+`PARSE`——裸名是各模块共享的一格，谁先登记谁留下（这里 csv 后登记，把它覆盖了）。
+`enum Error` 的成员是各模块都有的（INVAL/RANGE/PARSE/NOMEM…），所以这不是孤例。
+
+试过在枚举定义处按 `mod_prefix(...)+成员` 再登记一份（`std__core__err__PARSE`），
+**四个值一个没变**——说明限定名的解析根本没走到 `std__…__PARSE` 这种拼法上，
+或者它在更早的地方就被常量化成了裸名。改动已撤回。
+
+下一步：把 `std.core.err.PARSE` 这条表达式在 `gen_primary` 里的**实际查名串**打出来
+（第 32 轮打的是 `qd`/`qm`，那时看到 `qm=std__data__csv__PARSE`——但那是 csv 的，
+err 这条还没打过）。std-box 剩下的两条（csv/json 各一条"报 PARSE"）都是它。
