@@ -5458,3 +5458,14 @@ worker 到底卡在哪一步。
 
 回归仍是 90 / 92（stdthread 的 7 条断言没变），两边验收都过。
 下一步接着查线程池那段挂死：4 个 worker 只有 2 个进 `cond_wait`。
+
+### 第 280 轮：线程池那段的下一步（没动代码）
+
+看了 `std/os/thread.c6` 的 `start`：起 worker 时**不持** `self->m`，worker 一上来
+就是 `pthread_mutex_lock(&m)` + `cond_wait(&work, &m)`。上一轮 `C6C_DBG_CV` 只看到
+2 个 `[cv] wait enter`、而且都 leave 了，说明第 3、4 个 worker 卡在
+`pthread_mutex_lock(&m)` 上——要么我的 `unlock` 没真正让出去（状态 1 那条分支
+`cas(1,0)` 失败），要么 `cond_wait` 重新加锁那一下丢了。
+
+下一轮的打点就放在 `pthread_mutex_lock` 的三条出口（快路径 / 重抢 / 睡醒）上，
+每次打印 tid 和当时的 `*v`，跑 `stdthread` 看第 3 个 worker 停在哪条。
