@@ -2,126 +2,22 @@
 
 > **状态**：现行参考 · **索引**：[文档索引](../README.md) · **测试细节**：[manual/testing.md](../manual/testing.md) · **C99 后端**：[c99-backend.md](c99-backend.md)
 >
-> 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
+> 一句话：默认编译器 `c6c` 的选项速查（显式 `C6_ENABLE_TCC=ON` 时才有 `tcc/c6`） + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
 
-## 工程管理子命令（c6c init / scan / build / test / package / flash …）
+## 工程管理子命令（速查）
 
-`c6c` 除了编译源码，还带一组**工程管理子命令**（参考 cargo / go 的做法，
-用 c6 自身实现，子命令在 `c6c/src/pm.c6`）。第一个参数是这些名字时进入管理
-模式，其余情况仍是普通编译器：
+完整规范（清单字段、锁文件、workspace、固件、安装落点）在
+[c6c/docs/management.md](../../c6c/docs/management.md)（仓库内链接；安装包只带
+`docs/` 与根 `README.md` / `CHANGELOG.md`），本页只列名字：
 
-```sh
-c6c scan              # 只扫描仓库：推断 name/version/kind、源文件、import、test 块
-c6c init [--force] [--from=cmake|cargo|make|auto]
-                      # 扫描仓库写 c6c.yaml，可从既有 CMake/Cargo 工程迁移元数据
-c6c build [--force] [--locked] [--release]
-                      # 按清单编译（mtime 增量 / 锁文件校验 / profile）
-c6c test              # 编译全部源文件并运行 `test "…" { }` 块
-c6c run [参数...]     # 先 build，再执行产物并把参数透传
-c6c package           # 按 pkg_files 装 staging 树，出 TGZ / DEB
-c6c install [--destdir=pkg] [--prefix=/usr]  # 按 pkg_files 安装（保留执行位）
-c6c publish [--tag]   # package + SHA256SUMS；--tag 再打 v<version>
-c6c check             # -fsyntax-only，只检查不落盘
-c6c clean [--dry-run] # 只删本清单产物（不删整个 build/）
-c6c env / list [--json]  # 解析后的配置 / 源文件列表
-c6c lock                # 生成 c6c.lock（含本地 #include 依赖）
-c6c doctor              # 检查源文件 / import 是否齐全
-c6c workspace <cmd>     # 多包：init / list / build / test / check / clean / lock
-c6c flash|monitor|debug [--dry-run]  # 按 *_cmd 模板操作固件
-c6c help              # 子命令帮助
-```
+`c6c scan` / `init` / `build` / `test` / `run` / `package` / `install` /
+`publish` / `check` / `clean` / `env` / `list` / `lock` / `doctor` /
+`workspace` / `flash` / `monitor` / `debug` / `help`。
 
-`init` 的扫描规则：递归遍历当前目录（跳过隐藏目录与 `build/`、`out/`、`dist/`、
-`target/`、`node_modules/`），收集 `.c6` / `.c` 源文件；有 `main()` 或只有
-`test` 块 → `kind: app` / `lib`；只有 `_start`（无 main）→ `kind: firmware`，
-并在 `flags` 里自动加 `-nostdlib`。`import a.b;` 会按 `a/b.c6` / `a/b.c`
-核对能否在仓库里找到，找不到的打到 stderr 作为提醒。版本号优先取仓库根的
-`VERSION`，否则 `0.1.0`。
-
-`c6c.yaml` 是受控子集（不依赖 `std/data/yaml.c6`，保持 c6c 单 TU 可自举）：
-
-```yaml
-name: hello
-version: 0.1.0
-kind: app            # app / lib / firmware
-out: build/hello
-sources:
-  - src/main.c6
-include:
-  - .
-flags:
-  - -b
-```
-
-打包与固件的附加键（都由 `init` 生成空骨架，按需填）：
-
-```yaml
-pkg_name: hello
-pkg_desc: hello from c6
-pkg_license: MIT
-# 发行版打包：DESTDIR="${pkgdir}" c6c install --prefix=/usr
-destdir: pkg            # install 默认落点；DESTDIR / --destdir 优先
-prefix: /usr            # PREFIX / --prefix 优先
-dev_flags:              # 默认 profile 的追加编译参数
-release_flags:          # --release 的追加编译参数
-pkg_formats:            # tgz / deb（deb 需要 dpkg-deb）
-  - tgz
-pkg_files:              # "源:目标"，package/install 共用
-  - build/hello:bin/hello
-fw_formats:             # firmware 专用：ELF 由 cc 链接，BIN/HEX 用 objcopy
-  - elf
-  - bin
-  - hex
-link_flags:             # 传给链接固件的 cc（如 -T board.ld）
-flash_cmd:              # 参数列表；{elf} {bin} {out} {name} {version} 会展开
-  - openocd
-  - -f
-  - openocd.cfg
-  - -c
-  - "program {elf} verify reset exit"
-monitor_cmd:
-debug_cmd:
-```
-
-**锁文件**：`c6c lock` 生成 `c6c.lock`（JSON：元数据 + `include` / `flags` /
-`link_flags` / `dev_flags` / `release_flags` / `pkg_formats` / `pkg_files` /
-`fw_formats` + 每个源文件的大小与 FNV 校验和）。c6c 是单 TU 设计，锁文件会
-自动展开清单里 `src/c6c.c6` 的本地 `#include`，把 `src/pm.c6` 等十几个模块
-一起锁住；`c6c build --locked` 在源文件**或构建配置**漂移时直接失败，适合 CI
-与可复现构建。
-
-**workspace**：仓库根的 `c6c-workspace.yaml` 用 `members:` 列出子包，
-`c6c workspace init` 会自动发现含 `c6c.yaml` / `c6c.yml` 的子目录；
-`c6c workspace build|test|check|clean|lock|list` 逐个成员执行（失败即停）。
-本仓库自带 [`c6c-workspace.yaml`](../../c6c-workspace.yaml)（当前成员：c6c）。
-
-**迁移与诊断**：`c6c init --from=cmake|cargo|make|auto` 从 `project(NAME VERSION …)`、
-`[package]` 的 `name/version/description/license` 等提取元数据；`c6c doctor`
-报告缺失源文件与未解析的 `import`。
-
-像 go 找 `go.mod` 一样，`c6c` 会从当前目录逐级向上找 `c6c.yaml` /
-`c6c.yml`；`--manifest-path=...` 可显式指定。发行版打包推荐用标准
-`DESTDIR` 写法（`pkg_files` 是 package 与 install 的单一来源）：
-
-```sh
-DESTDIR="${pkgdir}" c6c install --prefix=/usr
-# 等价于：c6c install --destdir="${pkgdir}" --prefix=/usr
-```
-
-`build --release` 用清单里的 `release_flags`（默认用 `dev_flags`）；
-`env` / `list --json` 便于脚本读取解析后的配置。
-
-固件构建是两阶段：c6c 只认 `main` 当 ELF 入口，所以 `_start` 工程先用
-`c6c -c` 出 ET_REL，再由宿主 `cc -nostdlib -Wl,-e,_start` 链接（`link_flags`
-可追加 `-T` 等）；随后按 `fw_formats` 用 `objcopy` 出 `.bin` / `.hex`。
-`flash` / `monitor` / `debug` 只是模板执行器，`--dry-run` 先预览命令。
-
-`c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编到
-`build/c6c`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链；测试用
-编译器副本引导，避免覆盖正在执行的二进制。构建侧默认 `C6_ENABLE_TCC=OFF`。
-回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
-当前 56 项检查（54 项常规 + 2 项 DEB；缺 `dpkg-deb` 的环境跳过 2 项）。
+第一个参数是这些名字时进入工程管理，其余情况仍是普通编译器。
+回归入口：`cmake --build build --target pmtest`；当前 70 项检查（68 常规 +
+2 DEB，缺 `dpkg-deb` 时跳过 2 项）。
 
 ## 版本与发布号
 
@@ -207,7 +103,7 @@ CMake 内置目标。
 | 目标 | 作用 |
 |---|---|
 | `cmake -S . -B build` | 在构建目录生成 `config.mak` / `config.h` / `config.texi`（配置期对源码树零写入；构建期 `tcc-config` 每次比对并按需同步、清理旧目标文件，不联网） |
-| `cmake --build build` | 扩展模式构建（`EXTRA-DEFS=-DC6_EXT`），产物 `tcc/c6` |
+| `cmake --build build` | 默认构建（`C6_ENABLE_TCC=OFF`），产物 `c6c/build/c6c`；显式 `-DC6_ENABLE_TCC=ON` 才同时构建 `tcc/c6` |
 | `cmake --build build --target build-plain` | 上游模式构建（不定义 `C6_EXT`），用来验证「扩展关闭零行为变化」 |
 | `cmake --build build --target check-tcc` | 检查 `tcc/` 源码是否完整 |
 | `cmake --build build --target c6-clean` | 清理构建产物与自举产物 |

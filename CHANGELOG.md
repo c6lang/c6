@@ -151,7 +151,7 @@ worker 抢一个累加器，和自然是乱的。
 - `c6c init --from=cmake|cargo|make|auto` 从既有工程的 `project()` / `[package]`
   提取 name/version/description/license 等元数据，便于迁移。
 
-验证：`pmtest` 56 项（54 常规 + 2 DEB；无 `dpkg-deb` 时 54/54，跳过 2 项）；
+验证：`pmtest` 70 项（68 常规 + 2 DEB；无 `dpkg-deb` 时 68/68，跳过 2 项）；
 `selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
 
 ### c6c 工程管理交叉审计修复
@@ -186,6 +186,15 @@ c6c 自管清单的 `out` 由 `build/c6c-managed` 改为 `build/c6c`，版本同
 用的 argv 数组补显式 NULL 终止（`{0}` 初始化在自编译产物里不可靠），修好
 自编译 c6c 链接固件时 `cc` 收到残留参数的问题。构建侧（含 CI 的 c6c job）
 显式 `C6_ENABLE_TCC=OFF` 并断言没有 `tcc/c6` / `libtcc`，自管构建不依赖 tcc。
+
+第三轮审计继续补齐：多源文件固件各自 `-c` 再一起链接、`test` / `check`
+跟随清单 flags 与 profile、`include:` 目录头文件进入指纹与锁文件、import
+按目录分段匹配、严格拒绝未知/误用选项、`run` 执行无斜杠 `out`、空
+workspace 的未知子命令、子目录 `scan` 向上找 `VERSION`、扫描忽略注释与
+字符串里的伪定义、`--manifest-path` 绝对路径。运行时 `environ` 从
+`/proc/self/environ` 建表，自编译 c6c 的子进程不再丢环境。工程管理规范
+迁到 `c6c/docs/management.md` 作为单一事实源，`docs/reference/cli.md`
+只留速查并回链；`c6c/docs/plan.md` / `todo.md` 标记为历史文档。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
@@ -1061,7 +1070,7 @@ foreach_iter  局部 @T a[2] 的 a[i] = v 仍是托管赋值（第一版判据�
 - `make -C c6c check-all` 一条命令：自举 fixpoint 逐字节相同、tests 前端 124/0 +
   跑通 67/0、std 377/377、编译期诊断 316/316、C99 51/51、LLVM 51/51、
   c-testsuite 闸门绿、c6c 编出的 tcc 跑 tests2 通过 118。
-- 文档：`c6c/docs/acceptance.md` 新增"语言层 C99 的收官状态"，`docs/todo.md`
+- 文档：`c6c/docs/acceptance.md` 新增"语言层 C99 的收官状态"，`c6c/docs/todo.md`
   把每一类修复和**仍然不支持**的形态都记了卡点。`d4c9dba`
 
 ### 仍然不支持（明确报错，不是静默算错）
