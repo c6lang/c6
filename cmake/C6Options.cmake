@@ -7,9 +7,13 @@
 
 set(C6_TCC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tcc" CACHE PATH
     "tcc 源码树；其中的 CMakeLists.txt 生成配置、Makefile 负责编译")
+# 默认 OFF：c6c 已能自举，仓库默认只构建/安装/打包 c6c（bin/c6 是它的别名）；
+# tcc 只作语料与夹具保留（tcc/CMakeLists.txt 仍生成 config.mak/config.h，
+# c6c 的语料用例 `#include "config.h"` 要用），但不编译 tcc 产品、不安装。
+# 需要旧的 tcc 版 c6（libtcc / 交叉安装等）时显式 -DC6_ENABLE_TCC=ON。
 option(C6_ENABLE_TCC
   "构建/安装 tcc（c6 的 LGPL 实现）；OFF = 只构建 c6c，用宿主 C 编译器引导"
-  ON)
+  OFF)
 option(C6_ENABLE_EXT "给 tcc/Makefile 传 EXTRA-DEFS=-DC6_EXT" ON)
 set(C6_EXTRA_DEFS "" CACHE STRING
     "追加到 EXTRA-DEFS 的宏，空格分隔，例如 -DC6_EXT -DFOO")
@@ -27,14 +31,15 @@ option(C6_INSTALL_PKGCONF "安装 c6.pc" ON)
 option(C6_INSTALL_LIBTCC_PC "额外安装 libtcc.pc 兼容名" ON)
 option(C6_INSTALL_C6LIB "安装 c6c 的嵌入库 libc6c.a/.so 与头文件（c6lib.h、tcc 兼容头）" ON)
 option(C6_INSTALL_C6C
-  "安装自举编译器 c6c（默认与 tcc 版 c6 并存；C6_ENABLE_TCC=OFF 时它就是 c6）" ON)
+  "安装自举编译器 c6c（默认形态下它就是唯一编译器，bin/c6 是它的别名）" ON)
 option(C6_INSTALL_TCC_SYMLINK "安装 bindir/tcc -> c6 兼容软链" ON)
 option(C6_INSTALL_DOCS "安装 c6 的 docs/、README、CHANGELOG 与 license" ON)
-# 包名跟着 flavour 走：默认（tcc 在）出 c6 包，C6_ENABLE_TCC=OFF 出 c6c 包。
-# 两者装的是同一批路径（/usr/bin/c6、<libdir>/c6/…），所以只能二选一装上，
-# 见 cmake/C6Packaging.cmake 的 Provides/Conflicts。
+# 包名跟着 flavour 走：默认（C6_ENABLE_TCC=OFF）出 c6c 包；显式
+# -DC6_ENABLE_TCC=ON 时出 c6 包。两者装的是同一批路径（/usr/bin/c6、
+# <libdir>/c6/…），所以只能二选一装上，见 cmake/C6Packaging.cmake 的
+# Provides/Conflicts。
 set(C6_PACKAGE_NAME "" CACHE STRING
-    "包名（TGZ/DEB/RPM 与 <datarootdir>/doc/<名>）；留空 = 有 tcc 时 c6、C6_ENABLE_TCC=OFF 时 c6c")
+    "包名（TGZ/DEB/RPM 与 <datarootdir>/doc/<名>）；留空 = C6_ENABLE_TCC=ON 时 c6，默认 c6c")
 if(NOT C6_PACKAGE_NAME)
   if(C6_ENABLE_TCC)
     set(C6_PACKAGE_NAME "c6")
