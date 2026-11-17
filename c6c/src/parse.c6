@@ -3622,7 +3622,12 @@ static i64 const_unary(void)
         pa_advance();
         ty = parse_typename();
         pa_expect_ch(')');
-        return const_cast_to(const_unary(), ty);
+        {
+            i64 cv = const_cast_to(const_unary(), ty);
+
+            CONST_TY = ty;       /* 比较/取反要看转换后的类型 */
+            return cv;
+        }
     }
     if (pa_accept_ch('(')) {
         i64 v = const_expr();
@@ -3808,35 +3813,126 @@ static i64 const_shift(void)
     }
 }
 
+/* 常量层的比较：先按 C 的"寻常算术转换"定公共类型，再比。返回 -1 / 0 / 1。
+ *
+ * 直接拿 i64 比会错：`(0ULL - 1) < 1ULL` 变成 -1 < 1 → 真。内核
+ * include/linux/overflow.h:33 的 is_signed_type() 正是
+ *
+ *     #define is_signed_type(type) (((type)(-1)) < (type)1)
+ *
+ * 判错让 type_max() 只剩一半宽（0x7FFF… 而不是 0xFFFF…），
+ * arch/x86/include/asm/svm.h:308-310 的三条 static_assert 于是全假失败——
+ * 实测 7 个 arch/x86 文件卡在这条（crash.c / head64.c / kvm.c / nmi.c /
+ * probe_roms.c / smpboot.c / tsc.c）。 */
+static int const_cmp3(i64 a, u32 aty, i64 b, u32 bty)
+{
+    u32 aw = 0;
+    u32 bw = 0;
+    int as = 0;
+    int bs = 0;
+    int uns = 0;
+    u32 w = 0;
+    u64 m = 0;
+    u64 ua = 0;
+    u64 ub = 0;
+
+    if (!aty)
+        aty = bty ? bty : ty_int();
+    if (!bty)
+        bty = aty;
+    aw = ty_size(aty);
+    bw = ty_size(bty);
+    as = ty_is_signed(aty);
+    bs = ty_is_signed(bty);
+    /* 整型提升：窄于 int 的一律提到有符号 int */
+    if (aw < 4) {
+        aw = 4;
+        as = 1;
+    }
+    if (bw < 4) {
+        bw = 4;
+        bs = 1;
+    }
+    if (aw > 8)
+        aw = 8;
+    if (bw > 8)
+        bw = 8;
+    w = aw > bw ? aw : bw;
+    if (as && bs)
+        uns = 0;
+    else if (!as && !bs)
+        uns = 1;
+    else if (aw == bw)
+        uns = 1;                 /* 同宽时无符号胜出 */
+    else
+        /* 一宽一窄：宽的那个有符号就能装下窄的无符号类型的全部值，仍有符号 */
+        uns = (aw > bw) ? (as ? 0 : 1) : (bs ? 0 : 1);
+    m = (w >= 8) ? ~(u64)0 : ((1ULL << (w * 8)) - 1ULL);
+    ua = (u64)a & m;
+    ub = (u64)b & m;
+    if (uns)
+        return ua < ub ? -1 : (ua > ub ? 1 : 0);
+    {
+        i64 sa = (i64)ua;
+        i64 sb = (i64)ub;
+
+        if (w < 8) {
+            u64 sign = 1ULL << (w * 8 - 1);
+
+            if (ua & sign)
+                sa = (i64)(ua | ~m);
+            if (ub & sign)
+                sb = (i64)(ub | ~m);
+        }
+        return sa < sb ? -1 : (sa > sb ? 1 : 0);
+    }
+}
+
 static i64 const_rel(void)
 {
     i64 v = const_shift();
+    u32 lty = CONST_TY;
 
     for (;;) {
-        if (pa_accept_ch('<'))
-            v = v < const_shift() ? 1 : 0;
-        else if (pa_accept_punct("<="))
-            v = v <= const_shift() ? 1 : 0;
-        else if (pa_accept_ch('>'))
-            v = v > const_shift() ? 1 : 0;
-        else if (pa_accept_punct(">="))
-            v = v >= const_shift() ? 1 : 0;
-        else
+        i64 r = 0;
+
+        if (pa_accept_ch('<')) {
+            r = const_shift();
+            v = const_cmp3(v, lty, r, CONST_TY) < 0 ? 1 : 0;
+        } else if (pa_accept_punct("<=")) {
+            r = const_shift();
+            v = const_cmp3(v, lty, r, CONST_TY) <= 0 ? 1 : 0;
+        } else if (pa_accept_ch('>')) {
+            r = const_shift();
+            v = const_cmp3(v, lty, r, CONST_TY) > 0 ? 1 : 0;
+        } else if (pa_accept_punct(">=")) {
+            r = const_shift();
+            v = const_cmp3(v, lty, r, CONST_TY) >= 0 ? 1 : 0;
+        } else {
             return v;
+        }
+        lty = ty_int();          /* 比较结果是 int */
     }
 }
 
 static i64 const_eq(void)
 {
     i64 v = const_rel();
+    u32 lty = CONST_TY;
 
     for (;;) {
-        if (pa_accept_punct("=="))
-            v = v == const_rel() ? 1 : 0;
-        else if (pa_accept_punct("!="))
-            v = v != const_rel() ? 1 : 0;
-        else
+        i64 r = 0;
+
+        if (pa_accept_punct("==")) {
+            r = const_rel();
+            v = const_cmp3(v, lty, r, CONST_TY) == 0 ? 1 : 0;
+        } else if (pa_accept_punct("!=")) {
+            r = const_rel();
+            v = const_cmp3(v, lty, r, CONST_TY) != 0 ? 1 : 0;
+        } else {
             return v;
+        }
+        lty = ty_int();
     }
 }
 
