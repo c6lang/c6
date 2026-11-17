@@ -937,9 +937,9 @@ static int pm_firmware_outputs(const PmProject *p)
     snprintf(bin, sizeof(bin), "%s.bin", p->out);
     snprintf(hex, sizeof(hex), "%s.hex", p->out);
     if (pm_has_fmt(fmts, p->nfw_fmt, "bin")) {
-        char *av[5] = {(char *)0};
+        char *av[6] = {(char *)0};
         av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"binary";
-        av[3] = p->out; av[4] = bin;
+        av[3] = p->out; av[4] = bin; av[5] = (char *)0;
         if (pm_spawn(av) != 0) {
             fprintf(stderr, "c6c: 固件 BIN 生成失败\n");
             return 1;
@@ -947,9 +947,9 @@ static int pm_firmware_outputs(const PmProject *p)
         printf("c6c: 固件 %s 已生成\n", bin);
     }
     if (pm_has_fmt(fmts, p->nfw_fmt, "hex")) {
-        char *av[5] = {(char *)0};
+        char *av[6] = {(char *)0};
         av[0] = (char *)"objcopy"; av[1] = (char *)"-O"; av[2] = (char *)"ihex";
-        av[3] = p->out; av[4] = hex;
+        av[3] = p->out; av[4] = hex; av[5] = (char *)0;
         if (pm_spawn(av) != 0) {
             fprintf(stderr, "c6c: 固件 HEX 生成失败\n");
             return 1;
@@ -1020,6 +1020,7 @@ static int pm_build(PmProject *p, const char *self, int force, int release,
             oa[k++] = p->rel_flag[i];
         for (i = 0; i < p->nsrc && k + 1 < PM_MAX_ARGS; i++)
             oa[k++] = p->src[i];
+        oa[k] = (char *)0;
         rc = pm_spawn(oa);
         if (rc)
             return rc;
@@ -1031,6 +1032,7 @@ static int pm_build(PmProject *p, const char *self, int force, int release,
         lv[m++] = obj;
         for (i = 0; i < p->nlink_flag && m + 1 < PM_MAX_ARGS; i++)
             lv[m++] = p->link_flag[i];
+        lv[m] = (char *)0;
         rc = pm_spawn(lv);
         if (rc)
             return rc;
@@ -1157,7 +1159,7 @@ static int pm_package(const PmProject *p)
             char out[PM_PATH] = {0};
             snprintf(out, sizeof(out), "build/%s.deb", pkgname);
             av[0] = (char *)"dpkg-deb"; av[1] = (char *)"--build";
-            av[2] = stage; av[3] = out;
+            av[2] = stage; av[3] = out; av[4] = (char *)0;
             rc = pm_spawn(av);
             if (rc) {
                 fprintf(stderr, "c6c: package: DEB 生成失败\n");
@@ -1173,7 +1175,7 @@ static int pm_package(const PmProject *p)
         snprintf(out, sizeof(out), "build/%s.tar.gz", pkgname);
         av[0] = (char *)"tar"; av[1] = (char *)"-czf"; av[2] = out;
         av[3] = (char *)"-C"; av[4] = stage;
-        av[5] = (char *)"--exclude=./DEBIAN"; av[6] = (char *)".";
+        av[5] = (char *)"--exclude=./DEBIAN"; av[6] = (char *)"."; av[7] = (char *)0;
         rc = pm_spawn(av);
         if (rc) {
             fprintf(stderr, "c6c: package: TGZ 生成失败\n");
@@ -1275,7 +1277,7 @@ static int pm_publish(const PmProject *p, int tag, int dry)
         snprintf(msg, sizeof(msg), "c6 %s", p->version);
         snprintf(vtag, sizeof(vtag), "v%s", p->version);
         tav[0] = (char *)"git"; tav[1] = (char *)"tag"; tav[2] = (char *)"-a";
-        tav[3] = vtag; tav[4] = (char *)"-m"; tav[5] = msg;
+        tav[3] = vtag; tav[4] = (char *)"-m"; tav[5] = msg; tav[6] = (char *)0;
         rc = pm_spawn(tav);
         if (rc == 0)
             printf("c6c: publish: 已打 tag %s\n", p->version);

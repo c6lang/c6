@@ -89,9 +89,9 @@ jobs:
   # 一条 `cmake --build build --target check-all-c6c` 覆盖验收 (1)(2)(3)：
   # 自举 fixpoint 逐字节、全部后端同一套用例、tests+std+诊断语料、c6c 编出上游
   # tcc 并让它跑 tests2（含**第三代 selfhost**：那个 tcc 再编一遍 tcc.c）。
-  # 这一条是 tcc 形态（stage0 = 仓库自己的 tcc/c6）；默认 C6_ENABLE_TCC=OFF，
-  # 所以这里必须显式打开，下面的 `ls tcc/c6` 才有意义；宿主 cc 那条路由
-  # no-tcc job 把守。
+  # 默认形态（stage0 = 宿主 C 编译器，C6_ENABLE_TCC=OFF）：构建阶段不产出
+  # tcc/c6 / libtcc，只生成 tcc 的配置头供语料使用；显式 OFF 写在这里，
+  # 防止默认值将来被改动时这条 job 悄悄走回 tcc。
   # -------------------------------------------------------------------------
   c6c:
     name: c6c (c6 写的自举编译器)
@@ -107,18 +107,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake make gcc binutils texinfo perl pkgconf python3
 
-      # c6c 是 CMake 里的 `c6c` 目标（`cmake/C6C.cmake`），依赖 tcc-build 产出的
-      # 引导编译器 tcc/c6；它挂在 ALL 上，所以这一句就把 c6 和 c6c 都编了。
-      # c6c 要 `-B tcc` 那套 crt / libtcc1.a，也是 tcc-build 的产物。
+      # c6c 是 CMake 里的 `c6c` 目标（`cmake/C6C.cmake`），stage0 = 宿主 cc，
+      # `cmake --build build` 就会编出 c6c/build/c6c；不依赖任何 tcc 产物。
       - name: Configure and build (c6 + c6c)
         run: |
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_INSTALL_LIBDIR=lib \
-            -DC6_ENABLE_TCC=ON \
+            -DC6_ENABLE_TCC=OFF \
             -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
-          ls -l c6c/build/c6c tcc/c6
+          ls -l c6c/build/c6c
+          test ! -e tcc/c6
+          test ! -e tcc/libtcc.a
+          test ! -e tcc/libtcc.so
 
       # 验收 (1)(2)(3)：自举 fixpoint 逐字节、三后端同一套语料、tests+std+诊断、
       # c6c 编出上游 tcc 并让它跑 tests2（含**第三代 selfhost**），外加 tcc 上游
