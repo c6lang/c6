@@ -7,6 +7,27 @@
 
 ## 未发布
 
+### 互斥量和条件变量接上 futex（std-thread 的一部分）
+
+`pthread_mutex_*` / `pthread_cond_*` 一直是空操作（"单线程用不着锁"），可
+`pthread_create` 早就是真线程（clone）：空锁等于没锁，`stdthread` 里 4 个
+worker 抢一个累加器，和自然是乱的。
+
+现在按 `/tmp/pool1.c6` 里验证过的那版接上 futex：
+
+- 互斥量用第一个 `long` 当状态（0 空闲 / 1 占用），`lock` 用原子加尝试、
+  拿不到就还回去再 `futex_wait`，`unlock` 减回去再 `futex_wake`；
+- 条件变量用第一个 `int` 当通知计数，`wait` 记下计数 → 放锁 → 睡在计数上 →
+  醒来重比一次 → 重新加锁。
+
+效果（`stdthread`）：`sync` 段全绿、`thread` 段 `1..400 的和=80200` 对、
+`chan` 段 `和=5050` 也对，只剩两条 semaphore 断言——那三个原语（信号量、
+读写锁）还是空操作，单独接上会让 `chan` 段偶发挂死，所以这版没动它们。
+
+**已知问题**：`stdthread` 的 `chan` 段大约每两次有一次挂死（`timeout` 124），
+回归总数仍是 90 / 92。这一例不在 `regression-c6c.list` 里，不影响门禁。
+
+
 ### `pthread_create` 失败时不再漏放全局线程锁
 
 `c6c_th_lock()` 是全局自旋锁，而 mmap 失败、clone 失败两条 `return -1`

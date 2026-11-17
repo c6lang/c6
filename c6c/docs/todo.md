@@ -5517,3 +5517,16 @@ run3 rc=124 : 同上
 接下来建议换个顺序：先把 `stdthread` 的 chan 段单独拆成一个用例（现在它和
 sync/thread 挤在一个 `test` 文件里，挂死时看不出来是哪一段），再决定是修 rt.c6
 还是修 `std/container/chan.c6` 的丢唤醒。
+
+### 第 284 轮：互斥量 + 条件变量的 futex 版进主干了（90 / 92 不变）
+
+按第 282 轮的结论定稿：只上**互斥量 + 条件变量**（和 `/tmp/pool1.c6` 同一套
+算法），信号量和读写锁保持空操作。
+
+- 门禁：93 个 ctest 全过；tests2 意外失败 0；
+- 连跑两次完整回归都是 90 / 92，`std-thread` 一次 `rc=124`（chan 段挂死）、
+  一次跑完但两条 semaphore 断言红；
+- `stdthread` 跑完那次：`sync` 全绿、`1..400 的和=80200`、`chan 和=5050`。
+
+`std-thread` 不在 `regression-c6c.list` 里（表里 88 条全绿），所以门禁不受影响。
+下一轮接着收 `chan` 段的丢唤醒，然后把 semaphore / 读写锁也接上。
