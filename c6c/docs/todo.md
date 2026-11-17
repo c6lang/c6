@@ -5170,3 +5170,14 @@ std-demo（wordcount）从段错误变成通过；回归 87 → 88。
 指向谁）。修法不是加别名，是让"当前模块"跟着 `module X;` 那行走（新增 `CUR_MOD`，
 在 `pa_parse` 处理 module 语句时更新，枚举/模块级登记都用它，不再用 CUR_FILE）。
 改动已撤回，回归 88 / 92、CI 绿。
+
+### 第 262 轮：`CUR_FILE` 换成 token 的文件号也没用（又排除一条）
+
+`__c6_module_decl` 那段自己就写着"`CUR_FILE` 在解析期是 NULL，用 token 的"
+（`mfile = pa_cur()->file`），所以照着把 `parse_enum_spec` 里的
+`mod_of_file((u32)CUR_FILE->id)` 换成 `mod_of_file((u32)pa_cur()->file)`——stdbox
+的两条还是红。说明拿到 err 号段的原因不在取哪个 file id，更可能是**枚举定义本身就
+在一片被共享的符号表里**：`enum Error` 的成员是按**裸名**登记的，后登记的模块覆盖
+前一个（`poison_add` 只在值不同时中毒，而这里值恰好相同 = 都没中毒），于是无论
+哪个模块先解析，最后一个模块的号段赢。真要修得先决定"同名成员到底能不能共享"。
+改动已撤回，回归 88 / 92、CI 绿。
