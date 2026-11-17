@@ -32,6 +32,7 @@ CI 的 `no-tcc` 作业就是这条路的机器证据（构建完断言 `tcc/c6` 
 
 | 文档 | 内容 |
 |---|---|
+| [docs/management.md](docs/management.md) | 工程管理规范：清单 / 打包 / 固件 / lock / workspace |
 | [docs/plan.md](docs/plan.md) | 目标、验收口径、实测基线、阶段计划、风险 |
 | [docs/design.md](docs/design.md) | 架构、流式 IR（24 字节/条）、三后端、类型表位分配、镜像与落盘 |
 | [docs/concurrency.md](docs/concurrency.md) | 协程 / 线程 / 原子 / TLS |
@@ -478,11 +479,9 @@ cmake --build build --target regression-c6c         # 已全绿的那批（列�
 `__c6_co_run` 的主循环对 `blocked_on` 的处理——`await 某个 async 调用` 会在父任务里
 建一个子任务，主循环要么无条件跳过被挡住的父任务（子任务结束之后没人叫醒它），
 要么无条件恢复它（父任务空转，实测同一个协程被恢复到 guard 上限）。正确条件是
-"只在等的那个任务还没结束时才跳过"，见 `c6c/docs/todo.md` 第 301~306 轮。缺口分三类，都在
-`c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面（真信号投递、真 DNS、
-非阻塞 IO 的边角）；模板实例的身份与布局（同一个实例名在两个 TU 里会拿到两个类型 id，
-`Deque@T` 的成员类型在实例里会被解析错——`c6c/docs/todo.md` 第 215/216 轮
-有最小复现和下一步）；以及若干 `test` 块剩下的语义差异。
+"只在等的那个任务还没结束时才跳过"，历史过程记在 `c6c/docs/todo.md` 第
+301~306 轮。当前基线与剩余缺口以 [docs/acceptance.md](docs/acceptance.md) 和
+根 `CHANGELOG.md` 为准；`todo.md` 是施工账本，不应当作现行缺口清单。
 
 格式化那一片（`%f` 的舍入、`%g` 的尾零、`%.0d`、`%#x`、`-0.0`、1e19 以上的
 整数部分、二进制转义 `"\xde"`）已经在第 212 轮对齐 glibc，并各钉了一个

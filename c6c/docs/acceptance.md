@@ -67,7 +67,7 @@ G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个�
 
 `C6_ENABLE_TCC=OFF` 时安装/打包/pkgconf/wasm 与 tcc 侧的 115 个回归用例都不
 注册（它们描述的是 libtcc 与 tcc 产品面，不是 c6c 的能力）；c6c 自己的发布
-布局是下一步。
+布局已落地，见 [README 的安装与包契约](../README.md) 与 `cmake/C6CInstall.cmake`。
 
 `fast` 与 `check-all` 是同一套闸门、同一个被测编译器（c6c 自己），区别只在
 是否跑那几条全量编译：
