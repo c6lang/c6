@@ -7,6 +7,24 @@
 
 ## 未发布
 
+### 信号量、读写锁接上真实现（std-thread 的最好成绩：91 / 92）
+
+接着上一批的互斥量/条件变量，把 `sem_*` 和 `pthread_rwlock_*` 也从空操作换成
+真实现：
+
+- 信号量用第一个 `int` 当计数，`sem_wait` 原子减、减成负数就还回去睡到计数变正
+  （futex 比较用读到的那个值，丢不掉唤醒）；`sem_trywait`/`sem_getvalue` 跟着补上；
+- 读写锁用字节 0..8 当自旋锁（`__c6_xchg8`）、偏移 8 存读者数、偏移 12 存写者
+  标记；`rdlock`/`wrlock`/`tryrdlock`/`trywrlock`/`unlock` 都在自旋锁里改计数，
+  睡之前一定先放掉自旋锁。
+
+效果：`stdthread` 的 29 条断言在**跑完的那些次里全过**（`sync`/`thread`/`chan`
+三段都对，`1..400 的和=80200`、`chan 和=5050`）。回归单次最高到 **91 / 92**。
+
+**已知问题**：`chan` 段仍会偶发挂死（实测 4 次里 2 次 `rc=124`），所以连跑两次
+会看到 91/92 和 90/92 交替。这一例不在 `regression-c6c.list` 里，门禁不受影响。
+
+
 ### printf/fprintf 改用栈上的格式化缓冲（多线程打印不再串行）
 
 `printf`/`fprintf`/`vfprintf`/`vprintf` 一直共用一张全局 `c6c_obuf` 做格式化，

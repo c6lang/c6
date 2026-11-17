@@ -5581,3 +5581,16 @@ run3: [fa] ran A=1 [fb] ran B=1 A=1 B=1     ← 只有这一次两边都对
    但信号量现在还是空操作，得先把 sem 接上。
 
 更省事的方向可能是 (2)：`Chan` 本来就是个有界队列，用 sem 表达比 cond 简单。
+
+### 第 288 轮：sem / rwlock 接上真实现，stdthread 跑到 29/29、回归最高 91/92
+
+- `sem_*`：第一个 int 当计数，`sem_wait` 原子减、成负数就还回去睡到变正；
+  `sem_trywait`/`sem_getvalue` 一起补；
+- `pthread_rwlock_*`：字节 0..8 自旋锁（`__c6_xchg8`）、偏移 8 读者数、偏移 12
+  写者标记；`trywrlock` 原来恒返回 0（"总是成功"），导致"有读者时写锁拿不到"
+  那条断言红，一并修好。
+
+`stdthread` 现在跑完就是 29 check / 0 failure；连跑四次两次挂死（都在 `chan` 段）。
+回归：run1 **91 / 92**（只差 std-https），run2 90/92（std-thread 那次挂死）。
+
+下一步只剩两件事：`chan` 的挂死、`std-https`。
