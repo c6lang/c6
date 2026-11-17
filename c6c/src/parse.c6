@@ -1469,8 +1469,13 @@ static void agg_tab_grow(void)
  * 却有布局意义——tests2/90_struct-init.c 的 test_init_bf） */
 static int agg_member_named(u32 ty, u32 idx)
 {
-    u32 b = ty % AGG_NB;
-    u32 j = AGG_HEAD[b];
+    u32 b = 0;
+    u32 j = 0;
+
+    if (TY_AT(ty)->qual)
+        ty = ty_unqual(ty);
+    b = ty % AGG_NB;
+    j = AGG_HEAD[b];
 
     while (j) {
         AggInfo *e = &AGG[j - 1];
@@ -1544,9 +1549,16 @@ static u32 PEND_BITOFF;
 static int PEND_BF_ENUM;
 
 /* 返回成员下标；没找到返回 -1 */
+/* 类型 id 上带着 const/volatile 时（`const struct T g[]`：限定符按 C11
+ * 6.7.3p9 从数组落到元素上），它和成员名表里登记的 id 不是同一个。成员名
+ * 只跟布局走，所以查表前先剥掉限定符。 */
 static int agg_find_member(u32 ty, const char *name, u32 len)
 {
-    u32 j = AGG_HEAD[ty % AGG_NB];
+    u32 j = 0;
+
+    if (TY_AT(ty)->qual)
+        ty = ty_unqual(ty);
+    j = AGG_HEAD[ty % AGG_NB];
 
     while (j) {
         AggInfo *e = &AGG[j - 1];
@@ -1568,7 +1580,11 @@ static int agg_find_member(u32 ty, const char *name, u32 len)
  * 外层）。tcc 的 Sym 就是 `union { struct {int c;}; int *d; ... };` 这种。 */
 static int agg_member_is_anon(u32 ty, u32 idx)
 {
-    u32 j = AGG_HEAD[ty % AGG_NB];
+    u32 j = 0;
+
+    if (TY_AT(ty)->qual)
+        ty = ty_unqual(ty);
+    j = AGG_HEAD[ty % AGG_NB];
 
     while (j) {
         AggInfo *e = &AGG[j - 1];

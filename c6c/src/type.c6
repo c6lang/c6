@@ -530,13 +530,64 @@ static u32 ty_agg(const u32 *mem, const u32 *bits, u32 n, int is_union, u32 tag)
                           is_union ? 1u : 0u, tag, mem, n, L.bcopy, L.offs);
 }
 
+/* 从桶里摘掉 id（它的 hash 已经变了，老位置作废）。
+ *
+ * 线性探测的删除不能只把槽清空——会把后面同一簇里"绕过来"的条目截断。
+ * 这里的做法（Knuth 6.4 R）是清空之后把它到下一个空槽之间的整簇重新插一遍。 */
+static void tt_insert_existing(u32 id);
+
+static void tt_unlink(u32 id, u32 oldh)
+{
+    u32 mask = TT.cap - 1;
+    u32 slot = oldh & mask;
+    u32 j = 0;
+
+    while (TT.buckets[slot] != 0xFFFFFFFFu && TT.buckets[slot] != id)
+        slot = (slot + 1) & mask;
+    if (TT.buckets[slot] != id)
+        return;
+    TT.buckets[slot] = 0xFFFFFFFFu;
+    j = (slot + 1) & mask;
+    while (TT.buckets[j] != 0xFFFFFFFFu) {
+        u32 v = TT.buckets[j];
+
+        TT.buckets[j] = 0xFFFFFFFFu;
+        tt_insert_existing(v);
+        j = (j + 1) & mask;
+    }
+}
+
+/* 按 TY_AT(id)->hash 把 id 登记进桶（已经在里面就直接返回）。 */
+static void tt_insert_existing(u32 id)
+{
+    u32 mask = TT.cap - 1;
+    u32 slot = TY_AT(id)->hash & mask;
+
+    while (TT.buckets[slot] != 0xFFFFFFFFu) {
+        if (TT.buckets[slot] == id)
+            return;
+        slot = (slot + 1) & mask;
+    }
+    TT.buckets[slot] = id;
+}
+
 /* 补全一个已经存在的（前置声明出来的）类型 id。
  * `typedef struct X X; ... struct X { … };` 必须让先前那个 id 变成完整类型，
- * 否则所有早先写的 `X *p` 都查不到成员——tcc 的 TCCState 正是这个形状。 */
+ * 否则所有早先写的 `X *p` 都查不到成员——tcc 的 TCCState 正是这个形状。
+ *
+ * 补全改的是**已经 intern 过**的那条记录：`hash` 还是前置声明时（nkid=0、
+ * size=0）算的，桶也在老位置。不重新登记的话，任何"结构上完全一样"的
+ * ty_intern_full 都查不到它、另开一个新 id——`const struct T g[]` 的限定符
+ * 按 C11 6.7.3p9 落到元素上（ty_qual），剥掉限定符（ty_unqual）本该回到
+ * 原来那个 id；对不上，成员名表就按 id 查不到，报"结构体没有成员"。
+ * 内核 include/linux/parser.h 的 `typedef struct match_token match_table_t[]`
+ * + kernel/cpu.c 的 `static const match_table_t global_mitigations` 正是这个形状。 */
 static u32 ty_agg_complete(u32 id, const u32 *mem, const u32 *bits, u32 n, int is_union)
 {
     AggLay L = {0};
     C6Type *t = TY_AT(id);
+    u32 oldh = t->hash;
+    u32 nbits0 = 0;
 
     agg_layout(mem, bits, n, is_union, &L);
     t->align = (u16)L.align;
@@ -547,6 +598,13 @@ static u32 ty_agg_complete(u32 id, const u32 *mem, const u32 *bits, u32 n, int i
     t->kids = ty_dup(mem, n);
     t->offs = L.offs;
     t->bits = n ? L.bcopy : NULL;
+    nbits0 = t->bits ? t->nkid : 0;
+    t->hash = ty_hash(t->kind, t->qual, t->align, t->size, t->nkid, t->a, t->b,
+                      t->tag, t->kids, nbits0, t->bits);
+    if (t->hash != oldh) {
+        tt_unlink(id, oldh);
+        tt_insert_existing(id);
+    }
     return id;
 }
 
