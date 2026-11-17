@@ -5784,3 +5784,19 @@ fd 上之前加了一句 `C6_CO_CUR->blocked_on = 0;`——**没用**，`/tmp/cm
 `req → await snd → await c6_io(fd, WRITE)`），而把 `await snd` 摊平成直接在 `req`
 里 `await c6_io` 就正常。下一轮拿这个复现盯着 `__c6_co_run` 的主循环看：
 `c6c_co_poll_ready(-1)` 到底把 fd 8 的 POLLOUT 报出来没有、报出来之后恢复的是谁。
+
+### 第 299 轮：把 pump 的主循环读完了，`c6_io` 的"停一轮"和 co 并发撞在一起
+
+`c6c_co_pump` 每一轮先 `c6c_co_poll_ready(0)`（不等），再从 `C6_CO_ALL` 里挑一个
+`!waiting && !blocked_on` 的协程恢复；挑不到就顺着 `blocked_on` 链找，最后
+`c6c_co_poll_ready(-1)` 阻塞等下一个就绪 fd。
+
+`c6_io` 在协程里是**总是**停一轮（约束 C31：即使已经就绪也停）。两个 `co` 任务
+同时挂在"永远就绪"的 POLLOUT 上时，就变成：A 停一轮 → poll 立刻说 A 就绪 →
+恢复 A → A 又停一轮 → B 同理……两边来回倒，谁也没往 `write` 之后走。
+（`/tmp/cm9` 里 `[snd] await fd=8` 之后永远没有 `[snd] woke`，就是这么卡住的；
+`c6_io` 里那个 `g++ < 1000000` 的保险丝要等 100 万次 yield，实际等于无限。）
+
+下一轮的方向：给"同一轮里已经恢复过一次的协程"记个数（类似 epoll 的
+one-shot），或者让 `c6_io` 在 `poll_ready` 已经报过这个 fd 就绪时**不再停一轮**。
+这条改完再跑 `examples/stdhttps.c6`。
