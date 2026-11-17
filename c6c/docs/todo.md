@@ -5253,3 +5253,23 @@ DBG attach a=(6,7,512,0x7ffd2b587010) b=(10,11,512,0x7ffd2b586dd0)   ← 调用�
 顺手记一个看到的可疑点：`IR_CALL __c6_co_new` 之后
 `FN.ops[FN.n-1].narg = 2;` 紧接着又被 `= 1;` 覆盖——那行是给
 `__c6_co_launch` 的，写错位置了（不影响参数个数，但值得核一下）。
+
+### 第 267 轮：那些"同一个 ebase"的文件，其实是 **err.c6 被重复 include**
+
+打 `__c6_module_decl` 的登记处：
+
+```
+[e3] mfile=15 mnm=std.core.err  mod=2
+[e3] mfile=20 mnm=std.core.err  mod=2     ← 同一个 err.c6 的另一份副本
+[e3] mfile=21 mnm=std.text.num  mod=5
+```
+
+也就是说 file 15 / 20 / 23 / 26 … 都是 `std/core/err.c6` 的**不同包含副本**，
+它们映射到同一个模块是**对的**。所以第 261 轮"六个模块共用一个号段"的判断是错的
+（只看了 print 的 file 号，没看模块名）。
+
+真正还剩的现象只有一条：stdbox 里 `r.error` = 0x0E01B007（csv 自己的），而
+`std.data.csv.PARSE` = 0x0E000007（err 的）——限定名还是退回了裸名 `PARSE`，
+而裸名本该因为两个枚举值不同被 `poison_add` 标记成"歧义"（用的时候应当报错），
+这里却**静默**给了 err 的值。下一轮直接查 `poison_find` 在限定名回退那条路上
+有没有被查过。
