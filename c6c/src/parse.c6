@@ -9387,6 +9387,22 @@ static u32 gen_postfix_ops(u32 v)
                                  * 却完全正确，所以很难看出来）。 */
                                 if (pty3 && !ty_is_agg(pty3) && aty3 != pty3)
                                     av3 = gen_convert(av3, aty3, pty3);
+                                /* 聚合实参要先落到自己的帧槽里再传。方法糖这条
+                                 * 路的实参是"先全求值、最后统一 IR_ARG"，聚合临时
+                                 * 量就活在被调用的实参暂存区上——外层的 CALL 一
+                                 * 铺参数就把它盖掉了（`b.f(str(t))` 里 f 读到
+                                 * 的 Str.data 是栈上垃圾，json/xml 就是这么坏的）。
+                                 * 普通调用是边求值边 IR_ARG，所以不受影响。 */
+                                if (pty3 && ty_is_agg(pty3) && ty_size(pty3) > 0) {
+                                    u32 sl3 = frame_slots_for(ty_size(pty3));
+                                    u32 sa3 = irfn_vreg(&FN);
+
+                                    irfn_push(&FN, IR_ADDR, IRT_PTR, sa3, 0, 0, 0,
+                                              X64_SLOT(sl3));
+                                    irfn_push(&FN, IR_COPY, IRT_U8, sa3, av3, 0, 0,
+                                              ty_size(pty3));
+                                    av3 = sa3;
+                                }
                                 if (narg < 16)
                                     avs[narg++] = value_of(av3);
                                 if (!pa_accept_ch(','))

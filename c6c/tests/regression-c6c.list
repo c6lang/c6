@@ -31,6 +31,7 @@ std-clean
 std-cli
 std-client
 std-color
+std-conf
 std-cont
 std-creds
 std-crypto

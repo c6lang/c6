@@ -5089,3 +5089,9 @@ DBG a=0/0 b=0/0      # status / body_len，__c6_co_run() 返回 0（"跑完"了�
 `!error` 返回值的函数、实参又是由调用构造出来的聚合临时量时，实参槽没填对。
 下一轮的最小复现就是它：`int f(Str s) !error`，调用 `x->f(str(p))`，在 f 里打
 `s.len/s.data`。改动已撤回，回归 86 / 92、CI 绿。
+
+### 第 257 轮：**已修** —— 方法糖的聚合实参没落到帧槽（std-conf 绿、json 好了）
+
+见 CHANGELOG。json 现在能正确解析（`1`/`{}`/`[]`/`"x"`/`true` 的 kind 都对），
+std-conf 从红变绿（回归 86 → 87）。std-box 仍红在 csv 那半，std-demo 仍红在
+数组→切片（第 250-254 轮那条）。
