@@ -472,7 +472,7 @@ cmake --build build --target regression-c6c         # 已全绿的那批（列�
 * selfhost / c99selfhost 那几个用例拿 tcc 的**源码**自举，只能由 tcc 跑，脚本里
   仍直接用 `$C6_TCC_DIR/c6`——它们不在迁移目标里。
 
-当前基线（第 271 轮实测）：**90 / 92 全绿**，还差 2 个。缺口分三类，都在
+当前基线（第 289 轮实测）：**91 / 92 全绿**，还差 1 个（`std-https`）。缺口分三类，都在
 `c6c/docs/todo.md` 的「把回归迁到 c6c」那节：libc 面（真信号投递、真 DNS、
 非阻塞 IO 的边角）；模板实例的身份与布局（同一个实例名在两个 TU 里会拿到两个类型 id，
 `Deque@T` 的成员类型在实例里会被解析错——`c6c/docs/todo.md` 第 215/216 轮

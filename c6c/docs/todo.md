@@ -5594,3 +5594,20 @@ run3: [fa] ran A=1 [fb] ran B=1 A=1 B=1     ← 只有这一次两边都对
 回归：run1 **91 / 92**（只差 std-https），run2 90/92（std-thread 那次挂死）。
 
 下一步只剩两件事：`chan` 的挂死、`std-https`。
+
+### 第 289 轮：互斥量改用原子交换，std-thread 连跑 8 次全绿，回归稳定 91/92
+
+根因是第 288 轮那版互斥量的"原子加 1、出 1 就拿到"：两个线程同时抢时计数会加到 2，
+谁都没拿到又各自减回去，等待方就可能永远等在一个非 0 的值上。最小复现
+`/tmp/cv1.c6`（mutex + 两个 cond 的有界队列）6 次挂 3 次。
+
+改成 `__c6_xchg8(m, 1) == 0` 取锁、放锁直接写 0：
+
+```
+/tmp/cv1.c6           ok=10 timeout=0
+examples/stdthread.c6 8/8 全绿（29 check / 0 failure）
+回归                  run1/run2/run3 都是 91 / 92（只剩 std-https）
+```
+
+`std-box` / `std-term` / `std-thread` 一并补进 `regression-c6c.list`（91 条），
+CTest 96 个用例全过。下一步只剩 `std-https`。
