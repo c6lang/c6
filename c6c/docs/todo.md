@@ -5129,3 +5129,21 @@ printf("%p vs %p\n", (void *)g.p(), (void *)g.d);   // 修前 0x7a / 0x7ffe…
 ```
 
 std-demo（wordcount）从段错误变成通过；回归 87 → 88。
+
+### 第 260 轮：限定名的回退点找到了，但别名登记那段**根本没执行**
+
+在 `gen_primary` 的最长前缀那圈加打印，stdbox 里跑出来：
+
+```
+[q2] qd=std.data.csv       qm=std__data__csv        hit=0
+[q2] qd=std.data.csv.PARSE qm=std__data__csv__PARSE hit=1 val=234881031
+```
+
+`qm` 命中了，但值 **234881031 = std.core.err 的号段**。于是按 `mod_path` 手动拼
+`std__data__csv__PARSE` 再 `sym_add` 一份，并在登记处加打印——**打印一次都没出**
+（`C6C_DBG_Q3` 无输出），说明 `parse_enum_spec` 里"给模块错误码表登记"那段对
+`std/data/csv.c6` 根本没跑到：`[en]` 那条 trace 里 `tag=Error` 只出现一次
+（file=15，即 err.c6），csv 的 `enum Error` 是走**别的路径**解析的。
+
+所以下一轮要找的是"模块文件里的枚举到底由谁解析"——不是在 `parse_enum_spec`
+里加别名。改动已撤回，回归仍是 88 / 92、CI 绿。
