@@ -5116,3 +5116,16 @@ printf("%d\n", (int)std.core.err.PARSE);    // 234991623 ✗ 也成了 csv 的�
 下一步：把 `std.core.err.PARSE` 这条表达式在 `gen_primary` 里的**实际查名串**打出来
 （第 32 轮打的是 `qd`/`qm`，那时看到 `qm=std__data__csv__PARSE`——但那是 csv 的，
 err 这条还没打过）。std-box 剩下的两条（csv/json 各一条"报 PARSE"）都是它。
+
+### 第 259 轮：**已修** —— 方法体里数组成员不退化（std-demo 绿）
+
+见 CHANGELOG。最小复现：
+
+```c
+typedef struct G@(int N) { char d[N]; int n; char *p() { return d; } } G;
+G@(8) g = { { 0 }, 0 };
+g.d[0] = 'z';
+printf("%p vs %p\n", (void *)g.p(), (void *)g.d);   // 修前 0x7a / 0x7ffe…
+```
+
+std-demo（wordcount）从段错误变成通过；回归 87 → 88。

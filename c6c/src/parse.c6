@@ -10600,6 +10600,15 @@ static u32 gen_postfix(void)
                          * 就是这么来的）。 */
                         u32 cty5 = PEND_TY;
 
+                        /* 数组类型的成员不能取值，要**退化**成首元素地址
+                         * （`char *p() { return d; }` 里 d 是 char[N]：
+                         * load 出来的是 d[0] 那一个字节当指针，调用方拿到
+                         * 0x7a 这种数，std-demo 的 Buf 就是这么炸的）。 */
+                        if (ty_is_array(cty5)) {
+                            PEND_LVAL = 0;
+                            GEN_TY = ty_ptr(ty_target(cty5));
+                            return rv;
+                        }
                         rv = load_lval(rv, cty5);
                         PEND_LVAL = 0;
                         GEN_TY = cty5;
