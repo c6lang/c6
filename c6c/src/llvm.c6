@@ -5,8 +5,10 @@
  *     所以"取地址再存"的别名行为和另外两个后端逐条对齐；
  *   - 浮点是位模式（i64 里装 f32/f64 的位），要算的时候 bitcast 出来；
  *   - 聚合按地址传、调用约定是"全部 i64 参数"；
- *   - 数据段是一块 `@__c6l_D`，初值用 `@__c6l_D0` 常量块 memcpy 进去，
- *     符号地址的重定位在 `c6c_init_data()` 里回填（和 C99 后端同一张表）。
+ *   - 数据段是一整块 `@__c6l_D`；符号地址、字符串字面量、`&&label` 这些
+ *     指针槽都写成**静态初始化器**（packed struct 里 i64 + ptrtoint），
+ *     不依赖运行期初始化，裸机直接 load 就是对的值。
+ *     这和 native 后端的 `.rela.data` 是同一张重定位表（DFIX / C99_RL / CLBL）。
  *
  * 为什么调用点走 `bitcast ptr @f to ptr` 再 call：
  *   前端的调用是"无原型"的（C 里没见到声明就 `f()` 就是这样），同一个
@@ -30,6 +32,13 @@ static u32 LL_NFN;
 #define LL_REF_MAX 16384
 static u32 LL_REF[LL_REF_MAX];
 static u32 LL_NREF;
+
+/* `&&label` 的数据重定位按解析期的函数序号（fnseq）记；LLVM 后端不经过
+ * x64_func_begin，fnseq 得由 llvm_emit_fn 自己推进，并留下序号 → 符号的
+ * 映射，收尾时才发得出 blockaddress。 */
+#define LL_FNSEQ_MAX 16384
+static u32 LL_FNSEQ_SYM[LL_FNSEQ_MAX];
+static u8 LL_FNSEQ_OK[LL_FNSEQ_MAX];
 
 static int LL_TMP;          /* SSA 临时名计数器（每个函数清零） */
 
@@ -225,8 +234,17 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
     }
     LL_TMP = 0;
 
+    /* 数据段里的 `&&label` 按 (函数序号, 标签 id) 找地址：这里和 native
+     * 的 x64_func_begin 一样推进 X64.fnseq，并记下序号对应的 LLVM 符号名。 */
+    X64.fnseq++;
+    if (X64.fnseq < LL_FNSEQ_MAX) {
+        LL_FNSEQ_SYM[X64.fnseq] = func_sym;
+        LL_FNSEQ_OK[X64.fnseq] = 1;
+    }
+
     /* 形参一律 i64；变参函数带 `...`（va_list 走真 ABI） */
-    fprintf(out, "define i64 @%s(", nm);
+    fprintf(out, "define %si64 @%s(",
+            (func_sym < X64.nsym && X64.sym[func_sym].is_static) ? "internal " : "", nm);
     for (k = 0; k < f->nparams; k++)
         fprintf(out, "%si64 %%arg%u", k ? ", " : "", k);
     if (f->is_variadic) {
@@ -822,7 +840,7 @@ static int llvm_open(const char *out)
 /* 头部：变参结构、intrinsic 声明、内部辅助（alloca 用撞针分配器） */
 static void llvm_blobs(FILE *cf);
 
-static void llvm_prologue(FILE *cf, u32 dn)
+static void llvm_prologue(FILE *cf)
 {
     fprintf(cf,
             "; 由 c6c 的 LLVM IR 后端生成（不要手改）\n"
@@ -856,8 +874,7 @@ static void llvm_prologue(FILE *cf, u32 dn)
             "  %%p = getelementptr i8, ptr @__c6l_buf, i64 %%t2\n"
             "  ret ptr %%p\n"
             "}\n"
-            "\n"
-            "@__c6l_D = internal global [%u x i8] zeroinitializer\n", (unsigned)dn);
+            "\n");
     llvm_blobs(cf);
 }
 
@@ -925,14 +942,38 @@ static void llvm_blobs(FILE *cf)
     }
 }
 
-/* 数据段初值：一整块常量，init_data 里 memcpy 进可写的那块 */
-static void llvm_emit_dataconst(FILE *cf, u32 dn)
+/* 数据段里的一个重定位：槽偏移 + 目标。三张表（DFIX / C99_NRL / CLBL）
+ * 合并成一张按偏移排好的表，静态初始化器才能按"字节块 / i64"交替发。 */
+enum { LL_RL_SYM = 0, LL_RL_DATA, LL_RL_LBL };
+
+typedef struct LlReloc {
+    u32 off;
+    u32 kind;
+    u32 a;          /* SYM: 符号 id；DATA: 数据段内偏移；LBL: 函数序号 */
+    u32 lbl;        /* LBL: 标签 id */
+    i64 add;
+} LlReloc;
+
+static int ll_reloc_cmp(const void *pa, const void *pb)
+{
+    const LlReloc *a = (const LlReloc *)pa;
+    const LlReloc *b = (const LlReloc *)pb;
+
+    if (a->off < b->off)
+        return -1;
+    if (a->off > b->off)
+        return 1;
+    return 0;
+}
+
+/* 一段数据字节：LLVM 的 c"..." 字符串常量 */
+static void llvm_emit_bytes(FILE *cf, u32 off, u32 n)
 {
     u32 i = 0;
 
-    fprintf(cf, "@__c6l_D0 = internal constant [%u x i8] c\"", (unsigned)dn);
-    for (i = 0; i < dn; i++) {
-        u8 b = (i < DATA_IMG.n) ? DATA_IMG.p[i] : (u8)0;
+    fprintf(cf, " [%u x i8] c\"", (unsigned)n);
+    for (i = 0; i < n; i++) {
+        u8 b = (off + i < DATA_IMG.n) ? DATA_IMG.p[off + i] : (u8)0;
 
         if (b >= 32 && b < 127 && b != '"' && b != '\\') {
             fprintf(cf, "%c", (char)b);
@@ -940,45 +981,128 @@ static void llvm_emit_dataconst(FILE *cf, u32 dn)
             fprintf(cf, "\\%02X", (unsigned)b);
         }
     }
-    fprintf(cf, "\"\n\n");
+    fprintf(cf, "\"");
 }
 
-static void llvm_emit_datainit(FILE *cf, u32 dn)
+/* 一个指针槽的静态初值 */
+static void llvm_emit_reloc_value(FILE *cf, const LlReloc *r)
 {
-    u32 i = 0;
+    char sn[256] = {0};
 
-    fprintf(cf, "define void @c6c_init_data() {\n");
-    fprintf(cf, "  call void @llvm.memcpy.p0.p0.i64(ptr @__c6l_D, ptr @__c6l_D0,"
-                 " i64 %u, i1 false)\n", (unsigned)dn);
-    for (i = 0; i < NDFIX; i++) {
-        fprintf(cf, "  %%q%u = getelementptr i8, ptr @__c6l_D, i64 %u\n", (unsigned)i,
-                (unsigned)DFIX_OFF[i]);
-        if (X64.sym[DFIX_SYM[i]].is_data) {
-            /* DFIX_ADD 是解析期算好的字节加数（`A + 2` / `&s.m`），折进 GEP */
-            fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @__c6l_D,"
-                         " i64 %d) to i64), ptr %%q%u\n",
-                    (int)((i64)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR) + DFIX_ADD[i]),
-                    (unsigned)i);
-        } else {
-            char sn[256] = {0};
+    if (r->kind == LL_RL_DATA) {
+        fprintf(cf, "ptrtoint (ptr getelementptr (i8, ptr @__c6l_D, i64 %u) to i64)",
+                (unsigned)r->a);
+        return;
+    }
+    if (r->kind == LL_RL_LBL) {
+        u32 fs = r->a;
+        u32 sym = (fs < LL_FNSEQ_MAX && LL_FNSEQ_OK[fs]) ? LL_FNSEQ_SYM[fs] : 0;
 
-            llvm_sym(DFIX_SYM[i], sn, sizeof(sn));
-            if (DFIX_ADD[i] != 0)
-                fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @%s,"
-                             " i64 %d) to i64), ptr %%q%u\n", sn, (int)DFIX_ADD[i],
-                        (unsigned)i);
-            else
-                fprintf(cf, "  store i64 ptrtoint (ptr @%s to i64), ptr %%q%u\n", sn,
-                        (unsigned)i);
+        if (!sym || fs == 0) {
+            fprintf(cf, "0");
+            return;
         }
+        llvm_sym(sym, sn, sizeof(sn));
+        fprintf(cf, "ptrtoint (ptr blockaddress(@%s, %%L%u) to i64)", sn,
+                (unsigned)r->lbl);
+        return;
     }
-    for (i = 0; i < C99_NRL; i++) {
-        fprintf(cf, "  %%r%u = getelementptr i8, ptr @__c6l_D, i64 %u\n", (unsigned)i,
-                (unsigned)C99_RLOFF[i]);
-        fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @__c6l_D, i64 %u)"
-                     " to i64), ptr %%r%u\n", (unsigned)C99_RLTGT[i], (unsigned)i);
+    if (X64.sym[r->a].is_data) {
+        /* DFIX_ADD 是解析期算好的字节加数（`A + 2` / `&s.m`），折进 GEP */
+        fprintf(cf, "ptrtoint (ptr getelementptr (i8, ptr @__c6l_D, i64 %lld) to i64)",
+                (long long)((i64)(X64.sym[r->a].off - (u32)ELF_HDR) + r->add));
+        return;
     }
-    fprintf(cf, "  ret void\n}\n\n");
+    llvm_sym(r->a, sn, sizeof(sn));
+    if (r->add != 0)
+        fprintf(cf, "ptrtoint (ptr getelementptr (i8, ptr @%s, i64 %lld) to i64)", sn,
+                (long long)r->add);
+    else
+        fprintf(cf, "ptrtoint (ptr @%s to i64)", sn);
+}
+
+/* 数据段：一整块 `@__c6l_D`，指针槽直接写进静态初始化器。
+ *
+ * 关键点是**不能**靠运行期 `c6c_init_data()` 回填：裸机入口不跑那套初始化，
+ * 接口值（vtable 指针）就会是 0，分派时跳进 .bss。packed struct 保证每个槽
+ * 相对 `@__c6l_D` 的偏移和 DATA_IMG 逐字节一致；`align 16` 让整块按数据段的
+ * 最大对齐摆放（i64 槽在数据段里本来就是 8 对齐的）。 */
+static void llvm_emit_data(FILE *cf, u32 dn)
+{
+    LlReloc *rl = NULL;
+    u32 cap = NDFIX + C99_NRL + NCLBL;
+    u32 nr = 0;
+    u32 i = 0;
+    u32 prev = 0;
+
+    if (cap) {
+        rl = (LlReloc *)malloc(sizeof(LlReloc) * (size_t)cap);
+        if (!rl)
+            cap = 0;
+    }
+    for (i = 0; i < NDFIX && nr < cap; i++) {
+        if (DFIX_OFF[i] > dn || dn - DFIX_OFF[i] < 8)
+            continue;
+        rl[nr].off = DFIX_OFF[i];
+        rl[nr].kind = LL_RL_SYM;
+        rl[nr].a = DFIX_SYM[i];
+        rl[nr].lbl = 0;
+        rl[nr].add = DFIX_ADD[i];
+        nr++;
+    }
+    for (i = 0; i < C99_NRL && nr < cap; i++) {
+        if (C99_RLOFF[i] > dn || dn - C99_RLOFF[i] < 8)
+            continue;
+        rl[nr].off = C99_RLOFF[i];
+        rl[nr].kind = LL_RL_DATA;
+        rl[nr].a = C99_RLTGT[i];
+        rl[nr].lbl = 0;
+        rl[nr].add = 0;
+        nr++;
+    }
+    for (i = 0; i < NCLBL && nr < cap; i++) {
+        if (CLBL_OFF[i] > dn || dn - CLBL_OFF[i] < 8)
+            continue;
+        rl[nr].off = CLBL_OFF[i];
+        rl[nr].kind = LL_RL_LBL;
+        rl[nr].a = CLBL_FN[i];
+        rl[nr].lbl = CLBL_LBL[i];
+        rl[nr].add = 0;
+        nr++;
+    }
+    if (nr > 1)
+        qsort(rl, (size_t)nr, sizeof(LlReloc), ll_reloc_cmp);
+
+    fprintf(cf, "@__c6l_D = internal global <{");
+    prev = 0;
+    for (i = 0; i < nr; i++) {
+        if (rl[i].off > prev)
+            fprintf(cf, " [%u x i8],", (unsigned)(rl[i].off - prev));
+        fprintf(cf, " i64,");
+        prev = rl[i].off + 8;
+    }
+    if (dn > prev)
+        fprintf(cf, " [%u x i8]", (unsigned)(dn - prev));
+    else
+        fprintf(cf, " [0 x i8]");
+    fprintf(cf, " }> <{");
+    prev = 0;
+    for (i = 0; i < nr; i++) {
+        if (rl[i].off > prev) {
+            llvm_emit_bytes(cf, prev, rl[i].off - prev);
+            fprintf(cf, ",");
+        }
+        fprintf(cf, " i64 ");
+        llvm_emit_reloc_value(cf, &rl[i]);
+        fprintf(cf, ",");
+        prev = rl[i].off + 8;
+    }
+    /* 最后一段**总是**发（零长度也发）：结构体/数组类型和值都不允许
+     * 末尾多一个逗号，发一个 [0 x i8] 收尾最省事。 */
+    llvm_emit_bytes(cf, prev, dn > prev ? dn - prev : 0);
+    fprintf(cf, " }>, align 16\n\n");
+    if (rl)
+        free(rl);
 }
 
 /* 收尾：拼模块（头部 → 数据 → 外部符号声明 → 函数体 → init_data → 入口） */
@@ -997,8 +1121,8 @@ static int llvm_finish(const char *out)
         fprintf(stderr, "c6c: LLVM IR 后端：没有可用的入口\n");
         return 1;
     }
-    llvm_prologue(cf, dn);
-    llvm_emit_dataconst(cf, dn);
+    llvm_prologue(cf);
+    llvm_emit_data(cf, dn);
     /* 外部符号：引用过但本模块没定义的，发一条 declare（调用点走 bitcast，
      * 签名只作占位，不影响实参传递） */
     for (i = 0; i < LL_NREF; i++) {
@@ -1025,12 +1149,10 @@ static int llvm_finish(const char *out)
     }
     remove(LL_TMPNAME);
 
-    llvm_emit_datainit(cf, dn);
-
-    /* 入口：init_data → 构造器 → 真 main → 析构器 */
+    /* 入口：构造器 → 真 main → 析构器（数据段已经是静态初值，不需要
+     * init_data；裸机不经过这里也能拿到正确的 vtable 指针）。 */
     llvm_sym((u32)PA_MAIN->val, mn, sizeof(mn));
     fprintf(cf, "define i32 @main(i32 %%argc, ptr %%argv) {\n");
-    fprintf(cf, "  call void @c6c_init_data()\n");
     for (i = 0; i < NCTOR; i++) {
         char cn[256] = {0};
 

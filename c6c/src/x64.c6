@@ -23,6 +23,7 @@ typedef struct X64Sym {
     u32 next_same;  /* 同桶的下一个符号（0 = 链尾） */
     u8 defined;     /* off==0 也可能是“第一个函数”，不能用 0 当哨兵 */
     u8 is_data;     /* 数据符号：off 是**镜像偏移**，不参与 code_off 平移 */
+    u8 is_static;   /* 文件作用域的 static：-c 出 .o 时是 STB_LOCAL，LLVM 发 internal */
 } X64Sym;
 
 /* 符号表按名字哈希分桶：原来每个符号都要线性扫一遍全表，4 万个全局变量
@@ -474,6 +475,7 @@ static u32 x64_sym(X64State *st, const char *name)
     st->sym[st->nsym].hash = h;
     st->sym[st->nsym].defined = 0;
     st->sym[st->nsym].is_data = 0;
+    st->sym[st->nsym].is_static = 0;
     {
         u32 b = h % X64_SYMB;
 
@@ -679,6 +681,7 @@ static void x64_alias_idx(X64State *st, u32 a, u32 b)
     st->sym[a].va = st->sym[b].va;
     st->sym[a].defined = 1;
     st->sym[a].is_data = st->sym[b].is_data;
+    st->sym[a].is_static = st->sym[b].is_static;
 }
 
 static void x64_func_end(X64State *st)

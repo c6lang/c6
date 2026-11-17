@@ -419,7 +419,7 @@ static void obj_write(const char *path)
 
         if (!s->name || !s->name[0])
             continue;           /* 无名符号：重定位里退化成 0 号 */
-        local = ob_sym_local(s->name);
+        local = ob_sym_local(s->name) || s->is_static;
         bind = (u8)(local ? OBJ_STB_LOCAL : OBJ_STB_GLOBAL);
         if (s->defined && s->is_data) {
             type = OBJ_STT_OBJECT;
@@ -454,7 +454,7 @@ static void obj_write(const char *path)
                 map[i] = 0;
                 continue;
             }
-            map[i] = ob_sym_local(s->name) ? li++ : gi++;
+            map[i] = (ob_sym_local(s->name) || s->is_static) ? li++ : gi++;
         }
     }
 
