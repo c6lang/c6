@@ -156,5 +156,42 @@ fi
 (cd "$SELF" && "$C6C" publish --dry-run > "$WORK/pub.log" 2>&1)
 if grep -q '预览' "$WORK/pub.log"; then ok "publish 预览"; else bad "publish 预览"; fi
 
+# 9) cargo/go 习惯：清单内 destdir/prefix + DESTDIR 环境变量 + 向上发现
+if grep -q '^destdir: pkg$' "$WORK/app/c6c.yaml" && grep -q '^prefix: /usr$' "$WORK/app/c6c.yaml"; then
+  ok "init 生成 destdir/prefix"
+else
+  bad "init 落点字段"
+fi
+rm -rf "$WORK/envstage"
+(cd "$WORK/app" && DESTDIR="$WORK/envstage" PREFIX=/opt/c6 "$C6C" install > /dev/null 2>&1)
+if [ -x "$WORK/envstage/opt/c6/bin/app" ]; then ok "DESTDIR/PREFIX 环境变量覆盖清单"; else bad "DESTDIR 覆盖"; fi
+mkdir -p "$WORK/app/sub/deep"
+(cd "$WORK/app/sub/deep" && "$C6C" env > "$WORK/env.log" 2>&1)
+if grep -q "manifest=$WORK/app/c6c.yaml" "$WORK/env.log"; then
+  ok "向上发现 c6c.yaml（go.mod 风格）"
+else
+  bad "向上发现"
+fi
+(cd /tmp && "$C6C" env --manifest-path="$WORK/app/c6c.yaml" > "$WORK/mp.log" 2>&1)
+if grep -q 'name=app' "$WORK/mp.log"; then ok "--manifest-path"; else bad "--manifest-path"; fi
+
+# 10) cargo 风格辅助命令：env / list --json / check / clean / profile
+(cd "$WORK/app" && "$C6C" list --json > list.json 2>&1 && "$C6C" check > check.log 2>&1)
+if grep -q '"sources": \["src/util.c6", "src/main.c6"\]' "$WORK/app/list.json"; then
+  ok "list --json"
+else
+  bad "list --json"
+fi
+if [ $? -eq 0 ] && [ ! -s "$WORK/app/check.log" ]; then ok "check 只检查不落盘"; else bad "check"; fi
+(cd "$WORK/app" && "$C6C" clean --dry-run > clean.log 2>&1)
+if grep -q 'clean 预览：rm -f build/app' "$WORK/app/clean.log"; then ok "clean 预览"; else bad "clean 预览"; fi
+(cd "$WORK/app" && "$C6C" env --release > rel.log 2>&1)
+if grep -q 'profile=release' "$WORK/app/rel.log"; then ok "profile=release"; else bad "profile"; fi
+if [ -f "$SELF/c6c.yaml" ] && grep -q '^destdir: pkg$' "$SELF/c6c.yaml"; then
+  ok "c6c 自身清单含安装落点"
+else
+  bad "c6c 自身清单"
+fi
+
 echo "c6c pm: 通过 $pass / 失败 $fail"
 [ "$fail" -eq 0 ]

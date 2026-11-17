@@ -13,6 +13,12 @@ flags:
 pkg_name: c6c
 pkg_desc: c6c - the c6 compiler written in c6 (self-hosting)
 pkg_license: MIT
+# 发行版打包用：DESTDIR="${pkgdir}" c6c install --prefix=/usr
+# 命令行 / DESTDIR 环境变量优先于这里的默认值。
+destdir: pkg
+prefix: /usr
+dev_flags:
+release_flags:
 pkg_formats:
   - tgz
 pkg_files:

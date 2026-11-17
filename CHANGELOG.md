@@ -24,9 +24,16 @@
   objcopy 出 ELF/BIN/HEX；`flash` / `monitor` / `debug` 按清单中的命令模板
   执行（`{elf}` / `{bin}` 等占位符展开，`--dry-run` 可预览）。
 - `c6c/c6c.yaml` 是 c6c 自身的工程配置（dogfood）：`pmtest` 真跑它的自编、
-  打包与 staged install；回归增加到 21 项。
+  打包与 staged install。
+- 取 cargo/go 的长处：从当前目录向上找 `c6c.yaml` / `c6c.yml`（go.mod 风格），
+  `--manifest-path=` 显式指定；`build --release` + `dev_flags` / `release_flags`
+  两档 profile；`check`（-fsyntax-only）、`clean`（只删本清单产物）、`env` /
+  `list --json`（脚本可读）。
+- 清单新增 `destdir` / `prefix` 安装落点，`install` 认标准 `DESTDIR` /
+  `PREFIX` 环境变量（命令行 > 环境变量 > 清单），发行版可直接
+  `DESTDIR="${pkgdir}" c6c install --prefix=/usr`。
 
-验证：`pmtest` 21/21；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+验证：`pmtest` 30/30；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 
