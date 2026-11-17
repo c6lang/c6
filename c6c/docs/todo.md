@@ -5919,3 +5919,31 @@ c6c_co_poll_ready(-1)`。两个 co 都 `waiting` 时应该走到 poll，poll 立
 `blocked_on` 上）。
 
 门禁：96 个 ctest 全绿、tests2 意外失败 0。
+
+### 第 306 轮：`blocked_on` 只在"等的任务还没结束"时跳过 —— 回归 92 / 92
+
+第 305 轮补上 `!blocked_on` 之后，饿死没了但父任务再也不往下走：那个条件把父任务
+**永久**排除在可跑队列之外，子任务结束之后没人把它放回去。
+
+正确的判断是「只在等的那个任务**还没结束**时才跳过」：
+
+```c
+if (c->blocked_on) {
+    C6Co *t = c6c_co_find(c->blocked_on);
+    if (t && !t->done)
+        continue;              /* 还在等，别叫醒它 */
+}
+c6c_co_resume(c);
+break;
+```
+
+改完 `/tmp/cm9` 立刻对：`a=6,11,3 b=8,11,3`（pad[0]=11、blen=3 都和期望一致），
+`examples/stdhttps.c6` **25 check / 0 failure**。
+
+收口动作：`std-https` 进 `regression-c6c.list`（**92** 条），CTest **97** 个用例
+全绿；回归连跑两次 **92 / 92**；tests2 意外失败 0。
+
+回头看这条 bug 的形状：`co` 任务各自跑在 mmap 出来的栈上、靠执行权令牌串行，
+父子任务互相等待时必须让"最能推进的那个"先跑——只看 `waiting` 不够，`blocked_on`
+还要追一层。第 296~306 轮一路排除掉的：实参传递、协程栈大小、`swapstack` 的寄存器
+保存、事件掩码映射、`blocked_on` 的一刀切清空。

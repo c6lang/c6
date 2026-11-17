@@ -102,3 +102,4 @@ std-words
 std-box
 std-term
 std-thread
+std-https
