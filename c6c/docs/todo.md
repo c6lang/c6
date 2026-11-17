@@ -5751,3 +5751,19 @@ state 写成 DONE 并返回。孩子还挂在 `c6_io` 上时，父任务就会"�
 
 下一轮直接改这里：父任务等子任务时，把子任务的等待点（fd + 事件）接力给自己
 （或者把自己挂到子任务的 `waiter` 上），不要靠"泵一次不动就算完"。
+
+### 第 297 轮：改了「推一次就 break」那处，复现还是挂——父任务走的不是 `__c6_co_wait`
+
+按上一轮的想法把 `__c6_co_wait` 里那段改成：
+
+```c
+if (c && !c->done) c6c_co_pump(c);
+if (c && !c->done && c->waiting && !C6_CO_CUR) return -1;   /* 不谎报 DONE */
+```
+
+`/tmp/cm9` 还是挂（`a=6,0,0 b=8,0,0`），说明 `await snd(…)` 这条路根本不经过
+`__c6_co_wait`——它走的是 `__c6_co_await`（`async_unwind_gate` 那边发的
+`IR_CALL __c6_co_await`）。已撤回改动。
+
+下一轮从 `__c6_co_await` 读起：它把自己 `blocked_on` 到子任务上之后，谁负责在
+子任务推进/结束时把父任务放回可运行队列（`resumer` 链）。
