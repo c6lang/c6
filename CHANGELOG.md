@@ -33,7 +33,16 @@
   `PREFIX` 环境变量（命令行 > 环境变量 > 清单），发行版可直接
   `DESTDIR="${pkgdir}" c6c install --prefix=/usr`。
 
-验证：`pmtest` 30/30；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
+- `c6c lock` 生成 `c6c.lock`（元数据 + 源文件大小/FNV 校验和，自动展开本地
+  `#include`），`build --locked` 检测漂移；`c6c doctor` 报告缺失源文件与未解析
+  import。
+- `workspace`：仓库根 `c6c-workspace.yaml` 的 `members:` 列出子包，`c6c workspace
+  init` 自动发现，`workspace build|test|check|clean|lock|list` 逐成员执行；
+  本仓库已自带一份（成员 c6c）。
+- `c6c init --from=cmake|cargo|make|auto` 从既有工程的 `project()` / `[package]`
+  提取 name/version/description/license 等元数据，便于迁移。
+
+验证：`pmtest` 40/40；`selfhost` 逐字节 fixpoint（新代码可被 c6c 自己编译）。
 
 ### 默认禁用 tcc 的构建与安装（`C6_ENABLE_TCC` 默认 `OFF`）
 

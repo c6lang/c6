@@ -13,8 +13,10 @@
 
 ```sh
 c6c scan              # 只扫描仓库：推断 name/version/kind、源文件、import、test 块
-c6c init [--force]    # 把扫描结果写成 c6c.yaml（已存在需 --force 覆盖）
-c6c build [--force]   # 按清单编译到 out（默认 build/<name>）；mtime 增量
+c6c init [--force] [--from=cmake|cargo|make|auto]
+                      # 扫描仓库写 c6c.yaml，可从既有 CMake/Cargo 工程迁移元数据
+c6c build [--force] [--locked] [--release]
+                      # 按清单编译（mtime 增量 / 锁文件校验 / profile）
 c6c test              # 编译全部源文件并运行 `test "…" { }` 块
 c6c run [参数...]     # 先 build，再执行产物并把参数透传
 c6c package           # 按 pkg_files 装 staging 树，出 TGZ / DEB
@@ -23,6 +25,9 @@ c6c publish [--tag]   # package + SHA256SUMS；--tag 再打 v<version>
 c6c check             # -fsyntax-only，只检查不落盘
 c6c clean [--dry-run] # 只删本清单产物（不删整个 build/）
 c6c env / list [--json]  # 解析后的配置 / 源文件列表
+c6c lock                # 生成 c6c.lock（含本地 #include 依赖）
+c6c doctor              # 检查源文件 / import 是否齐全
+c6c workspace <cmd>     # 多包：init / list / build / test / check / clean / lock
 c6c flash|monitor|debug [--dry-run]  # 按 *_cmd 模板操作固件
 c6c help              # 子命令帮助
 ```
@@ -79,6 +84,20 @@ monitor_cmd:
 debug_cmd:
 ```
 
+**锁文件**：`c6c lock` 生成 `c6c.lock`（JSON：元数据 + 每个源文件的大小与
+FNV 校验和）。c6c 是单 TU 设计，锁文件会自动展开清单里 `src/c6c.c6` 的本地
+`#include`，把 `src/pm.c6` 等十几个模块一起锁住；`c6c build --locked` 在源文件
+漂移时直接失败，适合 CI 与可复现构建。
+
+**workspace**：仓库根的 `c6c-workspace.yaml` 用 `members:` 列出子包，
+`c6c workspace init` 会自动发现含 `c6c.yaml` / `c6c.yml` 的子目录；
+`c6c workspace build|test|check|clean|lock|list` 逐个成员执行（失败即停）。
+本仓库自带 [`c6c-workspace.yaml`](../../c6c-workspace.yaml)（当前成员：c6c）。
+
+**迁移与诊断**：`c6c init --from=cmake|cargo|make|auto` 从 `project(NAME VERSION …)`、
+`[package]` 的 `name/version/description/license` 等提取元数据；`c6c doctor`
+报告缺失源文件与未解析的 `import`。
+
 像 go 找 `go.mod` 一样，`c6c` 会从当前目录逐级向上找 `c6c.yaml` /
 `c6c.yml`；`--manifest-path=...` 可显式指定。发行版打包推荐用标准
 `DESTDIR` 写法（`pkg_files` 是 package 与 install 的单一来源）：
@@ -99,7 +118,7 @@ DESTDIR="${pkgdir}" c6c install --prefix=/usr
 `c6c/` 目录自带一份 [`c6c.yaml`](../../c6c/c6c.yaml)（dogfood 样本：自编
 `build/c6c-managed`、TGZ 打包、staged install），`pmtest` 会真跑一遍这条链。
 回归入口：`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），
-当前 30 项检查。
+当前 40 项检查。
 
 ## 版本与发布号
 
