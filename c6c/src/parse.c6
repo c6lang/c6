@@ -8611,10 +8611,13 @@ static u32 gen_call(Sym *fs)
             irfn_push(&FN, IR_ARG, IRT_U64, 0, env2, 0, 0, 0);
             irfn_push(&FN, IR_ARG, IRT_U64, 0, nf, 0, 0, 1);
         }
+        /* 两个实参都要传：第二个是 `nogate`（`co` 语句处先跑到第一个挂起点，
+         * 不参与调度门）。以前这里紧接着被改回 `narg = 1`，第二个实参就没人
+         * 填，`__c6_co_new` 拿到寄存器里的垃圾——`std-https` 的 co 那两路就是
+         * 这么看到 `wfd=1 / bcap=4592989` 这种值的（第 290 轮）。 */
         irfn_push(&FN, IR_CALL, IRT_PTR, cov, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_new"));
         FN.ops[FN.n - 1].narg = 2;
-        FN.ops[FN.n - 1].narg = 1;
         irfn_push(&FN, IR_ARG, IRT_U64, 0, cov, 0, 0, 0);
         tsk2 = irfn_vreg(&FN);
         irfn_push(&FN, IR_CALL, IRT_PTR, tsk2, 0, 0, 0,
