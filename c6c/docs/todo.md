@@ -5200,3 +5200,21 @@ poll_ready(-1)；poll 不到就 break」——提前 break 的条件得再查（
 回收 detached 任务时会不会把还在排队的算成"没人等了"）。
 
 下一轮：在 `__c6_co_run` 里打每次循环的 `C6_CO_ALL` 长度 / waiting 位数 / poll 结果。
+
+### 第 264 轮：co 循环是排干了的（all=7 done=7），a 那路确实跑了但什么也没写
+
+把 `__c6_co_run` 的循环打出来：
+
+```
+[co] loop=5   all=507 wait=0 done=7 poll=1
+[co] loop=506 all=7   wait=0 done=7 poll=0   → break
+```
+
+最后一轮 `all=7 / done=7 / wait=0`——排干了，没提前收工（第 263 轮的猜测不成立）。
+所以 a 那路的 `httpsa_get` 是**跑完了但没写进 `HAsync`**，和第 255 轮看到的
+`a=0/0` 一致。
+
+注意 `all=507` 那个数是前面几段 `task` 留下的（`C6_CO_ALL` 是全局链，不随
+`__c6_co_run` 清空）。下一轮该打的是 `httpsa_get` 的返回值
+（`httpsa_request` 返回 -1 还是 3）以及 `a.attach()` 之后 `a.wfd/a.rfd` 是不是
+真的落到了 `HAsync`（`attach` 是普通方法，`co` 传进去的是 `&a`）。
