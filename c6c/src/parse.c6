@@ -6753,9 +6753,16 @@ static u32 parse_typespec(void)
     /* 见过 `_Complex`（C99 6.7.2.5）：最后要把基础类型换成对应的复数结构体 */
     int saw_complex = 0;
 
-    /* typeof(expr) / __typeof__(type)：类型取自表达式（不求值） */
-    if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof"))
-        return parse_typeof();
+    /* typeof(expr) / __typeof__(type)：类型取自表达式（不求值）。
+     * 不能直接 `return`：后面还可能跟着限定符和 `*`——内核
+     * include/linux/kfifo.h:64 的 `ptrtype const *ptr_const;` 展开出来就是
+     * `typeof(*(__tmp)->type) const *ptr_const`，以前 `const` 成了声明符名，
+     * 报"这里要 ';'（当前是 '*'）"。`goto typespec_done` 让后缀限定符那段
+     * 接着吃，`*` 仍旧归声明符管。 */
+    if (PA_IS_IDENT("typeof") || PA_IS_IDENT("__typeof__") || PA_IS_IDENT("__typeof")) {
+        base = parse_typeof();
+        goto typespec_done;
+    }
     /* `closure RET(params)`：闭包类型，单字（指向 {代码指针, 捕获…} 的堆对象） */
     if (c6_kw() && PA_IS_IDENT("closure"))
         return parse_closure_type();

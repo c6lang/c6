@@ -1484,6 +1484,14 @@ have_macro:
                 expand_macro(m, NULL, NULL, 0, &ex, &exn);
                 for (q = 0; q < exn; q++)
                     ex[q].hs = ex[q].hs ? hide_union(nh, (Hide *)ex[q].hs) : nh;
+                /* 展开结果**第一个** token 的空格标志要跟宏名走，不能跟宏体
+                 * 走：`#define PATH .` 里那个 `.` 前面有空格，直接继承会让
+                 * `__stringify(PATH/system.h)` 变成本 `"./ trace.h"`
+                 * （gcc 是 "./trace.h"）——内核 include/trace/define_trace.h:118
+                 * 的 TRACE_INCLUDE 就是这么链的，13 个文件找不到头。宏体内部
+                 * 其余 token 的空格保持原样（-E 输出和 stringize 都要）。 */
+                if (exn)
+                    ex[0].flags = (ex[0].flags & ~TF_SPACE) | (out->flags & TF_SPACE);
                 pp_push_tokens(ex, exn);
                 PP_TOP->emark = em;
             }
@@ -1596,6 +1604,9 @@ have_macro:
              * section_ptr_add((s1-> s1->eh_frame_section), 4)。 */
             for (q = 0; q < exn; q++)
                 ex[q].hs = ex[q].hs ? hide_union(nh, (Hide *)ex[q].hs) : nh;
+            /* 首 token 的空格跟宏名走，理由见上面对象宏那一条 */
+            if (exn)
+                ex[0].flags = (ex[0].flags & ~TF_SPACE) | (out->flags & TF_SPACE);
             pp_push_tokens(ex, exn);
             PP_TOP->emark = em;
             arg_reset(am);
