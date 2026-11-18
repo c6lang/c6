@@ -7876,7 +7876,8 @@ static void skip_attributes(void)
                     }
                     /* `__attribute__((alias("目标")))`：这个名字没有自己的
                      * 代码/存储，只是目标的另一个入口 */
-                    if (PA_AT_DECL && c->kind == TK_IDENT && TOK_EQ(c, "alias")) {
+                    if (PA_AT_DECL && c->kind == TK_IDENT
+                        && (TOK_EQ(c, "alias") || TOK_EQ(c, "__alias__"))) {
                         Tok *nx3 = pa_peek(1);
                         Tok *ny3 = pa_peek(2);
 
@@ -22735,10 +22736,16 @@ static void pa_emit_deferred(void)
     for (i = 0; i < NDEF; i++)
         sym2def[DEF_FNS[i].sym] = i + 1;    /* 0 = 不在缓存里 */
 
-    /* 根集：全局函数（外部可能调用）+ ctor/dtor + 数据里引用的函数符号。 */
+    /* 根集：全局函数（外部可能调用）+ ctor/dtor + 数据里引用的函数符号。
+     * 带别名（`__attribute__((alias))` 或方法别名）的函数也要算：
+     * `SYSCALL_DEFINE` 生成的 do_sys_* 是 static，但它有全局别名 __x64_sys_*
+     * （system call table 通过它引用）。别名存在即意味着外部可见入口，
+     * 目标函数必须发射，否则 alias_apply 接不上、链接期 undefined。 */
     for (i = 0; i < NDEF; i++) {
-        if (!DEF_FNS[i].is_static)
-            DEF_FNS[i].emitted = 1;
+        DefFn *d = &DEF_FNS[i];
+
+        if (!d->is_static || d->alias_sym)
+            d->emitted = 1;
     }
     for (i = 0; i < NCTOR; i++)
         if (CTORS[i] < X64.nsym && sym2def[CTORS[i]])
@@ -24648,6 +24655,23 @@ static int pa_finish(const char *out)
             /* 两遍发射：IR 已全缓存，现在按可达集写出 live 函数（死函数
              * 不生成字节），再补跳板、出 .o。非该模式时 NDEF=0，直接返回。 */
             pa_emit_deferred();
+            /* 两遍发射才产生的别名（如系统调用 __x64_sys_* 的方法别名
+             * pt_regs___x64_sys_*、static_call trampoline）目标函数此时才
+             * defined，pa_finish 开头那次 alias_apply 跑得早、跳过了它们。
+             * x64_alias_idx 是幂等赋值，再跑一次把短名接上。 */
+            if (pa_defer_enabled()) {
+                alias_apply();
+                /* 别名符号（__x64_sys_* 等）在源码里是全局的，但 x64_alias_idx
+                 * 把目标的 is_static 拷过来——目标 do_sys_* 是 static（方法别名
+                 * 本地化），于是全局别名也成了 STB_LOCAL，跨 TU 看不到。
+                 * 两遍发射下把源码别名恢复成全局。 */
+                for (i = 0; i < NALIAS; i++) {
+                    u32 as = x64_sym(&X64, ALIAS_FROM[i]);
+
+                    if (as < X64.nsym && X64.sym[as].defined)
+                        X64.sym[as].is_static = 0;
+                }
+            }
             x64_resolve(&X64);
             code_len = CODE_IMG.n;
             obj_write(out);
