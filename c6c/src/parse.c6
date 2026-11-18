@@ -21503,7 +21503,11 @@ static void gen_stmt(void)
         if (is_range) {
             u32 lb = islot;
 
-            if (lb) {
+            /* vreg 0 是合法槽位（irfn_vreg 从 0 开始发号）。以前这里写
+             * `if (lb)`，于是「foreach 绑定恰好是该函数的第一个 vreg」时整段
+             * 循环体都不被解析，body 里的标识符掉到函数作用域报未声明。
+             * 区间形式必然有一个绑定（双绑定在前面已经报错），直接展开。 */
+            {
                 /* 计数器放**隐藏槽**里，绑定每轮拿一份副本：`foreach (size_t i =
                  * 0:3) { i = 99; }` 里改绑定不能影响迭代次数。 */
                 u32 rcnt = irfn_vreg(&FN);
