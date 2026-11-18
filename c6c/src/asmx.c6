@@ -243,6 +243,32 @@ static int ax_word(void)
 }
 
 /* 数字（十进制/十六进制，带可选符号）*/
+/* 从 q 解析一个十进制/0x 十六进制整数，成功推进 q 并返回 1。
+ * 给 `$(3*8)` 这类算术立即数用（内核 rethook.c 的 pushq $(3*8)）。 */
+static int ax_parse_int(const char **q, int *out)
+{
+    const char *p = *q;
+    int base = 10, v = 0, any = 0;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16; p += 2;
+    }
+    for (;;) {
+        int d = -1;
+        char c = *p;
+
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (base == 16 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (base == 16 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        if (d < 0) break;
+        v = v * base + d; any = 1; p++;
+    }
+    if (!any) return 0;
+    *q = p; *out = v;
+    return 1;
+}
+
 static int ax_num(int *out)
 {
     int v = 0;
@@ -439,8 +465,47 @@ static int ax_operand(AxOp *o)
     if (*AX_P == '$') {
         AX_P++;
         o->kind = AXK_IMM;
-        if (!ax_num(&o->disp))
-            return 0;
+        if (!ax_num(&o->disp)) {
+            /* `$(expr)`：内核 rethook 的 `pushq $(3*8)`。ax_num 只吃纯数字，
+             * 这里支持极简的 `(A*N)` / `(A+N)` / `(A-N)`（A、N 为整数）。
+             * 够用即可——汇编器不该因一个算术立即数就整段作废。 */
+            if (*AX_P == '(') {
+                const char *q = AX_P + 1;
+                int a = 0, b = 0, got = 0;
+                char op = 0;
+
+                if (ax_parse_int(&q, &a)) {
+                    while (*q == ' ' || *q == '\t') q++;
+                    op = *q;
+                    if (op == '*' || op == '+' || op == '-') {
+                        q++;
+                        if (ax_parse_int(&q, &b)) {
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ')') {
+                                o->disp = op == '*' ? a * b
+                                        : op == '+' ? a + b : a - b;
+                                o->kind = AXK_IMM;
+                                o->have_disp = 1;
+                                AX_P = q + 1;
+                                return 1;
+                            }
+                        }
+                    }
+                    (void)got;
+                }
+            }
+            /* `$symbol`：符号立即数（内核 rethook 的 `pushq $sym`）。
+             * a64 迷你汇编器不能直接发绝对 imm32 重定位（X64.fix 只有
+             * PC32），复用 AXK_SYM 并用 rip=1 标记"来自 $"，由 push 分支
+             * 翻译成等价的 `lea sym(%rip), %rax; pushq %rax`。 */
+            if (!ax_word())
+                return 0;
+            o->sym = arena_strndup(&A_main, AX_WBUF, AX_WLEN);
+            o->symlen = AX_WLEN;
+            o->kind = AXK_SYM;
+            o->rip = 1;
+            return 1;
+        }
         o->have_disp = 1;
         return 1;
     }
@@ -1122,6 +1187,29 @@ static int ax_insn(void)
     case 25:                            /* ror */
         return ax_shift(1, &o1, &o2, size);
     case 26:                            /* push */
+        if (o1.kind == AXK_SYM && o1.rip) {
+            /* `pushq $sym` → `lea sym(%rip), %rax; pushq %rax`。
+             * 复用 PC32 重定位（内核 relocs 接受），避免要求绝对 imm32
+             * 重定位。%rax 是 caller-saved，rethook 随后会 push 所有寄存器
+             * 保存现场，用它中转安全。
+             *   lea: 48 8d 05 <rel32>   push rax: 50 */
+            AxOp m = {0};
+            AxOp r = {0};
+
+            m.kind = AXK_MEM;
+            m.sym = o1.sym;
+            m.symlen = o1.symlen;
+            m.rip = 1;
+            m.disp = 0;
+            m.have_disp = 1;
+            r.kind = AXK_REG;
+            r.reg = 0;                  /* %rax */
+            r.size = 64;
+            ax_emit_rm(0x8D, 0, 0, &m, 1, 0);  /* lea rax, m（regf=0=%rax）*/
+            ax_rex(0, 0, 0, 0);
+            img_u8(&AX_IM, 0x50);       /* push %rax */
+            return 1;
+        }
         if (o1.kind == AXK_REG) {
             ax_rex(0, 0, 0, o1.reg);
             img_u8(&AX_IM, (u32)(0x50 + (o1.reg & 7)));
