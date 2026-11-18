@@ -2864,6 +2864,9 @@ int isspace(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c
 int isupper(int c) { return c >= 'A' && c <= 'Z'; }
 int islower(int c) { return c >= 'a' && c <= 'z'; }
 int isprint(int c) { return c >= 0x20 && c < 0x7F; }
+int isgraph(int c) { return c > 0x20 && c < 0x7F; }   /* 可打印且非空格 */
+int iscntrl(int c) { return c < 0x20 || c == 0x7F; }
+int ispunct(int c) { return isgraph(c) && !isalnum(c); }
 int isxdigit(int c) { return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 int toupper(int c) { return islower(c) ? c - 32 : c; }
 int tolower(int c) { return isupper(c) ? c + 32 : c; }
@@ -6019,6 +6022,91 @@ int scanf(const char *fmt, ...)
     r = vsscanf(line, fmt, ap);
     va_end(ap);
     return r;
+}
+
+/* dprintf：c6c 的 FILE* 就是 fd 装进的指针（stdio.h 标准流宏 0/1/2），
+ * 所以直接把 fd 转成 FILE* 交给 vfprintf。 */
+int dprintf(int fd, const char *fmt, ...)
+{
+    int r = 0;
+    va_list ap = 0;
+
+    va_start(ap, fmt);
+    r = vfprintf((FILE *)(long)fd, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+/* copy_file_range：c6c 走 read/write 循环等价实现。gen_init_cpio 传的
+ * off_in/off_out 都是 NULL（从当前位置拷）；flags 为 0。返回的字节数
+ * 语义同 syscall：正常 = 拷贝量，0 = EOF，<0 = 失败。 */
+ssize_t copy_file_range(int fd_in, long *off_in, int fd_out, long *off_out,
+                        size_t len, unsigned int flags)
+{
+    char buf[65536] = {0};
+    size_t done = 0;
+
+    (void)off_in;
+    (void)off_out;
+    (void)flags;
+    if (off_in || off_out)
+        return -1;                  /* 带偏移的语义这里不实现 */
+    while (done < len) {
+        size_t want = len - done;
+        long nr = 0;
+        long nw = 0;
+
+        if (want > sizeof(buf))
+            want = sizeof(buf);
+        nr = read(fd_in, buf, want);
+        if (nr <= 0)
+            break;
+        nw = write(fd_out, buf, (size_t)nr);
+        if (nw <= 0)
+            break;
+        done += (size_t)nw;
+        if (nw < nr)
+            break;                  /* 短写：让调用方重试 */
+    }
+    return (ssize_t)done;
+}
+
+/* strtok：用 static 游标保存下一次扫描位置。delim 里的字符都当分隔符。 */
+static char *c6c_strtok_next = 0;
+
+char *strtok(char *s, const char *delim)
+{
+    char *p = 0;
+
+    if (!delim)
+        return 0;
+    if (s)
+        p = s;
+    else
+        p = c6c_strtok_next;
+    if (!p || !*p) {
+        c6c_strtok_next = 0;
+        return 0;
+    }
+    while (*p && strchr(delim, *p))
+        p++;
+    if (!*p) {
+        c6c_strtok_next = 0;
+        return 0;
+    }
+    {
+        char *start = p;
+
+        while (*p && !strchr(delim, *p))
+            p++;
+        if (*p) {
+            *p = 0;
+            c6c_strtok_next = p + 1;
+        } else {
+            c6c_strtok_next = p;
+        }
+        return start;
+    }
 }
 
 #endif /* _C6C_RT_C6 */

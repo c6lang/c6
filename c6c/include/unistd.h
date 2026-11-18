@@ -14,6 +14,11 @@ void _exit(int code);
 typedef long ssize_t;
 typedef int pid_t;
 
+#define STDIN_FILENO  0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+ssize_t copy_file_range(int fd_in, long *off_in, int fd_out, long *off_out, size_t len, unsigned int flags);
+
 /* 进程/终端/临时文件：std/os 下那几个模块要用 */
 int fork(void);
 int waitpid(int pid, int *status, int options);

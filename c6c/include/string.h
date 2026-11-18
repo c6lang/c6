@@ -27,6 +27,7 @@ char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 char *strstr(const char *hay, const char *needle);
 char *strdup(const char *s);
+char *strtok(char *s, const char *delim);
 char *strndup(const char *s, size_t n);
 char *strerror(int errnum);
 size_t strspn(const char *s, const char *accept);

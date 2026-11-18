@@ -8,6 +8,7 @@
 #define O_CREAT 0100
 #define O_TRUNC 01000
 #define O_APPEND 02000
+#define O_LARGEFILE 0   /* x86-64 上 64 位偏移是默认的，这个 flag 无意义 */
 
 /* 记录锁（POSIX `fcntl` 的 F_SETLK / F_SETLKW）：std/os/lock 要用。
  * 布局照 x86-64 Linux 的 `struct flock`。 */
