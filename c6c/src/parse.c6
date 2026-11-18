@@ -24076,8 +24076,21 @@ static void gen_decl_from_spec(u32 base)
              * 会在每个 TU 全量发射 inline 函数体；GCC 的 inline 语义是"每个 TU
              * 一份、不跨 TU 冲突"，而 c6c 以前发成全局符号，导致 `native_save_fl`
              * 等与真实定义 multiple definition。按 static 的路子本地化即可。 */
-            if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up)
-                fscope_static = 1;
+            /* 带 alias 的名字是外部可见入口（SYSCALL_DEFINE 的 __x64_sys_*
+             * = __do_sys_* 的别名，system call table 跨 TU 引用），不能被
+             * inline 本地化——否则发成 STB_LOCAL，链接期 undefined。
+             * SYSCALL_DEFINEn(n>0) 的 x64/ia32 两个 sys_ 入口是真实函数
+             * （首形参 pt_regs 指针），同样必须全局：syscall table 跨 TU 引用。 */
+            {
+                /* `__x64_sys_*` / `__ia32_sys_*`：第 3 个字符区分 */
+                int is_sysentry = (d.nlen > 3 && d.name[0] == '_'
+                                   && d.name[1] == '_'
+                                   && (d.name[2] == 'x' || d.name[2] == 'i'));
+
+                if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up
+                    && !al && !is_sysentry)
+                    fscope_static = 1;
+            }
             enf = fscope_static ? tu_static_name(nm) : nm;
             s = sym_find(nm, d.nlen);
             if (s && s->is_func && ty_func_nparams(s->type) > 0)
