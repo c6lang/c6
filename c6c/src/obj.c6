@@ -513,7 +513,16 @@ static void obj_dce_stub_dead(void)
                            || strcmp(cn, "x86_64_start_reservations") == 0))
                     keep_call = 1;
             }
-            if (!drop && !keep_call && getenv("C6C_KERNEL_DCE")
+            /* 下面 NOP 化只认 E8 call。其它 fixup（lea reg,[rip+disp32] 0x8D、
+             * jmp rel32 0xE9、内联汇编 `.long sym - (.+4)` 等）的符号若被 drop，
+             * 指令保留但 disp32 停在占位 0 → 运行时跳到自身/地址 0 崩溃：
+             *  - get_current 的 per-CPU 符号取址（lea 0x0 → 错误函数指针）
+             *  - __SCT__WARN_trap 的 jmp __WARN_trap（.long 重定位丢失 → 跳 0）
+             * 只有真正的 E8 call 才因"UNC 不可达调用"被 NOP；其余 UND 引用
+             * 交给链接器正常解析。 */
+            u32 fp = X64.fix[i2].patch;
+            int is_call = fp > 0 && CODE_IMG.p[fp - 1] == 0xE8;
+            if (!drop && !keep_call && is_call && getenv("C6C_KERNEL_DCE")
                 && X64.fix[i2].sym < X64.nsym
                 && !X64.sym[X64.fix[i2].sym].defined
                 && !X64.sym[X64.fix[i2].sym].is_static)

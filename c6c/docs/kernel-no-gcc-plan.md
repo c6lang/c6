@@ -186,3 +186,16 @@
   ——缺 %gs 段前缀、displacement=0、无重定位。根因：c6c 后端对 per-CPU
   /全局符号取址生成了错误的 RIP-relative 0 偏移且丢失重定位，这是启动
   失败的根本 codegen bug。剩余：在后端（符号取址 lowering）定位并修复。
+
+  **本轮 codegen 修复（2026-11-19，已验证推进启动）**：
+  1. `obj.c6` DCE 压缩 fixup 时，只应 NOP 化 E8 call 的 UND 引用；原先无条件
+     drop 所有 UND fixup，导致 lea（per-CPU 符号取址）和 `.long sym-(.+4)`
+     （static_call trampoline jmp）的 disp32 停在 0。改为 `is_call` 判断。
+  2. `asmx.c6` 顶置的 `.pushsection .discard...` 元数据段（ANNOTATE_NOENDBR）
+     未正确吞掉，`.long 911b - ., N` 被拆成两个 long 发到 .text，在
+     `__SCT__WARN_trap` 的 jmp 前留下 8 字节垃圾。改为整条丢弃数字标签引用。
+  验证：999/999 编译 + 链接 + bzImage 全通过；qemu in_asm 显示 `call *%r11`
+  现在正确解析到 __SCT__WARN_trap → `jmp __WARN_trap` → `ud1`（WARN trap）。
+  内核从"跳地址 0 崩溃"推进到"WARN 触发 → #UD → #GP → triple fault"。
+  剩余：WARN 在正常启动中不该触发（cgroup_init_early 条件判断有误），且 #UD
+  处理本身跳 #GP 崩溃。

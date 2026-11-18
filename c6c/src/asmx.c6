@@ -1299,6 +1299,39 @@ static int ax_directive(void)
 {
     int v = 0;
 
+    /* ANNOTATE_NOENDBR 等展开成
+     *   .pushsection .discard.annotate_insn,"M",@progbits,8; .long 911b - .,N; .popsection
+     * 整段是 discard 段元数据：里面的 `.long 911b - .,N` 数字标签反向引用
+     * 迷你汇编器不支持，若照常发到当前段会留下 4 字节 0（启动陷阱 jmp 前的
+     * 垃圾，导致 call 进去后 #PF）。整段吞掉，不产生任何代码/数据。 */
+    if (ax_w_is(".pushsection")) {
+        const char *q = AX_P;
+
+        /* 只看本条指令到行尾的段名；非 discard 的 .pushsection 保持原样 */
+        while (q < AX_E && *q != '\n' && *q != ';') q++;
+        {
+            const char *b = AX_P;
+            int discard = 0;
+
+            while (b < q) {
+                if (b + 8 <= q && strncmp(b, ".discard", 8) == 0) { discard = 1; break; }
+                b++;
+            }
+            if (discard) {
+                /* 吞到 .popsection 之后（含分号），整段不发射 */
+                while (AX_P < AX_E) {
+                    if ((*AX_P == '.' ) && AX_P + 11 <= AX_E
+                        && strncmp(AX_P, ".popsection", 11) == 0) {
+                        AX_P += 11;
+                        break;
+                    }
+                    AX_P++;
+                }
+                return 1;
+            }
+        }
+    }
+
     if (ax_w_is(".byte") || ax_w_is(".word") || ax_w_is(".short") || ax_w_is(".value")
         || ax_w_is(".long") || ax_w_is(".int") || ax_w_is(".quad") || ax_w_is(".8byte")
         || ax_w_is(".4byte") || ax_w_is(".2byte")) {
@@ -1323,14 +1356,16 @@ static int ax_directive(void)
             }
             if (!ax_num(&v))
                 return 0;
-            /* `911b - .,1`：数字标签反向引用（annotate 元数据，discard 段）。
-             * 迷你汇编器不解析这种表达式，吞到参数分隔符，填 0 即可。 */
+            /* `911b - .,1`：数字标签反向引用，只出现在 ANNOTATE 的 discard
+             * 段元数据里（`.long 911b - ., N`）。迷你汇编器不解析它，且这段
+             * 数据本应随 discard 段丢弃，绝不能发到当前代码段——否则会在
+             * static_call trampoline 的 jmp 前留下 8 字节垃圾（0 和 type 值），
+             * 入口一执行就 #PF。整条吞到分号/行尾，不发射任何字节。 */
             if (AX_P < AX_E && (*AX_P == 'b' || *AX_P == 'f')) {
                 AX_P++;
-                while (AX_P < AX_E && *AX_P != ',' && *AX_P != ';'
-                       && *AX_P != '\n' && *AX_P != '#')
+                while (AX_P < AX_E && *AX_P != ';' && *AX_P != '\n' && *AX_P != '#')
                     AX_P++;
-                v = 0;
+                continue;   /* 整条 .long 丢弃，含 ", type" 尾参数 */
             }
             if (sz == 1)
                 img_u8(&AX_IM, (u32)v);
