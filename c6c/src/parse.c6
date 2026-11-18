@@ -4103,18 +4103,22 @@ static i64 const_unary(void)
 static i64 const_mul(void)
 {
     i64 v = const_unary();
+    u32 lty = CONST_TY;         /* 结果类型取左操作数 */
 
     for (;;) {
         if (pa_accept_ch('*')) {
             v = v * const_unary();
+            CONST_TY = lty;     /* 右侧求值会改写 CONST_TY */
         } else if (pa_accept_ch('/')) {
             i64 r = const_unary();
 
             v = r ? v / r : 0;
+            CONST_TY = lty;
         } else if (pa_accept_ch('%')) {
             i64 r = const_unary();
 
             v = r ? v % r : 0;
+            CONST_TY = lty;
         } else {
             return v;
         }
@@ -4124,13 +4128,16 @@ static i64 const_mul(void)
 static i64 const_add(void)
 {
     i64 v = const_mul();
+    u32 lty = CONST_TY;         /* 结果类型取左操作数（寻常算术转换） */
 
     for (;;) {
-        if (pa_accept_ch('+'))
+        if (pa_accept_ch('+')) {
             v = v + const_mul();
-        else if (pa_accept_ch('-'))
+            CONST_TY = lty;     /* 右侧求值会改写 CONST_TY */
+        } else if (pa_accept_ch('-')) {
             v = v - const_mul();
-        else
+            CONST_TY = lty;
+        } else
             return v;
     }
 }
@@ -4138,13 +4145,18 @@ static i64 const_add(void)
 static i64 const_shift(void)
 {
     i64 v = const_add();
+    u32 lty = CONST_TY;         /* 左操作数类型：移位结果的类型 */
 
     for (;;) {
-        if (pa_accept_punct("<<"))
-            v = (i64)((u64)v << (u64)const_add());
-        else if (pa_accept_punct(">>"))
-            v = v >> (u64)const_add();
-        else
+        if (pa_accept_punct("<<")) {
+            i64 sh = const_add();
+            v = (i64)((u64)v << (u64)sh);
+            CONST_TY = lty;     /* 右侧求值会改写 CONST_TY，恢复为左值类型 */
+        } else if (pa_accept_punct(">>")) {
+            i64 sh = const_add();
+            v = v >> (u64)sh;
+            CONST_TY = lty;
+        } else
             return v;
     }
 }

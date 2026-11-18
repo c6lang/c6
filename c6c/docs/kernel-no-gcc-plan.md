@@ -130,12 +130,11 @@
   而是在 .text 末尾生成独立 `ret` stub，pseudo 符号统一指向它；ABS WEAK
   符号从 140 降到 0，x86_64_start_kernel 的 `call 0` 已消除。
   make bzImage 全 c6c 工具链再次成功（35,776,000 字节），fast 全绿。
-  剩余：qemu 仍在解压后挂起（无 Linux version），但 x86_64_start_kernel
-  的调用链已无 call 0——需用 gdb 定位更深的挂起点（exc_divide_error 里
-  还有 call 0，可能与异常处理路径有关）。产物备份 /tmp/c6c_kernel_build2/。
-  （可能仍有个别符号被 ABS 抢占或 asmx 翻译问题）。产物备份在 /tmp/c6c_kernel_build/。
-  实验发现 C6C_KERNEL_WEAK_UND=1（完全关 ABS 化）会导致 kallsyms 不一致，
-  不可用——ABS 符号表项是 kallsyms 一致性的必要条件。
-- 阶段 2（HOSTCC kbuild 全链 + modpost）已打通；objcopy/ar 子集已完成并各自
-  经构建链集成验证（bzImage+qemu）；剩余 AS、LD 未完成。
-- 用户的完整目标尚未达成——中间产物（仅 CC、或 CC+kallsyms）是实质进展，不是终点。
+  修复 c6c 核心 bug：常量表达式 `~` 对二元右操作数会读到错误的 CONST_TY，
+  导致 `~(1UL<<63)` 算成全 1（应 0x7fff…）——内核 early_pmd_flags 多出 NX 位。
+  已修 const_mul/const_add/const_shift 的类型恢复；最小复现与 gcc 完全一致。
+  999/999 编译 + vmlinux 链接成功；early_pmd_flags 现为正确的 0xe3；bzImage
+  全 c6c 工具链构建成功（35,776,000 字节）；fast 全绿。
+  剩余：qemu 仍在解压后挂起（无 Linux version），early_pmd_flags 已正确，
+  需用 gdb 定位更深的挂起点（并发回归干扰，可用改名 qemu 绕开 pkill）。
+  产物备份 /tmp/c6c_kernel_build3/。
