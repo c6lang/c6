@@ -286,3 +286,18 @@
   （gcc 代码）两者都加载 0x1ff；差异来自 idt_setup_early_traps/cpu_init
   的时机或 c6c 早期代码破坏了 IDT 切换路径。剩余：查 c6c 内核里 idt_table
   的加载时机（native_load_idt）与 setup_arch 流程。
+
+
+  ★★★ 决定性根因：函数入口多一个 ret 字节（2026-11-20）★★★
+  c6c vmlinux 里 desc_ptr_native_load_idt（来自 arch/x86/include/asm/desc.h
+  的 `asm volatile("lidt %0"::"m" (*dtr))`）反汇编：
+    812a8606 <desc_ptr_native_load_idt>:
+    812a8606: c3              ret        ← 函数入口直接 ret！
+    812a8607: 48 89 e5        mov %rsp,%rbp  ← 真正序言在入口+1
+  字节序列 `c9 c3 c3`（leave; ret; ret），符号指向第二个 c3，多出一个 ret。
+  结果：所有 native_load_idt 调用立即返回，lidt 从不执行 → IDT 一直是
+  bringup_idt_table（32 门空表，limit 0x1ff）→ 早期 #PF 投递 #DF → triple fault。
+  idt_setup_early_handler 正确填充 idt_table（设了 32 门 + 调
+  desc_ptr_native_load_idt(&idt_descr)），但被 ret 短路。
+  这是 c6c 内联汇编/函数序言 codegen bug（函数入口多 1 字节 ret）。
+  修复方向：查 asmx.c6 对 asm volatile("lidt") 的处理 / x64.c6 序言生成。
