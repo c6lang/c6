@@ -126,12 +126,13 @@
   根因诊断：full_twopass 的 make vmlinux 用的是 GNU ld（不是 c6c ld.c6），
   在 ld.c6 里改 weak 覆盖逻辑无效（已回退）。关闭 ABS 化会令 kallsyms
   多遍地址不收敛（KALLSYMS_EXTRA_PASS 只加一遍，不能解决），不可用。
-  已修：DFIX 路径对 weak defined 符号也跳过 R_X86_64_64（EXPORT_SYMBOL 的
-  weak 函数地址），SCK 与 paddr_vmcoreinfo_note 的 relocs 错误均消除。
-  **端到端 make bzImage 首次全 c6c 工具链成功**：999/999 编译 + vmlinux
-  + bzImage（36,275,712 字节），ar/objcopy 包装均接入。qemu 加载后能
-  解压内核并跳转（`Decompressing Linux... done. Booting the kernel`），
-  但解压后早期启动无 `Linux version` 输出——卡在早期 C 初始化，需继续调试
+  已修：DFIX/NOP 化 + ret stub——UND weak 引用不再发成 SHN_ABS 0，
+  而是在 .text 末尾生成独立 `ret` stub，pseudo 符号统一指向它；ABS WEAK
+  符号从 140 降到 0，x86_64_start_kernel 的 `call 0` 已消除。
+  make bzImage 全 c6c 工具链再次成功（35,776,000 字节），fast 全绿。
+  剩余：qemu 仍在解压后挂起（无 Linux version），但 x86_64_start_kernel
+  的调用链已无 call 0——需用 gdb 定位更深的挂起点（exc_divide_error 里
+  还有 call 0，可能与异常处理路径有关）。产物备份 /tmp/c6c_kernel_build2/。
   （可能仍有个别符号被 ABS 抢占或 asmx 翻译问题）。产物备份在 /tmp/c6c_kernel_build/。
   实验发现 C6C_KERNEL_WEAK_UND=1（完全关 ABS 化）会导致 kallsyms 不一致，
   不可用——ABS 符号表项是 kallsyms 一致性的必要条件。

@@ -499,6 +499,14 @@ static void obj_dce_stub_dead(void)
             u32 o = owner[i2];
             int drop = (o != NONE && !mark[o] && X64.sym[o].is_static);
 
+            /* 内核模式 UND weak → SHN_ABS 0 的符号：代码若 call 它，链接器把
+             * rel32 解析成跳到地址 0，早期启动崩溃（gcc 会常量折叠掉这些
+             * 不可达调用，c6c 保留了调用）。像死函数一样 NOP 化该 call。 */
+            if (!drop && getenv("C6C_KERNEL_DCE") && X64.fix[i2].sym < X64.nsym
+                && !X64.sym[X64.fix[i2].sym].defined
+                && !X64.sym[X64.fix[i2].sym].is_static)
+                drop = 1;
+
             if (drop) {
                 u32 p = X64.fix[i2].patch;
 
@@ -543,7 +551,8 @@ static void obj_write(const char *path)
     u32 *map = NULL;            /* X64 符号 id → ELF 符号下标 */
     u8 *emit = NULL;            /* 内核模式：UND 且未被重定位引用的符号不发表项 */
     u8 *seen = NULL;            /* 数据段里已落过重定位的字节（去重） */
-    u8 *pseudo_syms = NULL;     /* 内核模式 UND weak → SHN_ABS 的符号 id */
+    u8 *pseudo_syms = NULL;     /* 内核模式 UND weak → ret stub 的符号 id */
+    u32 weak_stub_off = 0;      /* .text 末尾 ret stub 的偏移 */
     u32 i = 0;
     u32 nlocal = 0;
     u32 off_text = 0;
@@ -572,6 +581,13 @@ static void obj_write(const char *path)
         return;
     }
     obj_dce_stub_dead();
+    /* 内核模式 UND weak 引用（gcc 常量折叠掉、c6c 保留）不能发成 ABS 0：
+     * 代码里 call 它会跳地址 0 崩溃。在 .text 末尾放一条独立的 `ret` stub，
+     * pseudo 符号统一指向它——call 安全返回，数据引用得到非零地址。 */
+    if (getenv("C6C_KERNEL_DCE") && CODE_IMG.n < CODE_IMG.cap) {
+        weak_stub_off = CODE_IMG.n;
+        CODE_IMG.p[CODE_IMG.n++] = 0xC3;   /* ret */
+    }
     ob_str_init(&str);
     ob_str_init(&shstr);
 
@@ -670,17 +686,23 @@ static void obj_write(const char *path)
             type = OBJ_STT_OBJECT;
         }
         if (pseudo && !getenv("C6C_KERNEL_WEAK_UND")) {
-            /* 内核模式未解析的 weak 引用：发成 SHN_ABS value=0。
-             * 普通 UND weak 在中间遍次被链接器丢弃（值 0、无定义），
-             * 但最终链接带 --emit-relocs 会保留，导致 kallsyms 的
-             * System.map 比中间遍次的 .syms 多一批地址 0 的 v 符号。
-             * ABS 符号在所有遍次都保留，System.map 与 .syms 一致。
-             * 有强定义的符号（别的 TU/.S）链接器仍正常解析覆盖。 */
-            shndx = OBJ_SHN_ABS;
-            type = OBJ_STT_NOTYPE;
+            /* 内核模式未解析的 weak 引用：指向 .text 末尾的 `ret` stub。
+             * 不能发成 SHN_ABS 0——代码里 call 它会跳地址 0 崩溃（gcc 会
+             * 常量折叠掉这些不可达调用，c6c 保留了）。stub 在所有遍次
+             * 都保留且地址一致，System.map 与 .syms 一致；有强定义的符号
+             * （别的 TU/.S）链接器仍正常解析覆盖。 */
+            if (weak_stub_off) {
+                shndx = OBJ_SHN_TEXT;
+                type = OBJ_STT_NOTYPE;
+            } else {
+                shndx = OBJ_SHN_ABS;
+                type = OBJ_STT_NOTYPE;
+            }
         }
         ob_sym_add(local ? &loc : &glob, ob_str(&str, s->name),
-                   (u8)((bind << 4) | type), shndx, ob_sym_value(s));
+                   (u8)((bind << 4) | type), shndx,
+                   (pseudo && weak_stub_off && !getenv("C6C_KERNEL_WEAK_UND"))
+                       ? weak_stub_off : ob_sym_value(s));
     }
     nlocal = loc.n;
     for (i = 0; i < loc.n; i++)
