@@ -20,7 +20,7 @@
 cmake --build build --target std-ub                   # 先编出检查器（build/stdub），并跑内置演示样例
 ./build/stdub 你的文件.c6      # 真实文件，可以给多个
 ./build/stdub std             # 给目录就**递归**扫里面所有 *.c6（子目录一起）
-./tcc/c6 --ub 你的文件.c6      # 同一个检查器，从编译器入口调（等价于上面这条）
+./tcc/c6 --ub 你的文件.c6      # 从 tcc 形态的编译器入口调（需 -DC6_ENABLE_TCC=ON；等价于上面这条）
 ./build/stdub -q 你的文件.c6   # --quiet-uncertain：只报「一定」
 ./build/stdub -W 你的文件.c6   # --strict：安全门模式（见下）
 ./build/stdub -S 你的文件.c6   # --sound：健全模式（证明不了的访问也算失败）

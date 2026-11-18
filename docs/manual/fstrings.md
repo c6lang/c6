@@ -132,7 +132,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 完整可运行示例见 [examples/fstr_demo.c6](../../examples/fstr_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/fstr_demo.c6
+./c6c/build/c6c -run examples/fstr_demo.c6
 ```
 
 回归用例见 [tests/fstr.c6](../../tests/fstr.c6)（`cmake --build build --target selftest` 里跑），编译期诊断见

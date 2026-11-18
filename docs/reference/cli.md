@@ -38,7 +38,10 @@
 
 ## 编译器选项
 
-### c6 专用（只在 `C6_EXT` 构建里存在）
+### c6 专用（tcc 形态为主）
+
+下表多数选项属于显式 `-DC6_ENABLE_TCC=ON` 构建的 `tcc/c6`；默认交付的 c6c 也实现了
+`-test` / `-test-filter` 与部分诊断开关，其余以 `./c6c/build/c6c -h` 为准。
 
 | 选项 | 作用 |
 |---|---|
@@ -55,13 +58,15 @@
 
 | 选项 | 作用 |
 |---|---|
-| `-c99` | 选用 C99 输出后端（生成 C 源码，不是机器码） |
-| `-o *.c` / `-o <目录>` / `-o <路径>/` | 不写 `-c99` 也会自动选中 C 后端；`-o <目录>` 给每个输入 TU 一个 `<目录>/<输入>.c` |
-| `-emit-llvm` | 输出 LLVM IR（见 [llvm-backend.md](llvm-backend.md)） |
-| `--target=TRIPLE`（或 `-target=`） | 交叉目标；IR 交给 `clang`，见 [llvm-backend.md](llvm-backend.md) |
-| `-cc <编译器>` | 交给哪个宿主编译器处理 IR |
+| `--emit-c` | c6c：选 C99 输出后端，写 `.c` 源文件（[c99-backend.md](c99-backend.md)） |
+| `-c99` / `-o *.c` / `-o <目录>` / `-o <路径>/` | tcc 形态：选 C 后端；`-o <目录>` 给每个输入 TU 一个 `<目录>/<输入>.c` |
+| `--emit-llvm` | 两边都有：输出 LLVM IR（c6c 见 [c6c/README.md](../../c6c/README.md)，tcc 见 [llvm-backend.md](llvm-backend.md)） |
+| `--target=TRIPLE`（或 `-target=`）/ `-cc <编译器>` / `--print-targets` | tcc 形态：交叉目标，IR 交给 `clang`（[llvm-backend.md](llvm-backend.md)）；c6c 只有 `--target=aarch64 -S`（aarch64 汇编文本） |
 
-### 常用 tcc 选项（本仓库每天都在用）
+### 常用选项（默认 c6c；部分仅 tcc 形态）
+
+下表标「tcc 形态」的选项只在显式 `-DC6_ENABLE_TCC=ON` 构建的 `tcc/c6` 里存在；
+其余在默认交付的 `c6c` 与 tcc 形态里都用同一套写法。
 
 | 选项 | 作用 |
 |---|---|
@@ -80,8 +85,9 @@
 ```sh
 ./c6c/build/c6c -run examples/err_demo.c6                 # 直接跑
 ./c6c/build/c6c -test tests/defer.c6                      # 跑 test 块
-./c6c/build/c6c -c -emit-header geo/shape.h geo/shape.c6  # 导出 C 头文件
-./c6c/build/c6c -o out.c prog.c6 && cc -std=c99 -o prog out.c   # C99 后端
+./c6c/build/c6c -c -o shape.o geo/shape.c6                # 出可重定位目标文件
+./c6c/build/c6c --emit-c -o out.c prog.c6 && cc -std=c99 -o prog out.c  # C99 后端
+./tcc/c6 -B tcc -c -emit-header geo/shape.h geo/shape.c6  # 导出 C 头文件（tcc 形态）
 ```
 
 ## CMake 构建目标与 CTest 用例
@@ -201,22 +207,25 @@ c6c 已能自举，tcc 只作语料与参考实现保留，需要 tcc 版 c6 时
 
 ### C99 输出后端
 
+默认 c6c 用 `--emit-c`；tcc 形态用 `-c99` / `-o *.c`。两条路径的细节见
+[c99-backend.md](c99-backend.md)。
+
 | 目标 | 作用 |
 |---|---|
-| `cmake --build build --target c99` | 兼容旧脚本的占位目标（C99 后端已内置，用 `-c99`） |
+| `cmake --build build --target c99` | 兼容旧脚本的占位目标（c6c 用 `--emit-c`，tcc 形态用 `-c99`） |
 | `cmake --build build --target c99test` | 与 `selftest` 同一套用例，经 C 后端后用 `gcc` 编译运行 |
-| `cmake --build build --target c99tcc-test` | 同上，宿主编译器换成 `tcc/c6`（整条链不需要 gcc） |
+| `cmake --build build --target c99tcc-test` | 同上，宿主编译器换成 `tcc/c6`（tcc 形态专属，整条链不需要 gcc） |
 
 ### 自举
 
 | 目标 | 作用 |
 |---|---|
-| `cmake --build build --target c6selfcheck` | `tcc/tcc.c` 拷成 `.c6` 用 c6 规则编译（「变量必须初始化」最严格的回归） |
-| `cmake --build build --target selfhost` | c6 路线：`tcc` → `stage1` → `stage2`，两次目标文件逐字节比对 |
-| `cmake --build build --target c99selfhost` | C99 路线：生成 C → `gcc` → `stage2` → `stage3` → 比对 |
+| `cmake --build build --target selfhost` | **默认路径**：宿主 cc 引导出 c6c，c6c 编自己两遍，逐字节 fixpoint |
+| `cmake --build build --target c6selfcheck` | tcc 形态专属：`tcc/tcc.c` 拷成 `.c6` 用 c6 规则编译（「变量必须初始化」最严格的回归） |
+| `cmake --build build --target c99selfhost` | tcc 形态的 C99 路线：生成 C → `gcc` → `stage2` → `stage3` → 比对 |
 | `cmake --build build --target c99selfhost-tcc` | 同上，但生成的 C 也由 tcc 自己编（不需要 gcc） |
 
-三条自举路线都会做 bootstrap fixpoint 比对，再用最终编译器编并运行一个小程序；
+默认路径与 tcc 形态的自举路线都会做 bootstrap fixpoint 比对，再用最终编译器编并运行一个小程序；
 产物在各自的 `build/tests/<用例>/selfhost/`（`cmake --build build --target c6-clean`
 一起删）。
 
@@ -241,7 +250,7 @@ c6c 已能自举，tcc 只作语料与参考实现保留，需要 tcc 版 c6 时
 | `C6_CASE_OUT` | 单独运行时 `build/` | 每用例独立输出目录（`build/tests/<用例>/`） |
 | `C6_TCC_DIR` / `C6_MAKE` | `tcc` / `make` | 编译器目录与 make 可执行文件 |
 | `C6_SELFHOST` / `C6_BARE` / `C6_TMP` | `<C6_CASE_OUT>/{selfhost,bare,tmp}` | 自举、裸机与临时产物目录 |
-| `TCC` / `C99TCC` | `tcc/c6` | `tests/run-tests.sh` 用的编译器 |
+| `TCC` / `C99TCC` | `tcc/c6` | tcc 形态的 `tests/run-tests.sh` 用的编译器；c6c 用例用 `C6C` |
 | `BACKEND` | `native` | `native` / `c99` / `llvm` |
 | `C99CC` | `gcc` | C99 后端的宿主编译器（`clang` 也行） |
 | `C99FLAGS` | gcc 的一整套严格开关 | 编译生成 C 的开关（换成 tcc 时自动去掉 gcc 专有开关） |

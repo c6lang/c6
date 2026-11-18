@@ -103,7 +103,7 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：
 
 ```sh
-./tcc/c6 -B tcc -run examples/async_demo.c6
+./c6c/build/c6c -run examples/async_demo.c6
 ```
 
 
@@ -185,5 +185,5 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
 完整可运行示例见 [examples/thread_demo.c6](../../examples/thread_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/thread_demo.c6
+./c6c/build/c6c -run examples/thread_demo.c6
 ```

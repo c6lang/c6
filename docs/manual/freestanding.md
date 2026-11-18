@@ -4,6 +4,9 @@
 >
 > 扩展不依赖 libc 也能跑：运行库的外部依赖全是 weak，缺 `malloc` / `pthread_*` / `select` 时自己顶上，一直到 512 字节引导扇区进长模式。
 >
+> **形态**：下面的 `libtcc1` 细节属于 tcc 形态（`-DC6_ENABLE_TCC=ON`）；默认交付的
+> c6c 用 `c6c/lib/rt.c6`，freestanding / 裸机的现行入口是 `fstest*` CMake 目标。
+>
 > 相关：示例 `examples/freestanding_*.c6`、`examples/boot/`；目标 `cmake --build build --target fstest*` / `cmake --build build --target fstest-bare*`
 
 ---
@@ -24,6 +27,7 @@
 也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
 
 ```sh
+# tcc 形态专属（需 -DC6_ENABLE_TCC=ON）；默认用下面的 CMake 目标即可
 ./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
     examples/freestanding_fstr.c6 tcc/libtcc1.a   # 或 cmake --build build --target fstest
 ./build/freestanding_fstr
@@ -100,8 +104,9 @@ SLIP 串行分帧）。它们只依赖 `std.core.types`，不分配、不链 lib
 `catch`、`@T` 全在内存里做完，最后用 `ud2`（全过，退出码 132）或往 0 地址写
 （某个断言失败）报信 —— 这两个「报信」在裸机上就是你的异常向量。
 
-注意：编译器自己还是得在别的地方跑（宿主上的 `tcc` 产出静态 ELF，再交给引导
-程序/烧写工具）；`tcc -run` 那套 JIT 与裸机无关。
+注意：编译器自己还是得在别的地方跑（宿主上的 `c6c` 产出静态 ELF，再交给引导
+程序/烧写工具）；裸机产物不走 `-run`——c6c 的 `-run` 是落临时 ELF 再执行，
+tcc 形态的 `-run` 才是 mmap + 重定位的 JIT，两者都与烧写无关。
 
 `cmake --build build --target fstest-qemu` 会把这三个产物再用 `qemu-x86_64`（qemu 的用户态模拟器）跑
 一遍：它不用本机的加载器，也不需要 libc —— syscall 由 qemu 自己实现，等于换了

@@ -67,7 +67,7 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
 V1 的完整可运行示例见 [examples/fn_lit_demo.c6](../../examples/fn_lit_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/fn_lit_demo.c6
+./c6c/build/c6c -run examples/fn_lit_demo.c6
 ```
 
 #### 捕获式闭包 `closure`（V2）

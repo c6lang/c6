@@ -1,19 +1,30 @@
 # C99 输出后端（`-c99`、`-o *.c`、`-o <dir>`）
 
-> **状态**：现行实现 · **索引**：[文档索引](../README.md) · **同级后端**：[llvm-backend.md](llvm-backend.md)
+> **状态**：现行实现（两条路径） · **索引**：[文档索引](../README.md) · **同级后端**：[llvm-backend.md](llvm-backend.md)
 >
-> 一句话：复用完整前端，把机器码换成**可移植的 C99 源码**；后端编译进同一个 `tcc/c6`，没有第二个编译器。
+> 一句话：复用完整前端，把机器码换成**可移植的 C99 源码**。默认交付的 c6c 有自己的
+> C99 发射器；`tcc/c99-gen.c` 那条路径属于 **tcc 形态**（需 `-DC6_ENABLE_TCC=ON`），
+> 不再随默认构建交付。
 
-`tcc/c99-gen.c` 是第二个代码生成后端：它复用完整前端，把**可移植的 C99 源码**写出来，
-而不是机器码。它编译进普通的 `tcc/c6` 二进制里，没有单独的编译器。
+默认路径是 c6c 的 `src/c99.c6`，用 `--emit-c` 选中（显式给 `-o out.c`）：
 
 ```sh
-cmake --build build                                  # 一个 tcc，两个后端
-./tcc/c6 -B tcc -o out.c prog.c              # prog.c -> out.c（.c 后缀选中 C 后端）
-./tcc/c6 -B tcc -c99 -o out.c prog.c         # 同上，显式指定
+cmake --build build --target c6c
+./c6c/build/c6c --emit-c -o out.c prog.c6
 cc -std=c99 -o prog out.c && ./prog         # 用任意 C 编译器编结果
+cmake --build build --target c99test        # 同一套用例经 C 后端编译运行
+```
 
-./tcc/c6 -B tcc -c -o out/ a.c b.c          # out/a.c、out/b.c（每个 TU 一个 .c）
+以下属于 **tcc 形态**（显式 `-DC6_ENABLE_TCC=ON`）：`tcc/c99-gen.c` 编进 `tcc/c6`，
+`-o out.c` 靠后缀或 `-c99` 选中 C 后端。
+
+```sh
+cmake --build build --target tcc-build     # 一个 tcc，两个后端
+./tcc/c6 -B tcc -o out.c prog.c            # prog.c -> out.c（.c 后缀选中 C 后端）
+./tcc/c6 -B tcc -c99 -o out.c prog.c       # 同上，显式指定
+cc -std=c99 -o prog out.c && ./prog        # 用任意 C 编译器编结果
+
+./tcc/c6 -B tcc -c -o out/ a.c b.c         # out/a.c、out/b.c（每个 TU 一个 .c）
 
 cmake --build build --target c99test                                # 与 selftest 相同的用例，走 C 后端
 cmake --build build --target c99tcc-test                            # 同上，但宿主编译器换成 tcc 自己
@@ -86,7 +97,7 @@ cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
 不支持（都给出明确错误而不是错编译）：计算 goto 与变长数组。非 POSIX 宿主上生成的运行时
 仍能编译，但 `async`/`spawn`/`c6_io` 需要平台移植。
 
-## 用 C 后端自举
+## 用 C 后端自举（tcc 形态）
 
 `cmake --build build --target c99selfhost` 是端到端证明：生成的 C 是一个能用的编译器，不只是能用的代码。
 
