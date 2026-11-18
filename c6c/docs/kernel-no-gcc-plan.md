@@ -13,7 +13,7 @@
 |---|---|---|---|
 | CC | 3006 | `gcc -c` 编内核 .c | **999/999 TU 两遍发射编译成功，全量链接 + qemu 启动通过**（阶段 1 完成） |
 | AS | 75 | `as` 编 `.S` | 无独立汇编器；需 GNU as 兼容前端或改写 75 个 .S（阶段 3） |
-| HOSTCC | 6 | gcc 编 kallsyms/modpost/sorttable/fixdep/relocs | **kallsyms 三 TU 用 c6c 编译 + 链接成功，输出与 gcc 版逐字节一致**；其余 5 个未做（阶段 2 进行中） |
+| HOSTCC | 6 | gcc 编 kallsyms/modpost/sorttable/fixdep/relocs | **4 个已用 c6c 编译链接**（kallsyms/fixdep/sorttable 输出与 gcc 版逐字节一致，recordmcount 可编链）；modpost/relocs/objtool 未做（阶段 2 进行中） |
 | LD | 10 | `ld` 按 vmlinux.lds.S 链接 | 仍用 GNU ld；ld.c6 不支持自定义段布局/归档/kallsyms 两遍（阶段 4） |
 | AR/OBJCOPY | 800+ | `ar`/`objcopy` | 仍用 binutils；无 ELF 归档与段抽取工具（阶段 4） |
 
@@ -42,13 +42,15 @@
 
 ## 阶段 2：HOSTCC——用 c6c 编 host tools（进行中）
 
-- **kallsyms 已完成**：`scripts/kallsyms.c` + `kallsyms-sysmap.c` + `elf-parse.c` 三 TU
-  分别用 c6c 编译，与 `rt.c6` 一起链接（`-Wl,--allow-undefined` 忽略用不到的 `environ`）。
-  补齐的 libc 面：`strndup`、`perror`、`getopt_long`（新增 `<getopt.h>`）。
-  对同一 vmlinux 的输出：sysmap 与 .bin **逐字节一致**，.S 仅 `.incbin` 引用的文件名不同。
-- **剩余 5 个 host tools**：modpost（依赖 libelf/gelf，`elf-parse.c` 已有基础）、
-  sorttable、fixdep、relocs、objtool（C 实现但依赖较多）。
-  验证口径：`HOSTCC=c6c` 重编后这些工具能跑对，最终 kbuild 不再调 gcc 编 host 工具。
+- **已完成 4 个 host tools 的 c6c 编译链接**：
+  - **kallsyms**（三 TU + elf-parse）：输出与 gcc 版 sysmap/.bin 逐字节一致，.S 仅 .incbin 文件名不同；
+  - **fixdep**：对真实 .d 文件 stdout/depfile 修改逐字节一致；
+  - **sorttable**（+ elf-parse）：对同一 vmlinux 排序后 ELF 逐字节一致；
+  - **recordmcount**：可编译链接（本配置 `CONFIG_HAVE_FENTRY=y` 用 fentry 不走 mcount，故未做功能等价验证）。
+  - 补齐的 libc 面：`strndup`、`perror`、`getopt`（短选项）、`getopt_long`（长选项，新增 `<getopt.h>`）。
+- **剩余 host tools**：modpost（2420 行，依赖 fnmatch + libelf/gelf，`elf-parse.c` 已有基础）、
+  asn1_compiler、relocs、objtool。验证口径：`HOSTCC=c6c` 重编后这些工具能跑对。
+- 验证脚本 `c6c/tests/hostcc-tools.sh`：逐 TU 编译 + c6c 静态链接各工具，与 gcc 版逐字节对比输出。
 
 ## 阶段 3：AS——独立汇编器
 

@@ -74,6 +74,11 @@ $C6C_LINK "$TMP/sorttable.o" "$TMP/elf-parse.o" "$TMP/rt.o" \
     cmp -s "$TMP/g.elf" "$TMP/c.elf" && ok "ELF 一致" || fail "ELF"
 }
 
+echo "=== recordmcount（本配置 CONFIG_HAVE_FENTRY=y 不启用，仅验证可编译链接） ==="
+"$C6C" $INC -c scripts/recordmcount.c -o "$TMP/rm.o" >/dev/null 2>&1 || fail "编译"
+$C6C_LINK "$TMP/rm.o" "$TMP/rt.o" -o "$TMP/rm.c6c" >/dev/null 2>&1 || fail "链接"
+[ -x "$TMP/rm.c6c" ] && ok "编译链接通过"
+
 echo "=== 结果 ==="
 [ $rc -eq 0 ] && echo "全部通过" || echo "有失败项"
 exit $rc
