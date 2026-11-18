@@ -18,8 +18,8 @@ test "add works" {
 ```
 
 ```sh
-./tcc/c6 -B tcc -test tests/slice.c6               # 运行全部 test 块
-./tcc/c6 -B tcc -test -test-filter=切片 tests/slice.c6
+./c6c/build/c6c -test tests/slice.c6               # 运行全部 test 块
+./c6c/build/c6c -test -test-filter=切片 tests/slice.c6
 ```
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
@@ -134,9 +134,9 @@ tests/run-tests.sh --list           # 列出会跑的文件
 单个文件也可以直接跑：
 
 ```sh
-./tcc/c6 -B tcc -test tests/err.c6
-./tcc/c6 -B tcc -test tests/slice.c6 tests/tu/slice.c6
-./tcc/c6 -B tcc -test -test-filter=切片 tests/slice.c6   # 按描述过滤
+./c6c/build/c6c -test tests/err.c6
+./c6c/build/c6c -test tests/slice.c6 tests/tu/slice.c6
+./c6c/build/c6c -test -test-filter=切片 tests/slice.c6   # 按描述过滤
 ```
 
 输出形如：

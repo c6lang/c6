@@ -84,5 +84,5 @@ struct 传递路径，所以和等价的 struct 可以互操作：
 完整可运行示例见 [examples/tuple_demo.c6](../../examples/tuple_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/tuple_demo.c6
+./c6c/build/c6c -run examples/tuple_demo.c6
 ```

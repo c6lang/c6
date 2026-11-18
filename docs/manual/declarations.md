@@ -80,7 +80,7 @@ int main(void)
 完整可运行示例见 [examples/typename_demo.c6](../../examples/typename_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/typename_demo.c6
+./c6c/build/c6c -run examples/typename_demo.c6
 ```
 
 
@@ -152,7 +152,9 @@ int a[n];                 ->  不用改（VLA 豁免）
 
 TCC 自己的源码也遵守这条规则（`cmake --build build --target c6selfcheck` 把 `tcc.c` 拷成 `.c6` 后再
 按 c6 规则编译一遍来检查），因此 c6 规则编 tcc 自己不会撞上这条诊断；带
-`-DC6_EXT` 也一样，`#ifdef C6_EXT` 里的扩展实现同样补了初始化器：
+`-DC6_EXT` 也一样，`#ifdef C6_EXT` 里的扩展实现同样补了初始化器。下面两条是
+**tcc 形态专属**的手动复现（需 `-DC6_ENABLE_TCC=ON`；c6c 的自举验收见
+[c6c/docs/acceptance.md](../../c6c/docs/acceptance.md)）：
 
 ```sh
 cp tcc/tcc.c build/tcc-c6.c6 && \
