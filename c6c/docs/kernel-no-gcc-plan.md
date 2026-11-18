@@ -158,4 +158,8 @@
   反汇编定位：该 `call *%r11` 在 cgroup_init_early（gcc 编译的 cgroup.c，
   不在 c6c 编译列表）——不是 c6c codegen bug，而是 gcc 代码引用了被 c6c
   生成代码/数据破坏的状态（函数指针数组元素无效）。剩余：用 -d int 抓崩溃
-  异常类型（#GP/#PF），确定是数据损坏还是野指针。
+  异常类型。#PF(CR2=0)→#GP→#GP 确认 `call *%r11` 跳地址 0（RIP=0、R11=0）。
+  -d in_asm 显示 r11 来自栈槽 -0xe30(%rbp)，该槽在 gcc 代码里被存成
+  `lea 0x0(%rip)` 的有效地址（对照 gcc 内核正常）；运行时却是 0——疑似
+  c6c 生成的代码在低栈地址写坏了该槽，或 static_call 函数指针未初始化。
+  剩余：用 gdbstub 在 0x83140bfb 下断点看 -0xe30 槽何时被清零。
