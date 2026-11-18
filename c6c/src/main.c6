@@ -829,7 +829,11 @@ static int parse_args(int argc, char **argv)
             /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
              * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
              * 会被静默忽略，链接还是静态的，症状是"我明明开了动态链接"却
-             * 报未定义符号。 */
+             * 报未定义符号。kbuild 的 KBUILD_HOSTLDFLAGS 固定带
+             * -Wl,--fatal-warnings（把链接告警转错误）；c6c 没有链接告警
+             * 子系统，收下不生效。 */
+            if (strcmp(a, "-Wl,--fatal-warnings") == 0)
+                continue;
             diag_error_plain("不认识的链接器选项 '%s'（支持 -Wl,--allow-undefined"
                              " / -Wl,--dynamic）", a);
             return -1;
