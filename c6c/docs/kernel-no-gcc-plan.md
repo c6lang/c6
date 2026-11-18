@@ -263,3 +263,15 @@
   idt_setup_early_traps 的 E8 call + PLT32 重定位存在（符号 WEAK DEFINED，
   不被 weak-only DCE NOP）。疑点：c6c 生成的 idt_setup_early_traps 内
   early_idt_handler_array 符号地址或 set_intr_gate 写入有误，导致 IDT 门仍空。
+
+
+  **#DF 收束（2026-11-20）**：确认 copy_bootdata 阶段加载的 IDT 是
+  bringup_idt_table（gdt_idt.c，静态全 0），而能调用 do_early_exception 的
+  早期 IDT 由 idt_setup_early_traps()（setup.c:948，setup_arch 内）填充——
+  此时还没运行。所以该阶段任何 #PF 都直接 #DF。gcc 内核靠早期页表已映射
+  real_mode_data 页而不触发 #PF；c6c 内核该页未映射才暴露此问题。
+  已验证 __early_make_pgtable 的 CR3 检查通过（CR3=0x1f646000 =
+  __pa(early_top_pgt)，phys_base=0x1500000），故建表逻辑本身可达。
+  疑点最终收敛到 __startup_64 早期页表 fixup（head_64.S 调用，C 实现在
+  arch/x86/boot/startup/ 或 head64.c）映射范围：c6c 编译版本未覆盖
+  real_mode_data 物理页 0x14770。
