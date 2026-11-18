@@ -233,3 +233,12 @@
   疑点：0x14770 这页未映射（早期 direct map 页表缺失），或 real_mode_data
   物理地址值被 c6c 早期代码算错（gcc 内核该地址有效）。剩余：查 real_mode_data
   来源（head_64.S 传参）与早期 direct map 页表建立。
+
+
+  **参数链确认（2026-11-20）**：反汇编 x86_64_start_kernel → copy_bootdata
+  的调用点，确认 `__va(real_mode_data)` 计算正确：rdi = real_mode_data(物理
+  0x14770) + page_offset_base(ffff888000000000, vmlinux 初始值已验证) =
+  ffff888000014770。参数传递无误，#PF 是运行时该 direct map 页 truly 未映射
+  （早期页表只覆盖内核镜像区，boot_params 页 0x14770 未纳入）。gcc 内核靠
+  早期页表映射该页而 c6c 内核镜像布局不同（bzImage 35MB vs 15MB）可能导致
+  早期映射范围差异。剩余：查 head_64.S 早期页表建立 / init_mem_mapping 时机。
