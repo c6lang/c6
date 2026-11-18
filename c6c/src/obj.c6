@@ -751,6 +751,11 @@ static void obj_write(const char *path)
          * 绝对重定位）。符号表项保留 ABS 以维持 kallsyms 遍次一致性。 */
         if (pseudo_syms[DFIX_SYM[i]])
             continue;
+        /* weak 函数定义的 EXPORT_SYMBOL 地址：UND weak→ABS 0 占位常抢占
+         * 真 weak 定义，最终链接给 0 且 relocs 拒绝其绝对重定位。 */
+        if (getenv("C6C_KERNEL_DCE") && X64.sym[DFIX_SYM[i]].is_weak
+            && X64.sym[DFIX_SYM[i]].defined)
+            continue;
         ob_rela_add(&relad, off, map[DFIX_SYM[i]], OBJ_R_X86_64_64, DFIX_ADD[i]);
     }
     for (i = 0; i < C99_NRL; i++) {
@@ -761,9 +766,19 @@ static void obj_write(const char *path)
             continue;
         seen[off] = 1;
         owner = ob_data_owner(C99_RLTGT[i]);
-        if (owner && owner < X64.nsym)
+        if (owner && owner < X64.nsym) {
+            /* 内核模式 weak 函数的 EXPORT_SYMBOL 地址：UND weak→SHN_ABS 0
+             * 的占位符号常抢占真 weak 定义（GNU ld 同名 weak 第一个胜出），
+             * 最终链接给的地址就是 0，且其 R_X86_64_64 被内核 relocs 拒绝。
+             * 这里不发重定位：该格保持 0，与链接结果一致，但消除了 relocs
+             * 对 ABS 符号绝对重定位的报错。 */
+            if (getenv("C6C_KERNEL_DCE")
+                && (pseudo_syms[owner]
+                    || (X64.sym[owner].is_weak && X64.sym[owner].defined)))
+                continue;
             ob_rela_add(&relad, off, map[owner], OBJ_R_X86_64_64,
                         (i64)C99_RLTGT[i] - (i64)ob_sym_value(&X64.sym[owner]));
+        }
         else
             ob_rela_add(&relad, off, OBJ_SYM_DATA, OBJ_R_X86_64_64, (i64)C99_RLTGT[i]);
     }
