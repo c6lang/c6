@@ -1209,6 +1209,15 @@ static int ax_directive(void)
             }
             if (!ax_num(&v))
                 return 0;
+            /* `911b - .,1`：数字标签反向引用（annotate 元数据，discard 段）。
+             * 迷你汇编器不解析这种表达式，吞到参数分隔符，填 0 即可。 */
+            if (AX_P < AX_E && (*AX_P == 'b' || *AX_P == 'f')) {
+                AX_P++;
+                while (AX_P < AX_E && *AX_P != ',' && *AX_P != ';'
+                       && *AX_P != '\n' && *AX_P != '#')
+                    AX_P++;
+                v = 0;
+            }
             if (sz == 1)
                 img_u8(&AX_IM, (u32)v);
             else if (sz == 2)
@@ -1270,8 +1279,9 @@ static int ax_directive(void)
         return 1;
     }
     /* 其余（.globl/.text/.data/.align/.type/.size/.section/.cfi_*…）对这个
-     * 迷你汇编器没有意义：整行吞掉（含分号后的 annotate 元数据语句）。 */
-    ax_line_end();
+     * 迷你汇编器没有意义：吞到分号/行尾。分号后可能是另一条 `.globl`/标签
+     * （tests2 98_al_ax_extend），必须留给 ax_body 下轮解析。 */
+    ax_eol();
     return 1;
 }
 
