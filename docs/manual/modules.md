@@ -59,7 +59,8 @@ int main(void)
 - 导入只带**声明**：函数只取原型、跳过函数体，全局变量只取 `extern`、跳过初始化器。
   代码仍在模块自己的目标文件里，链接时把它（或库）放上命令行；
 - `-emit-header FILE`（配合 `-c`）可把模块导出写成普通 C 头文件：
-  `tcc -B tcc -c -emit-header geo/shape.h geo/shape.c6`。头文件里是
+  `./tcc/c6 -B tcc -c -emit-header geo/shape.h geo/shape.c6`（tcc 形态专用，需
+  `-DC6_ENABLE_TCC=ON`）。头文件里是
   `struct geo__shape__Point`、`geo__shape__add`、`geo__shape__Point_area` 这些
   真正的 C 名；切片和元组会生成 `geo__shape__slice_N` / `geo__shape__tuple_N`
   typedef。纯 C 一侧 `#include` 就能调用，不需要知道模块的存在；

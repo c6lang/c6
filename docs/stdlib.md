@@ -21,7 +21,7 @@
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
-./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
+./c6c/build/c6c -I . -I examples -o build/wordcount \
     examples/wordcount.c6 examples/wordcount/text.c6 \
     std/core/types.c6 std/core/err.c6 std/text/str.c6 std/container/sort.c6 \
     std/container/vec.c6 std/container/span.c6 std/text/fmt.c6 std/container/range.c6

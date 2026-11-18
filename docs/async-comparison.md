@@ -296,7 +296,7 @@ c6 的位置很清楚：**C 的成本结构，Go 的写法**。它没有 GC、�
 cmake --build build --target bench-async            # 编译各语言目标 + 打表，明细在 build/bench-async.csv
 
 # 只跑某一个语言 / 某一段
-./tcc/c6 -B tcc -I . -o build/bench_c6 bench/async/bench.c6 std/os/time.c6
+./c6c/build/c6c -I . -o build/bench_c6 bench/async/bench.c6 std/os/time.c6
 BENCH_SEC=conns ./build/bench_c6
 BENCH_SEC=conns ./build/bench_go
 BENCH_SEC=conns ./build/bench_rs threads
