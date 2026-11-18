@@ -588,6 +588,7 @@ static void obj_write(const char *path)
     for (i = 0; i < X64.nsym; i++) {
         X64Sym *s = &X64.sym[i];
         int local = 0;
+        int pseudo = 0;
         u8 bind = OBJ_STB_GLOBAL;
         u8 type = OBJ_STT_NOTYPE;
         u16 shndx = OBJ_SHN_UNDEF;
@@ -595,7 +596,25 @@ static void obj_write(const char *path)
         if (!s->name || !s->name[0])
             continue;           /* 无名符号：重定位里退化成 0 号 */
         local = ob_sym_local(s->name) || s->is_static;
-        bind = (u8)(local ? OBJ_STB_LOCAL : s->is_weak ? OBJ_STB_WEAK : OBJ_STB_GLOBAL);
+        /* 内核编译期断言伪函数：__bad_size_call_parameter / ____wrong_branch_error
+         * 等只出现在 gcc 会常量折叠掉的不可达分支，gcc 从不发对它们的引用。
+         * c6c 不做常量传播，保留了这些引用；若发成强 UND，链接期 undefined。
+         * 发成 WEAK UND（链接器允许缺失、填 0）——这些分支永不执行。 */
+        if (!s->defined && !s->is_data && !local && getenv("C6C_KERNEL_DCE")) {
+            const char *nm = s->name;
+
+            pseudo = (nm[0] == '_' && nm[1] == '_')
+                     && (memcmp(nm, "__bad_", 6) == 0
+                         || memcmp(nm, "____wrong_", 10) == 0
+                         || memcmp(nm, "__BUILD_BUG", 11) == 0
+                         || memcmp(nm, "__cmpxchg_wrong", 15) == 0
+                         || memcmp(nm, "__get_user_bad", 14) == 0
+                         || memcmp(nm, "__put_user_bad", 14) == 0
+                         || memcmp(nm, "__invalid_size_argument", 23) == 0
+                         || memcmp(nm, "__ftrace_bad_type", 17) == 0);
+        }
+        bind = (u8)(local ? OBJ_STB_LOCAL
+                    : (s->is_weak || pseudo) ? OBJ_STB_WEAK : OBJ_STB_GLOBAL);
         if (s->defined && s->is_data) {
             type = OBJ_STT_OBJECT;
             shndx = OBJ_SHN_DATA;
