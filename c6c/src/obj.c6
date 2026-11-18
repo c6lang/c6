@@ -506,26 +506,21 @@ static void obj_dce_stub_dead(void)
              * 本 TU 看到的是 UND）不能 NOP：x86_64_start_reservations 必须
              * 真的 call 它，否则直接 ret → head_64.S 的 ud2。gcc 优化掉的
              * 不可达引用（tracepoint stub 等）仍按老规矩 NOP。 */
-            int keep_call = 0;
-            if (X64.fix[i2].sym < X64.nsym) {
-                const char *cn = X64.sym[X64.fix[i2].sym].name;
-                if (cn && (strcmp(cn, "start_kernel") == 0
-                           || strcmp(cn, "x86_64_start_reservations") == 0))
-                    keep_call = 1;
-            }
             /* 下面 NOP 化只认 E8 call。其它 fixup（lea reg,[rip+disp32] 0x8D、
-             * jmp rel32 0xE9、内联汇编 `.long sym - (.+4)` 等）的符号若被 drop，
-             * 指令保留但 disp32 停在占位 0 → 运行时跳到自身/地址 0 崩溃：
-             *  - get_current 的 per-CPU 符号取址（lea 0x0 → 错误函数指针）
-             *  - __SCT__WARN_trap 的 jmp __WARN_trap（.long 重定位丢失 → 跳 0）
-             * 只有真正的 E8 call 才因"UNC 不可达调用"被 NOP；其余 UND 引用
-             * 交给链接器正常解析。 */
+             * jmp rel32 0xE9、内联汇编 `.long sym - (.+4)` 等）绝不能 drop：
+             * 指令保留但 disp32 停在占位 0 → 跳到自身/地址 0 崩溃。
+             * 只有 E8 call 指向 **weak UND**（真 pseudo/tracepoint stub）时才 NOP：
+             * 这类符号链接后是 SHN_ABS 0，call 它会跳地址 0。GLOBAL UND 是
+             * 别的 TU 里有真实定义的外部函数（start_kernel、idt_setup_traps、
+             * __warn_printk…），必须保留 call 交给链接器解析，否则 IDT/启动初始化
+             * 整条调用链被 NOP（IDT 表全 0 → 所有异常投递 #GP → triple fault）。 */
             u32 fp = X64.fix[i2].patch;
             int is_call = fp > 0 && CODE_IMG.p[fp - 1] == 0xE8;
-            if (!drop && !keep_call && is_call && getenv("C6C_KERNEL_DCE")
+            if (!drop && is_call && getenv("C6C_KERNEL_DCE")
                 && X64.fix[i2].sym < X64.nsym
                 && !X64.sym[X64.fix[i2].sym].defined
-                && !X64.sym[X64.fix[i2].sym].is_static)
+                && !X64.sym[X64.fix[i2].sym].is_static
+                && X64.sym[X64.fix[i2].sym].is_weak)
                 drop = 1;
 
             if (drop) {

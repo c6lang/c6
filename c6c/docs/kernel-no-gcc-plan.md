@@ -208,3 +208,17 @@
   （arch/x86/kernel/idt.c / traps.c 的 early_idts / idt_setup_traps）
   中 vector 6 的门无效，或 asm_exc_invalid_op 地址错误。剩余：查 IDT
   #UD 门设置。
+
+
+  **关键 DCE 修复（2026-11-20）：只 NOP weak UND 调用**
+  obj_dce_stub_dead 原先 NOP 所有 UND 非 static 的 E8 call（仅白名单
+  start_kernel 等例外）。但 GLOBAL UND 是别的 TU 有真实定义的外部函数，
+  把它们 NOP 掉会摧毁整条初始化调用链：trap_init() 里的
+  `idt_setup_traps()` 调用被 NOP → IDT 表运行时全 0 → 所有异常投递失败
+  （#UD/#PF → #GP → triple fault）。修正：只 NOP **weak** UND call
+  （真 pseudo/tracepoint stub，链接后是 ABS 0）；GLOBAL UND 全部保留交
+  链接器解析。验证：traps.o 恢复 idt_setup_traps PLT32 重定位（386 条
+  vs 342）；999/999 编译+链接+bzImage 通过；qemu 启动从 WARN trap 推进
+  到内存拷贝循环（21127 指令），#PF(CR2=ffff888000014770) 在
+  setup_cpu_entry_areas 类代码处，#PF 处理再 #DF。剩余：查该 #PF 的
+  无效地址来源（copy 循环 rsi/rdi 指针）。
