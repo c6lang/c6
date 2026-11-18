@@ -7,6 +7,14 @@
 
 ## 0.6.4 — 2026-11-18
 
+### 移除 c6c 的 libtcc.h 兼容面（破坏性）
+
+c6c 的宿主 API 收敛到 `c6lib.h` 的 `c6_*`：无 tcc 的安装不再把
+`include/tcc-compat.h` 改名装成 `libtcc.h`，也不再把 `c6::libtcc` 指向
+`c6::c6lib`；整套 `tcc_*` 兼容函数与头文件已删除。老消费者要么改用
+`c6_*` + `-lc6c`，要么用 `-DC6_ENABLE_TCC=ON` 的 c6 包（真 `libtcc.h` /
+`c6::libtcc` 照旧）。`pkgcheck` / `embedcheck` 与文档已同步。
+
 ### CMake 门禁补齐 c6c 完整功能覆盖 + 内核验证可自动下载
 
 上一轮 vmlinux / 内联汇编成果落地后，把对应的验收接进门禁，避免"改完没人守"：
