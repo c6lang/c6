@@ -199,3 +199,12 @@
   内核从"跳地址 0 崩溃"推进到"WARN 触发 → #UD → #GP → triple fault"。
   剩余：WARN 在正常启动中不该触发（cgroup_init_early 条件判断有误），且 #UD
   处理本身跳 #GP 崩溃。
+
+
+  **后续诊断（WARN trap → #UD）**：call *r11 → __SCT__WARN_trap → jmp
+  __WARN_trap → `ud1 (%edx),%arg1`。-d int 显示 #UD(v=6) 后立即 #GP
+  (e=0x32: IDT=1, index=6)，RIP 仍是 ud1 地址——CPU 无法通过 IDT 门 6
+  deliver #UD 到 asm_exc_invalid_op。疑点：c6c 生成的 IDT traps 表
+  （arch/x86/kernel/idt.c / traps.c 的 early_idts / idt_setup_traps）
+  中 vector 6 的门无效，或 asm_exc_invalid_op 地址错误。剩余：查 IDT
+  #UD 门设置。
