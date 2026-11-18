@@ -179,4 +179,10 @@
   崩溃序列：0x83140bf4 `lea 0x0(%rip),%rax` → 存 -0xe30 → 0x83140c99
   `mov -0xe30(%rbp),%r11` → `call *%r11` 调用指令自身 → 无限递归/栈溢出 →
   RIP=0 #PF。c6c 后端对函数/全局符号取址错误生成 RIP-relative 0 偏移，
-  丢失符号重定位。剩余：在后端定位何时应发 `lea symbol(%rip)` 重定位。
+  丢失符号重定位。
+  **最终对比证据**：gcc 基线访问 current_task 是
+  `mov %gs:0x25bfe2c(%rip),%rax # current_task`（per-CPU 段 %gs + RIP 相对
+  重定位）；c6c 对应代码是 `lea 0x0(%rip),%rax; mov 0x0(%rax),%rdx`
+  ——缺 %gs 段前缀、displacement=0、无重定位。根因：c6c 后端对 per-CPU
+  /全局符号取址生成了错误的 RIP-relative 0 偏移且丢失重定位，这是启动
+  失败的根本 codegen bug。剩余：在后端（符号取址 lowering）定位并修复。
