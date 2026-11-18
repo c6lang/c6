@@ -5,6 +5,28 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 0.6.4 — 2026-11-18
+
+### CMake 门禁补齐 c6c 完整功能覆盖 + 内核验证可自动下载
+
+上一轮 vmlinux / 内联汇编成果落地后，把对应的验收接进门禁，避免"改完没人守"：
+
+- **native 内联汇编机器码回归**（`c6c/tests/asm-native-check.sh`）：新增 target
+  `asmnativecheck`，进 `fast` 与 `check-all-c6c`。用 `objdump` 验 `c6c -c` 的
+  `.o` 里真有 `rdtsc`(0F 31)/`wrmsr`(0F 30)/`cpuid`(0F A2)，以及固定寄存器
+  约束 `a/b/c/d` 的输入装值与输出写回——此前 native 后端静默丢弃整条 asm
+  没有任何门禁能发现。实测 10/10。
+- **c6c `.o` 链接 vmlinux 验证**（`c6c/tests/kernel-vmlinux.sh`）：新增 target
+  `kernelvmlinux`，只进 `check-all-c6c`（全内核链接 + qemu 启动，重量级）。
+  脚本现在能在 `K` 不存在时从 kernel.org**自动下载**稳定版内核（默认 6.12，
+  7.4-rc3 是预置版本无公开 tarball），解压、构建基线、替换 TU、链接、启动
+  验证、最后恢复基线。缺 qemu/pc-bios/host 依赖（CI 常态）时打印 SKIP 并
+  退出 0，不把门禁搞红——完整验证留给有环境时手动跑。
+- 结果：`fast` 门禁全绿（含新增 `asmnativecheck`），`check-all-c6c` 挂载
+  `kernelvmlinux`（有环境真跑，无环境 SKIP）。
+
+这是 0.6.3 "c6c `.o` 链接 vmlinux 并启动" 的验收收尾，让成果可被持续验证。
+
 ## 0.6.3 — 2026-11-17
 
 ### c6c 的 `.o` 首次链接进 Linux vmlinux 并成功启动

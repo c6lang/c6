@@ -80,6 +80,16 @@ c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)
 c6c_target(bcheck ENV C6C=${C6C_BIN} COMMAND ./tests/bcheck.sh)
 c6c_target(dbgcheck ENV C6C=${C6C_BIN} COMMAND ./tests/dbgcheck.sh)
 c6c_target(asmcheck ENV C6C=${C6C_BIN} COMMAND ./tests/asmcheck.sh)
+# native 后端直接发机器码的内联汇编回归（rdtsc/wrmsr/cpuid + 固定寄存器
+# 装值/写回）。asmcheck 只验 -S 文本那条路，这条补 native machine code 路。
+c6c_target(asmnativecheck ENV C6C=${C6C_BIN} OBJDUMP=${CMAKE_OBJDUMP}
+  COMMAND ./tests/asm-native-check.sh
+  COMMENT "c6c: asmnativecheck（native 内联汇编机器码 + 固定寄存器约束）")
+# c6c .o 链接进 Linux vmlinux 并在 qemu 启动（重量级：全内核链接 + 启动，
+# 只放 check-all-c6c，不放 fast）。脚本自带 K/QEMU_BIOS 环境默认值。
+c6c_target(kernelvmlinux ENV C6C=${C6C_BIN}
+  COMMAND ./tests/kernel-vmlinux.sh
+  COMMENT "c6c: kernelvmlinux（c6c .o 链接 vmlinux + qemu 启动验证）")
 c6c_target(a64check ENV C6C=${C6C_BIN} COMMAND ./tests/a64check.sh)
 c6c_target(archcheck ENV C6C=${C6C_BIN} COMMAND ./tests/archcheck.sh)
 
