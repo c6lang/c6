@@ -24135,6 +24135,12 @@ static void gen_decl_from_spec(u32 base)
                  * 这个名字只是 target 的另一个入口，没有自己的代码/存储。 */
                 if (al && s)
                     alias_register(enf, al);
+                /* `__attribute__((weak, alias("target")))`（内核 cpu_show_*）：
+                 * 这是纯声明（`;` 结尾），走不到函数定义的 SAW_WEAK 应用处。
+                 * 在这里把 weak 落到符号，否则发成强定义与真实实现 multiple
+                 * definition。 */
+                if (SAW_WEAK && s && (u32)s->val < X64.nsym)
+                    X64.sym[(u32)s->val].is_weak = 1;
                 /* `!error` 是这一条声明上的事实：立刻落到符号上。原型没有
                  * 函数体、走不到 pa_func_def，留着会把标记传给下一条声明
                  * （`tests/errors/drop_bad.c6` 顶上那条 `int!error boom(void);`）。 */
