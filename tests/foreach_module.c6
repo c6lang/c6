@@ -1,0 +1,29 @@
+/* c6 自测：模块文件里的 foreach 头绑定必须在其 body 中可见 */
+import tu.foreach_module;
+
+test "模块里的 foreach 区间绑定可见" {
+    if (sum_range(5) != 10)
+        return err(1, "range");
+}
+
+test "模块里的 foreach 区间上界是常量时绑定仍可见" {
+    if (sum_const() != 6)
+        return err(4, "const bound");
+    if (sum_macro() != 6)
+        return err(5, "macro bound");
+}
+
+test "foreach 绑定用作全局数组下标时仍可见" {
+    if (fill_global() != 3)
+        return err(6, "global subscript");
+}
+
+test "模块里的 foreach 值绑定可见" {
+    if (sum_array() != 10)
+        return err(2, "value");
+}
+
+test "模块里的 foreach 双绑定可见" {
+    if (sum_pairs() != 20)
+        return err(3, "pair");
+}

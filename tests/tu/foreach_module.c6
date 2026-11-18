@@ -1,0 +1,67 @@
+/* foreach 区间绑定的回归夹具：绑定是该函数的第一个 vreg（槽号 0）时，
+ * 循环体也必须照常解析并可见。 */
+module tu.foreach_module;
+
+int sum_range(int n)
+{
+    int s = 0;
+
+    foreach (int i = 0:n) {
+        s += i;
+    }
+    return s;
+}
+
+#define LIMIT 4
+
+static int g_slots[LIMIT] = { 0 };
+
+int fill_global(void)
+{
+    foreach (int i = 0:LIMIT) {
+        g_slots[i] = i;
+    }
+    return g_slots[3];
+}
+
+int sum_const(void)
+{
+    int s = 0;
+
+    foreach (int i = 0:4) {
+        s += i;
+    }
+    return s;
+}
+
+int sum_macro(void)
+{
+    int s = 0;
+
+    foreach (int i = 0:LIMIT) {
+        s += i;
+    }
+    return s;
+}
+
+int sum_array(void)
+{
+    int a[4] = { 1, 2, 3, 4 };
+    int s = 0;
+
+    foreach (int v = a) {
+        s += v;
+    }
+    return s;
+}
+
+int sum_pairs(void)
+{
+    int a[4] = { 1, 2, 3, 4 };
+    int s = 0;
+
+    foreach ((int i, int v) = a) {
+        s += i * v;
+    }
+    return s;
+}
