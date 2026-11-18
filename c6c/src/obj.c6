@@ -486,8 +486,20 @@ static void obj_dce_stub_dead(void)
             if (p >= lo && p < hi)
                 drop = 1;
         }
-        if (!drop)
+        if (drop) {
+            /* fixup 删了，但 call 指令字节还在；rel32 占位 0 会让 objtool
+             * 静态分析以为 call 跳到"当前函数内部"（intra-function call）。
+             * 把 E8 rel32（5 字节）改成 NOP——死函数入口已是 ret，这段永不执行。 */
+            if (p > 0 && CODE_IMG.p[p - 1] == 0xE8) {
+                CODE_IMG.p[p - 1] = 0x90;
+                CODE_IMG.p[p] = 0x90;
+                CODE_IMG.p[p + 1] = 0x90;
+                CODE_IMG.p[p + 2] = 0x90;
+                CODE_IMG.p[p + 3] = 0x90;
+            }
+        } else {
             X64.fix[k++] = X64.fix[i];
+        }
     }
     X64.nfix = k;
 
