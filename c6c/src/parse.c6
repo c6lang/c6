@@ -17,6 +17,17 @@ static int llvm_open(const char *out);
 static int llvm_finish(const char *out);
 static void be_emit_fn(IrFn *f, u32 func_sym);
 
+/* 优化 pass 的统一入口：一个函数的 IR 已经降完、还没交给任何后端。
+ * -O0 时 ir_optimize() 立即返回，字节行为与优化器引入前完全一致。 */
+static void pa_emit_fn(IrFn *f, u32 func_sym)
+{
+    ir_optimize(f);
+    if (C99_MODE || llvm_mode())
+        be_emit_fn(f, func_sym);
+    else
+        x64_compile(&X64, f, func_sym);
+}
+
 static IrFn FN;
 static int PA_ERRS;
 static Image CODE_IMG;
@@ -8836,10 +8847,7 @@ static u32 spawn_thunk(int n, u32 mgdmask)
      * （`thread h = spawn f(x); h->value()`）。 */
     irfn_push(&FN, IR_RET, IRT_I64, 0, dst, 0, 0, 0);
     /* 中转函数也是"函数"：C99/LLVM 后端要按自己的方式发出去，不能只写镜像 */
-    if (C99_MODE || llvm_mode())
-        be_emit_fn(&FN, tsym);
-    else
-        x64_compile(&X64, &FN, tsym);
+    pa_emit_fn(&FN, tsym);
     tmpl_restore_state(&sv);
     if (n0)
         memcpy(FN.ops, bak, (size_t)n0 * sizeof(IrOp));
@@ -22397,7 +22405,7 @@ static void pa_func_def(Sym *fn, Declarator *d)
     }
     scope_leave();
     if (C99_MODE || llvm_mode()) {
-        be_emit_fn(&FN, (u32)fn->val);
+        pa_emit_fn(&FN, (u32)fn->val);
         return;
     }
     if (NFL > 0) {
@@ -22413,6 +22421,9 @@ static void pa_func_def(Sym *fn, Declarator *d)
         if (n0)
             memcpy(FN.ops, bak, (size_t)n0 * sizeof(IrOp));
     }
+    /* fnlit_drain 已经把 FN.ops 恢复成当前函数本体，这里才是 native 的
+     * "函数 IR 完稿"时刻；C99/LLVM 路在上面 pa_emit_fn 里做同一件事。 */
+    ir_optimize(&FN);
     x64_compile(&X64, &FN, (u32)fn->val);
     if (fn->alias) {
         /* 别名就是另一个名字指向同一份代码（PA 用的镜像里没有符号表，

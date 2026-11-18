@@ -589,3 +589,501 @@ static void irfn_setcc(IrFn *f, u8 cc)
     if (f->n)
         f->ops[f->n - 1].flags = cc;
 }
+
+/* ---------------- 分级优化（-O1..-O3）----------------
+ * 不建 AST、不把 IR 留到函数外：pass 只跑在"一个函数已经降完 IR、还没交给后端"
+ * 这个窗口里，对 f->ops 原地做线性扫描。-O0 一个 pass 都不跑，所以字节级
+ * fixpoint / IR 指纹 / 三后端差分全部保持原样。
+ *
+ * 每条 pass 必须是纯的：不读地址、不读时钟、不依赖宿主编译器。自举 fixpoint
+ * 比的是 c6c2 与 c6c3（都是 c6c 自己编出来的），同一份 IR 永远给出同一份输出，
+ * 级别自身的 fixpoint 就成立。
+ */
+static int IR_OPT_LEVEL;
+
+static void ir_set_opt(int n)
+{
+    IR_OPT_LEVEL = n < 0 ? 0 : (n > 3 ? 3 : n);
+}
+
+static int ir_opt_level(void)
+{
+    return IR_OPT_LEVEL;
+}
+
+/* 有副作用 / 控制流语义：dst 没人用也不能删 */
+static int ir_has_side_effect(u8 op)
+{
+    switch (op) {
+    case IR_STORE: case IR_COPY: case IR_MEMCPY: case IR_MEMSET:
+    case IR_CALL: case IR_CALLI: case IR_ARG: case IR_RET:
+    case IR_BR: case IR_JMP: case IR_JMPIND: case IR_LABEL:
+    case IR_ALLOCA: case IR_SETRSP:
+    case IR_TRAP: case IR_COMMENT:
+    case IR_VASTART: case IR_VAARG: case IR_VAEND:
+    case IR_LABELADDR:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 把一条 op 换成常量。u64 装不进 imm 就进函数常量池（IR_CONSTK） */
+static void ir_op_const(IrFn *f, u32 i, u8 type, u32 dst, u64 v)
+{
+    IrOp o = {0};
+
+    o.type = type;
+    o.dst = dst;
+    if (v == (u64)(u32)v) {
+        o.op = IR_CONST;
+        o.imm = (u32)v;
+    } else {
+        o.op = IR_CONSTK;
+        o.imm = irfn_kconst(f, v);
+    }
+    f->ops[i] = o;
+}
+
+/* 常量传播 + 算术/比较折叠。只折语义无歧义的整数 op；窄类型除法与浮点
+ * 留给后端（x86 的 idiv 按 type 决定符号扩展宽度，折错了很难查）。 */
+static void ir_fold(IrFn *f)
+{
+    u8 *known = 0;
+    u64 *val = 0;
+    u32 i = 0;
+
+    if (!f->nvreg)
+        return;
+    known = arena_zalloc(&A_opt, f->nvreg);
+    val = arena_zalloc(&A_opt, (size_t)f->nvreg * sizeof(u64));
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+        u32 a = o->a;
+        u32 b = o->b;
+        u64 r = 0;
+        int ok = 0;
+
+        /* 常量传播只在基本块内有效。跨 label / 分支时同一个 vreg 可能被
+         * 另一条路重新定义；把这种"线性上最后一次赋值"当真会把条件跳转
+         * 折成错误的无条件跳转（实测 c6c 自举在第二个 stage 崩）。 */
+        if (o->op == IR_LABEL || o->op == IR_JMP || o->op == IR_JMPIND
+            || o->op == IR_RET) {
+            memset(known, 0, f->nvreg);
+            continue;
+        }
+        if (o->op == IR_BR) {
+            if (o->a < f->nvreg && known[o->a]) {
+                IrOp j = {0};
+
+                j.op = IR_JMP;
+                j.a = val[o->a] ? o->b : o->c;
+                f->ops[i] = j;
+            }
+            memset(known, 0, f->nvreg);
+            continue;
+        }
+        if (o->op == IR_CONST) {
+            if (o->dst < f->nvreg) {
+                known[o->dst] = 1;
+                val[o->dst] = (u64)o->imm;
+            }
+            continue;
+        }
+        if (o->op == IR_CONSTK) {
+            if (o->dst < f->nvreg) {
+                if (o->imm < f->nk) {
+                    known[o->dst] = 1;
+                    val[o->dst] = f->kpool[o->imm];
+                } else {
+                    known[o->dst] = 0;
+                }
+            }
+            continue;
+        }
+        if (!(fm & IRF_DST) || o->dst >= f->nvreg)
+            continue;
+        if ((fm & IRF_A) && !(lm & IRF_A)) {
+            if (a >= f->nvreg || !known[a])
+                goto unknown;
+        }
+        if ((fm & IRF_B) && !(lm & IRF_B)) {
+            if (b >= f->nvreg || !known[b])
+                goto unknown;
+        }
+        /* 窄类型（i8/i16/i32/u8/u16/u32）的后端按各自宽度做符号/零扩展，
+         * 而 IR_CONST 的 imm 只有 32 位且后端直接当 64 位写槽；用 u64 算
+         * 出来的窄结果折成常量会丢符号位（SAR 尤其明显）。只折 64 位整数
+         * 和指针；MOV 是纯位拷贝，任何宽度都安全。 */
+        if (o->op != IR_MOV
+            && o->type != IRT_I64 && o->type != IRT_U64 && o->type != IRT_PTR)
+            break;
+        switch (o->op) {
+        case IR_MOV:
+            r = val[a]; ok = 1; break;
+        case IR_ADD: r = val[a] + val[b]; ok = 1; break;
+        case IR_SUB: r = val[a] - val[b]; ok = 1; break;
+        case IR_MUL: r = val[a] * val[b]; ok = 1; break;
+        case IR_AND: r = val[a] & val[b]; ok = 1; break;
+        case IR_OR:  r = val[a] | val[b]; ok = 1; break;
+        case IR_XOR: r = val[a] ^ val[b]; ok = 1; break;
+        case IR_NEG: r = (u64)(0 - val[a]); ok = 1; break;
+        case IR_NOT: r = ~val[a]; ok = 1; break;
+        case IR_SHL: case IR_SHR: case IR_SAR:
+            /* x86 用 cl 取低 6 位；>=64 的不折，避免和硬件行为分叉 */
+            if (val[b] < 64) {
+                if (o->op == IR_SHL)
+                    r = val[a] << val[b];
+                else if (o->op == IR_SHR)
+                    r = val[a] >> val[b];
+                else
+                    r = (u64)((i64)val[a] >> val[b]);
+                ok = 1;
+            }
+            break;
+        case IR_UDIV:
+            if (val[b]) { r = val[a] / val[b]; ok = 1; }
+            break;
+        case IR_UMOD:
+            if (val[b]) { r = val[a] % val[b]; ok = 1; }
+            break;
+        case IR_CMP:
+            if (o->type != IRT_F32 && o->type != IRT_F64) {
+                int c = 0;
+                i64 sa = (i64)val[a];
+                i64 sb = (i64)val[b];
+
+                switch (o->flags) {
+                case IRCC_EQ: c = val[a] == val[b]; break;
+                case IRCC_NE: c = val[a] != val[b]; break;
+                case IRCC_LT: c = sa < sb; break;
+                case IRCC_LE: c = sa <= sb; break;
+                case IRCC_GT: c = sa > sb; break;
+                case IRCC_GE: c = sa >= sb; break;
+                case IRCC_ULT: c = val[a] < val[b]; break;
+                case IRCC_ULE: c = val[a] <= val[b]; break;
+                case IRCC_UGT: c = val[a] > val[b]; break;
+                case IRCC_UGE: c = val[a] >= val[b]; break;
+                default: c = 0; break;
+                }
+                r = (u64)c;
+                ok = 1;
+            }
+            break;
+        default:
+            break;
+        }
+        if (ok) {
+            ir_op_const(f, i, o->type, o->dst, r);
+            known[o->dst] = 1;
+            val[o->dst] = r;
+            continue;
+        }
+    unknown:
+        known[o->dst] = 0;
+    }
+}
+
+/* 跳转串接：JMP L; L: JMP M ⇒ JMP M。标签号是 per-function 的，映射表
+ * 一次建好，最多迭代 8 轮。 */
+static void ir_jumps(IrFn *f)
+{
+    u32 *lmap = 0;
+    u32 i = 0;
+    int pass = 0;
+
+    if (!f->nlbl)
+        return;
+    lmap = arena_zalloc(&A_opt, (size_t)f->nlbl * sizeof(u32));
+    memset(lmap, 0xff, (size_t)f->nlbl * sizeof(u32));
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_LABEL && f->ops[i].a < f->nlbl)
+            lmap[f->ops[i].a] = i;
+    for (pass = 0; pass < 8; pass++) {
+        int changed = 0;
+
+        for (i = 0; i < f->n; i++) {
+            IrOp *o = &f->ops[i];
+
+            if (o->op == IR_BR && o->b == o->c) {
+                o->op = IR_JMP;
+                o->a = o->b;
+                o->b = 0;
+                o->c = 0;
+                changed = 1;
+                continue;
+            }
+            if (o->op == IR_JMP && o->a < f->nlbl) {
+                u32 li = lmap[o->a];
+
+                if (li != 0xffffffffu && li + 1 < f->n
+                    && f->ops[li + 1].op == IR_JMP
+                    && f->ops[li + 1].a != o->a) {
+                    o->a = f->ops[li + 1].a;
+                    changed = 1;
+                }
+            }
+        }
+        if (!changed)
+            break;
+    }
+}
+
+/* 死代码消除：从"没人用 + 没副作用"的 dst 倒着删，删完压实。
+ * 压实必须同步 f->lines（-g 的行号表与 ops 平行）。 */
+static void ir_dce(IrFn *f)
+{
+    u32 *use = 0;
+    u32 i = 0;
+    u32 j = 0;
+    int changed = 1;
+
+    if (!f->nvreg)
+        return;
+    use = arena_zalloc(&A_opt, (size_t)f->nvreg * sizeof(u32));
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        /* STORE/COPY/MEMCPY/MEMSET 的 dst 是"写到哪"的地址输入，不是定义。
+         * 漏算它就会把 `addr/load/add` 这条算地址链当成死代码删掉。 */
+        if ((o->op == IR_STORE || o->op == IR_COPY
+             || o->op == IR_MEMCPY || o->op == IR_MEMSET)
+            && o->dst < f->nvreg)
+            use[o->dst]++;
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < f->nvreg) use[o->a]++;
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < f->nvreg) use[o->b]++;
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < f->nvreg) use[o->c]++;
+        /* IR_ADDR 的 imm 在 flags==0 时是栈槽号（X64_SLOT(n) = -16*(n+1)），
+         * 局部变量靠"取槽地址再 LOAD"来读。这个槽号不是 a/b/c 里的操作数，
+         * 但它是真实的使用点——漏算就会把 `int x = a+b; return x*2;` 里的
+         * x 当成死代码删掉（实测 -O1 的程序返回 1）。 */
+        if (o->op == IR_ADDR && (o->flags & 3) == 0
+            && o->imm >= 16 && (o->imm & 15u) == 0) {
+            /* 必须是 32 位环绕运算：imm 是 u32 的 -16*(n+1)，用 u64 减会
+             * 得到 2^64-imm 这种天文数字，槽号永远越界（实测踩过）。 */
+            u32 slot = (0u - o->imm) / 16u - 1u;
+
+            if (slot < f->nvreg)
+                use[slot]++;
+        }
+        /* IR_ALLOCA / IR_MEMSET 的 a 没写进 IR_FIELDS，但后端真读：
+         * ALLOCA 拿它当元素个数，MEMSET 拿它当填充字节。 */
+        if ((o->op == IR_ALLOCA || o->op == IR_MEMSET)
+            && o->a < f->nvreg)
+            use[o->a]++;
+    }
+    while (changed) {
+        changed = 0;
+        for (i = 0; i < f->n; i++) {
+            IrOp *o = &f->ops[i];
+            u8 fm = IR_FIELDS[o->op];
+            u8 lm = IR_LABELS[o->op];
+
+            if (!(fm & IRF_DST) || o->dst >= f->nvreg
+                || use[o->dst] || ir_has_side_effect(o->op))
+                continue;
+            if (((fm & IRF_A) && !(lm & IRF_A)
+                 || o->op == IR_ALLOCA || o->op == IR_MEMSET)
+                && o->a < f->nvreg)
+                use[o->a]--;
+            if ((fm & IRF_B) && !(lm & IRF_B) && o->b < f->nvreg) use[o->b]--;
+            if ((fm & IRF_C) && !(lm & IRF_C) && o->c < f->nvreg) use[o->c]--;
+            o->op = IR_NOP;
+            changed = 1;
+        }
+    }
+    j = 0;
+    for (i = 0; i < f->n; i++) {
+        if (f->ops[i].op == IR_NOP)
+            continue;
+        f->ops[j] = f->ops[i];
+        if (f->lines)
+            f->lines[j] = f->lines[i];
+        j++;
+    }
+    f->n = j;
+}
+
+/* O2：块内拷贝传播。MOV 是纯位拷贝，把它的源一直传下去可以省掉大量
+ * 寄存器间倒手；跨基本块/调用一律清空，保证不会混进另一条控制流路径。 */
+static void ir_copyprop(IrFn *f)
+{
+    u32 *cp = 0;
+    u8 *live = 0;
+    u8 *esc = 0;                 /* 地址被 IR_ADDR 暴露的栈槽 */
+    u32 i = 0;
+
+    if (!f->nvreg)
+        return;
+    /* IR_LEA 可以拿某个槽的地址再加偏移形成别名，esc[] 认不全；
+     * 有 LEA 的函数直接放弃拷贝传播。 */
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_LEA)
+            return;
+    cp = arena_zalloc(&A_opt, (size_t)f->nvreg * sizeof(u32));
+    live = arena_zalloc(&A_opt, f->nvreg);
+    esc = arena_zalloc(&A_opt, f->nvreg);
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+
+        if (o->op == IR_ADDR && (o->flags & 3) == 0
+            && o->imm >= 16 && (o->imm & 15u) == 0) {
+            u32 slot = (0u - o->imm) / 16u - 1u;
+
+            if (slot < f->nvreg)
+                esc[slot] = 1;
+        }
+    }
+#define CP_GET(x) (live[(x)] && !esc[(x)] ? cp[(x)] : (x))
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        /* 控制流边界 / 调用：前面块里的拷贝关系在这里不可靠 */
+        if (o->op == IR_LABEL || o->op == IR_BR || o->op == IR_JMP
+            || o->op == IR_JMPIND || o->op == IR_RET
+            || o->op == IR_CALL || o->op == IR_CALLI) {
+            memset(live, 0, f->nvreg);
+            continue;
+        }
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < f->nvreg)
+            o->a = CP_GET(o->a);
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < f->nvreg)
+            o->b = CP_GET(o->b);
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < f->nvreg)
+            o->c = CP_GET(o->c);
+        /* 这几条 op 的 dst 是写入地址，属于"操作数"而不是定义 */
+        if ((o->op == IR_STORE || o->op == IR_COPY
+             || o->op == IR_MEMCPY || o->op == IR_MEMSET)
+            && o->dst < f->nvreg)
+            o->dst = CP_GET(o->dst);
+        if (o->op == IR_MOV && o->dst < f->nvreg) {
+            /* 槽地址被取过就不能信拷贝关系：函数/ memcpy 可能绕过 IR
+             * 直接改这块栈。实测不挡这一点会把整批用例搞崩。 */
+            if (!esc[o->dst] && o->a < f->nvreg && !esc[o->a]
+                && o->a != o->dst) {
+                cp[o->dst] = o->a;
+                live[o->dst] = 1;
+            } else {
+                live[o->dst] = 0;
+            }
+        } else if ((fm & IRF_DST) && o->dst < f->nvreg) {
+            live[o->dst] = 0;
+        }
+    }
+#undef CP_GET
+}
+
+/* O3：CFG 不可达块消除。BR 常量折叠后留下的死分支、JMP 后面的孤立代码
+ * 在这里整段删掉（连 LABEL/JMP 一起）。有计算 goto / &&label 时直接放弃，
+ * 那两类控制流不走静态标签表。 */
+static void ir_unreachable(IrFn *f)
+{
+    u32 *lmap = 0;
+    u8 *reach = 0;
+    u32 *stack = 0;
+    u32 sp = 0;
+    u32 i = 0;
+    u32 j = 0;
+
+    if (!f->n || !f->nlbl)
+        return;
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_JMPIND || f->ops[i].op == IR_LABELADDR)
+            return;
+    lmap = arena_zalloc(&A_opt, (size_t)f->nlbl * sizeof(u32));
+    memset(lmap, 0xff, (size_t)f->nlbl * sizeof(u32));
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_LABEL && f->ops[i].a < f->nlbl)
+            lmap[f->ops[i].a] = i;
+    reach = arena_zalloc(&A_opt, f->n);
+    stack = arena_alloc(&A_opt, (size_t)f->n * sizeof(u32));
+    reach[0] = 1;
+    stack[sp++] = 0;
+    while (sp) {
+        IrOp *o = 0;
+        u32 idx = stack[--sp];
+        u32 t = 0;
+
+        o = &f->ops[idx];
+        if (o->op == IR_JMP) {
+            if (o->a < f->nlbl) {
+                t = lmap[o->a];
+                if (t != 0xffffffffu && !reach[t]) {
+                    reach[t] = 1;
+                    stack[sp++] = t;
+                }
+            }
+            continue;
+        }
+        if (o->op == IR_BR) {
+            if (o->b < f->nlbl) {
+                t = lmap[o->b];
+                if (t != 0xffffffffu && !reach[t]) {
+                    reach[t] = 1;
+                    stack[sp++] = t;
+                }
+            }
+            if (o->c < f->nlbl) {
+                t = lmap[o->c];
+                if (t != 0xffffffffu && !reach[t]) {
+                    reach[t] = 1;
+                    stack[sp++] = t;
+                }
+            }
+            continue;
+        }
+        if (o->op == IR_RET || o->op == IR_TRAP)
+            continue;
+        if (idx + 1 < f->n && !reach[idx + 1]) {
+            reach[idx + 1] = 1;
+            stack[sp++] = idx + 1;
+        }
+    }
+    for (i = 0; i < f->n; i++) {
+        if (reach[i])
+            continue;
+        f->ops[i].op = IR_NOP;
+    }
+    j = 0;
+    for (i = 0; i < f->n; i++) {
+        if (f->ops[i].op == IR_NOP)
+            continue;
+        f->ops[j] = f->ops[i];
+        if (f->lines)
+            f->lines[j] = f->lines[i];
+        j++;
+    }
+    f->n = j;
+}
+
+static void ir_optimize(IrFn *f)
+{
+    if (IR_OPT_LEVEL <= 0 || !f || !f->n)
+        return;
+    arena_reset(&A_opt);
+    /* -O1：块内常量折叠 + 跳转串接 + 死代码消除 */
+    ir_fold(f);
+    ir_jumps(f);
+    ir_dce(f);
+    if (IR_OPT_LEVEL >= 2) {
+        /* -O2：CFG 不可达块消除 + 再来一轮折叠/跳转/DCE */
+        ir_fold(f);
+        ir_jumps(f);
+        ir_dce(f);
+    }
+    if (IR_OPT_LEVEL >= 3) {
+        /* -O3：拷贝传播 + CFG 不可达块消除（有 LEA 的函数自动跳过拷贝传播） */
+        ir_copyprop(f);
+        ir_fold(f);
+        ir_jumps(f);
+        ir_unreachable(f);
+        ir_dce(f);
+    }
+    arena_reset(&A_opt);
+}
