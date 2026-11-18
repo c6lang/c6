@@ -47,9 +47,14 @@
   - **fixdep**：对真实 .d 文件 stdout/depfile 修改逐字节一致；
   - **sorttable**（+ elf-parse）：对同一 vmlinux 排序后 ELF 逐字节一致；
   - **recordmcount**：可编译链接（本配置 `CONFIG_HAVE_FENTRY=y` 用 fentry 不走 mcount，故未做功能等价验证）。
-  - 补齐的 libc 面：`strndup`、`perror`、`getopt`（短选项）、`getopt_long`（长选项，新增 `<getopt.h>`）。
-- **剩余 host tools**：modpost（2420 行，依赖 fnmatch + libelf/gelf，`elf-parse.c` 已有基础）、
-  asn1_compiler、relocs、objtool。验证口径：`HOSTCC=c6c` 重编后这些工具能跑对。
+  - 补齐的 libc 面：`strndup`、`perror`、`getopt`（短选项）、`getopt_long`（长选项，新增 `<getopt.h>`）、
+    `scanf/sscanf/vsscanf`（gen_init_cpio 等用）。
+- **kbuild 集成已打通单 TU host tool**：`make HOSTCC=<c6c> -j1 scripts_basic` rc=0，
+  kbuild 自己用 c6c 编出 fixdep（输出与 gcc 版逐字节一致）。为此 c6c 补了 kbuild
+  固定带的 gcc 选项兼容：`-fomit-frame-pointer`、`-Wl,--fatal-warnings` 收下不生效，
+  以及 `-Wp,-MMD,<path>` 真正写出依赖文件（fixdep 靠它生成 .d）。
+  整条 `make scripts` 仍卡在 gen_init_cpio 的 dprintf/copy_file_range/isgraph（非目标工具）。
+- **剩余 host tools**：modpost、relocs、objtool（及非目标的 gen_init_cpio 等）。
 - 验证脚本 `c6c/tests/hostcc-tools.sh`：逐 TU 编译 + c6c 静态链接各工具，与 gcc 版逐字节对比输出。
 
 ## 阶段 3：AS——独立汇编器
