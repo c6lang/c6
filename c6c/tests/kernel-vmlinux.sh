@@ -123,7 +123,7 @@ make -j8 vmlinux bzImage > "$BACKUP/link.log" 2>&1 || {
 
 # 3) qemu 启动验证
 echo "== qemu 启动"
-timeout 20 "$QEMU" -L "$QEMU_BIOS" -kernel arch/x86/boot/bzImage \
+timeout "${QEMU_TIMEOUT:-20}" "$QEMU" -L "$QEMU_BIOS" -kernel arch/x86/boot/bzImage \
     -m 512M -nographic -no-reboot -append "console=ttyS0 panic=-1" \
     > "$BACKUP/qemu.log" 2>&1 || true
 CLEAN=$(sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1bc//g' "$BACKUP/qemu.log")

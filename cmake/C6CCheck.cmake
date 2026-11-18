@@ -86,7 +86,8 @@ c6c_target(asmnativecheck ENV C6C=${C6C_BIN} OBJDUMP=${CMAKE_OBJDUMP}
   COMMAND ./tests/asm-native-check.sh
   COMMENT "c6c: asmnativecheck（native 内联汇编机器码 + 固定寄存器约束）")
 # c6c .o 链接进 Linux vmlinux 并在 qemu 启动（重量级：全内核链接 + 启动，
-# 只放 check-all-c6c，不放 fast）。脚本自带 K/QEMU_BIOS 环境默认值。
+# 不放 fast / check-all-c6c；由 CTest 用例 c6c-kernelvmlinux 单独调度）。
+# 脚本自带 K/QEMU_BIOS 环境默认值。
 c6c_target(kernelvmlinux ENV C6C=${C6C_BIN}
   COMMAND ./tests/kernel-vmlinux.sh
   COMMENT "c6c: kernelvmlinux（c6c .o 链接 vmlinux + qemu 启动验证）")

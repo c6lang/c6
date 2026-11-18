@@ -1,4 +1,4 @@
-# c6 —— 带语言扩展的 TinyCC
+# c6 —— 带语言扩展的自举 C 编译器
 
 [![CI](https://github.com/c6lang/c6/actions/workflows/ci.yml/badge.svg)](https://github.com/c6lang/c6/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/c6lang/c6)](https://github.com/c6lang/c6/releases)
@@ -47,14 +47,18 @@ int!error save(const char *path, const char *data, int n)
 
 记住三条：登记顺序的**倒序**执行（`defer` 与 `errdefer` 混在一起排队）；`defer` 覆盖所有出口
 （`return` / `break` / `continue` / `goto` / `err`）；`errdefer` 只在本次调用真的 `err` 过时跑，
-正常返回跳过。清理状态放在**函数帧**里而不是 TLS，所以 `tcc -run` 和裸机上一样能用。
+正常返回跳过。清理状态放在**函数帧**里而不是 TLS，所以 `c6c -run` 和裸机上一样能用。
 细节见[错误处理](docs/manual/errors.md)，可运行示例 `./c6c/build/c6c -run examples/err_demo.c6`。
 
 ## 这是什么
 
-c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏原有 C 语义的前提下加入
-一组系统编程友好的语言扩展。**开关只有两个**：编译器打开 `C6_EXT`、源文件用 `.c6` 后缀
-（`.c` 文件永远是普通 C，没有 `-std=c6` 这个选项）。
+c6 是一套 C 语言扩展与配套的自举编译器：默认交付 `c6c`，支持 x86-64 原生、C 源码与
+LLVM IR 三种后端，在尽量保持普通 C 语义的前提下加入一组系统编程友好的语言扩展。
+它的前身是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，`tcc/` 源码仍留在
+仓库里，但只作测试语料与差分参考，默认构建不产出 tcc 产品（渊源与许可见文末）。
+
+**启用方式看源文件后缀**：`.c6` 文件开启扩展（并定义 `__C6__`），`.c` 文件永远是
+普通 C，没有 `-std=c6` 这个选项；tcc 形态另需在编译时打开 `C6_EXT`，c6c 不需要。
 
 | 扩展 | 作用 | 详情 |
 |---|---|---|
@@ -80,10 +84,10 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | 无 libc | freestanding：运行库外部依赖全是 weak，一直到 512 字节引导扇区的裸机 | [无 libc](docs/manual/freestanding.md) |
 | `test "描述" { ... }` + `-test` | 顶层测试块与内建测试运行器 | [测试](docs/manual/testing.md) |
 
-扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
-`C6_EXT` 只决定「有没有这套扩展」，真正启用哪一份代码由**源文件后缀**决定：`.c6` 文件开启扩展
-（并定义 `__C6__`），`.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启。`import NAME;`
-优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
+扩展只在 `.c6` 文件里生效，不会因为同一次编译里出现 `.c6` 而连带开启 `.c` 文件。
+tcc 形态的 `C6_EXT` 只决定「编译器有没有这套扩展」：不定义它时与上游 TCC 行为对齐；
+默认交付的 c6c 直接按后缀区分。`import NAME;` 优先查找 `NAME.c6`，找不到才回退到
+`NAME.c`。
 
 ## 快速开始
 
@@ -152,10 +156,11 @@ CMake 是仓库唯一的构建入口，CTest 是唯一的测试调度器，根 `
 `./tests/regression.sh std-demo` 单独跑一个用例。
 `scripts/` 里的 wasm 脚本由 CMake 直接调用；原先的 `bootstrap.sh` 已移除。
 
-CTest 常用命令：
+CTest 常用命令（默认 c6c 用 `-L c6c`；`daily` / `regression` 是 tcc 形态入口）：
 
 ```sh
-ctest --test-dir build -L daily --output-on-failure              # 日常 5 个
+ctest --test-dir build -L c6c -LE perf --output-on-failure       # c6c 默认门禁
+ctest --test-dir build -L daily --output-on-failure              # 日常 5 个（tcc 形态）
 ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure # 完整回归门禁
 ctest --test-dir build -L aux --output-on-failure               # 4 个辅助用例
 ctest --test-dir build -R '^std-demo$' --output-on-failure      # 单个用例
@@ -180,17 +185,26 @@ ctest --test-dir build -L daily --output-on-failure
 DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 DESTDIR
 ```
 
-注意：配置阶段会把 `TCC_INSTALL_TCCDIR` 等绝对路径写进 `config.h`
-（`CONFIG_TCCDIR`），共享库还会烤入 rpath。`cmake --install --prefix=...` 只改变文件
-落点，改不了二进制里的路径；要换安装前缀，得重新
-`cmake -S . -B build -DCMAKE_INSTALL_PREFIX=...` 再 `cmake --build build`。生成的
-`c6Config.cmake` / `c6.pc` 本身是可重定位的。
-
-可从 c6 侧传入的参数（都不用改 `tcc/` 的 `configure` / `Makefile`）：
+以下参数在默认（c6c）构建里生效：
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
-| `C6_ENABLE_TCC` | **`OFF`** | 构建/安装 tcc 版 c6（`tcc/c6`、`libtcc`、交叉安装、wasm）。默认关：c6c 已能自举，tcc 只作语料与参考实现保留（`tcc/` 的配置头仍会生成，语料要用） |
+| `C6_ENABLE_TCC` | **`OFF`** | 是否额外构建/安装 tcc 版 c6（`tcc/c6`、`libtcc`、交叉安装、wasm）。默认关：c6c 已能自举，tcc 只作语料与参考实现保留（`tcc/` 的配置头仍会生成，语料要用） |
+| `C6_INSTALL_DOCS` | `ON` | 安装 `docs/`、`README.md`、`CHANGELOG.md` 与 `copyright` |
+| `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
+| `C6_INSTALL_C6C` | `ON` | 安装自举编译器 `bin/c6c`（默认形态下同时是 `bin/c6`；`C6_ENABLE_TCC=ON` 时与 tcc 版 `c6` 并存） |
+| `C6_PACKAGE_NAME` | 按 flavour | 包名（`c6c` / `c6`），同时决定 `<datarootdir>/doc/<名>` |
+| `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
+| `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
+| `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
+| `C6_CHECK_JOBS` | 空（= CPU 核数） | `check-all` / `test-all` 的 CTest `-j` 并发度 |
+| `C6_LLVMCC` / `C6_LLVMAR` / `C6_NODE` / `C6_WASM_TRIPLE` | 空 | wasm 目标的工具链与 triple（留空交给脚本探测） |
+| `C6_PACKAGE_RELEASE` / `C6_PACKAGE_PRERELEASE` | `1` / 自动 | DEB/RPM 的 Release 与预发布标记 |
+
+tcc 形态专用（显式 `-DC6_ENABLE_TCC=ON`；都不用改 `tcc/` 的 `configure` / `Makefile`）：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
 | `C6_ENABLE_EXT` | `ON` | 传 `EXTRA-DEFS=-DC6_EXT`；`OFF` 等价于 `cmake --build build --target build-plain` |
 | `C6_EXTRA_DEFS` | 空 | 追加宏，例如 `-DC6_FOO` |
 | `C6_TCC_CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | `tcc/Makefile` 的 `CFLAGS` |
@@ -201,27 +215,24 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_TCC_JOBS` | CPU 核数 | 非 Makefile 生成器下子 make 的 `-j`；Makefile 生成器用 `$(MAKE)` 继承 jobserver |
 | `C6_INSTALL_TCCDIR` | `<libdir>/tcc` | 运行时库（`libtcc1.a`）目录 |
 | `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 上游 tcc 文档目录（`tcc-doc.html`） |
-| `C6_INSTALL_DOCS` | `ON` | 安装 c6 的 `docs/`、`README.md`、`CHANGELOG.md` 与 `copyright` |
-| `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
-| `C6_INSTALL_C6C` | `ON` | 安装自举编译器 `bin/c6c`（默认形态下同时是 `bin/c6`；`C6_ENABLE_TCC=ON` 时与 tcc 版 `c6` 并存） |
-| `C6_PACKAGE_NAME` | 按 flavour | 包名（`c6` / `c6c`），同时决定 `<datarootdir>/doc/<名>` |
-| `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
-| `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
-| `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
-| `C6_CHECK_JOBS` | 空（= `C6_TCC_JOBS`） | `check-all` / `test-all` 的 CTest `-j` 并发度 |
-| `C6_LLVMCC` / `C6_LLVMAR` / `C6_NODE` / `C6_WASM_TRIPLE` | 空 | wasm 目标的工具链与 triple（留空交给脚本探测） |
-| `C6_PACKAGE_RELEASE` / `C6_PACKAGE_PRERELEASE` | `1` / 自动 | DEB/RPM 的 Release 与预发布标记 |
 
-`tcc/` 是树内构建，同一时间只应有一个 CMake 构建目录：`tcc-config` 在每次
+tcc 形态的配置路径还会把 `TCC_INSTALL_TCCDIR` 等绝对路径写进 `config.h`
+（`CONFIG_TCCDIR`），共享库还会烤入 rpath。`cmake --install --prefix=...` 只改变文件
+落点，改不了二进制里的路径；要换安装前缀，得重新
+`cmake -S . -B build -DCMAKE_INSTALL_PREFIX=...` 再 `cmake --build build`。生成的
+`c6Config.cmake` / `c6.pc` 本身是可重定位的。
+
+tcc 形态的 `tcc/` 是树内构建，同一时间只应有一个 CMake 构建目录：`tcc-config` 在每次
 构建时比对生成目录与 `tcc/` 里的 `config.mak` / `config.h` / `config.texi`，
 并用 `config.sig`（覆盖只走 make 命令行的 `EXTRA-DEFS` / `CFLAGS` 等参数）
 记录上次应用的签名；任一变化就同步配置并清掉旧目标文件，避免 `libtcc.a` /
 `libtcc.so` 混用非 `-fPIC` 的目标文件。`config.mak` 里的 `# c6-build-dir:`
 让第二个构建目录在配置阶段就收到警告，构建期也会自动把配置同步回来。
-配置期仍对源码树零写入、不需要手写哈希戳。
+配置期仍对源码树零写入、不需要手写哈希戳。默认构建只生成配置头供语料使用，
+不涉及这些目标文件。
 
-`cmake --build build --target build-plain` 是上游模式；配置参数变化只需重跑
+`cmake --build build --target build-plain` 是 tcc 形态的上游模式；配置参数变化只需重跑
 `cmake -S . -B build`（没有单独的重新配置目标）。`--target c6-clean` 清构建产物，
 `--target clean-all` 连生成的 `config.mak` / `config.h` 一起清（之后再重新
 `cmake -S . -B build`）。`--target c6-help` 打印常用命令与用例清单，`--target help`
@@ -236,7 +247,24 @@ target 仍保留为兼容薄壳。每个用例有独立的 `build/tests/<用例>
 `build/...` 路径）。clang / node / qemu 这类可选工具缺失时，对应用例会跳过或
 明确报错，不会自动安装。
 
-安装后同时提供两套库配置，供下游工程直接消费 `libtcc`：
+默认交付的是自举编译器 `c6c` 与它的嵌入库 `libc6c`（`bin/c6` 是 c6c 的兼容别名）：
+
+```cmake
+find_package(c6c 0.9 REQUIRED COMPONENTS compiler libc6c)
+target_link_libraries(app PRIVATE c6c::libc6c)  # 静态；要动态链接用 c6c::libc6c_shared
+# c6c::compiler 是 bin/c6c 的 IMPORTED target
+```
+
+```sh
+pkgconf --cflags --libs c6c     # -I<includedir> -L<libdir> -lc6c
+```
+
+可用变量：`c6c_EXECUTABLE`、`c6c_LIBC6C_STATIC` / `c6c_LIBC6C_SHARED`、
+`c6c_INCLUDE_DIR`、`c6c_VERSION`。`c6c.pc` 的 `prefix` 由 `${pcfiledir}` 反推，
+装到 `DESTDIR` 暂存目录里再搬走也照样能用。
+
+显式 `-DC6_ENABLE_TCC=ON` 时另有 tcc 形态的 `libtcc` / `c6::libtcc`（默认 flavour
+下 `c6.pc` 只是指向 c6c 的兼容名）：
 
 ```cmake
 find_package(c6 0.9 REQUIRED COMPONENTS libtcc compiler)
@@ -253,25 +281,8 @@ pkgconf --static --libs c6
 cc $(pkgconf --cflags --libs c6) app.c -o app
 ```
 
-`c6.pc` 的 `prefix` 由 `${pcfiledir}` 反推，装到 `DESTDIR` 暂存目录里再搬走也照样能用。
-
-自举编译器 `c6c` 与嵌入库 `libc6c` 用**自己的包名**，和 `c6` 并列（`c6` 是 tcc
-分支的 libtcc 接口，`c6c` 是自举编译器本身）：
-
-```cmake
-find_package(c6c 0.9 REQUIRED COMPONENTS compiler libc6c)
-target_link_libraries(app PRIVATE c6c::libc6c)  # 静态；要动态链接用 c6c::libc6c_shared
-# c6c::compiler 是 bin/c6c 的 IMPORTED target
-```
-
-```sh
-pkgconf --cflags --libs c6c     # -I<includedir> -L<libdir> -lc6c
-```
-
-可用变量：`c6c_EXECUTABLE`、`c6c_LIBC6C_STATIC` / `c6c_LIBC6C_SHARED`、
-`c6c_INCLUDE_DIR`、`c6c_VERSION`。两个名字不打架：`c6.pc` 在两种 flavour 下内容
-不同（有 tcc 时 `-ltcc`、没有时 `-lc6c`），而 `c6c.pc` 只描述自举编译器、只在装
-了 c6c 时出现——消费者按自己真正依赖的东西选名字即可。
+两个名字不打架：`c6.pc` 在两种 flavour 下内容不同（有 tcc 时 `-ltcc`、没有时
+`-lc6c`），而 `c6c.pc` 始终描述默认交付的 c6c——按自己真正依赖的东西选名字即可。
 
 ### 打包与发布
 
@@ -345,9 +356,9 @@ yay -Syu c6
 │                       C6CheckInstall / C6Testing / C6Packaging，
 │                       以及 c6Config / c6Targets / c6.pc 模板与 C6Help.txt
 ├── .github/workflows/  GitHub Actions：编译测试、DEB/RPM/TGZ 打包与发布
-└── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交；
-                        CMakeLists.txt 与 cmake/ 模板是新增的配置层，
-                        导出 tcc::c6 / tcc::libtcc；configure / Makefile 源码不改动
+└── tcc/                上游 TinyCC 派生源码（语料 + 差分 oracle）：上游基线 + 每个 c6 补丁一个提交；
+                        默认不编译、不安装，显式 -DC6_ENABLE_TCC=ON 时才产出
+                        tcc::c6 / tcc::libtcc；configure / Makefile 源码不改动
 ```
 
 ## 文档地图
@@ -370,27 +381,32 @@ yay -Syu c6
 
 ```sh
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build --parallel                  # 扩展模式（EXTRA-DEFS=-DC6_EXT）
-cmake --build build --target build-plain       # 上游模式（不定义 C6_EXT）
-ctest --test-dir build -L daily --output-on-failure # 只跑 5 个日常用例
-cmake --build build --target test-all          # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
-cmake --build build --target check-all         # 全部回归门禁用例（发布前跑这一条）
-cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all  # 整轮串行
-cmake --build build --target fast              # c6c 当编译器：快速门禁 ≈40 s（含外部语料）
-cmake --build build --target check-all-c6c     # c6c 当编译器：全量门禁 ≈4 min（含外部语料）
+cmake --build build --parallel                  # 默认构建：自举编译器 c6c
+cmake --build build --target fast              # c6c 快速门禁 ≈40 s（含外部语料）
+cmake --build build --target check-all-c6c     # c6c 全量门禁 ≈4 min（Linux 内核编译另跑）
 cmake --build build --target check-aux         # 4 个 aux 用例
 cmake --build build --target check-install     # 校验装出去的 CMake / pkgconf 库配置
 cmake --build build --target c6-help           # 常用命令与用例清单
 ```
 
-`ctest --test-dir build -L daily` 的 5 个用例是 `c6-selftest`、`c6-errcheck`、
+tcc 形态（需 `-DC6_ENABLE_TCC=ON`）：
+
+```sh
+cmake --build build --target build-plain       # 上游模式（不定义 C6_EXT）
+ctest --test-dir build -L daily --output-on-failure # 只跑 5 个日常用例
+cmake --build build --target test-all          # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
+cmake --build build --target check-all         # 全部回归门禁用例（发布前跑这一条）
+cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all  # 整轮串行
+```
+
+tcc 形态的 `ctest --test-dir build -L daily` 的 5 个用例是 `c6-selftest`、`c6-errcheck`、
 `c6-tests2`、`c6-c99-selftest`、`c6-c99tcc-selftest`；只想跑上游 tests2 用
 `ctest --test-dir build -R c6-tests2`。不加 `-L` 会连 114 个回归用例（含 4 个
 `aux`）一起跑。`check-all` 排除 `aux`，并让 fstest / tests2 / source-tree 三组
 用例按 `RESOURCE_LOCK` 串行，其余全并发。完整目标清单用
 `cmake --build build --target help` 查看。
 
-构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：
+tcc 形态的tcc 形态的构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：
 切模式或换 `CFLAGS` 后下一次 `cmake --build build` 自动全量重编。别手工删一部分
 产物——`C6_EXT` 会改 `struct TCCState` 的布局，混编出来的 `c6` 能链接，但任何输入
 都报 `tcc: error: no input files`（详见 [docs/reference/cli.md](docs/reference/cli.md#构建)）。
@@ -892,11 +908,13 @@ cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++
   （每个语法对应哪个实现函数，语法见 [docs/reference/grammar.md](docs/reference/grammar.md)）。
 - **阶段与验收状态**：[docs/history/status.md](docs/history/status.md)；**变更史**：[CHANGELOG.md](CHANGELOG.md)。
 - 三条要点：运行时状态（错误槽、插值构造器、协程池、子线程链表）是**每线程**一份，用
-  `pthread_key` 而不是 `__thread`（`tcc -run` 不支持 TLS），`defer` 的清理状态不在其中——
-  它在函数帧里；方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；元组复用
+  `pthread_key` 而不是 `__thread`（tcc 形态的 JIT `-run` 不支持 TLS），`defer` 的清理状态不在其中——
+  它在函数帧里；方法必须在调用点之前声明或定义（单趟编译的固有限制）；元组复用
   `VT_STRUCT`、切片是普通对象，两者的 ABI 都不随 `#pragma pack` 改变。
 
-## 上游与许可
+## 渊源与许可
+
+TinyCC 只在这一节交代渊源与许可；日常构建、命令与交付物都以 c6c 为准。
 
 仓库根的 [`LICENSE`](LICENSE) 是仓库的**主许可**：**MIT**（与
 [`c6c/LICENSE`](c6c/LICENSE) 同文）。仓库的主体现在是自举编译器
