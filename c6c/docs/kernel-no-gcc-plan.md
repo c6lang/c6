@@ -275,3 +275,14 @@
   疑点最终收敛到 __startup_64 早期页表 fixup（head_64.S 调用，C 实现在
   arch/x86/boot/startup/ 或 head64.c）映射范围：c6c 编译版本未覆盖
   real_mode_data 物理页 0x14770。
+
+
+  **gcc vs c6c #PF 对比（2026-11-20，决定性）**：gcc 内核 trace 显示同样在
+  CR2=ffff888000014770 触发 #PF（IP=memcpy_orig），但被正常处理（4 次 #PF
+  0 次 #DF，启动到 VFS）。c6c 内核同一 CR2 的 #PF 直接 #DF。关键差异：
+  gcc 首次 #PF 时 IDT limit=0xfff（256 门完整表，idt_table），c6c 为
+  0x1ff（32 门 bringup_idt_table 空表）。即 c6c 内核在 copy_bootdata 阶段
+  尚未切换到能处理异常的 idt_table，而 gcc 已切换。startup_64_load_idt
+  （gcc 代码）两者都加载 0x1ff；差异来自 idt_setup_early_traps/cpu_init
+  的时机或 c6c 早期代码破坏了 IDT 切换路径。剩余：查 c6c 内核里 idt_table
+  的加载时机（native_load_idt）与 setup_arch 流程。
