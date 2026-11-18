@@ -222,3 +222,14 @@
   到内存拷贝循环（21127 指令），#PF(CR2=ffff888000014770) 在
   setup_cpu_entry_areas 类代码处，#PF 处理再 #DF。剩余：查该 #PF 的
   无效地址来源（copy 循环 rsi/rdi 指针）。
+
+
+  **精确定位 #PF（2026-11-20）**：in_asm+int 追踪，崩溃在 `memcpy_orig`
+  （arch/x86/lib/memcpy_64.S，汇编非 c6c），指令 `mov (%rsi),%r8`，
+  CR2=ffff888000014770（direct map 物理 0x14770），#PF error=0（not-present
+  read）。调用者是 `copy_bootdata`（arch/x86/kernel/head64.c:194）的
+  `memcpy(&boot_params, real_mode_data, sizeof(boot_params))`，src=real_mode_data
+  =__va(0x14770)。KASLR 偏移 0x1e200000（运行 0xa6ca1fa6 ↔ vmlinux 0x88aa1fa6）。
+  疑点：0x14770 这页未映射（早期 direct map 页表缺失），或 real_mode_data
+  物理地址值被 c6c 早期代码算错（gcc 内核该地址有效）。剩余：查 real_mode_data
+  来源（head_64.S 传参）与早期 direct map 页表建立。
