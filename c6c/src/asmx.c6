@@ -213,6 +213,15 @@ static void ax_eol(void)
         AX_P++;
 }
 
+/* 吞到换行（含分号后的语句）：用于 .pushsection.discard...; .long 911b - .;
+ * .popsection 这类 annotate 行——整行是 discard 段元数据，里面的数字标签
+ * 反向引用（911b）迷你汇编器不支持，连着分号内容一起吞掉即可。 */
+static void ax_line_end(void)
+{
+    while (AX_P < AX_E && *AX_P != '\n' && *AX_P != '#')
+        AX_P++;
+}
+
 static int ax_ch_ident(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
@@ -1134,9 +1143,10 @@ static int ax_long_symrel(void)
     int adj = 0;
 
     ax_sp();
-    if (!ax_word() || AX_WBUF[0] < 'A'
-        || (AX_WBUF[0] > 'Z' && AX_WBUF[0] < 'a')
-        || (AX_WBUF[0] > 'z' && AX_WBUF[0] != '_'))
+    /* ax_word 也收数字开头的 token（`911`）——那种不是符号引用，
+     * 交给 ax_num 处理。下划线 / 字母开头的都是合法符号名。 */
+    if (!ax_word()
+        || (AX_WBUF[0] >= '0' && AX_WBUF[0] <= '9'))
         goto fail;
     nlen = AX_WLEN;
     name = arena_strndup(&A_main, AX_WBUF, nlen);
@@ -1260,8 +1270,8 @@ static int ax_directive(void)
         return 1;
     }
     /* 其余（.globl/.text/.data/.align/.type/.size/.section/.cfi_*…）对这个
-     * 迷你汇编器没有意义：整行吞掉。 */
-    ax_eol();
+     * 迷你汇编器没有意义：整行吞掉（含分号后的 annotate 元数据语句）。 */
+    ax_line_end();
     return 1;
 }
 
