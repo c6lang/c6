@@ -55,6 +55,7 @@ int getc(FILE *f);
 char *fgets(char *buf, int n, FILE *f);
 int fputc(int c, FILE *f);
 int putc(int c, FILE *f);
+void perror(const char *s);
 int remove(const char *path);
 int rename(const char *from, const char *to);
 

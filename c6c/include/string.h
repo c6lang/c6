@@ -27,6 +27,8 @@ char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 char *strstr(const char *hay, const char *needle);
 char *strdup(const char *s);
+char *strndup(const char *s, size_t n);
+char *strerror(int errnum);
 size_t strspn(const char *s, const char *accept);
 size_t strcspn(const char *s, const char *reject);
 void *memmem(const void *hay, size_t hn, const void *needle, size_t nn);
