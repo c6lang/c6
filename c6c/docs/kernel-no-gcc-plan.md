@@ -135,10 +135,14 @@
   已修 const_mul/const_add/const_shift 的类型恢复；最小复现与 gcc 完全一致。
   999/999 编译 + vmlinux 链接成功；early_pmd_flags 现为正确的 0xe3；bzImage
   全 c6c 工具链构建成功（35,776,000 字节）；fast 全绿。
-  根因链已追到（qemu -d in_asm + 反汇编对比）：KASLR 重定位正确，但
-  common_startup_64 里 `mov -0x76768048(%rdx),%rax`（读 per-CPU 栈指针）
-  在 c6c vmlinux 里读到 0（gcc 对应位置读到有效 init_thread_union+0x4000），
-  随后 `mov 0xc58(%rax),%rsp` 设出无效栈 → triple fault（qemu 自行退出）。
-  c6c 的 .data..percpu 段在 0x8a860000，而该 disp 指向 0x89897fb8（普通
-  .data 段、值 0）——per-CPU 段布局/符号解析不一致。需修 c6c .o 的
-  per-CPU 段属性或链接符号解析。产物备份 /tmp/c6c_kernel_build3/。
+  根因链已完整追到（qemu -d in_asm + 反汇编 + 符号对比）：
+  head_64.S 的 `current_task(%rdx)`（per-CPU 栈指针）读到的地址在 c6c
+  vmlinux 里值为 0（gcc 里是有效 init_thread_union+0x4000），随后
+  `mov 0xc58(%rax),%rsp` 设出无效栈 → triple fault。
+  **根因：c6c 不支持 `__attribute__((section(...)))`**——DEFINE_PER_CPU
+  用 `__attribute__((section(".data..percpu...")))` 定义 per-CPU 变量，
+  c6c 把 current_task 等全放进普通 .data（段 12、size 0），而 gcc 放进
+  .data..percpu（段 31、size 8）。后续必须实现 section 属性 + 自定义段输出，
+  否则 per-CPU 符号解析永远错误，内核无法启动。
+  属性解析入口在 parse.c6:7830-7884（已认 weak/packed/aligned，需加 section）。
+  产物备份 /tmp/c6c_kernel_build3/。
