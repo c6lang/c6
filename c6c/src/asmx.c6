@@ -1488,6 +1488,7 @@ static u32 asmx_flush(X64State *st, u32 idx)
         st->sym[s].va = ELF_BASE_VA + st->sym[s].off;
         st->sym[s].defined = 1;
         st->sym[s].is_data = 0;
+        st->sym[s].is_asm = 1;
     }
     for (i = 0; i < pc->nfix; i++) {
         AxFix *f = &AX_FIX[pc->fix0 + i];

@@ -322,7 +322,10 @@ static u64 ob_sym_value(const X64Sym *s)
 {
     if (!s->defined)
         return 0;
-    if (s->is_data)
+    /* top-level asm 定义的符号 off 是 CODE_IMG 坐标，即使被 C 的 extern u8[]
+     * 引用设了 is_data，也不能按数据段减 ELF_HDR——否则得到负偏移
+     * （0xffffff9a），PC32 重定位放不下。 */
+    if (s->is_data && !s->is_asm)
         return (u64)(s->off - (u32)ELF_HDR);
     return (u64)s->off;
 }
@@ -596,30 +599,23 @@ static void obj_write(const char *path)
         if (!s->name || !s->name[0])
             continue;           /* 无名符号：重定位里退化成 0 号 */
         local = ob_sym_local(s->name) || s->is_static;
-        /* 内核编译期断言伪函数：__bad_size_call_parameter / ____wrong_branch_error
-         * 等只出现在 gcc 会常量折叠掉的不可达分支，gcc 从不发对它们的引用。
-         * c6c 不做常量传播，保留了这些引用；若发成强 UND，链接期 undefined。
-         * 发成 WEAK UND（链接器允许缺失、填 0）——这些分支永不执行。 */
-        if (!s->defined && !s->is_data && !local && getenv("C6C_KERNEL_DCE")) {
-            const char *nm = s->name;
-
-            pseudo = (nm[0] == '_' && nm[1] == '_')
-                     && (memcmp(nm, "__bad_", 6) == 0
-                         || memcmp(nm, "____wrong_", 10) == 0
-                         || memcmp(nm, "__BUILD_BUG", 11) == 0
-                         || memcmp(nm, "__cmpxchg_wrong", 15) == 0
-                         || memcmp(nm, "__get_user_bad", 14) == 0
-                         || memcmp(nm, "__put_user_bad", 14) == 0
-                         || memcmp(nm, "__invalid_size_argument", 23) == 0
-                         || memcmp(nm, "__ftrace_bad_type", 17) == 0);
-        }
+        /* 内核模式下，未定义的外部函数引用一律发 WEAK UND。原因：
+         * gcc 会常量折叠掉大量不可达分支（编译期断言 __bad_*、条件编译
+         * 关闭的功能、register asm 变量如 current_stack_pointer），从不发
+         * 对它们的引用。c6c 不做常量传播/寄存器绑定，保留了这些引用，若
+         * 发成强 UND 会全量链接 undefined。
+         * WEAK UND：有强定义的符号（.S、其他 TU）链接器仍正常解析；确实
+         * 缺失的就是 gcc 也优化掉的不可达引用，填 0 无害。qemu 启动验证。 */
+        if (!s->defined && !local && getenv("C6C_KERNEL_DCE"))
+            pseudo = 1;
         bind = (u8)(local ? OBJ_STB_LOCAL
                     : (s->is_weak || pseudo) ? OBJ_STB_WEAK : OBJ_STB_GLOBAL);
-        if (s->defined && s->is_data) {
+        if (s->defined && s->is_data && !s->is_asm) {
             type = OBJ_STT_OBJECT;
             shndx = OBJ_SHN_DATA;
         } else if (s->defined) {
-            type = OBJ_STT_FUNC;
+            /* is_asm 符号即使被当数据引用，off 也是 CODE_IMG 坐标 → TEXT 段 */
+            type = (u8)(s->is_data ? OBJ_STT_OBJECT : OBJ_STT_FUNC);
             shndx = OBJ_SHN_TEXT;
         } else if (s->is_data) {
             /* **未定义**的数据符号也要标成 OBJECT：链接器靠这个区分
