@@ -1,10 +1,10 @@
 /* c6c 自带 <stdbool.h> */
-#if !defined(_C6C_STDBOOL_H) && !defined(_NOLIBC_STDBOOL_H)
+#if !defined(_C6C_STDBOOL_H) && !defined(_NOLIBC_STDBOOL_H) && !defined(_LINUX_STDDEF_H)
 #define _C6C_STDBOOL_H
-/* 内核 tools/include/nolibc/stdbool.h 也定义 true/false，guard 名不同。
- * 两边都认对方的 guard：谁先被 include，另一个就整体跳过，避免同一个宏
- * 被 #define 两次（c6c 预处理器会展开 #define 的名字，二次定义
- * `#define false 0` 会变成 `#define 0 0` 报语法错）。 */
+/* 内核 tools/include/nolibc/stdbool.h 与 include/linux/stddef.h 都定义
+ * true/false（后者是 enum { false=0, true=1 }），guard 名各异。谁先被
+ * include，另一个就整体跳过，避免 c6c 把 `#define false 0` 再展开一次、
+ * 或把内核的 `enum { false = 0 }` 展开成 `enum { 0 = 0 }` 报语法错。 */
 #define _NOLIBC_STDBOOL_H
 
 #define bool _Bool
