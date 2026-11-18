@@ -18,6 +18,7 @@ struct option {
 extern char *optarg;
 extern int optind;
 
+int getopt(int argc, char **argv, const char *shortopts);
 int getopt_long(int argc, char **argv, const char *shortopts,
                 const struct option *longopts, int *longindex);
 

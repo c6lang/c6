@@ -5748,8 +5748,54 @@ void __c6c_test_summary(int nrun, int nfail)
     printf("%d test(s), %d failure(s)\n", nrun, nfail);
 }
 
-/* getopt_long：host tools 用的最小长选项解析器。只处理 --name / --name=value，
- * 短选项（shortopts）暂不展开——kallsyms/modpost 只用长选项。
+/* 短选项解析：getopt 与 getopt_long 共用。shortopts 里字母后带 ':' 表示要参数。
+ * 支持 "-s value" / "-svalue" /  clustered "-abc"；optarg 指向参数值。 */
+static int c6c_getopt_short(int argc, char **argv, const char *shortopts)
+{
+    char *a;
+    const char *sp;
+    char c;
+
+    if (optind >= argc)
+        return -1;
+    a = argv[optind];
+    if (!a || a[0] != '-' || a[1] == 0)
+        return -1;                      /* 非选项（含单独 "-"）：结束 */
+    if (a[1] == '-') {                  /* "--"：吃掉并返回结束 */
+        optind++;
+        return -1;
+    }
+    c = a[1];
+    sp = shortopts ? strchr(shortopts, c) : 0;
+    if (!sp)
+        optarg = 0, optind++, c = '?';  /* 未知选项 */
+    else if (sp[1] == ':') {
+        if (a[2]) {
+            optarg = a + 2;
+            optind++;
+        } else if (optind + 1 < argc) {
+            optarg = argv[++optind];
+            optind++;
+        } else {
+            optarg = 0;
+            optind++;
+            c = '?';
+        }
+    } else {
+        optarg = 0;
+        optind++;
+    }
+    return c;
+}
+
+int getopt(int argc, char **argv, const char *shortopts)
+{
+    optarg = 0;
+    return c6c_getopt_short(argc, argv, shortopts);
+}
+
+/* getopt_long：host tools 用的最小选项解析器。--name / --name=value 走长选项表，
+ * 其余交给短选项解析（kallsyms 只用长选项，sorttable 用 -s）。
  * optarg 指向 = 后或下一个 argv；optind 是下一个待处理参数下标。 */
 char *optarg = 0;
 int optind = 1;
@@ -5759,13 +5805,12 @@ int getopt_long(int argc, char **argv, const char *shortopts,
 {
     const char *a;
 
-    (void)shortopts;
     (void)longindex;
     optarg = 0;
     while (optind < argc) {
         a = argv[optind];
         if (!a || a[0] != '-' || a[1] != '-')
-            return -1;                 /* 第一个非选项：后面全是位置参数 */
+            return c6c_getopt_short(argc, argv, shortopts);   /* 短选项或非选项 */
         if (a[2] == 0) {               /* "--"：选项结束 */
             optind++;
             return -1;
