@@ -45,6 +45,12 @@ int dup2(int oldfd, int newfd);
 int nice(int inc);
 unsigned int sleep(unsigned int seconds);
 int usleep(unsigned int usec);
+/* POSIX: getopt 在 <unistd.h> 声明（<getopt.h> 也有，重复声明无碍）。
+ * modpost.c 只 include <unistd.h> 却调用 getopt——gcc 靠系统 unistd.h
+ * 的声明编过，c6c 以前只在 <getopt.h> 里声明，故报"未声明的标识符"。 */
+int getopt(int argc, char *const argv[], const char *shortopts);
+extern char *optarg;
+extern int optind;
 
 #endif
 

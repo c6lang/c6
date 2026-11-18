@@ -6111,4 +6111,36 @@ char *strtok(char *s, const char *delim)
     }
 }
 
+/* strsep：与 strtok 不同，游标保存在调用方的 **stringp 里（无 static 状态）。
+ * 语义：扫描 *stringp 找 delim 中任一字符，就地写成 '\0'，返回原起点，
+ * 并把 *stringp 指向分隔符之后；找不到分隔符则返回整个串并置 *stringp=0。
+ * 空串（**stringp == 0）返回 0。modpost/sumversion.c 用它拆版本字符串。 */
+char *strsep(char **stringp, const char *delim)
+{
+    char *start = *stringp;
+    char *p;
+
+    if (!start)
+        return 0;
+    p = start;
+    while (*p && !(delim && strchr(delim, *p)))
+        p++;
+    if (*p) {
+        *p = 0;
+        *stringp = p + 1;
+    } else {
+        *stringp = 0;
+    }
+    return start;
+}
+
+/* strchrnul：GNU 扩展——找到 c 返回其位置，找不到返回末尾 '\0' 的位置
+ * （永远非 NULL）。modpost.c 用 `sep = strchrnul(ns, ',')` 后直接算长度。 */
+char *strchrnul(const char *s, int c)
+{
+    while (*s && *s != c)
+        s++;
+    return (char *)s;
+}
+
 #endif /* _C6C_RT_C6 */
