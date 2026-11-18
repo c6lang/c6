@@ -47,6 +47,7 @@ typedef struct Opts {
     const char *forceincs[MAX_INC];
     int nforceincs;
     const char *out;
+    const char *depfile;        /* -Wp,-MMD,path：gcc 风格依赖文件输出 */
     const char *bdir;
     int verbose;
     int mode;
@@ -263,6 +264,42 @@ static void stat_totals(void)
         ST_lines += f->nlines;
         ST_bytes += f->size;
     }
+}
+
+/* -Wp,-MMD,path：gcc 风格的依赖文件。kbuild 编 host tools 时靠它生成 .d，
+ * 再喂给 fixdep。格式和 gcc -MMD 一样：`<basename>.o: file.c header.h ...`。
+ * FILES 里 owned=1 的是 -D 合成内容/模块改写产物，不是磁盘上的真实头文件，
+ * 不能列进去（fixdep 会 stat 每个依赖，列了会报找不到）。 */
+static void emit_depfile(const char *path)
+{
+    FILE *f = NULL;
+    SrcFile *sf = NULL;
+    char target[512] = {0};
+    const char *base = O.files[0];
+    const char *slash = NULL;
+    size_t n = 0;
+
+    if (!path || !path[0] || O.nfiles < 1)
+        return;
+    f = fopen(path, "w");
+    if (!f)
+        return;
+    slash = strrchr(base, '/');
+    if (slash)
+        base = slash + 1;
+    n = strlen(base);
+    if (n > 2 && base[n - 2] == '.' && (base[n - 1] == 'c' || base[n - 1] == 'S'))
+        n -= 2;
+    if (n > sizeof(target) - 3)
+        n = sizeof(target) - 3;
+    memcpy(target, base, n);
+    memcpy(target + n, ".o", 2);
+    fprintf(f, "%s:", target);
+    for (sf = FILES.head; sf; sf = sf->next)
+        if (!sf->owned && sf->path && sf->path[0])
+            fprintf(f, " %s", sf->path);
+    fprintf(f, "\n");
+    fclose(f);
 }
 
 static void print_stats(double ms)
@@ -783,6 +820,11 @@ static int parse_args(int argc, char **argv)
              * 生成代码。内核 kbuild 的 KBUILD_HOSTCFLAGS 固定带它，收下
              * 但不生效，好让 HOSTCC=c6c 直接编 host tools 不被陌生 flag 打死。 */
             continue;
+        } else if (strncmp(a, "-Wp,-MMD,", 9) == 0) {
+            /* gcc/clang 风格依赖文件：-Wp,-MMD,path。kbuild 编 host tools
+             * 固定带它，且靠生成的 .d 驱动 fixdep。真正写出在编译完成后。 */
+            O.depfile = a + 9;
+            continue;
         } else if (strncmp(a, "-Wl,", 4) == 0) {
             /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
              * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
@@ -1220,6 +1262,8 @@ int main(int argc, char **argv)
             }
             unlink(RUN_PATH);
         }
+        if (rc == 0 && O.depfile)
+            emit_depfile(O.depfile);
         return rc;
     }
     case M_SCAN: {
