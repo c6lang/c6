@@ -24005,6 +24005,11 @@ static void pa_parse_tu(void)
             }
             continue;
         }
+        /* 每条顶层声明独立判断 inline：PA_INLINE_SEEN 是 parse_typespec 里
+         * 见到 inline 关键字时置位的，上一条纯声明（无函数体，走不到 pa_func_def
+         * 的清零）的残留会污染下一条，使 rb_next 这类非 inline 全局函数被误
+         * 本地化成 STB_LOCAL，链接期 undefined。 */
+        PA_INLINE_SEEN = 0;
         PA_AT_DECL = 1;             /* 这条声明里认 alias / asm 标签 */
         base = parse_typespec();
         if (ty_is_taskh(base))

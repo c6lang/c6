@@ -1122,6 +1122,53 @@ static int ax_insn(void)
     (void)base;
 }
 
+/* `.long sym - (. + 4)`：static_call trampoline / 跳转跳板里常见的 rel32
+ * 回填写法。ax_num 只吃纯数字，符号表达式会令整段 asm 作废（标签丢掉）。
+ * `.` 是当前位置 = rel32 patch 落点，`sym - (. + 4)` 正是 rel32 语义，
+ * 与 ax_fix_sym 生成的 kind 0 fix（obj.c6 里 A=-4）一致，直接复用。 */
+static int ax_long_symrel(void)
+{
+    const char *save = AX_P;
+    const char *name = NULL;
+    u32 nlen = 0;
+    int adj = 0;
+
+    ax_sp();
+    if (!ax_word() || AX_WBUF[0] < 'A'
+        || (AX_WBUF[0] > 'Z' && AX_WBUF[0] < 'a')
+        || (AX_WBUF[0] > 'z' && AX_WBUF[0] != '_'))
+        goto fail;
+    nlen = AX_WLEN;
+    name = arena_strndup(&A_main, AX_WBUF, nlen);
+    ax_sp();
+    if (*AX_P != '-')
+        goto fail;
+    AX_P++;
+    ax_sp();
+    if (*AX_P != '(')
+        goto fail;
+    AX_P++;
+    ax_sp();
+    if (*AX_P != '.')
+        goto fail;
+    AX_P++;
+    ax_sp();
+    if (*AX_P == '+') {
+        AX_P++;
+        if (!ax_num(&adj))
+            goto fail;
+    }
+    ax_sp();
+    if (*AX_P != ')' || adj != 4)
+        goto fail;
+    AX_P++;
+    ax_fix_sym(name, nlen);
+    return 1;
+fail:
+    AX_P = save;
+    return 0;
+}
+
 /* ---- 指示符与标签 ------------------------------------------------------ */
 
 static int ax_directive(void)
@@ -1144,6 +1191,12 @@ static int ax_directive(void)
             ax_sp();
             if (AX_P >= AX_E || *AX_P == '\n' || *AX_P == ';' || *AX_P == '#')
                 break;
+            if (sz == 4 && ax_long_symrel()) {
+                ax_sp();
+                if (AX_P < AX_E && *AX_P == ',')
+                    AX_P++;
+                continue;               /* ax_fix_sym 已占 4 字节 */
+            }
             if (!ax_num(&v))
                 return 0;
             if (sz == 1)
