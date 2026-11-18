@@ -619,7 +619,8 @@ static int parse_args(int argc, char **argv)
 {
     int i = 0;
 
-    O.bdir = ".";
+    O.bdir = 0;    /* 没显式 -B 就不加 <bdir>/include：内核工具编译里
+                    * ./include 是内核头，会被 #include_next 误命中 */
     O.mode = M_EXE;
     O.run_argi = 0;
     for (i = 1; i < argc; i++) {
@@ -1013,10 +1014,12 @@ static void setup_incdirs(void)
             c6_self_incdir_add(INCDIR[NINCDIR++]);
         }
     }
-    snprintf(bd, sizeof(bd), "%s/include", O.bdir);
-    if (NINCDIR < MAX_INCDIRS) {
-        INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
-        c6_self_incdir_add(INCDIR[NINCDIR++]);
+    if (O.bdir) {
+        snprintf(bd, sizeof(bd), "%s/include", O.bdir);
+        if (NINCDIR < MAX_INCDIRS) {
+            INCDIR[NINCDIR] = arena_strdup(&A_main, bd);
+            c6_self_incdir_add(INCDIR[NINCDIR++]);
+        }
     }
     /* `-nostdinc`：系统 include 目录一个都不要。自带 include/ 与 -I 仍在
      * （它们不是"系统"目录）——编内核就是这样：头只从内核树里找，
