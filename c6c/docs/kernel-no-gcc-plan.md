@@ -165,9 +165,10 @@
   剩余：用 gdbstub 在 0x83140bfb 下断点看 -0xe30 槽何时被清零。
   **关键对照**（gcc 基线 vmlinux）：同位置 gcc 生成的是
   `call __SCT__WARN_trap`（直接调用，地址有效）；c6c 内核里变成
-  `lea 0x0(%rip),%rax; call *%r11`——即 CONFIG_STATIC_CALL 的 trampoline
-  间接调用。gcc 代码本身没变（cgroup.c 是 gcc 编译），差异在于 c6c 内核里
-  static_call trampoline 的函数指针是 0（未 patch / site 数据被破坏）。
-  疑点：c6c 编译的 arch/x86/kernel/static_call.o / kernel/static_call_inline.o
-  提供的 static_call 初始化（`__static_call_transform` 等）未正确建立 site
-  映射，或 DCE 把 site 数据符号转 pseudo 导致 trampoline 指向 0。
+  `lea 0x0(%rip),%rax; call *%r11`——**cgroup.c 其实在 c6c 编译列表里**
+  （我先前误判为 gcc 编译），所以这是 c6c codegen：把 gcc 的 `WARN` 宏里
+  `call __SCT__WARN_trap`（真实直接调用）错误地生成了 `call *%r11`。
+  c6c cgroup.o 里 `UND __SCK__WARN_trap` 是罪魁：DCE=2 下该 UND 符号被转
+  pseudo/stub 0，`call *%r11` 的函数指针=0 → #PF(CR2=0)。
+  修复方向：`__SCK__WARN_trap` 应像 `__SCK__tp_func_*` 一样保护，或 c6c
+  不该把 static call 生成成间接 trampoline 调用。
