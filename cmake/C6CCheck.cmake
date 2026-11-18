@@ -111,6 +111,19 @@ c6c_target(selfhost
   COMMAND ./tests/selfhost.sh
   COMMENT "c6c: selfhost（c6c 编自己两遍，逐字节 fixpoint）")
 
+# 分级优化：每一级都要有自己的逐字节 fixpoint（c6c2 == c6c3）。
+# 用同一份 selfhost.sh，只多给一个 C6C_FLAGS；默认 -O0 的门禁口径不变。
+foreach(_opt 1 2 3)
+  c6c_target(selfhost-O${_opt}
+    ENV C6C=${C6C_BIN} BUILD=${C6C_BUILD}/selfhost-O${_opt}
+        SRC=${C6C_DIR}/src/c6c.c6 C6C_RT=${C6C_DIR}/lib/rt.c6
+        INC=${C6C_DIR}/include C6C_FLAGS=-O${_opt}
+    COMMAND sh -c "mkdir -p '${C6C_BUILD}/selfhost-O${_opt}' && ./tests/selfhost.sh"
+    COMMENT "c6c: selfhost-O${_opt}（-O${_opt} 独立逐字节 fixpoint）")
+endforeach()
+add_custom_target(selfhost-opt DEPENDS selfhost-O1 selfhost-O2 selfhost-O3
+  COMMENT "c6c: selfhost-opt（O1/O2/O3 三级 fixpoint）")
+
 add_custom_target(selftest
   COMMAND "${C6C_BIN}" -o "${C6C_BUILD}/c6c-self" "${C6C_DIR}/src/c6c.c6"
   COMMAND "${C6C_BUILD}/c6c-self" --type-selftest

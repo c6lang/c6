@@ -21,6 +21,23 @@ typedef struct Arena {
 } Arena;
 
 static Arena A_main;
+/* 优化器的临时数组放在这里，每个函数前后整块回收，否则自编译时
+ * 每函数几 MB 的 use/known/val 数组会把 RSS 顶爆（实测 O2 49MB / O3 59MB）。 */
+static Arena A_opt;
+
+static void arena_reset(Arena *a)
+{
+    ArenaBlock *b = a->head;
+
+    while (b) {
+        ArenaBlock *next = b->next;
+
+        free(b);
+        b = next;
+    }
+    a->head = 0;
+    a->total = 0;
+}
 
 /* 分项统计（-v 时打印）：arena 里谁在吃内存，得先量再改。
  * 只加一次加法，热路径上没有分支。 */

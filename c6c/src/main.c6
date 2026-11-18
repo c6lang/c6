@@ -77,6 +77,9 @@ typedef struct Opts {
     int so_out;     /* 叫 so_out 不叫 shared：shared 是 c6 的关键字（@shared） */
     /* -b：数组下标边界检查（越界就打印一行并退出码 2） */
     int bcheck;
+    /* -O0..-O3：分级优化。默认 0 — 编译器的字节级 fixpoint 与三后端差分
+     * 全部在 -O0 口径上断言；级别只决定"函数 IR 交给后端前跑哪些 pass"。 */
+    int olevel;
     /* -g：调试信息（行号表 + DWARF 段，-c 出的 .o 里带上） */
     int debug;
     /* --target=aarch64：第二套 native 后端（只出汇编文本，配 -S 用） */
@@ -134,6 +137,7 @@ static void usage(FILE *fp)
         "                       用系统 cc/gcc 链接后可 gdb/addr2line）\n"
         "  -b                   数组下标边界检查（越界打印一行、退出码 2；\n"
         "                       只查编译期知道长度的数组）\n"
+        "  -O0|-O1|-O2|-O3      IR 分级优化（默认 -O0；-O 等价于 -O1）\n"
         "  -nostdlib            不自动带上 c6c 自带运行时（lib/rt.c6）\n"
         "  -Wl,--dynamic        链接出动态可执行文件（DT_NEEDED libc.so.6 + PLT/GOT）\n"
         "  -shared              链接出共享库 .so（ET_DYN：没有入口与 PT_INTERP，\n"
@@ -632,6 +636,11 @@ static int parse_args(int argc, char **argv)
         } else if (strcmp(a, "-b") == 0) {
             /* 数组下标的边界检查（见 parse.c6 的 pa_bound_check） */
             O.bcheck = 1;
+        } else if (strcmp(a, "-O") == 0) {
+            O.olevel = 1;
+        } else if (strncmp(a, "-O", 2) == 0 && a[2] >= '0' && a[2] <= '3'
+                   && a[3] == 0) {
+            O.olevel = a[2] - '0';
         } else if (strcmp(a, "-test") == 0 || strcmp(a, "--test") == 0) {
             /* 和 tcc 的 -test 同一件事：跑 test 块、不跑用户 main。
              * 不给 -o 就编到临时 ELF 再 exec（c6c 没有"进程内执行"那条路）。 */
@@ -1111,6 +1120,7 @@ int main(int argc, char **argv)
         }
         pa_set_reloc(O.mode == M_OBJ);
         pa_set_bcheck(O.bcheck);
+        ir_set_opt(O.olevel);
         if (O.debug) {
             ir_set_lines(1);        /* 每条 IR 记源码行 */
             x64_set_debug(1);       /* 代码偏移 → 行 */

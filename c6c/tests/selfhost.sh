@@ -7,9 +7,12 @@ BUILD=${BUILD:?需要 BUILD=输出目录}
 SRC=${SRC:?需要 SRC=src/c6c.c6}
 C6C_RT=${C6C_RT:?需要 C6C_RT=lib/rt.c6}
 INC=${INC:?需要 INC=include}
+# 可选：分级优化要按级别各自验一遍 fixpoint。留空时就是原来的 -O0 口径，
+# 已有门禁一个字都不用改；给了 -O1/-O2/-O3 则两遍编译都带同一组旗子。
+C6C_FLAGS=${C6C_FLAGS:-}
 
-"$C6C" -o "$BUILD/c6c2" "$SRC" || exit 1
-C6C_RT="$C6C_RT" "$BUILD/c6c2" -I"$INC" -o "$BUILD/c6c3" "$SRC" || exit 1
+"$C6C" $C6C_FLAGS -o "$BUILD/c6c2" "$SRC" || exit 1
+C6C_RT="$C6C_RT" "$BUILD/c6c2" $C6C_FLAGS -I"$INC" -o "$BUILD/c6c3" "$SRC" || exit 1
 cmp "$BUILD/c6c2" "$BUILD/c6c3" || {
     echo "c6c: 自举 fixpoint 不一致（c6c2 != c6c3）"
     exit 1
