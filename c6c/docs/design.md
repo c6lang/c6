@@ -515,6 +515,22 @@ op 种类的好处是 C99/LLVM 后端一行都不用改（它们本来就把 `IR
 `83 41 fb 00`，那是 `cmp [rcx-5],0`——asm goto 一跑就段错误，而且看不出是
 汇编器的问题。
 
+**操作数约束**：`asm_one_operand()` 认 `"m"`（内存，取地址）、`"r"`（临时分配
+的通用寄存器）、以及固定寄存器约束 `a/b/c/d/S/D`。后者的搬值走
+`ax_binds_in()` / `ax_binds_out()`：输入在 asm 前 `x_ld64` 把帧槽装进
+`%rax/%rbx/%rcx/%rdx/%rsi/%rdi`，输出在 asm 后 `x_st64` 写回；按操作数宽度
+选 `%al/%eax/%rax` 等文本。此前只认 `m`/`r`，内核里 `asm("wrmsr"::"c"(m),…`
+这种含固定约束的整条被跳过——比"翻不动"更隐蔽，连指令都没发出来。
+
+**`::` 是词法器合成的单 token**：`pa_accept_ch(':')` 匹配不上它，会让
+`try_stmt_asm()` 把整条 asm 当成"没有操作数段"吞掉。改成 `pa_asm_sep()`
+状态机后，`::` 当两个冒号处理（中间那段操作数表为空）。
+
+**系统指令表**：内核高频的无操作数指令（`rdtsc`/`wrmsr`/`rdmsr`/`cpuid`/
+`swapgs`/`lfence`/`mfence`/`sfence`/`cli`/`sti`/`xgetbv`/`xsetbv`/`iretq`/
+`sysret`/`ud2`/`pause` 等）在 `asmx.c6` 里按机器码直接编码。带操作数的端口
+I/O（`inb`/`outb`）尚未覆盖。
+
 ## 16 镜像、回填与落盘
 
 native 后端的内存模型：一个 `Image`（`u8 *p / u32 n / u32 cap`），1.5 倍增长。
