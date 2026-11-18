@@ -135,14 +135,15 @@
   已修 const_mul/const_add/const_shift 的类型恢复；最小复现与 gcc 完全一致。
   999/999 编译 + vmlinux 链接成功；early_pmd_flags 现为正确的 0xe3；bzImage
   全 c6c 工具链构建成功（35,776,000 字节）；fast 全绿。
-  根因链已完整追到（qemu -d in_asm + 反汇编 + 符号对比）：
-  head_64.S 的 `current_task(%rdx)`（per-CPU 栈指针）读到的地址在 c6c
-  vmlinux 里值为 0（gcc 里是有效 init_thread_union+0x4000），随后
-  `mov 0xc58(%rax),%rsp` 设出无效栈 → triple fault。
-  **根因：c6c 不支持 `__attribute__((section(...)))`**——DEFINE_PER_CPU
-  用 `__attribute__((section(".data..percpu...")))` 定义 per-CPU 变量，
-  c6c 把 current_task 等全放进普通 .data（段 12、size 0），而 gcc 放进
-  .data..percpu（段 31、size 8）。后续必须实现 section 属性 + 自定义段输出，
-  否则 per-CPU 符号解析永远错误，内核无法启动。
-  属性解析入口在 parse.c6:7830-7884（已认 weak/packed/aligned，需加 section）。
-  产物备份 /tmp/c6c_kernel_build3/。
+  **启动失败根因已确认并修复**（2026-11-19）：DCE=2 下 UND 数据符号
+  （DFIX 初始化目标如 `current_task = &init_task` 的 init_task）被无条件
+  转成 pseudo/WEAK-ABS，导致 DFIX 的 R_X86_64_64 初始化重定位被整条跳过，
+  current_task 数据格留在 0 → common_startup_64 读到 0 → 无效 %rsp →
+  triple fault。修复（obj.c6）：DFIX 目标中真正的外部符号保持 GLOBAL UND；
+  仅 `__SCK__tp_func_*`（tracepoint stub，无定义、gcc 优化掉）仍转 pseudo
+  ——它必须在 System.map 里保持非零 stub 地址，否则 kallsyms 一致性检查失败。
+  修复后：current_task=0xffffffff89808a40（有效），999/999 编译 + vmlinux
+  链接 + kallsyms 一致 + c6c 工具链 bzImage 全通过；qemu in_asm 显示内核已从
+  triple fault 推进到 x86_64_start_kernel() 调用链返回、触发 head_64.S 的
+  ud2（该函数源码标注 __noreturn，不该返回）。剩余：查为何 start_kernel 链
+  返回（__noreturn 处理 / c6c 代码生成）。

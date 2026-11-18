@@ -666,7 +666,23 @@ static void obj_write(const char *path)
          * 发成强 UND 会全量链接 undefined。
          * WEAK UND：有强定义的符号（.S、其他 TU）链接器仍正常解析；确实
          * 缺失的就是 gcc 也优化掉的不可达引用，填 0 无害。qemu 启动验证。 */
-        if (!s->defined && !local && getenv("C6C_KERNEL_DCE")) {
+        /* 内核模式 UND 引用默认转 pseudo（→ .text ret stub / ABS 0）：gcc
+         * 常量折叠掉的不可达引用（含 tracepoint stub `__SCK__tp_func_*`）若
+         * 发成强 UND 会全量链接 undefined。
+         * 但**数据初始化目标**（DFIX，如 `current_task = &init_task`）里，
+         * 真正有定义的外部符号（init_task 等）必须保持 UND——否则 DFIX 那条
+         * R_X86_64_64 被跳过、初值留在 0，common_startup_64 读 current_task
+         * 得到 0 → 无效 %rsp → triple fault。tracepoint stub 名字固定以
+         * `__SCK__tp_func_` 开头，它们确实没有定义，仍按老规矩转 pseudo。 */
+        int dfix_target = 0;
+        if (getenv("C6C_KERNEL_DCE")) {
+            u32 di2 = 0;
+            for (di2 = 0; di2 < NDFIX; di2++)
+                if (DFIX_SYM[di2] == i) { dfix_target = 1; break; }
+        }
+        int sck_stub = s->name && strncmp(s->name, "__SCK__tp_func_", 15) == 0;
+        if (!s->defined && !local && getenv("C6C_KERNEL_DCE")
+            && (!dfix_target || sck_stub)) {
             pseudo = 1;
             pseudo_syms[i] = 1;
         }
@@ -767,14 +783,13 @@ static void obj_write(const char *path)
                     DFIX_SYM[i], X64.nsym, off);
             continue;
         }
-        /* 内核模式 UND weak → SHN_ABS 的符号：值固定 0，链接器直接填常量。
-         * 若仍发 R_X86_64_64，内核 RELOCS 工具会报
-         * "Invalid absolute R_X86_64_64 relocation"（它不接受 ABS 符号的
-         * 绝对重定位）。符号表项保留 ABS 以维持 kallsyms 遍次一致性。 */
+        /* pseudo（UND→ABS/stub）符号不发绝对重定位：内核 RELOCS 工具拒绝
+         * ABS 符号的 R_X86_64_64。真正有定义的初始化目标（init_task 等）已在
+         * 符号生成处排除出 pseudo，不受此限。
+         * weak 函数定义的 EXPORT_SYMBOL 地址：UND weak→ABS 0 占位常抢占
+         * 真 weak 定义，最终链接给 0 且 relocs 拒绝其绝对重定位。 */
         if (pseudo_syms[DFIX_SYM[i]])
             continue;
-        /* weak 函数定义的 EXPORT_SYMBOL 地址：UND weak→ABS 0 占位常抢占
-         * 真 weak 定义，最终链接给 0 且 relocs 拒绝其绝对重定位。 */
         if (getenv("C6C_KERNEL_DCE") && X64.sym[DFIX_SYM[i]].is_weak
             && X64.sym[DFIX_SYM[i]].defined)
             continue;
