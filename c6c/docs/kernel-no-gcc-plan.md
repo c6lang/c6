@@ -43,11 +43,27 @@
     `__xadd_wrong_size`/`____wrong_branch_error` 等死符号引用**全部消除**。
     4 个之前冲突的 TU（string_helpers/iomem_copy/irq_regs/rdrand）替换后，
     LD 阶段链接 vmlinux **成功**（undefined reference 归零）。
-  - **剩余障碍**：链接后 objtool 报 `unannotated intra-function call`（c6c 代码
-    缺 objtool 的 annotate/noinstr 标注）——这是 objtool 兼容性问题，不是 DCE 缺陷。
-    禁用 objtool 验证时链接成功，但 ORC unwind 表无法生成、sorttable 失败。
+  - objtool 的 `unannotated intra-function call` 已解决：DCE 删 fixup 后把残留的
+    `E8 rel32` 5 字节 NOP 化（死函数入口已是 ret，永不执行）。
+  - DCE 从 O(n²) 改预排序+二分定 patch 所属函数：common.c 编译 180s→6.5s。
+- **阶段1 全量实验（994/1004 TU c6c+DCE 编译成功）已解决的符号问题**：
+  - 文件作用域 `static const char[]="字面量"` 未本地化（`ucode_path` 等）：
+    字符串初始化专用路径提前 return，漏设 is_static → 补上，D→d。
+  - `__attribute__((weak))`/`__weak` 未识别：内核大量 `__weak` 默认实现
+    （fork.c/panic.c/cpu.c）发成 STB_GLOBAL 与 arch/x86 强定义冲突 →
+    识别 weak 属性设 STB_WEAK（含方法别名短名、函数指针变量三条路径）。
+  - 数据 fixup 符号 id 偶发越界（common.o 19574>16640）导致 ld
+    "bad reloc symbol index" → 加边界跳过。
+- **当前剩余障碍：DCE 代码膨胀**。DCE 只把死函数入口写 ret、**没删函数体字节**，
+  994 个 c6c `.o` 的 `.text` 累计 **2.86GB**（gcc 基线 16.76MB，170×）。
+  `ld -r` 聚合后 objtool 用 32 位节偏移溢出，报 `can't decode instruction at
+  .text:0x0`。4 个 TU 的小规模验证已能完整链接 + qemu 启动（Linux version +
+  网络协议栈初始化与 gcc 基线一致），全量卡在规模。
+  - **下一步**：物理代码压缩——删除死函数字节并重映射所有 CODE_IMG 坐标
+    （sym.off / fix.patch / labs_patch / labs_val / lblg_off / CLBL），或改两遍
+    发射在解析期就跳过死函数。这是阶段1 全量链接通过的最后一块拼图。
 - **验证**：全 999 个 TU 用 c6c 编译 + DCE，kbuild 链接 vmlinux 通过 objtool 校验；
-  qemu 启动与 gcc 基线一致。
+  qemu 启动与 gcc 基线一致。（小规模 4 TU 已通过，全量待代码压缩）
 
 ### 阶段 2：HOSTCC——用 c6c 编 host tools
 - 补 libc 缺口：`pthread_create/join/exit`、`regcomp/regexec/regerror`、`fnmatch`、
