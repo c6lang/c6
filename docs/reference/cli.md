@@ -25,7 +25,7 @@
 
 | 来源 | 是什么 | 谁在用 |
 |---|---|---|
-| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.3`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
+| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.6.4`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
 | `tcc/VERSION` | 内嵌上游 TinyCC 的**兼容版本**（`0.9.28rc`），跟着上游走 | `TCC_VERSION` 宏、`-dumpversion`、`c6 -v` 第二行、libtcc 命名与上游文档 |
 
 - 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的
