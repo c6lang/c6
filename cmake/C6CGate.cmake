@@ -5,6 +5,7 @@
 #
 #   fast            ≈40 s：日常改一行跑这条（外部语料也是它的一部分，不是可选）
 #   check-all-c6c   ≈4 min：提交/发布前，再加自举 fixpoint / std / 诊断 / 嵌出 tcc
+#                   （Linux 内核链接 + 启动拆成独立用例 c6c-kernelvmlinux，CI 单独跑）
 #   check-all-perf  再加验收 (4) 的跑分与内存门槛
 #
 # fast 挪出去的都是"要重跑一整遍全量编译"的：selfhost + selftest（两遍 ~12 MB
@@ -21,8 +22,8 @@ add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag pmtest stage1check
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck asmnativecheck a64check archcheck
           embedcheck pkgcheck ctutest selfhost selftest stdtest diagtest c99test
-          c99suite ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check regression-c6c kernelvmlinux
-  COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost + c6c .o 链接 vmlinux 启动）")
+          c99suite ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check regression-c6c
+  COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost；Linux 内核见 c6c-kernelvmlinux 用例）")
 
 add_custom_target(check-all-perf
   DEPENDS check-all-c6c bench-c6c
@@ -63,6 +64,13 @@ if(BUILD_TESTING)
   add_test(NAME c6c-pm
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target pmtest)
   set_tests_properties(c6c-pm PROPERTIES LABELS "c6c" TIMEOUT 600)
+
+  # Linux 内核链接 + qemu 启动：重量级（下载/构建内核 + 启动），不放 c6c 标签，
+  # 免得 c6c 主 job 重复跑；CI 用 `ctest -R '^c6c-kernelvmlinux$'` 单独调度。
+  # 脚本在依赖不全时会 SKIP(0)，CI job 会先备好内核源码与 pc-bios 让它真跑。
+  add_test(NAME c6c-kernelvmlinux
+           COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target kernelvmlinux)
+  set_tests_properties(c6c-kernelvmlinux PROPERTIES LABELS "linux-kernel" TIMEOUT 3600)
 
   add_test(NAME c6c-bench
            COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"

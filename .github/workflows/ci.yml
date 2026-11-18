@@ -136,6 +136,63 @@ jobs:
         run: ctest --test-dir build -L perf --output-on-failure
 
   # -------------------------------------------------------------------------
+  # Linux 内核编译：独立 job，只调度 CTest 用例 c6c-kernelvmlinux。
+  #
+  # 重量级：下载内核源码 + 构建 gcc 基线 vmlinux + 用 c6c 重编若干 TU + qemu 启动。
+  # 不放进 c6c 主门禁（check-all-c6c），也不进 release 的 needs；本地复现用同一条
+  # `ctest --test-dir build -R '^c6c-kernelvmlinux$'`。脚本自带依赖不全就 SKIP(0)
+  # 的兜底，这里先备好内核源码与 pc-bios，并让下载失败直接红，避免空跑。
+  # -------------------------------------------------------------------------
+  linux-kernel:
+    name: linux kernel (c6c .o → vmlinux + qemu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils python3 \
+            curl ca-certificates bison flex bc libelf-dev libssl-dev libncurses-dev \
+            xz-utils zstd cpio kmod rsync qemu-system-x86 qemu-system-common
+
+      - name: Prepare Linux source and pc-bios
+        run: |
+          set -e
+          K=/tmp/linux-6.12
+          if [ ! -f "$K/vmlinux" ]; then
+            curl -fsSL --retry 3 --max-time 900 \
+              https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.gz \
+              -o /tmp/linux-6.12.tar.gz
+            tar -xzf /tmp/linux-6.12.tar.gz -C /tmp
+          fi
+          test -d "$K"
+          bios=$(find /usr/share/qemu /usr/share/seabios -type f \
+                   \( -name 'bios.bin' -o -name 'bios-256k.bin' \) 2>/dev/null | head -n1)
+          [ -n "$bios" ] || { echo "::error::找不到 SeaBIOS rom（bios.bin）"; exit 1; }
+          if [ ! -f /usr/share/qemu/bios.bin ]; then
+            sudo ln -sf "$bios" /usr/share/qemu/bios.bin
+          fi
+          {
+            echo "K=$K"
+            echo "QEMU_BIOS=/usr/share/qemu"
+            echo "KERNEL_NO_DOWNLOAD=1"
+            echo "QEMU_TIMEOUT=60"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure and build c6c
+        run: |
+          cmake -S . -B build -DC6_ENABLE_TCC=OFF -DBUILD_TESTING=ON
+          cmake --build build --parallel "$(nproc)"
+          ls -l c6c/build/c6c
+
+      - name: c6c .o 链接 vmlinux 并在 qemu 启动
+        run: ctest --test-dir build -R '^c6c-kernelvmlinux$' --output-on-failure
+
+  # -------------------------------------------------------------------------
   # no-tcc：tcc 退出工具链的那条路（`-DC6_ENABLE_TCC=OFF`）。
   #
   # 只用一个系统 C 编译器把 c6c 编出来：c6c 的源码是 C99 兼容的单 TU
