@@ -7,6 +7,8 @@
 *.a
 *.exe
 *.core
+# c6c 工程管理的运行时互斥锁（fcntl 记录锁的锚文件，非 c6c.lock 内容锁）
+.c6c.lock
 
 # 自举产物（cmake --build build --target selfhost / c99selfhost）
 /build/

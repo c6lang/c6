@@ -52,7 +52,7 @@ c6c_target(ctest-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/run.sh
 
 # --- 2.2b 工程管理子命令（扫描 / 清单 / 编译 / 测试 / 打包安装 / 固件 / lock / workspace / 迁移）---
 c6c_target(pmtest ENV C6C=${C6C_BIN} COMMAND ./tests/pm-tests.sh
-  COMMENT "c6c: pmtest（c6c 工程管理子命令全链路回归，70 项检查）")
+  COMMENT "c6c: pmtest（c6c 工程管理子命令全链路回归，83 项检查）")
 
 # --- 2.3 各后端 / 各特性的专项回归 ---
 c6c_target(objcheck ENV C6C=${C6C_BIN} COMMAND ./tests/obj-check.sh)

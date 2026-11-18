@@ -16,7 +16,7 @@
 `workspace` / `flash` / `monitor` / `debug` / `help`。
 
 第一个参数是这些名字时进入工程管理，其余情况仍是普通编译器。
-回归入口：`cmake --build build --target pmtest`；当前 70 项检查（68 常规 +
+回归入口：`cmake --build build --target pmtest`；当前 83 项检查（81 常规 +
 2 DEB，缺 `dpkg-deb` 时跳过 2 项）。
 
 ## 版本与发布号

@@ -35,6 +35,27 @@ c6c 的宿主 API 收敛到 `c6lib.h` 的 `c6_*`：无 tcc 的安装不再把
 
 这是 0.6.3 "c6c `.o` 链接 vmlinux 并启动" 的验收收尾，让成果可被持续验证。
 
+### c6c 工程管理：`merge_c6` 多 `.c6` 合并单 TU
+
+新清单布尔字段 `merge_c6: true` 把 `sources` 中多个 `.c6` 按清单顺序合并成
+`<out>.merged.<pid>.c6` 再编译，解决文件级 `static` 跨 TU 不可见（c6 单遍编译
+要求定义先于调用）。仅对 `app` / `lib` 生效，`firmware` 逐文件 `-c` 编译不受
+影响；临时文件编译后即清，也纳入 `clean`。合并改为流式拷贝，不再有 1MB 栈
+缓冲与静默截断；超长 `out` 与写失败均报错而非损坏产物。fingerprint 纳入该字段，
+切换即重编。`risc6/c6c.yml` 据此启用 `c6c build`，`pkg_files` 对齐 0.2.0 发行包
+布局。
+
+### c6c 工程管理并发安全
+
+多 agent 交叉验证（静态分析 + 实测矩阵）发现同工程并发存在固定路径竞态
+（merge=true 并发 build、build+clean 等）。按最佳工程实践修复：工程级 `fcntl`
+记录锁（清单目录 `.c6c.lock`，进程退出/崩溃由内核自动释放，无 stale 锁；
+锁 fd 设 CLOEXEC）串行化落盘命令；fingerprint / lock 等小文件改为「写临时文件
++ `rename`」原子提交；合并 TU 文件名带 PID，并发 build/test/check 各写各的；
+`clean` 按 `<out>.merged.<纯数字>.c6` 精确清残留。`run` 只在 build 阶段持锁。
+跨工程并行、`make -j` 多 `-o` 不受影响。`pmtest` 新增 4 项并发回归，累计
+81 项常规 + 2 DEB。
+
 ## 0.6.3 — 2026-11-17
 
 ### c6c 的 `.o` 首次链接进 Linux vmlinux 并成功启动

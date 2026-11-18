@@ -662,5 +662,172 @@ if grep -q 'kind=app' "$WORK/cmt/cm.log"; then ok "扫描忽略注释与字符�
 if grep -q '^name=app$' /tmp/absman.log; then ok "--manifest-path 绝对路径"; else bad "--manifest-path 绝对路径"; fi
 rm -f /tmp/absman.log
 
+# 36) merge_c6：多 .c6 合并单 TU，static 跨文件可见；关掉则跨 TU 不可见
+mkdir -p "$WORK/mrg/on" "$WORK/mrg/off" "$WORK/mrg/rev"
+for d in on off rev; do
+  printf 'static int hidden(void) { return 42; }\n' > "$WORK/mrg/$d/a.c6"
+  printf 'int main(void) { return hidden() == 42 ? 0 : 1; }\n' > "$WORK/mrg/$d/b.c6"
+done
+printf 'name: on\nversion: 0.1.0\nkind: app\nout: build/on\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/on/c6c.yaml"
+(cd "$WORK/mrg/on" && "$C6C" build > b.log 2>&1)
+if [ -x "$WORK/mrg/on/build/on" ] && "$WORK/mrg/on/build/on"; then
+  ok "merge_c6=true 合并单 TU 跨文件 static 可见"
+else
+  bad "merge_c6=true 合并单 TU"
+fi
+printf 'name: off\nversion: 0.1.0\nkind: app\nout: build/off\nmerge_c6: false\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/off/c6c.yaml"
+(cd "$WORK/mrg/off" && "$C6C" build > b.log 2>&1)
+if [ $? -ne 0 ]; then ok "merge_c6=false 跨 TU static 不可见"; else bad "merge_c6=false 应失败"; fi
+printf 'name: rev\nversion: 0.1.0\nkind: app\nout: build/rev\nmerge_c6: true\nsources:\n  - b.c6\n  - a.c6\n' > "$WORK/mrg/rev/c6c.yaml"
+(cd "$WORK/mrg/rev" && "$C6C" build > b.log 2>&1)
+if [ $? -ne 0 ]; then ok "合并顺序颠倒要求定义先于调用"; else bad "合并顺序不敏感"; fi
+
+# 37) 合并大 .c6（>1MB）不得静默截断
+mkdir -p "$WORK/mrg/big"
+printf 'name: big\nversion: 0.1.0\nkind: app\nout: build/big\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/big/c6c.yaml"
+{ printf '/*\n'; dd if=/dev/zero bs=1024 count=1200 2>/dev/null | tr '\000' 'a'; printf '\n*/\nstatic int f(void){return 9;}\n'; } > "$WORK/mrg/big/a.c6"
+printf 'int main(void){return f() == 9 ? 0 : 1;}\n' > "$WORK/mrg/big/b.c6"
+(cd "$WORK/mrg/big" && "$C6C" build > b.log 2>&1)
+if [ -x "$WORK/mrg/big/build/big" ] && "$WORK/mrg/big/build/big"; then
+  ok "合并 >1MB 源文件未截断"
+else
+  bad "合并大源文件"
+fi
+
+# 38) 编译失败后必须清掉 merged 临时文件
+mkdir -p "$WORK/mrg/fail"
+printf 'name: fail\nversion: 0.1.0\nkind: app\nout: build/fail\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/fail/c6c.yaml"
+printf 'static int f(void){return 1;}\n' > "$WORK/mrg/fail/a.c6"
+printf 'int main(void){ return f( ; }\n' > "$WORK/mrg/fail/b.c6"
+(cd "$WORK/mrg/fail" && "$C6C" build > b.log 2>&1)
+if [ $? -ne 0 ] && [ -z "$(ls "$WORK/mrg/fail"/build/fail.merged.*.c6 2>/dev/null)" ]; then
+  ok "编译失败清理 merged"
+else
+  bad "编译失败清理 merged"
+fi
+
+# 39) 切换 merge_c6 触发重编（fingerprint 含该字段）
+mkdir -p "$WORK/mrg/fp"
+printf 'name: fp\nversion: 0.1.0\nkind: app\nout: build/fp\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/fp/c6c.yaml"
+printf 'static int f(void){return 3;}\n' > "$WORK/mrg/fp/a.c6"
+printf 'int main(void){return f();}\n' > "$WORK/mrg/fp/b.c6"
+(cd "$WORK/mrg/fp" && "$C6C" build > b.log 2>&1)
+OUT=$(cd "$WORK/mrg/fp" && "$C6C" build 2>&1)
+case "$OUT" in
+  *已是最新*) ok "未变更跳过重编" ;;
+  *) bad "未变更却重编" ;;
+esac
+printf 'name: fp\nversion: 0.1.0\nkind: app\nout: build/fp\nmerge_c6: false\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/mrg/fp/c6c.yaml"
+OUT=$(cd "$WORK/mrg/fp" && "$C6C" build 2>&1)
+case "$OUT" in
+  *已是最新*) bad "切 merge_c6 应重编" ;;
+  *) ok "切 merge_c6 触发重编" ;;
+esac
+
+# 40) firmware 逐文件 -c，不得创建 merged 残留
+mkdir -p "$WORK/mrg/fw"
+cat > "$WORK/mrg/fw/c6c.yaml" <<'EOF'
+name: fw
+version: 0.1.0
+kind: firmware
+out: build/fw
+merge_c6: true
+sources:
+  - start.c6
+  - aux.c6
+fw_formats:
+  - elf
+EOF
+printf 'void _start(void) { for(;;){} }\n' > "$WORK/mrg/fw/start.c6"
+printf 'int aux(void){return 1;}\n' > "$WORK/mrg/fw/aux.c6"
+(cd "$WORK/mrg/fw" && "$C6C" build > b.log 2>&1)
+if [ -z "$(ls "$WORK/mrg/fw"/build/fw.merged.*.c6 2>/dev/null)" ]; then
+  ok "firmware 不产生 merged 残留"
+else
+  bad "firmware merged 残留"
+fi
+
+# 41) 超长 out 路径应拒绝，且不得清空 out 文件
+LONG=$(awk 'BEGIN { for (i = 0; i < 500; i++) printf "z" }')
+mkdir -p "$WORK/mrg/long"
+printf 'name: lng\nversion: 0.1.0\nkind: app\nout: %s\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' "$LONG" > "$WORK/mrg/long/c6c.yaml"
+printf 'static int f(void){return 1;}\n' > "$WORK/mrg/long/a.c6"
+printf 'int main(void){return f();}\n' > "$WORK/mrg/long/b.c6"
+(cd "$WORK/mrg/long" && "$C6C" build > b.log 2>&1)
+if [ $? -ne 0 ] && [ ! -e "$WORK/mrg/long/$LONG" ]; then
+  ok "超长 out 拒绝且未触碰产物"
+else
+  bad "超长 out"
+fi
+
+# 42) 并发：同工程 merge=true 的 build×N（工程锁 + merged 文件带 pid）
+mkdir -p "$WORK/conc/bb"
+{ printf '/*\n'; head -c 200000 /dev/zero | tr '\000' x; printf '\n*/\nstatic int ans(void){return 42;}\n'; } > "$WORK/conc/bb/a.c6"
+printf 'int main(void){return ans()==42?0:1;}\n' > "$WORK/conc/bb/b.c6"
+printf 'name: bb\nversion: 0.1.0\nkind: app\nout: build/app\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/conc/bb/c6c.yaml"
+(cd "$WORK/conc/bb" && "$C6C" build > /dev/null 2>&1)
+conc_bad=0
+r=1
+while [ $r -le 8 ]; do
+  : > "$WORK/conc/pids"
+  (cd "$WORK/conc/bb" && "$C6C" build --force > "$WORK/conc/x.log" 2>&1; echo $? > "$WORK/conc/x.rc") & echo $! >> "$WORK/conc/pids"
+  (cd "$WORK/conc/bb" && "$C6C" build --force > "$WORK/conc/y.log" 2>&1; echo $? > "$WORK/conc/y.rc") & echo $! >> "$WORK/conc/pids"
+  while read -r p; do wait "$p"; done < "$WORK/conc/pids"
+  xy="$(cat "$WORK/conc/x.rc" 2>/dev/null)$(cat "$WORK/conc/y.rc" 2>/dev/null)"
+  [ "$xy" = 00 ] || conc_bad=$((conc_bad + 1))
+  [ -z "$(ls "$WORK/conc/bb"/build/*.merged.*.c6 2>/dev/null)" ] || conc_bad=$((conc_bad + 1))
+  r=$((r + 1))
+done
+if [ $conc_bad -eq 0 ]; then ok "并发：同工程 merge=true build×2"; else bad "并发 build"; fi
+
+# 43) 并发：build + clean（串行化后两命令都应 rc=0；产物存在与否取决于先后，均合法）
+mkdir -p "$WORK/conc/bc"
+cp "$WORK/conc/bb/a.c6" "$WORK/conc/bb/b.c6" "$WORK/conc/bc/"
+printf 'name: bc\nversion: 0.1.0\nkind: app\nout: build/app\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/conc/bc/c6c.yaml"
+conc_bad=0
+r=1
+while [ $r -le 8 ]; do
+  (cd "$WORK/conc/bc" && "$C6C" build > /dev/null 2>&1)
+  : > "$WORK/conc/pids"
+  (cd "$WORK/conc/bc" && "$C6C" build --force > "$WORK/conc/kb.log" 2>&1; echo $? > "$WORK/conc/kb.rc") & echo $! >> "$WORK/conc/pids"
+  (cd "$WORK/conc/bc" && "$C6C" clean > "$WORK/conc/kl.log" 2>&1; echo $? > "$WORK/conc/kl.rc") & echo $! >> "$WORK/conc/pids"
+  while read -r p; do wait "$p"; done < "$WORK/conc/pids"
+  kl="$(cat "$WORK/conc/kb.rc" 2>/dev/null)$(cat "$WORK/conc/kl.rc" 2>/dev/null)"
+  [ "$kl" = 00 ] || conc_bad=$((conc_bad + 1))
+  [ -z "$(ls "$WORK/conc/bc"/build/*.merged.*.c6 2>/dev/null)" ] || conc_bad=$((conc_bad + 1))
+  r=$((r + 1))
+done
+if [ $conc_bad -eq 0 ]; then ok "并发：build + clean 串行化"; else bad "并发 build+clean"; fi
+
+# 44) 并发：两独立工程各自 build（编译器进程间无共享状态）
+mkdir -p "$WORK/conc/pa" "$WORK/conc/pb"
+cp "$WORK/conc/bb/a.c6" "$WORK/conc/bb/b.c6" "$WORK/conc/pa/"
+cp "$WORK/conc/bb/a.c6" "$WORK/conc/bb/b.c6" "$WORK/conc/pb/"
+printf 'name: pa\nversion: 0.1.0\nkind: app\nout: build/x\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/conc/pa/c6c.yaml"
+printf 'name: pb\nversion: 0.1.0\nkind: app\nout: build/y\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/conc/pb/c6c.yaml"
+(cd "$WORK/conc/pa" && "$C6C" build > /dev/null 2>&1)
+(cd "$WORK/conc/pb" && "$C6C" build > /dev/null 2>&1)
+: > "$WORK/conc/pids"
+(cd "$WORK/conc/pa" && "$C6C" build --force > "$WORK/conc/pa.log" 2>&1; echo $? > "$WORK/conc/pa.rc") & echo $! >> "$WORK/conc/pids"
+(cd "$WORK/conc/pb" && "$C6C" build --force > "$WORK/conc/pb.log" 2>&1; echo $? > "$WORK/conc/pb.rc") & echo $! >> "$WORK/conc/pids"
+while read -r p; do wait "$p"; done < "$WORK/conc/pids"
+if [ "$(cat "$WORK/conc/pa.rc" 2>/dev/null)$(cat "$WORK/conc/pb.rc" 2>/dev/null)" = 00 ]; then
+  ok "并发：两独立工程 build"
+else
+  bad "并发独立工程"
+fi
+
+# 45) kill -9 后工程锁自动释放（fcntl 记录锁随进程退出释放，无 stale 锁）
+mkdir -p "$WORK/conc/kill"
+cp "$WORK/conc/bb/a.c6" "$WORK/conc/bb/b.c6" "$WORK/conc/kill/"
+printf 'name: kill\nversion: 0.1.0\nkind: app\nout: build/app\nmerge_c6: true\nsources:\n  - a.c6\n  - b.c6\n' > "$WORK/conc/kill/c6c.yaml"
+(cd "$WORK/conc/kill" && "$C6C" build --force > /dev/null 2>&1) &
+kp=$!
+sleep 0.05
+kill -9 "$kp" 2>/dev/null
+wait "$kp" 2>/dev/null
+(cd "$WORK/conc/kill" && "$C6C" build --force > "$WORK/conc/kill.log" 2>&1)
+if [ $? -eq 0 ]; then ok "并发：kill -9 后锁自动释放"; else bad "kill 后锁未释放"; fi
+
 echo "c6c pm: 通过 $pass / 失败 $fail"
 [ "$fail" -eq 0 ]

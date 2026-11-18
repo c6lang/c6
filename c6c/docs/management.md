@@ -63,6 +63,26 @@ flags:
   - -b
 ```
 
+**多 `.c6` 源合并（`merge_c6`）**：c6c 默认按文件切换 TU。当某个 `.c6`
+调用另一个 `.c6` 里的文件级 `static` 符号时（c6 单遍编译要求定义先于调用），
+在清单里设 `merge_c6: true`，`build` / `test` / `check` 会先把 `sources`
+中的 `.c6` 原样文本按清单顺序合并成 `<out>.merged.<pid>.c6` 再编译，`.c`
+宿主源保持独立；临时文件在编译后自动删除，`clean` 也能清残留。约束：
+
+- 合并顺序 = `sources` 顺序，被调函数所在文件要排在调用者之前；
+- 仅对 `app` / `lib` 生效，`firmware` 逐文件 `-c` 编译，该字段被忽略；
+- 重复 `#include` 靠头文件自身的 include guard 去重；
+- 切换该值会触发重编（fingerprint 已含此字段），但 `c6c.lock` 不记录它。
+
+**并发安全**：同一工程内会落盘的命令（`build` / `test` / `check` / `clean` /
+`package` / `install` / `publish` / `lock` / `init`）通过清单目录的 `.c6c.lock`
+取 `fcntl` 记录锁串行执行，进程退出（含 `kill -9`）时由内核自动释放，无 stale
+锁问题；fingerprint / lock 等小文件用「写临时文件 + `rename`」原子提交，合并
+TU 文件名带 PID，因此这些命令可安全并发。`run` 只在 build 阶段持锁，执行产物
+前放锁。不同工程的清单目录各自持锁，可并行；把 c6c 当编译器用（`make -j`
+多个不同 `-o`）也不受工程锁影响。**注意**：`build` 与 `clean` 并发时，谁先拿到
+锁决定最终状态——`clean` 后执行会删掉产物，这是其正常语义，不是竞态损坏。
+
 打包与固件的附加键：
 
 ```yaml
@@ -141,5 +161,5 @@ members:
 `c6c/` 目录自带的 `c6c.yaml` 是 dogfood 样本：自编到 `build/c6c`、TGZ
 打包、staged install；`pmtest` 会真跑一遍这条链（用编译器副本引导，避免
 覆盖正在执行的二进制）。回归入口：
-`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），当前 70 项
-检查（68 项常规 + 2 项 DEB；缺 `dpkg-deb` 的环境跳过 2 项）。
+`cmake --build build --target pmtest`（或 `ctest -R '^c6c-pm$'`），当前 83 项
+检查（81 项常规 + 2 项 DEB；缺 `dpkg-deb` 的环境跳过 2 项）。
