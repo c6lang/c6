@@ -43,6 +43,7 @@
 #define OBJ_SHN_UNDEF      0u
 #define OBJ_SHN_TEXT       1u
 #define OBJ_SHN_DATA       2u
+#define OBJ_SHN_ABS        0xfff1u     /* SHN_ABS：绝对符号，链接器遍次间不丢弃 */
 #define OBJ_NSEC           19u
 #define OBJ_SYM_TEXT       1u      /* .text 段符号在符号表里的下标 */
 #define OBJ_SYM_DATA       2u      /* .data 段符号 */
@@ -662,6 +663,16 @@ static void obj_write(const char *path)
              * "能动态导入的函数"和"要做 COPY 重定位的数据"（environ 这类）。
              * 全标 NOTYPE 的话链接器只能瞎猜。 */
             type = OBJ_STT_OBJECT;
+        }
+        if (pseudo) {
+            /* 内核模式未解析的 weak 引用：发成 SHN_ABS value=0。
+             * 普通 UND weak 在中间遍次被链接器丢弃（值 0、无定义），
+             * 但最终链接带 --emit-relocs 会保留，导致 kallsyms 的
+             * System.map 比中间遍次的 .syms 多一批地址 0 的 v 符号。
+             * ABS 符号在所有遍次都保留，System.map 与 .syms 一致。
+             * 有强定义的符号（别的 TU/.S）链接器仍正常解析覆盖。 */
+            shndx = OBJ_SHN_ABS;
+            type = OBJ_STT_NOTYPE;
         }
         ob_sym_add(local ? &loc : &glob, ob_str(&str, s->name),
                    (u8)((bind << 4) | type), shndx, ob_sym_value(s));
