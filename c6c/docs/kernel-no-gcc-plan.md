@@ -155,7 +155,7 @@
   __SCK__ stub 地址）未重定位。
   **否定 KASLR 假设**：nokaslr 对照实验（in_asm）同样停在 `call *%r11`
   （nokaslr 地址 0x83140cb1 / KASLR 0xa6740cb1，同一指令），排除重定位问题。
-  反汇编定位：该 `call *%r11` 的 %r11 来自紧邻的 `call __WARN_validate_printf`
-  返回值（0x83140bfb `mov %rax,-0xe30(%rbp)`）→ c6c 把普通函数返回值当函数
-  指针间接调用。这是 c6c 后端栈槽/寄存器分配的深层 bug（WARN_ON 宏展开处），
-  不是内核 relocs 问题。剩余：查 IR 里 call 返回值与间接调用目标的槽复用。
+  反汇编定位：该 `call *%r11` 在 cgroup_init_early（gcc 编译的 cgroup.c，
+  不在 c6c 编译列表）——不是 c6c codegen bug，而是 gcc 代码引用了被 c6c
+  生成代码/数据破坏的状态（函数指针数组元素无效）。剩余：用 -d int 抓崩溃
+  异常类型（#GP/#PF），确定是数据损坏还是野指针。
