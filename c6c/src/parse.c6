@@ -22744,7 +22744,7 @@ static void pa_emit_deferred(void)
     for (i = 0; i < NDEF; i++) {
         DefFn *d = &DEF_FNS[i];
 
-        if (!d->is_static || d->alias_sym)
+        if (!d->is_static)
             d->emitted = 1;
     }
     for (i = 0; i < NCTOR; i++)
@@ -22759,6 +22759,27 @@ static void pa_emit_deferred(void)
     for (i = 0; i < NCLBL; i++)
         if (CLBL_FN[i] < NDEF)
             DEF_FNS[CLBL_FN[i]].emitted = 1;
+    /* 全局 alias 的目标必须发射：SYSCALL_DEFINE0 的 __x64_sys_gettid 是
+     * __do_sys_gettid 的 alias（纯声明无函数体），system call table 跨 TU
+     * 引用。只有 ALIAS_FROM 登记的 __attribute__((alias)) 才算外部入口；
+     * 普通方法别名（首形参指针自动生成的 pt_regs___*）不是外部入口，
+     * 不能当根——否则几千个死函数被误留。 */
+    for (k = 0; k < NALIAS; k++) {
+        u32 as = x64_sym(&X64, ALIAS_FROM[k]);
+
+        if (as >= X64.nsym || X64.sym[as].is_static)
+            continue;
+        for (i = 0; i < NDEF; i++) {
+            DefFn *d = &DEF_FNS[i];
+            const char *an = NULL;
+
+            if (!d->alias_sym || d->alias_sym >= X64.nsym)
+                continue;
+            an = X64.sym[d->alias_sym].name;
+            if (an && strcmp(an, ALIAS_TO[k]) == 0)
+                d->emitted = 1;
+        }
+    }
     for (i = 0; i < NDEF; i++)
         if (DEF_FNS[i].emitted)
             work[nwork++] = i;
