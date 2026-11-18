@@ -1180,8 +1180,7 @@ static void pa_error(const char *fmt, ...)
         vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, ap);
         va_end(ap);
         msg[sizeof(msg) - 1] = 0;
-        /* 走 diag_emit：宿主用 tcc_set_error_func 设了回调就交给它，否则还是
-         * 一行 path:line: 打到 stderr（字节与以前一样）。 */
+        /* 走 diag_emit：一行 path:line: 打到 stderr（字节与以前一样）。 */
         diag_emit(msg);
     }
 }
