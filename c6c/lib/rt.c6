@@ -2880,8 +2880,10 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
  * （踩过：C6C_RT 恰好在末尾，于是 getenv 永远找不到） */
 static char c6c_envbuf[65536] = {0};
 static long c6c_envlen;
-/* 自编译的 c6c 里 extern environ 只是一格零存储（parse.c6 的单镜像规则），
- * 这里从 /proc/self/environ 建一张真正的指针表，execvp 才能传完整环境。 */
+/* environ 保持 extern（UND）：ld-check 的基线就是 rt.o 带这个未定义符号，
+ * 用来验证 --allow-undefined / 缺符号硬报错。M_LINK 自动挂 rt.o 时会在
+ * 链接器开关上放 allow_undef，把这个符号填 0（execve 才读它，host tools
+ * 用不到）。单镜像编译时 parse.c6 照旧给它一格零存储。 */
 extern char **environ;
 static char *c6c_envp[512] = {0};
 

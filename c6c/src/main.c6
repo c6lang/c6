@@ -938,6 +938,7 @@ static int parse_args(int argc, char **argv)
 }
 
 static char C6C_SELF_DIR[512];
+static const char *C6C_ARGV0 = 0;   /* 自调用编运行时用（M_LINK 自动挂 rt.c6） */
 
 /* c6c **自带**的 include 目录（stddef.h / string.h … 所在的那几个）。
  * 数组本体声明在 parse.c6（它比本文件先被 #include，那边要用），这里只负责填。 */
@@ -1114,8 +1115,10 @@ int main(int argc, char **argv)
     double t0 = 0.0, ms = 0.0;
     int i = 0;
 
-    if (argc > 0 && argv[0] && argv[0][0])
+    if (argc > 0 && argv[0] && argv[0][0]) {
         progname = argv[0];
+        C6C_ARGV0 = argv[0];
+    }
     {
         int pmrc = (argc >= 2) ? pm_dispatch(argc, argv) : PM_NOT_SUB;
         if (pmrc != PM_NOT_SUB)
@@ -1135,10 +1138,54 @@ int main(int argc, char **argv)
         /* 只做链接：所有输入都是 ET_REL 目标文件，产出静态可执行文件。
          * 退出码 0 = 成功，2 = 链接失败（ld.c6 里已经把原因写到 stderr 了）。
          * `-shared` 时改成 ET_DYN 共享库。 */
+        const char *files[MAX_SRC + 1] = {0};
+        char rtpath[768] = {0};
+        char tmpl[] = "/tmp/c6c-rt-XXXXXX";
+        int n = 0, i = 0, fd = -1, pid = 0, st = 0, rc = 0;
+        const char *out = O.out ? O.out : (O.so_out ? "a.so" : "a.out");
+
         ld_set_allow_undef(O.allow_undef);
         ld_set_dynamic(O.dyn_link);
         ld_set_shared(O.so_out);
-        return ld_link(O.files, O.nfiles, O.out ? O.out : (O.so_out ? "a.so" : "a.out"));
+        for (i = 0; i < O.nfiles && n < MAX_SRC; i++)
+            files[n++] = O.files[i];
+
+        /* 多 TU 链接（kbuild 的 host-cmulti）不像单 TU M_EXE 那样自动带
+         * 运行时，于是 malloc/printf 全未定义。这里把 rt.c6 临时编成 .o
+         * 追加进链接输入——用 fork/exec 自调用编译，隔离全局编译状态。
+         * -nostdlib（内核链接）或 -shared（动态库）时不加；找不到 rt.c6
+         * 就退回原行为，不阻塞纯 .o 链接。 */
+        if (getenv("C6C_LINK_WITH_RT") && !O.nostdlib && !O.so_out &&
+            n > 0 && n < MAX_SRC && C6C_ARGV0) {
+            snprintf(rtpath, sizeof(rtpath), "%s/../lib/rt.c6", C6C_SELF_DIR);
+            if (access(rtpath, R_OK) == 0) {
+                fd = mkstemp(tmpl);
+                if (fd >= 0) {
+                    close(fd);
+                    pid = fork();
+                    if (pid == 0) {
+                        char *cargv[7] = {0};
+
+                        cargv[0] = (char *)C6C_ARGV0;
+                        cargv[1] = (char *)"-c";
+                        cargv[2] = rtpath;
+                        cargv[3] = (char *)"-o";
+                        cargv[4] = tmpl;
+                        execvp(C6C_ARGV0, cargv);
+                        _exit(127);
+                    }
+                    if (pid > 0 && waitpid(pid, &st, 0) >= 0 &&
+                        (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0) {
+                        files[n++] = tmpl;
+                        ld_set_allow_undef(1);   /* rt.o 的 environ 保持 UND，按 0 */
+                    }
+                    rc = ld_link(files, n, out);
+                    unlink(tmpl);
+                    return rc;
+                }
+            }
+        }
+        return ld_link(files, n, out);
     }
     case M_OBJ:
     case M_EXE:
