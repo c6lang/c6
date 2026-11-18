@@ -163,3 +163,11 @@
   `lea 0x0(%rip)` 的有效地址（对照 gcc 内核正常）；运行时却是 0——疑似
   c6c 生成的代码在低栈地址写坏了该槽，或 static_call 函数指针未初始化。
   剩余：用 gdbstub 在 0x83140bfb 下断点看 -0xe30 槽何时被清零。
+  **关键对照**（gcc 基线 vmlinux）：同位置 gcc 生成的是
+  `call __SCT__WARN_trap`（直接调用，地址有效）；c6c 内核里变成
+  `lea 0x0(%rip),%rax; call *%r11`——即 CONFIG_STATIC_CALL 的 trampoline
+  间接调用。gcc 代码本身没变（cgroup.c 是 gcc 编译），差异在于 c6c 内核里
+  static_call trampoline 的函数指针是 0（未 patch / site 数据被破坏）。
+  疑点：c6c 编译的 arch/x86/kernel/static_call.o / kernel/static_call_inline.o
+  提供的 static_call 初始化（`__static_call_transform` 等）未正确建立 site
+  映射，或 DCE 把 site 数据符号转 pseudo 导致 trampoline 指向 0。
