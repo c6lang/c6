@@ -79,6 +79,10 @@
     生成的 thin archive 经 **GNU `ar t` 验证格式合法、成员列表一致**。
     CMake 目标 `c6c-ar` 用 c6c 自编译。符号索引（4 次带 s 的 built-in.a）
     仍由 GNU ar 处理。
+  - **ar 构建链集成验证**：用 AR wrapper（无 s → c6c-ar，带 s → GNU ar）
+    `make -j8 vmlinux` 全量重建，794 个归档中 791 次由 c6c-ar 生成；
+    最终 **bzImage 逐字节不变**，qemu 启动打印 Linux version/Console/
+    5×NET: Registered 并走到预期无 rootfs panic——与 gcc 基线一致。
   - **objcopy 子集已完成**（`c6c/src/objcopy.c6`）：`-O binary`（-R 排除 section、
     -S 忽略）支持 ELF32/ELF64 小端，摊平 PT_LOAD 为裸二进制。内核的
     setup.bin / realmode.bin / vmlinux.bin 三个输出与 GNU objcopy **逐字节一致**
