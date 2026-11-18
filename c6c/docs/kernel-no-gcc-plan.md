@@ -301,3 +301,19 @@
   desc_ptr_native_load_idt(&idt_descr)），但被 ret 短路。
   这是 c6c 内联汇编/函数序言 codegen bug（函数入口多 1 字节 ret）。
   修复方向：查 asmx.c6 对 asm volatile("lidt") 的处理 / x64.c6 序言生成。
+
+
+  ★★★ 突破：修复 load_idt 后内核启动到 idle（2026-11-20）★★★
+  两个决定性 codegen bug 已修复并验证：
+  (1) asmx.c6 增加 lidt/lgdt/sidt/sgdt（0F 01 /reg）编码支持——以前
+      native_load_idt 的 `asm volatile("lidt %0")` 整段作废。
+  (2) obj.c6 DCE 死函数判定：同一入口的多别名符号（native_load_idt /
+      desc_ptr_native_load_idt 同址）只有被 fixup 引用的那个被 mark，
+      另一个未标记别被当死函数写 0xC3 ret，把活函数短路。修复：写 ret
+      前检查同址任一符号已标记则跳过。
+  验证：native_load_idt 入口恢复 0x55(push rbp)；999/999 编译+链接+bzImage
+  通过；qemu trace：3 次 #PF 全部正常处理、IDT limit=0xfff（完整表）、
+  0 次 #DF；执行 22617 指令后到达 native_halt（CPU idle）——内核启动到空闲！
+  剩余：第 2 次 #PF 是 early_fixup_exception→__inline_bsearch 的 call *%r11
+  跳到 0x2300000（= KASLR 偏移本身，未加基址的指针）。疑为 KASLR 重定位
+  bug，下一步用 nokaslr 验证。

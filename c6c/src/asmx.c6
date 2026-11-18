@@ -973,6 +973,22 @@ static int ax_insn(void)
         img_u8(&AX_IM, 0x05);
         return 1;
     }
+    /* LGDT/LIDT/SGDT/SIDT：0F 01 /reg，一个内存操作数（desc_ptr）。
+     * 内核 native_load_idt() 用 `asm volatile("lidt %0"::"m" (*dtr))`；
+     * 以前不认识这些助记符 → 整段 piece 作废（或错编成 ret），load_idt
+     * 变成空操作，早期 IDT 一直是 32 门空表 → 早期 #PF 直接 #DF。
+     * reg 字段：sgdt=/0, sidt=/1, lgdt=/2, lidt=/3。在 64 位模式下
+     * 默认操作数就是 16+64 位 desc_ptr，不加 0x66 前缀。 */
+    if (strcmp(mn, "sgdt") == 0 || strcmp(mn, "sidt") == 0 ||
+        strcmp(mn, "lgdt") == 0 || strcmp(mn, "lidt") == 0) {
+        int regf = (mn[1] == 'g') ? 2 : 3;   /* lgdt/sgdt → /2, lidt/sidt → /3 */
+        if (mn[0] == 's')
+            regf -= 2;                       /* sgdt=/0, sidt=/1 */
+        if (isn != 1 || o1.kind != AXK_MEM && o1.kind != AXK_SYM)
+            return 0;
+        ax_emit_rm(0x0F, 0x01, regf, &o1, 0, 0);
+        return 1;
+    }
     /* ---- 内核常用的系统/特权指令 ----
      * 这些都没有显式操作数：输入/输出值靠固定寄存器约束（"=a"/"c"/"d"）
      * 在段首/段尾由 ax_binds_in/out 搬到帧槽，模板里只写助记符。

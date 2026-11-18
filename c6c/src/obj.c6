@@ -489,6 +489,27 @@ static void obj_dce_stub_dead(void)
                 continue;
             if (mark[i2] || s->off >= CODE_IMG.n)
                 continue;
+            /* 同一入口可以有多个别名符号（`static inline` 的包装：`native_load_idt`
+             * 与 `desc_ptr_native_load_idt` 同址）。调用点的 fixup 只指向其中一个
+             * 名字，可达性 mark 也只落在那一个上；另一个未标记的别名会被误判成
+             * 死函数，入口写 0xC3 把活函数短路（早期 load_idt 变空操作 → IDT
+             * 从不切换 → 早期 #PF 直接 #DF）。同址任一符号被标记就当作活。 */
+            {
+                u32 a2;
+                int alive_alias = 0;
+
+                for (a2 = 0; a2 < X64.nsym; a2++) {
+                    X64Sym *t = &X64.sym[a2];
+
+                    if (mark[a2] && t->defined && !t->is_data &&
+                        t->off == s->off) {
+                        alive_alias = 1;
+                        break;
+                    }
+                }
+                if (alive_alias)
+                    continue;
+            }
             CODE_IMG.p[s->off] = 0xC3;      /* ret */
             ndead++;
         }
