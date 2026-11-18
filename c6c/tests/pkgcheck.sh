@@ -2,9 +2,9 @@
 # 库形态与安装契约的回归：没有 tcc 也照样能装、能 find_package、能 pkgconf。
 #
 # 验六件事：
-#   1. 安装树长什么样（bin/c6 + 嵌入库 + 头文件 + 自带头文件/运行时 + 元数据）；
-#   2. find_package(c6 COMPONENTS libtcc) 拿到的 c6::libtcc 真能编能跑
-#      （tcc 不在场时由 libc6c + tcc_* 兼容层顶上）；
+#   1. 安装树长什么样（bin/c6 + 嵌入库 + c6lib.h + 自带头文件/运行时 + 元数据）；
+#   2. 安装树里没有 libtcc.h，find_package(c6 COMPONENTS libtcc) 也不再被
+#      libc6c 顶上（要 libtcc 请用 -DC6_ENABLE_TCC=ON 的 c6 包）；
 #   3. find_package(c6c COMPONENTS compiler libc6c) 拿到 c6c 自己的名字
 #      （c6 与 c6c 是两个产品，各有各的包名与 pkgconf 名）；
 #   4. pkgconf --cflags --libs c6lib / c6c 的旗子对**宿主 C 程序**是干净的
@@ -55,16 +55,22 @@ ok "安装完成（--prefix 到临时目录）"
 
 # --- 1. 安装树 ---
 miss=""
-for f in bin/c6 bin/c6c include/c6lib.h include/libtcc.h lib/libc6c.a lib/libc6c.so \
+for f in bin/c6 bin/c6c include/c6lib.h lib/libc6c.a lib/libc6c.so \
          lib/c6/rt.c6 lib/c6/include/stddef.h lib/c6/include/stdarg.h \
          lib/pkgconfig/c6.pc lib/pkgconfig/c6lib.pc lib/pkgconfig/c6c.pc \
          lib/cmake/c6/c6Config.cmake lib/cmake/c6c/c6cConfig.cmake; do
     [ -e "$PREFIX/$f" ] || miss="$miss $f"
 done
 if [ -z "$miss" ]; then
-    ok "安装树齐全（bin/c6 + bin/c6c / 嵌入库 / 兼容头 / lib/c6 自带头与运行时 / pc / cmake）"
+    ok "安装树齐全（bin/c6 + bin/c6c / 嵌入库 / 宿主头 / lib/c6 自带头与运行时 / pc / cmake）"
 else
     bad "安装树齐全" "缺：$miss"
+fi
+
+if [ -e "$PREFIX/include/libtcc.h" ]; then
+    bad "安装树里没有 libtcc.h" "c6c 不提供 tcc 兼容头"
+else
+    ok "安装树里没有 libtcc.h（宿主头只有 c6lib.h）"
 fi
 
 if [ -e "$PREFIX/include/stdio.h" ]; then
@@ -73,52 +79,42 @@ else
     ok "include/ 只放宿主用的头文件（c6 自己的在 lib/c6/include）"
 fi
 
-# --- 2. find_package(c6 COMPONENTS libtcc) ---
+# --- 2. 无 tcc 的安装里没有 c6::libtcc，也不该拿 libc6c 冒充 ---
 mkdir -p "$WORK/consumer"
-cat >"$WORK/consumer/main.c" <<'EOF'
-#include <stdio.h>
-#include <libtcc.h>
-
-int main(int argc, char **argv)
-{
-    TCCState *s = tcc_new();
-    int rc;
-
-    if (!s)
-        return 1;
-    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    if (tcc_compile_string(s, "int printf(const char*,...);\n"
-                              "int main(void){printf(\"pkg ok\\n\");return 9;}\n") != 0)
-        return 2;
-    tcc_relocate(s, TCC_RELOCATE_AUTO);
-    rc = tcc_run(s, argc, argv);
-    tcc_delete(s);
-    return rc == 9 ? 0 : 3;
-}
-EOF
 cat >"$WORK/consumer/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.16)
 project(consumer C)
 find_package(c6 0.1 REQUIRED COMPONENTS libtcc)
-add_executable(consumer main.c)
-target_link_libraries(consumer PRIVATE c6::libtcc)
 EOF
 if cmake -S "$WORK/consumer" -B "$WORK/consumer/b" \
-        -DCMAKE_PREFIX_PATH="$PREFIX" >"$WORK/cons-cfg.log" 2>&1 &&
-        cmake --build "$WORK/consumer/b" >"$WORK/cons-b.log" 2>&1; then
-    got=$("$WORK/consumer/b/consumer")
-    if [ "$got" = "pkg ok" ]; then
-        ok "find_package(c6 COMPONENTS libtcc)：c6::libtcc 真能编能跑"
-    else
-        bad "find_package 消费者运行" "输出『$got』"
-    fi
+        -DCMAKE_PREFIX_PATH="$PREFIX" >"$WORK/cons-cfg.log" 2>&1; then
+    bad "find_package(c6 COMPONENTS libtcc) 在无 tcc 包里本该失败"
 else
-    bad "find_package(c6 COMPONENTS libtcc)" "$(tail -3 "$WORK/cons-cfg.log" "$WORK/cons-b.log" 2>/dev/null | tr '\n' ' ')"
+    ok "find_package(c6 COMPONENTS libtcc) 在无 tcc 包里按预期失败"
 fi
 
 # --- 3. find_package(c6c COMPONENTS compiler libc6c) ---
 # c6c 有自己的包名：它不是"另一个 c6"，下游依赖的是自举编译器 + libc6c。
 mkdir -p "$WORK/consumer-c6c"
+cat >"$WORK/consumer/main.c" <<'EOF'
+#include <stdio.h>
+#include <c6lib.h>
+
+int main(int argc, char **argv)
+{
+    C6State *s = c6_new();
+    int rc;
+
+    if (!s)
+        return 1;
+    if (c6_compile_string(s, "int printf(const char*,...);\n"
+                              "int main(void){printf(\"pkg ok\\n\");return 9;}\n") != 0)
+        return 2;
+    rc = c6_run(s, argc, argv);
+    c6_delete(s);
+    return rc == 9 ? 0 : 3;
+}
+EOF
 cp "$WORK/consumer/main.c" "$WORK/consumer-c6c/main.c"
 cat >"$WORK/consumer-c6c/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.16)

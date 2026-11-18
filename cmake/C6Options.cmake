@@ -29,7 +29,7 @@ option(C6_TCC_SHARED_LIBTCC "CONFIG_static=no，产出 libtcc.so" OFF)
 option(C6_INSTALL_CMAKE_PACKAGE "安装 c6Config.cmake / c6Targets.cmake" ON)
 option(C6_INSTALL_PKGCONF "安装 c6.pc" ON)
 option(C6_INSTALL_LIBTCC_PC "额外安装 libtcc.pc 兼容名" ON)
-option(C6_INSTALL_C6LIB "安装 c6c 的嵌入库 libc6c.a/.so 与头文件（c6lib.h、tcc 兼容头）" ON)
+option(C6_INSTALL_C6LIB "安装 c6c 的嵌入库 libc6c.a/.so 与头文件（c6lib.h）" ON)
 option(C6_INSTALL_C6C
   "安装自举编译器 c6c（默认形态下它就是唯一编译器，bin/c6 是它的别名）" ON)
 option(C6_INSTALL_TCC_SYMLINK "安装 bindir/tcc -> c6 兼容软链" ON)

@@ -1191,8 +1191,7 @@ static void pa_error(const char *fmt, ...)
         vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, ap);
         va_end(ap);
         msg[sizeof(msg) - 1] = 0;
-        /* 走 diag_emit：宿主用 tcc_set_error_func 设了回调就交给它，否则还是
-         * 一行 path:line: 打到 stderr（字节与以前一样）。 */
+        /* 走 diag_emit：一行 path:line: 打到 stderr（字节与以前一样）。 */
         diag_emit(msg);
     }
 }
@@ -3012,6 +3011,10 @@ static u32 NTESTS;
 static u32 CTORS[256];
 static u32 NCTOR;
 static int SAW_CTOR;
+/* `__attribute__((weak))` / `__weak`（内核里 __weak 宏展开成前者）：符号绑定
+ * 走 STB_WEAK，链接器允许被同名的强定义覆盖。内核大量 __weak 默认实现
+ * （fork.c/panic.c/cpu.c），不认它就会和 arch/x86 的真实定义 multiple definition。 */
+static int SAW_WEAK;
 /* __attribute__((destructor))：main 返回之后按**逆序**调用 */
 static u32 DTORS[256];
 static u32 NDTOR;
@@ -7750,6 +7753,9 @@ static void skip_attributes(void)
                     }
                     if (c->kind == TK_IDENT && TOK_EQ(c, "constructor"))
                         is_ctor = 1;
+                    if (c->kind == TK_IDENT
+                        && (TOK_EQ(c, "weak") || TOK_EQ(c, "__weak__")))
+                        SAW_WEAK = 1;
                     if (c->kind == TK_IDENT
                         && (TOK_EQ(c, "cleanup") || TOK_EQ(c, "__cleanup__"))) {
                         Tok *nx = pa_peek(1);
@@ -19021,6 +19027,13 @@ static void gen_one_local(u32 ty, Declarator *d)
         gs = sym_find(nm, sd.nlen);
         if (!gs)
             return;
+        /* 局部 static 改名成 `<函数>.<N>` 后走 gen_one_global，那条路的
+         * `char s[]="lit"` 分支按普通全局创建数据符号、没设 STB_LOCAL。
+         * 两个 TU 的同名 static 局部变量会 multiple definition（内核里
+         * `task_index_to_char.4` 就是这样撞的）。这里按新名字补本地化。 */
+        if ((u32)gs->val < X64.nsym)
+            X64.sym[(u32)gs->val].is_static = 1;
+        gs->is_static = 1;
         ls = sym_add(d->name, d->nlen, gs->type, SC_GLOBAL);
         ls->goff = gs->goff;
         ls->val = gs->val;
@@ -22753,6 +22766,13 @@ static void gen_one_global(u32 ty, Declarator *d)
         s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
         s->goff = data_alloc(ty_size(ty), ty_align_of(ty));
         s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+        /* `static const char x[] = "lit"`（内核里极常见）走这条字符串专用路，
+         * 提前 return 不会经过下面 22887 的文件作用域 static 分支——漏设
+         * STB_LOCAL，两个 TU 的同名 static 表就 multiple definition。 */
+        if (SCOPE && !SCOPE->up && PA_STATIC) {
+            s->is_static = 1;
+            X64.sym[(u32)s->val].is_static = 1;
+        }
         memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off,
                (size_t)ty_size(ty) < (size_t)(WIDE_LIT ? n * 4 : n)
                ? (size_t)ty_size(ty) : (size_t)(WIDE_LIT ? n * 4 : n));
@@ -22781,6 +22801,10 @@ static void gen_one_global(u32 ty, Declarator *d)
             s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
             s->goff = data_alloc(ty_size(ty), ty_align_of(ty));
             s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+            if (SCOPE && !SCOPE->up && PA_STATIC) {
+                s->is_static = 1;
+                X64.sym[(u32)s->val].is_static = 1;
+            }
             memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off,
                    (size_t)ty_size(ty) < (size_t)(STR_LIT_ESZ * n)
                    ? (size_t)ty_size(ty) : (size_t)(STR_LIT_ESZ * n));
@@ -23587,6 +23611,7 @@ static void pa_parse_tu(void)
         }
         SAW_CTOR = 0;
         SAW_DTOR = 0;
+        SAW_WEAK = 0;
         SAW_ALIAS = NULL;
         SAW_ASMNAME = NULL;
         PA_STATIC = 0;
@@ -23870,6 +23895,12 @@ static void gen_decl_from_spec(u32 base)
             int fscope_static = (SCOPE && !SCOPE->up && PA_STATIC);
             int had_proto = 0;
 
+            /* 内核模式：inline 函数本地化（发射名带 TU 后缀）。c6c 不做内联，
+             * 会在每个 TU 全量发射 inline 函数体；GCC 的 inline 语义是"每个 TU
+             * 一份、不跨 TU 冲突"，而 c6c 以前发成全局符号，导致 `native_save_fl`
+             * 等与真实定义 multiple definition。按 static 的路子本地化即可。 */
+            if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up)
+                fscope_static = 1;
             enf = fscope_static ? tu_static_name(nm) : nm;
             s = sym_find(nm, d.nlen);
             if (s && s->is_func && ty_func_nparams(s->type) > 0)
@@ -23988,6 +24019,12 @@ static void gen_decl_from_spec(u32 base)
                             if (old_val != (u32)s->val && X64.sym[old_val].name
                                 && strcmp(X64.sym[old_val].name, sn) == 0)
                                 meth_alias_register(old_val, (u32)s->val);
+                            /* 方法别名(<Struct>_<fn>)已经分到新符号槽；weak 必须
+                             * 同时设到短名符号 old_val 上，否则 __weak 的默认实现
+                             * （内核 fork.c 的 arch_release_task_struct）短名那条
+                             * 发成 GLOBAL，和 arch/x86 的强定义 multiple definition。 */
+                            if (SAW_WEAK && old_val < X64.nsym)
+                                X64.sym[old_val].is_weak = 1;
                         }
                         if (s->len == 4 && memcmp(s->name, "drop", 4) == 0
                             && ty_func_nparams(ty) == 1) {
@@ -24014,6 +24051,8 @@ static void gen_decl_from_spec(u32 base)
                 CTORS[NCTOR++] = (u32)s->val;
             if (SAW_DTOR && NDTOR < 256)
                 DTORS[NDTOR++] = (u32)s->val;
+            if (SAW_WEAK && (u32)s->val < X64.nsym)
+                X64.sym[(u32)s->val].is_weak = 1;
             /* K&R 旧式定义：`int f(a, b) float a; float b; { … }`
              * 参数表里只有名字（类型默认 int），真正的类型写在 `{` 前面的
              * 声明列表里。这里把声明里的类型回填到参数上。 */

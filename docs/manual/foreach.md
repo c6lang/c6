@@ -86,6 +86,6 @@ foreach (int v = it) { ... }    /* 迭代器：it 的类型提供 has(T *)/next(
 [examples/foreach_iter_demo.c6](../../examples/foreach_iter_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/foreach_demo.c6
-./tcc/c6 -B tcc -run examples/foreach_iter_demo.c6
+./c6c/build/c6c -run examples/foreach_demo.c6
+./c6c/build/c6c -run examples/foreach_iter_demo.c6
 ```

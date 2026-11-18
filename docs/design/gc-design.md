@@ -502,7 +502,7 @@ error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own'
 而是 `interface` 值本身不持有引用。（`struct→interface` 转换不 +1、作用域退出不释放：
 `@Counted c = new Counted; Node n = *c;` 之后 `__c6_gc_live()` 回到基线，实测 rc=0。）
 
-由此，多态下环检测的行为分三种，全部实测（`tcc/c6 -run` / `-o`）：
+由此，多态下环检测的行为分三种，全部实测（tcc 形态的 `tcc/c6 -run` / `-o`；默认交付是 c6c）：
 
 | 情形 | 图里有边吗 | 结论 |
 |---|---|---|
