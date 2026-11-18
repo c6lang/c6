@@ -3642,7 +3642,7 @@ make -C c6c fast                            # 全绿（objcheck + ldcheck 都在
 `c6_get_symbol()` 会顺手 `c6_relocate()`：忘了那一步的调用方拿到 `NULL`
 会以为是"没有这个符号"，这种误解比多一次 relocate 贵得多。
 
-### (2) `tcc_*` 兼容层：`include/tcc-compat.h`
+### (2) `tcc_*` 兼容层：`include/tcc-compat.h`（历史：第 307 轮已移除）
 
 声明 tcc 那套名字（`tcc_new` / `tcc_compile_string` / `tcc_relocate` /
 `tcc_run` / `tcc_get_symbol` / `tcc_output_file` / `tcc_set_options` /
@@ -3653,7 +3653,7 @@ make -C c6c fast                            # 全绿（objcheck + ldcheck 都在
 收了回调但诊断仍走 stderr；`tcc_add_file` 只收源文件；`tcc_set_options`
 只认 `-I/-D/-U`。
 
-### (3) 没有 tcc 的安装契约（`cmake -DC6_ENABLE_TCC=OFF`）
+### (3) 没有 tcc 的安装契约（`cmake -DC6_ENABLE_TCC=OFF`）（历史：第 307 轮已移除 libtcc.h）
 
 以前 `C6Install.cmake` 和 `C6LibraryConfig.cmake` 在 OFF 时直接 `return()`
 ——"没有 tcc 就没有库可描述"。库形态落地以后这个前提不成立了，所以补齐：
@@ -3994,7 +3994,7 @@ $ make -C c6c selfhost # fixpoint 逐字节相同（3816960 字节 / 5758 符号
 调用约定"，与 x86-64 后端（连编码和 ELF 都自己写）相比这一步是租来的，文档里
 写清楚。
 
-## 第 207 轮：`tcc_*` 兼容面补齐
+## 第 207 轮：`tcc_*` 兼容面补齐（历史：第 307 轮已撤销）
 
 `include/tcc-compat.h` 以前只声明 13 个函数，tcc 公开嵌入头里剩下的九个连声明
 都没有——拿 tcc 写的宿主程序一碰这些名字就编不过。这一轮按「能做的做、做不到
@@ -6015,3 +6015,23 @@ break;
 父子任务互相等待时必须让"最能推进的那个"先跑——只看 `waiting` 不够，`blocked_on`
 还要追一层。第 296~306 轮一路排除掉的：实参传递、协程栈大小、`swapstack` 的寄存器
 保存、事件掩码映射、`blocked_on` 的一刀切清空。
+
+## 第 307 轮：移除 libtcc.h 兼容面
+
+c6c 自己的宿主 API 一直是 `c6lib.h` 的 `c6_*`；`libtcc.h` 只是无 tcc 安装时
+把 `include/tcc-compat.h` 改名装出去的兼容名，配套还有 `c6::libtcc` 指向
+`c6::c6lib` 的 INTERFACE 别名。现在这套全部移除：
+
+* 删掉 `include/tcc-compat.h` 与 `src/embed.c6` 末尾的整套 `tcc_*` 函数，
+  连带只给它用的诊断回调钩子（diag.c6 / parse.c6 的注释同步）；
+* `C6CInstall.cmake` 不再装任何叫 `libtcc.h` 的头；`c6Targets.cmake.in`
+  不再造假的 `c6::libtcc`，`c6Config.cmake.in` 的 `libtcc` component
+  只在真 libtcc 在场时成立；`c6_LIBRARIES` / `C6_LIBRARIES` 回落到 c6lib；
+* `pkgcheck.sh` 改断言：安装树没有 `libtcc.h`，`find_package(c6 COMPONENTS
+  libtcc)` 在无 tcc 包里按预期失败；宿主消费者统一用 `c6lib.h` /
+  `c6c::libc6c`。`embed-check.sh` 删掉两段 `tcc_*` 兼容测试；
+* `check-install` 只校验有 tcc 的 c6 包，真 `tcc/libtcc.h` 与 `c6::libtcc`
+  照旧，没有改动；显式 `C6_ENABLE_TCC=ON` 的用户不受影响。
+
+这是破坏性变更：写 `tcc_new` 那套的宿主程序要改用 `c6_*` 并链 `-lc6c`，
+或继续用有 tcc 的 c6 包。

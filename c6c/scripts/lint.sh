@@ -36,8 +36,8 @@ scan "c6c 不得引用 tcc 的 .c：" -nE '(^|[^a-zA-Z0-9_/])tcc/[a-z0-9_]+\.c'
 scan "c6c 源码里不得出现 LGPL 头：" -lniE 'gnu (lesser|library) general public license|LGPL'
 
 # 构建定义在 CMake 里：去掉 `#` 注释再查（注释里讲边界是允许的）。
-# 这里只查"链接"形态（-ltcc / libtcc.so / libtcc.a）：`RENAME "libtcc.h"` 是
-# 把 tcc 兼容头装成 tcc 的标准头名，跟链接别家库不是一回事。
+# 这里只查"链接"形态（-ltcc / libtcc.so / libtcc.a）；c6c 现在连 tcc 兼容头
+# 都不装了，构建脚本里也不该再出现这些名字。
 for f in ../cmake/C6C.cmake ../CMakeLists.txt; do
     [ -f "$f" ] || continue
     hits=$(sed -E 's/#.*$//' "$f" | grep -nE -- '-ltcc|libtcc\.(so|a)($|[^0-9a-zA-Z_])' || true)

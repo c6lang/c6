@@ -2,7 +2,7 @@
 #
 # 描述的对象按构建形态分两种：
 #   * 有 tcc（C6_ENABLE_TCC=ON）：tcc 的 libtcc + 它的 libtcc1.a；
-#   * 没有 tcc（OFF）：c6c 自己的嵌入库 libc6c（c6_* API + tcc_* 兼容层）。
+#   * 没有 tcc（OFF）：c6c 自己的嵌入库 libc6c（c6_* API）。
 # 两种都要把 find_package(c6) / pkgconf 元数据装对——"没有 tcc 就没有库"
 # 这个前提在库形态落地以后就不成立了。
 #
@@ -50,7 +50,7 @@ if(C6_INSTALL_PKGCONF)
   # c6c 的嵌入库：pkgconf --cflags --libs c6lib → -lc6c
   if(C6_INSTALL_C6LIB)
     c6_install_pc(c6lib "c6lib"
-      "c6lib - c6c embeddable compiler (c6_* API + tcc_* compat)"
+      "c6lib - c6c embeddable compiler (c6_* API)"
       "-lc6c" "c6=\${bindir}/c6${C6_TCC_EXESUF}")
   endif()
 

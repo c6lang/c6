@@ -7,6 +7,8 @@
 # libtcc 由 tcc/Makefile 编译，不是 CMake 原生 target，所以这里以 IMPORTED
 # target 描述已经安装的文件。@PACKAGE_*@ 在 find_package 时按实际安装前缀
 # 重定位，因此 DESTDIR 暂存过的安装树搬走后依然可用。
+# C6_ENABLE_TCC=OFF 的构建里没有 libtcc / libtcc.h，也没有 c6::libtcc；
+# 这类安装请用 find_package(c6c COMPONENTS libc6c) 的 c6::c6lib。
 
 @PACKAGE_INIT@
 
@@ -28,18 +30,17 @@ endif()
 set(C6_C6LIB_LIBRARY "${C6_LIBDIR}/libc6c.a")
 set(C6_EXECUTABLE "${C6_BINDIR}/c6@C6_TCC_EXESUF@")
 set(C6_LIBTCC_LIBRARY "${C6_LIBDIR}/@C6_LIBTCC_FILENAME@")
-set(C6_LIBRARIES "${C6_LIBTCC_LIBRARY}")
+if(EXISTS "${C6_LIBTCC_LIBRARY}")
+  set(C6_LIBRARIES "${C6_LIBTCC_LIBRARY}")
+else()
+  set(C6_LIBRARIES "${C6_C6LIB_LIBRARY}")
+endif()
 set(C6_INCLUDE_DIRS "${C6_INCLUDE_DIR}")
 
 include("${CMAKE_CURRENT_LIST_DIR}/c6Targets.cmake")
 
 foreach(_c6_comp IN LISTS c6_FIND_COMPONENTS)
-  if(_c6_comp STREQUAL "libtcc" AND (EXISTS "${C6_LIBTCC_LIBRARY}"
-                                     OR EXISTS "${C6_C6LIB_LIBRARY}"))
-    # 有 tcc 的 libtcc 就用它；没有就用 c6c 的嵌入库（tcc_* 兼容层顶上）。
-    if(NOT EXISTS "${C6_LIBTCC_LIBRARY}")
-      message(STATUS "c6: 没有 tcc 的 libtcc，用 c6c 的嵌入库 (libc6c) 顶替")
-    endif()
+  if(_c6_comp STREQUAL "libtcc" AND EXISTS "${C6_LIBTCC_LIBRARY}")
     set(c6_libtcc_FOUND TRUE)
   elseif(_c6_comp STREQUAL "c6lib" AND EXISTS "${C6_C6LIB_LIBRARY}")
     set(c6_c6lib_FOUND TRUE)
