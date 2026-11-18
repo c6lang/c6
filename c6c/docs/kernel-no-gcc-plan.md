@@ -33,12 +33,20 @@
     （GCC 内联/消除它们，c6c 全量发射）。
   - 结论：**函数级 DCE（剔除未被调用的 local 函数）即可消除绝大多数死符号**，不需要
     复杂的常量折叠/分支消除。
-- **DCE 实现方案**：c6c 当前是单遍编译（parse.c6:22410 边解析边 `x64_compile`），
-  需在发射前知道函数是否被引用。两条路：
-  - 两遍：先解析全部函数收集 IR + 引用图，从全局符号做可达性分析，再发射可达函数。
-    工作量大但彻底。
-  - 延迟发射：local 函数先缓存 IR，TU 结束按引用计数决定发射。需改 x64 镜像布局。
-- **验证**：全 999 个 TU 用 c6c 编译后，kbuild 链接 vmlinux 不再 undefined reference；
+- **DCE 已实现（实验性，commit 待补，env `C6C_KERNEL_DCE=1` 开）**：在
+  `obj_write` 出 `.o` 前做**函数级可达性分析**：
+  1. 根集 = 全局 defined 函数 + 数据/ctor 引用符号（不能把所有 fixup 目标当根，
+     否则一串互相调用的 inline 函数全被误标为活）；
+  2. worklist 传递闭包：沿 fixup.patch 所属函数 → 目标符号扩展可达集；
+  3. 不可达的 local 函数入口写 `ret`(0xC3)，落在其中的 fixup 丢弃。
+  - **实测**：rdrand.o stub 1421 个死函数，fixup 从 ~1200 降到 **8 条**，
+    `__xadd_wrong_size`/`____wrong_branch_error` 等死符号引用**全部消除**。
+    4 个之前冲突的 TU（string_helpers/iomem_copy/irq_regs/rdrand）替换后，
+    LD 阶段链接 vmlinux **成功**（undefined reference 归零）。
+  - **剩余障碍**：链接后 objtool 报 `unannotated intra-function call`（c6c 代码
+    缺 objtool 的 annotate/noinstr 标注）——这是 objtool 兼容性问题，不是 DCE 缺陷。
+    禁用 objtool 验证时链接成功，但 ORC unwind 表无法生成、sorttable 失败。
+- **验证**：全 999 个 TU 用 c6c 编译 + DCE，kbuild 链接 vmlinux 通过 objtool 校验；
   qemu 启动与 gcc 基线一致。
 
 ### 阶段 2：HOSTCC——用 c6c 编 host tools
