@@ -22,12 +22,23 @@
 ### 阶段 1：CC 全量替换——消除 inline 符号冲突与膨胀
 - **问题**：c6c 不做内联展开，内核头里上万个 `static/extern inline` 全量发射成全局
   符号，`native_save_fl` 等与真实定义 multiple definition；main.o 膨胀 70×。
-- **做法**（二选一，先试 A）：
-  - A. **死代码消除（DCE）**：在 `-c` 输出前，从入口（全局符号 + 被引用符号）做可达性
-    分析，剔除未被引用的 inline 函数。需给 IR/符号表加引用计数与可达标记。
-  - B. **inline 符号本地化**：`inline` 函数的发射名带 TU 后缀（像 static 那样），
-    即使全量发射也不跨 TU 冲突；膨胀仍在但可链接。
-- **验证**：全 999 个 TU 用 c6c 编译后，kbuild 链接 vmlinux 不再 multiple definition；
+- **已做（增量 1，commit 026a694）**：
+  - B. **inline 符号本地化**：kernel 模式下 inline 函数发射名带 TU 后缀（像 static），
+    消除 multiple definition。局部 static（`task_index_to_char.4`）也补了 STB_LOCAL。
+  - 实测：之前冲突的 4 个 TU 符号正确本地化，fast 全绿。
+- **剩余核心障碍：函数级 DCE**（下一步）。实测数据：
+  - c6c 编 rdrand.o 有 **1425 个 local 函数**（gcc 0 个）——全是未内联的 inline 函数体；
+  - c6c 有 **740 个未定义符号**，gcc 只有 3 个——737 个是死代码引用；
+  - 死符号引用（如 `__xadd_wrong_size`）都在 `arch_atomic_*` 这类 **local inline 函数内**
+    （GCC 内联/消除它们，c6c 全量发射）。
+  - 结论：**函数级 DCE（剔除未被调用的 local 函数）即可消除绝大多数死符号**，不需要
+    复杂的常量折叠/分支消除。
+- **DCE 实现方案**：c6c 当前是单遍编译（parse.c6:22410 边解析边 `x64_compile`），
+  需在发射前知道函数是否被引用。两条路：
+  - 两遍：先解析全部函数收集 IR + 引用图，从全局符号做可达性分析，再发射可达函数。
+    工作量大但彻底。
+  - 延迟发射：local 函数先缓存 IR，TU 结束按引用计数决定发射。需改 x64 镜像布局。
+- **验证**：全 999 个 TU 用 c6c 编译后，kbuild 链接 vmlinux 不再 undefined reference；
   qemu 启动与 gcc 基线一致。
 
 ### 阶段 2：HOSTCC——用 c6c 编 host tools
