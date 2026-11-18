@@ -73,3 +73,18 @@ add_custom_command(
 add_custom_target(c6c-lib ALL DEPENDS "${C6C_LIB_A}" "${C6C_LIB_SO}")
 set_target_properties(c6c-lib PROPERTIES
   ADDITIONAL_CLEAN_FILES "${C6C_LIB_A};${C6C_LIB_SO};${C6C_BUILD}/libc6c.o")
+
+# 去 binutils 阶段 4：c6c 自带的 objcopy 子集（-O binary / -R），
+# 用 c6c 自己编译并自动挂 rt.c6。内核构建里 setup.bin / realmode.bin /
+# vmlinux.bin 都靠 `objcopy -O binary`，这三条的输出已与 GNU 版逐字节一致。
+set(C6C_OBJCOPY "${C6C_BUILD}/objcopy")
+add_custom_command(
+  OUTPUT "${C6C_OBJCOPY}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+  COMMAND "${CMAKE_COMMAND}" -E env C6C_LINK_WITH_RT=1
+          "${C6C_BIN}" -o "${C6C_OBJCOPY}" "${C6C_DIR}/src/objcopy.c6"
+  DEPENDS "${C6C_BIN}" "${C6C_DIR}/src/objcopy.c6"
+  COMMENT "c6c: 用 c6c 自编译 objcopy（去 binutils 阶段 4）"
+  VERBATIM)
+add_custom_target(c6c-objcopy ALL DEPENDS "${C6C_OBJCOPY}")
+set_target_properties(c6c-objcopy PROPERTIES ADDITIONAL_CLEAN_FILES "${C6C_OBJCOPY}")

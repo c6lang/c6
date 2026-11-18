@@ -1,6 +1,6 @@
 # 完全用 c6c 替代 gcc 构建 Linux 内核：分阶段路线
 
-> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC kbuild 全链 + modpost）已打通；阶段 3–5 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
+> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC kbuild 全链 + modpost）已打通；阶段 4 的 objcopy 子集已完成；阶段 3（AS）与 LD/AR 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
 
 ## 目标
 
@@ -73,6 +73,10 @@
 - 扩展 ld.c6：自定义段布局（vmlinux.lds.S 的 SECTIONS 语法）、--gc-sections、
   .a 归档、kallsyms 两遍链接、符号版本、orphan 段处理。
 - 补 ELF 归档（ar）与段抽取（objcopy）。
+  - **objcopy 子集已完成**（`c6c/src/objcopy.c6`）：`-O binary`（-R 排除 section、
+    -S 忽略）支持 ELF32/ELF64 小端，摊平 PT_LOAD 为裸二进制。内核的
+    setup.bin / realmode.bin / vmlinux.bin 三个输出与 GNU objcopy **逐字节一致**
+    （17980 / 25188 / 15013376 bytes）。CMake 目标 `c6c-objcopy` 用 c6c 自编译。
 - **验证**：`LD=c6c-ld` 链接出 vmlinux，qemu 启动一致。
 
 ## 阶段 5：端到端
