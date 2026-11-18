@@ -24019,6 +24019,12 @@ static void gen_decl_from_spec(u32 base)
                             if (old_val != (u32)s->val && X64.sym[old_val].name
                                 && strcmp(X64.sym[old_val].name, sn) == 0)
                                 meth_alias_register(old_val, (u32)s->val);
+                            /* 方法别名(<Struct>_<fn>)已经分到新符号槽；weak 必须
+                             * 同时设到短名符号 old_val 上，否则 __weak 的默认实现
+                             * （内核 fork.c 的 arch_release_task_struct）短名那条
+                             * 发成 GLOBAL，和 arch/x86 的强定义 multiple definition。 */
+                            if (SAW_WEAK && old_val < X64.nsym)
+                                X64.sym[old_val].is_weak = 1;
                         }
                         if (s->len == 4 && memcmp(s->name, "drop", 4) == 0
                             && ty_func_nparams(ty) == 1) {
