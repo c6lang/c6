@@ -3011,6 +3011,10 @@ static u32 NTESTS;
 static u32 CTORS[256];
 static u32 NCTOR;
 static int SAW_CTOR;
+/* `__attribute__((weak))` / `__weak`（内核里 __weak 宏展开成前者）：符号绑定
+ * 走 STB_WEAK，链接器允许被同名的强定义覆盖。内核大量 __weak 默认实现
+ * （fork.c/panic.c/cpu.c），不认它就会和 arch/x86 的真实定义 multiple definition。 */
+static int SAW_WEAK;
 /* __attribute__((destructor))：main 返回之后按**逆序**调用 */
 static u32 DTORS[256];
 static u32 NDTOR;
@@ -7749,6 +7753,9 @@ static void skip_attributes(void)
                     }
                     if (c->kind == TK_IDENT && TOK_EQ(c, "constructor"))
                         is_ctor = 1;
+                    if (c->kind == TK_IDENT
+                        && (TOK_EQ(c, "weak") || TOK_EQ(c, "__weak__")))
+                        SAW_WEAK = 1;
                     if (c->kind == TK_IDENT
                         && (TOK_EQ(c, "cleanup") || TOK_EQ(c, "__cleanup__"))) {
                         Tok *nx = pa_peek(1);
@@ -23604,6 +23611,7 @@ static void pa_parse_tu(void)
         }
         SAW_CTOR = 0;
         SAW_DTOR = 0;
+        SAW_WEAK = 0;
         SAW_ALIAS = NULL;
         SAW_ASMNAME = NULL;
         PA_STATIC = 0;
@@ -24037,6 +24045,8 @@ static void gen_decl_from_spec(u32 base)
                 CTORS[NCTOR++] = (u32)s->val;
             if (SAW_DTOR && NDTOR < 256)
                 DTORS[NDTOR++] = (u32)s->val;
+            if (SAW_WEAK && (u32)s->val < X64.nsym)
+                X64.sym[(u32)s->val].is_weak = 1;
             /* K&R 旧式定义：`int f(a, b) float a; float b; { … }`
              * 参数表里只有名字（类型默认 int），真正的类型写在 `{` 前面的
              * 声明列表里。这里把声明里的类型回填到参数上。 */
