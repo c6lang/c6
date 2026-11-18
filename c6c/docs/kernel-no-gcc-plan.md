@@ -1,6 +1,6 @@
 # 完全用 c6c 替代 gcc 构建 Linux 内核：分阶段路线
 
-> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC/kallsyms）已打通；阶段 3–5 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
+> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC kbuild 全链 + modpost）已打通；阶段 3–5 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
 
 ## 目标
 
@@ -42,19 +42,23 @@
 
 ## 阶段 2：HOSTCC——用 c6c 编 host tools（进行中）
 
-- **已完成 4 个 host tools 的 c6c 编译链接**：
+- **已完成多个 host tools 的 c6c 编译链接**：
   - **kallsyms**（三 TU + elf-parse）：输出与 gcc 版 sysmap/.bin 逐字节一致，.S 仅 .incbin 文件名不同；
   - **fixdep**：对真实 .d 文件 stdout/depfile 修改逐字节一致；
   - **sorttable**（+ elf-parse）：对同一 vmlinux 排序后 ELF 逐字节一致；
   - **recordmcount**：可编译链接（本配置 `CONFIG_HAVE_FENTRY=y` 用 fentry 不走 mcount，故未做功能等价验证）。
+  - **modpost**：4 个 host TU（modpost/file2alias/sumversion/symsearch）已用 c6c 编译成功；devicetable-offsets 需用 kbuild 真实命令编译。
   - 补齐的 libc 面：`strndup`、`perror`、`getopt`（短选项）、`getopt_long`（长选项，新增 `<getopt.h>`）、
-    `scanf/sscanf/vsscanf`（gen_init_cpio 等用）。
-- **kbuild 集成已打通单 TU host tool**：`make HOSTCC=<c6c> -j1 scripts_basic` rc=0，
-  kbuild 自己用 c6c 编出 fixdep（输出与 gcc 版逐字节一致）。为此 c6c 补了 kbuild
-  固定带的 gcc 选项兼容：`-fomit-frame-pointer`、`-Wl,--fatal-warnings` 收下不生效，
-  以及 `-Wp,-MMD,<path>` 真正写出依赖文件（fixdep 靠它生成 .d）。
-  整条 `make scripts` 仍卡在 gen_init_cpio 的 dprintf/copy_file_range/isgraph（非目标工具）。
-- **剩余 host tools**：modpost、relocs、objtool（及非目标的 gen_init_cpio 等）。
+    `scanf/sscanf/vsscanf`、`strsep`、`strchrnul`，以及 `<unistd.h>` 的 getopt 声明、
+    `<stdbool.h>` 的 bool 类型无条件定义（内核 linux/stddef.h 只给 enum false/true 却不给 bool）。
+- **kbuild HOSTCC 全链已打通**：`make HOSTCC=<c6c wrapper> -j1 scripts` rc=0，
+  kbuild 自己用 c6c 编出 fixdep/mdp/gen_init_cpio/kallsyms/sorttable/asn1_compiler/
+  tracepoint-update 并全部链接成功（多 TU 链接靠 c6c M_LINK 自动挂 rt.c6）。
+  为此 c6c 补了 kbuild 固定带的 gcc 选项兼容：`-fomit-frame-pointer`、
+  `-Wl,--fatal-warnings` 收下不生效，`-Wp,-MMD,<path>` 真正写出依赖文件；
+  并修了 `include_next` 误命中——未给 `-B` 时不再把当前目录的 `include/`
+  （内核根头）加进搜索路径，否则 sorttable 编不过。
+- **剩余 host tools**：relocs、objtool（内核编译真正用到的部分尚未逐一验证）。
 - 验证脚本 `c6c/tests/hostcc-tools.sh`：逐 TU 编译 + c6c 静态链接各工具，与 gcc 版逐字节对比输出。
 
 ## 阶段 3：AS——独立汇编器
@@ -79,5 +83,5 @@
 ## 关键约束
 
 - 每阶段独立可验证，不引入"全做完了才知道对不对"的大爆炸。
-- 阶段 1 已完成；阶段 2 的 kallsyms 已打通；剩余 host tools、AS、LD/AR/OBJCOPY 未完成。
+- 阶段 1 已完成；阶段 2 的 kbuild HOSTCC 全链 + modpost 已打通；剩余 relocs/objtool、AS、LD/AR/OBJCOPY 未完成。
 - 用户的完整目标尚未达成——中间产物（仅 CC、或 CC+kallsyms）是实质进展，不是终点。
