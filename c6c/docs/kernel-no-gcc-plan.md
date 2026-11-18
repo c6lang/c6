@@ -145,5 +145,11 @@
   修复后：current_task=0xffffffff89808a40（有效），999/999 编译 + vmlinux
   链接 + kallsyms 一致 + c6c 工具链 bzImage 全通过；qemu in_asm 显示内核已从
   triple fault 推进到 x86_64_start_kernel() 调用链返回、触发 head_64.S 的
-  ud2（该函数源码标注 __noreturn，不该返回）。剩余：查为何 start_kernel 链
-  返回（__noreturn 处理 / c6c 代码生成）。
+  ud2（该函数源码标注 __noreturn，不该返回）。
+  第二个 DCE=2 bug（已修复）：obj_dce_stub_dead 把所有 UND 非 static 符号的
+  call 都 NOP 化（head64.o 的 PLT32=0），包括有真实定义的 start_kernel
+  （在 gcc 编译的 init/main.o）——x86_64_start_reservations 没调用它就 ret →
+  ud2。修复：start_kernel / x86_64_start_reservations 保持 GLOBAL UND 且 call
+  保留。修复后内核推进到 tracepoint 的 `call *%r11`（22711 条指令，无 ud2），
+  最后的间接调用未返回——疑为 KASLR 下 tracepoint 函数指针（.data 里的
+  __SCK__ stub 地址）未重定位。剩余：查 KASLR relocs 对间接函数指针的处理。
