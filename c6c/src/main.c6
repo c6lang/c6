@@ -777,6 +777,12 @@ static int parse_args(int argc, char **argv)
              * "静态链接也有 libm"这个前提写的）。真的少了某个符号，链接期会
              * 如实报「未定义的符号」，不会因为收下 `-lm` 而变成运行时炸。 */
             continue;
+        } else if (strcmp(a, "-fomit-frame-pointer") == 0 ||
+                   strcmp(a, "-fno-omit-frame-pointer") == 0) {
+            /* 帧指针省略：c6c 的 x64 后端自己决定帧布局，这个开关不改变
+             * 生成代码。内核 kbuild 的 KBUILD_HOSTCFLAGS 固定带它，收下
+             * 但不生效，好让 HOSTCC=c6c 直接编 host tools 不被陌生 flag 打死。 */
+            continue;
         } else if (strncmp(a, "-Wl,", 4) == 0) {
             /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
              * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
