@@ -242,3 +242,13 @@
   （早期页表只覆盖内核镜像区，boot_params 页 0x14770 未纳入）。gcc 内核靠
   早期页表映射该页而 c6c 内核镜像布局不同（bzImage 35MB vs 15MB）可能导致
   早期映射范围差异。剩余：查 head_64.S 早期页表建立 / init_mem_mapping 时机。
+
+
+  **排除栈槽覆盖假设（2026-11-20）**：曾怀疑 x86_64_start_kernel 里
+  real_mode_data 槽(-0x10 rbp)被 `call __c6_tls_len; mov %rax,-0x10(%rbp)`
+  覆盖。但 in_asm trace 显示该 call（运行时 0x9f43a371）被安全检查的
+  `jmp 0x9f43a3a3`（0x9f43a324）绕过，未执行。real_mode_data 参数链完整：
+  x86_64_start_kernel 的 rdi → (经 rep movsb 后重设) → x86_64_start_reservations
+  (rdi) → -0x10 rbp → __va(real_mode_data) → copy_bootdata。参数正确，
+  #PF 纯粹是 direct map 页未映射。疑点收敛到早期页表（head_64.S 早期映射
+  vs c6c 更大镜像布局）。
