@@ -395,31 +395,16 @@ API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
 `c6_output_file`。库形态没有 `argv[0]` 可推，所以 `lib/rt.c6` 和自带
 `include/` 的绝对路径在编译期就塞进去（`C6_DEFAULT_RT` / `C6_DEFAULT_INC`）。
 
-**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 公开嵌入头里的一整套
-名字，实现一一接到 `c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库
-换掉就能编过；能做的照旧跑，做不到的当场返回失败并说明原因（不留"设上了但
-没生效"的坑）。这是"顶替 tcc 产品位"里最实的一步。
-
-* 真实现：`tcc_new` / `tcc_delete` / `tcc_set_options` /
-  `tcc_add_include_path` / `tcc_add_sysinclude_path`（等价 `-I`，c6c 不区分
-  系统头）/ `tcc_define_symbol` / `tcc_undefine_symbol` /
-  `tcc_compile_string` / `tcc_add_file` / `tcc_relocate`（一参数与老的
-  `(s, TCC_RELOCATE_AUTO)` 两种写法都收）/ `tcc_get_symbol` / `tcc_run` /
-  `tcc_output_file` / `tcc_list_symbols`（列镜像里的符号与 VA）/
-  `tcc_set_error_func`（诊断整行交给回调，不再打 stderr）/ `tcc_set_lib_path`
-  （认 `<dir>/lib/rt.c6` 与 `<dir>/rt.c6`）。
-* 收了但不动：`tcc_set_realloc`（arena 不可换）、`tcc_set_backtrace_func`
-  （没有 `-b` 的运行期）。
-* 如实拒绝（返回 -1 + 原因）：`tcc_add_library_path` / `tcc_add_library`
-  （链接器没有 `-L`/`-l`）、`tcc_add_symbol`（宿主地址注入要 JIT 重定位）。
+**没有 `libtcc.h` / `tcc_*` 兼容层**：c6c 的宿主 API 只有 `c6lib.h` 里的
+`c6_*` 一套；tcc 的嵌入头与库属于显式 `-DC6_ENABLE_TCC=ON` 的 c6 包。
+原本写 `tcc_new` 那套的程序要改成 `c6_*`，不能靠换头/换库名顶替。
 
 口径与限制：**一个进程只能编一次**（前端/后端/符号表都是文件级全局量，重置
-那套还没做，换 state 也不行，见 `c6c/docs/todo.md`）；`tcc_add_file` 只收
-`.c6`/`.c` 源文件，不收 `.o`/`.a`；`tcc_set_options` 只认 `-I`/`-D`/`-U`。
+那套还没做，换 state 也不行，见 `c6c/docs/todo.md`）；`c6_compile_file` 只收
+`.c6`/`.c` 源文件，不收 `.o`/`.a`。
 
-回归：`cmake --build build --target embedcheck`（10 条：动态库 / 静态库 /
-落盘后独立跑 / 编译失败被报告 / 二次编译被拒绝 / `tcc_*` 一条龙 / 错误回调 /
-系统头目录 + 列符号 / 如实拒绝的三件 / `tcc_set_lib_path`）。
+回归：`cmake --build build --target embedcheck`（5 条：动态库 / 静态库 /
+落盘后独立跑 / 编译失败被报告 / 二次编译被拒绝）。
 
 ## 安装与包契约：没有 tcc 也能装出全套
 
@@ -427,7 +412,7 @@ API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
 
 ```
 bin/c6                                  编译器（c6c 编的）
-include/c6lib.h  include/libtcc.h       宿主 C 程序用的头（兼容层装成 libtcc.h）
+include/c6lib.h                         宿主 C 程序用的头（没有 libtcc.h）
 lib/libc6c.a     lib/libc6c.so          嵌入库
 lib/c6/rt.c6     lib/c6/include/*.h     编译器自带的运行时与头文件
 lib/cmake/c6/c6Config.cmake             find_package(c6)
@@ -437,23 +422,27 @@ lib/pkgconfig/{c6,c6lib}.pc             pkgconf
 c6c 用 `argv[0]` 推自己的目录去找 `<bin>/../lib/c6/{include,rt.c6}`，所以
 整棵树搬走、换前缀都还能自己找到自带头文件。
 
-两种用法，`C6_ENABLE_TCC=OFF` 下都成立：
+无 tcc 的安装里只能用 c6c 自己的包：
 
 ```cmake
-find_package(c6 0.1 REQUIRED COMPONENTS libtcc)   # 没有 tcc 时由 libc6c 顶上
-target_link_libraries(app PRIVATE c6::libtcc)     # 也可以直接用 c6::c6lib
+find_package(c6c 0.1 REQUIRED COMPONENTS compiler libc6c)
+target_link_libraries(app PRIVATE c6c::libc6c)
 ```
+
+需要 `find_package(c6 COMPONENTS libtcc)` 或 `<libtcc.h>` 的老消费者请用
+`-DC6_ENABLE_TCC=ON` 构建的 c6 包；无 tcc 的包不提供 `c6::libtcc` 这个假目标。
 
 ```sh
 cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 ```
 
-注意 `include/` 里只放宿主用的两个头：c6 自己的 `stdio.h`/`stddef.h` 在
+注意 `include/` 里只放宿主用的 `c6lib.h`：c6 自己的 `stdio.h`/`stddef.h` 在
 `lib/c6/include/`，装到系统 includedir 会把宿主程序的系统头文件盖掉。
 
-回归：`cmake --build build --target pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
-`include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
-`-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
+回归：`cmake --build build --target pkgcheck`（11 条：无 tcc 也能 configure /
+安装树齐全 / 没有 `libtcc.h` / `include/` 干净 / `find_package(c6 COMPONENTS libtcc)`
+按预期失败 / `find_package(c6c)` 消费者真编真跑 / `pkgconf` 旗子
+`-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 与 `c6c` 自找头文件与运行时）。
 
 ## 回归：让 `tests/regression.sh` 换编译器跑
 

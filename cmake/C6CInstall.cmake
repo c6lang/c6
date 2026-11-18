@@ -27,13 +27,8 @@ if(C6_INSTALL_C6LIB)
           DESTINATION "${C6_LIBDIR_REL}")
   install(PROGRAMS "${C6C_LIB_SO}"
           DESTINATION "${C6_LIBDIR_REL}")
-  # tcc 的嵌入 API 兼容头：装的时候用它的标准名，原本用 tcc 的程序不用改。
-  # 只在**没有 tcc** 的时候装——两个都装会抢同一个 libtcc.h。
-  if(NOT C6_ENABLE_TCC)
-    install(FILES "${C6C_DIR}/include/tcc-compat.h"
-            DESTINATION "${C6_INCLUDEDIR_REL}"
-            RENAME "libtcc.h")
-  endif()
+  # c6c 的宿主头只有 c6lib.h（c6_* API）：不装 tcc 兼容头，也不会装出
+  # libtcc.h 这个名字。需要 libtcc 的老消费者必须显式用有 tcc 的构建。
 endif()
 
 # ---------------------------------------------------------------------------
@@ -61,7 +56,7 @@ endif()
 # ---------------------------------------------------------------------------
 # 3. pkgconf c6c：pkgconf --cflags --libs c6c -> -lc6c（宿主侧头文件在 includedir）
 #
-# 只描述**装进 includedir 的宿主头**（c6lib.h / libtcc.h）；c6c 自己那套 stdio.h
+# 只描述**装进 includedir 的宿主头**（c6lib.h）；c6c 自己那套 stdio.h
 # 在 <libdir>/c6/include，不能进 Cflags，否则会盖掉宿主程序的系统头。
 # ---------------------------------------------------------------------------
 if(_c6c_installed AND C6_INSTALL_PKGCONF)

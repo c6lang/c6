@@ -417,6 +417,8 @@ tcc/c6 ──► c6c stage1 ──► (stage1 编 c6c) ──► c6c stage2
 - **隔离**（ADR-1）：`c6c/` 不 `#include` `tcc/*.h`、不链接 `libtcc`、不复制 `tcc/` 源码；
   `make c6c-lint` 用 grep + 构建图检查。将来可用 `git subtree split -P c6c` 原样拆成独立仓库。
 - `tcc/` 保留两个角色：bootstrap 第一步、差分测试 oracle；不做运行时依赖。
+- 宿主侧因此**不装** `libtcc.h`，也不提供 `tcc_*` 兼容层；下游需要 libtcc
+  嵌入 API 时显式用 `-DC6_ENABLE_TCC=ON` 的 c6 包。
 
 ## 12. 修掉的 tcc 缺陷（“更容易扩展维护”的具体内容）
 
