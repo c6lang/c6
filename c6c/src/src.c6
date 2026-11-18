@@ -301,7 +301,6 @@ static SrcFile *src_load(const char *path)
     int fd = open(path, O_RDONLY);
     struct stat st = {0};
     char *p = NULL;
-    void *m = NULL;
 
     if (fd < 0)
         return NULL;
@@ -309,12 +308,32 @@ static SrcFile *src_load(const char *path)
         close(fd);
         return NULL;
     }
-    /* PROT_WRITE 是为了给末尾补那个 0（MAP_PRIVATE，不会写回文件） */
-    m = mmap(NULL, (size_t)st.st_size + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED)
+    /* 文件末尾补 0。不能用 mmap(size+1)：文件大小正好是页的整数倍时，
+     * data[size] 落在文件末尾之外的页，MAP_PRIVATE 文件映射访问会 SIGBUS
+     * （vsyscall.c 这种 size=4096 倍数的头文件就是这么崩的）。
+     * 拷进 malloc 缓冲，可写且末尾安全；src_trigraphs/rewrite 本来就要改写。 */
+    p = (char *)malloc((size_t)st.st_size + 1);
+    if (!p) {
+        close(fd);
         return NULL;
-    p = m;
+    }
+    {
+        size_t got = 0;
+
+        while (got < (size_t)st.st_size) {
+            ssize_t r = read(fd, p + got, (size_t)st.st_size - got);
+
+            if (r <= 0)
+                break;
+            got += (size_t)r;
+        }
+        if (got < (size_t)st.st_size) {
+            free(p);
+            close(fd);
+            return NULL;
+        }
+    }
+    close(fd);
     p[st.st_size] = 0;
     /* `#!/path/to/c6c -run`：tcc 的 -run 靠"行首 #! 忽略掉"支持 C 脚本，
      * 这里把首行抹成空白——行号不变，MAP_PRIVATE 也不会写回文件。 */
@@ -347,6 +366,8 @@ static SrcFile *src_load(const char *path)
             }
         }
     }
+    /* owned=0：普通源文件，参与 already_loaded 缓存与统计。malloc 缓冲
+     * 生命周期同进程（与 mmap 版本一致，退出即回收），不能标 owned=1。 */
     return src_new(path, p, (size_t)st.st_size, 0);
 }
 

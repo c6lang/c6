@@ -9656,7 +9656,7 @@ static u32 gen_call(Sym *fs)
 {
     /* 记下这次调用可不可失败：catch / 表达式语句要据此判断 */
     E_CALL_FALLIBLE = (fs && fs->fallible) ? 1 : 2;
-    u32 args[16] = {0};
+    u32 args[PA_ARG_MAX] = {0};   /* 必须和 narg 上限一致；16 会在 narg>=16 时栈溢出覆盖 fs */
     u32 narg = 0;
     u32 aty0[PA_ARG_MAX] = {0};   /* 实参**转换前**的类型（重载重选后要从原值重转） */
     u32 av0[PA_ARG_MAX] = {0};    /* 实参转换前的值 */
