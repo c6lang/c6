@@ -22,8 +22,8 @@ add_custom_target(check-all-c6c
   DEPENDS unit irtest hello ctest-c6c runflag testflag pmtest stage1check
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck asmnativecheck a64check archcheck
           embedcheck pkgcheck ctutest selfhost selfhost-opt selftest stdtest diagtest c99test
-          c99suite ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check regression-c6c
-  COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost；Linux 内核见 c6c-kernelvmlinux 用例）")
+          c99suite ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check regression-c6c kernelvmlinux
+  COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost + c6c .o 链接 vmlinux 启动）")
 
 add_custom_target(check-all-perf
   DEPENDS check-all-c6c bench-c6c

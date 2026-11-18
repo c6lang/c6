@@ -32,6 +32,75 @@ static IrFn FN;
 static int PA_ERRS;
 static Image CODE_IMG;
 
+/* --- 两遍发射（kernel DCE=2）-------------------------------------------
+ * c6c 是单遍编译：边解析边 x64_compile。内核头里上万个 static inline 全量
+ * 发射，99% 是死函数（见 docs/kernel-no-gcc-plan.md）。出 .o 后做物理压缩
+ * 不可行——x64_branch 把函数内 rel32 目标拍死进代码字节、无重定位记录。
+ * 这里改成延迟发射：先把每个函数的 IR 深拷贝缓存，TU 解析完后从全局根
+ * 沿 IR_CALL 引用图算可达集，只发射 live 函数（死函数根本不生成字节）。
+ * env C6C_KERNEL_DCE=2 开，默认关，行为与原来一致。 */
+typedef struct {
+    IrFn ir;            /* 深拷贝（ops/kpool/lines 都是独立缓冲） */
+    u32 sym;            /* 函数符号 id（X64.sym 下标） */
+    u32 alias_sym;      /* 函数别名符号 id，0 = 无 */
+    u8 is_static;       /* local 函数（可安全剔除） */
+    u8 emitted;         /* 可达性标记（发射阶段用） */
+} DefFn;
+
+static DefFn *DEF_FNS;
+static u32 NDEF;
+static u32 DEF_CAP;
+static int PA_DEFER_EMIT;   /* =1 时延迟发射（kernel DCE=2） */
+
+static int pa_defer_enabled(void)
+{
+    const char *v = getenv("C6C_KERNEL_DCE");
+
+    return v && v[0] == '2';
+}
+
+static void def_fn_add(const IrFn *f, u32 sym, u32 alias_sym)
+{
+    DefFn *d = NULL;
+
+    if (NDEF >= DEF_CAP) {
+        u32 nc = DEF_CAP ? DEF_CAP * 2 : 512;
+        DefFn *nv = (DefFn *)malloc((size_t)nc * sizeof(DefFn));
+
+        if (!nv)
+            return;
+        if (NDEF)
+            memcpy(nv, DEF_FNS, (size_t)NDEF * sizeof(DefFn));
+        free(DEF_FNS);
+        DEF_FNS = nv;
+        DEF_CAP = nc;
+    }
+    d = &DEF_FNS[NDEF++];
+    memset(d, 0, sizeof(*d));
+    d->ir = *f;
+    d->ir.ops = NULL;
+    d->ir.kpool = NULL;
+    d->ir.lines = NULL;
+    d->sym = sym;
+    d->alias_sym = alias_sym;
+    if (sym < X64.nsym)
+        d->is_static = X64.sym[sym].is_static;
+    if (f->n && f->ops) {
+        d->ir.ops = (IrOp *)malloc((size_t)f->n * sizeof(IrOp));
+        if (d->ir.ops) {
+            memcpy(d->ir.ops, f->ops, (size_t)f->n * sizeof(IrOp));
+            d->ir.cap = f->n;
+        }
+    }
+    if (f->nk && f->kpool) {
+        d->ir.kpool = (u64 *)malloc((size_t)f->nk * sizeof(u64));
+        if (d->ir.kpool) {
+            memcpy(d->ir.kpool, f->kpool, (size_t)f->nk * sizeof(u64));
+            d->ir.kcap = f->nk;
+        }
+    }
+}
+
 /* --- token 流（跳过换行；带 4 个 token 的前瞻） --- */
 
 /* 前瞻窗口：PA_BUF[0] 永远是“当前 token”，消费就是整体左移一格。
@@ -7807,7 +7876,8 @@ static void skip_attributes(void)
                     }
                     /* `__attribute__((alias("目标")))`：这个名字没有自己的
                      * 代码/存储，只是目标的另一个入口 */
-                    if (PA_AT_DECL && c->kind == TK_IDENT && TOK_EQ(c, "alias")) {
+                    if (PA_AT_DECL && c->kind == TK_IDENT
+                        && (TOK_EQ(c, "alias") || TOK_EQ(c, "__alias__"))) {
                         Tok *nx3 = pa_peek(1);
                         Tok *ny3 = pa_peek(2);
 
@@ -22428,6 +22498,16 @@ static void pa_func_def(Sym *fn, Declarator *d)
     /* fnlit_drain 已经把 FN.ops 恢复成当前函数本体，这里才是 native 的
      * "函数 IR 完稿"时刻；C99/LLVM 路在上面 pa_emit_fn 里做同一件事。 */
     ir_optimize(&FN);
+    if (pa_defer_enabled()) {
+        /* 两遍发射：缓存 IR，等 TU 解析完、可达集算出来再决定是否发射。 */
+        u32 asym = 0;
+
+        if (fn->alias)
+            asym = x64_sym(&X64, emit_name(fn->alias));
+        def_fn_add(&FN, (u32)fn->val, asym);
+        fn->alias = NULL;
+        return;
+    }
     x64_compile(&X64, &FN, (u32)fn->val);
     if (fn->alias) {
         /* 别名就是另一个名字指向同一份代码（PA 用的镜像里没有符号表，
@@ -22629,6 +22709,94 @@ static void code_lbl_fixup_add(u32 data_off, u32 fnseq, u32 lbl)
     CLBL_FN[NCLBL] = fnseq;
     CLBL_LBL[NCLBL] = lbl;
     NCLBL++;
+}
+
+/* 两遍发射的第二节：TU 解析完、IR 全缓存好后，从全局根沿 IR_CALL 引用图
+ * 算可达集，只发射 live 函数。死函数根本不生成字节——.text 从根上只有
+ * 可达代码，不需要出 .o 后搬字节（那会因为拍死的 rel32 分支而错位）。 */
+static void pa_emit_deferred(void)
+{
+    u32 *sym2def = NULL;
+    u32 *work = NULL;
+    u32 nwork = 0;
+    u32 wi = 0;
+    u32 i = 0;
+    u32 k = 0;
+    u32 nemit = 0;
+
+    if (!NDEF)
+        return;
+    sym2def = (u32 *)calloc(X64.nsym ? X64.nsym : 1, sizeof(u32));
+    work = (u32 *)calloc(NDEF ? NDEF : 1, sizeof(u32));
+    if (!sym2def || !work) {
+        free(sym2def);
+        free(work);
+        return;
+    }
+    for (i = 0; i < NDEF; i++)
+        sym2def[DEF_FNS[i].sym] = i + 1;    /* 0 = 不在缓存里 */
+
+    /* 根集：全局函数（外部可能调用）+ ctor/dtor + 数据里引用的函数符号。
+     * 带别名（`__attribute__((alias))` 或方法别名）的函数也要算：
+     * `SYSCALL_DEFINE` 生成的 do_sys_* 是 static，但它有全局别名 __x64_sys_*
+     * （system call table 通过它引用）。别名存在即意味着外部可见入口，
+     * 目标函数必须发射，否则 alias_apply 接不上、链接期 undefined。 */
+    for (i = 0; i < NDEF; i++) {
+        DefFn *d = &DEF_FNS[i];
+
+        if (!d->is_static || d->alias_sym)
+            d->emitted = 1;
+    }
+    for (i = 0; i < NCTOR; i++)
+        if (CTORS[i] < X64.nsym && sym2def[CTORS[i]])
+            DEF_FNS[sym2def[CTORS[i]] - 1].emitted = 1;
+    for (i = 0; i < NDTOR; i++)
+        if (DTORS[i] < X64.nsym && sym2def[DTORS[i]])
+            DEF_FNS[sym2def[DTORS[i]] - 1].emitted = 1;
+    for (i = 0; i < NDFIX; i++)
+        if (DFIX_SYM[i] < X64.nsym && sym2def[DFIX_SYM[i]])
+            DEF_FNS[sym2def[DFIX_SYM[i]] - 1].emitted = 1;
+    for (i = 0; i < NCLBL; i++)
+        if (CLBL_FN[i] < NDEF)
+            DEF_FNS[CLBL_FN[i]].emitted = 1;
+    for (i = 0; i < NDEF; i++)
+        if (DEF_FNS[i].emitted)
+            work[nwork++] = i;
+
+    /* 传递闭包：live 函数体里的 IR_CALL 目标也 live。 */
+    while (wi < nwork) {
+        DefFn *d = &DEF_FNS[work[wi++]];
+        IrFn *f = &d->ir;
+
+        for (i = 0; i < f->n; i++) {
+            u32 t = 0;
+
+            if (f->ops[i].op != IR_CALL)
+                continue;
+            t = f->ops[i].imm;
+            if (t < X64.nsym && sym2def[t] && !DEF_FNS[sym2def[t] - 1].emitted) {
+                DEF_FNS[sym2def[t] - 1].emitted = 1;
+                if (nwork < NDEF)
+                    work[nwork++] = sym2def[t] - 1;
+            }
+        }
+    }
+
+    /* 按缓存顺序发射 live 函数（保持 clabel fnseq 语义稳定）。 */
+    for (i = 0; i < NDEF; i++) {
+        DefFn *d = &DEF_FNS[i];
+
+        if (!d->emitted)
+            continue;
+        x64_compile(&X64, &d->ir, d->sym);
+        if (d->alias_sym && !X64.sym[d->alias_sym].defined)
+            x64_alias_idx(&X64, d->alias_sym, d->sym);
+        nemit++;
+    }
+    fprintf(stderr, "c6c: 两遍发射：缓存 %u 函数，发射 %u（剔除 %u 死函数）\n",
+            NDEF, nemit, NDEF - nemit);
+    free(sym2def);
+    free(work);
 }
 
 static void data_fixup_drop_range(u32 lo, u32 hi)
@@ -23908,8 +24076,21 @@ static void gen_decl_from_spec(u32 base)
              * 会在每个 TU 全量发射 inline 函数体；GCC 的 inline 语义是"每个 TU
              * 一份、不跨 TU 冲突"，而 c6c 以前发成全局符号，导致 `native_save_fl`
              * 等与真实定义 multiple definition。按 static 的路子本地化即可。 */
-            if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up)
-                fscope_static = 1;
+            /* 带 alias 的名字是外部可见入口（SYSCALL_DEFINE 的 __x64_sys_*
+             * = __do_sys_* 的别名，system call table 跨 TU 引用），不能被
+             * inline 本地化——否则发成 STB_LOCAL，链接期 undefined。
+             * SYSCALL_DEFINEn(n>0) 的 x64/ia32 两个 sys_ 入口是真实函数
+             * （首形参 pt_regs 指针），同样必须全局：syscall table 跨 TU 引用。 */
+            {
+                /* `__x64_sys_*` / `__ia32_sys_*`：第 3 个字符区分 */
+                int is_sysentry = (d.nlen > 3 && d.name[0] == '_'
+                                   && d.name[1] == '_'
+                                   && (d.name[2] == 'x' || d.name[2] == 'i'));
+
+                if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up
+                    && !al && !is_sysentry)
+                    fscope_static = 1;
+            }
             enf = fscope_static ? tu_static_name(nm) : nm;
             s = sym_find(nm, d.nlen);
             if (s && s->is_func && ty_func_nparams(s->type) > 0)
@@ -23954,6 +24135,12 @@ static void gen_decl_from_spec(u32 base)
                  * 这个名字只是 target 的另一个入口，没有自己的代码/存储。 */
                 if (al && s)
                     alias_register(enf, al);
+                /* `__attribute__((weak, alias("target")))`（内核 cpu_show_*）：
+                 * 这是纯声明（`;` 结尾），走不到函数定义的 SAW_WEAK 应用处。
+                 * 在这里把 weak 落到符号，否则发成强定义与真实实现 multiple
+                 * definition。 */
+                if (SAW_WEAK && s && (u32)s->val < X64.nsym)
+                    X64.sym[(u32)s->val].is_weak = 1;
                 /* `!error` 是这一条声明上的事实：立刻落到符号上。原型没有
                  * 函数体、走不到 pa_func_def，留着会把标记传给下一条声明
                  * （`tests/errors/drop_bad.c6` 顶上那条 `int!error boom(void);`）。 */
@@ -24484,6 +24671,26 @@ static int pa_finish(const char *out)
         if (PA_RELOC) {
             X64_OBJ = 1;
             X64.im_base = 0;
+            /* 两遍发射：IR 已全缓存，现在按可达集写出 live 函数（死函数
+             * 不生成字节），再补跳板、出 .o。非该模式时 NDEF=0，直接返回。 */
+            pa_emit_deferred();
+            /* 两遍发射才产生的别名（如系统调用 __x64_sys_* 的方法别名
+             * pt_regs___x64_sys_*、static_call trampoline）目标函数此时才
+             * defined，pa_finish 开头那次 alias_apply 跑得早、跳过了它们。
+             * x64_alias_idx 是幂等赋值，再跑一次把短名接上。 */
+            if (pa_defer_enabled()) {
+                alias_apply();
+                /* 别名符号（__x64_sys_* 等）在源码里是全局的，但 x64_alias_idx
+                 * 把目标的 is_static 拷过来——目标 do_sys_* 是 static（方法别名
+                 * 本地化），于是全局别名也成了 STB_LOCAL，跨 TU 看不到。
+                 * 两遍发射下把源码别名恢复成全局。 */
+                for (i = 0; i < NALIAS; i++) {
+                    u32 as = x64_sym(&X64, ALIAS_FROM[i]);
+
+                    if (as < X64.nsym && X64.sym[as].defined)
+                        X64.sym[as].is_static = 0;
+                }
+            }
             x64_resolve(&X64);
             code_len = CODE_IMG.n;
             obj_write(out);
