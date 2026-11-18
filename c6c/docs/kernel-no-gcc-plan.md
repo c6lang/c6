@@ -135,6 +135,11 @@
   已修 const_mul/const_add/const_shift 的类型恢复；最小复现与 gcc 完全一致。
   999/999 编译 + vmlinux 链接成功；early_pmd_flags 现为正确的 0xe3；bzImage
   全 c6c 工具链构建成功（35,776,000 字节）；fast 全绿。
-  剩余：qemu 仍在解压后挂起（无 Linux version），early_pmd_flags 已正确，
-  需用 gdb 定位更深的挂起点（并发回归干扰，可用改名 qemu 绕开 pkill）。
+  剩余：qemu 仍在解压后挂起（无 Linux version）。用 qemu -d in_asm 追踪
+  到挂起点在 common_startup_64 的 0x8123413b 附近：
+  `mov -0x767041c0(,%rcx,8),%rdx`（per_cpu_offset 绝对索引）→
+  `mov 0xc58(%rax),%rsp`（取 boot CPU 栈）→ 之后 `je` 处停止。
+  gcc 内核同位置也有绝对地址指令且能启动，所以差异可能在重定位数据或
+  栈设置的具体值，需进一步对比 KASLR 后该地址的实际内容。gdbstub 被
+  BIOS 阶段的 "exited normally" 干扰，改用 in_asm 追踪有效。
   产物备份 /tmp/c6c_kernel_build3/。
