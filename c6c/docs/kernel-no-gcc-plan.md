@@ -101,11 +101,17 @@
 ## 关键约束
 
 - 每阶段独立可验证，不引入"全做完了才知道对不对"的大爆炸。
-- 阶段 1（CC）已验证到 vmlinux+qemu；但用 c6c .o 跑 `make bzImage` 会在
+- 阶段 1（CC）已验证到 vmlinux+qemu；用 c6c .o 跑 `make bzImage` 会在
   `RELOCS arch/x86/boot/compressed/vmlinux.relocs` 报
-  `Invalid absolute R_X86_64_64 relocation: nop_func`——c6c 的绝对重定位类型
-  与内核 relocs 工具不兼容，是阶段 1 遗留限制（full_twopass 只验到 vmlinux）。
-  这是端到端（阶段 5）必须解决的下一处。
+  `Invalid absolute R_X86_64_64 relocation`。根因不是重定位类型，而是
+  **顶层 asm 里的全局函数标签被 asmx 丢弃**：asmx 不支持 `endbr64` 指令、
+  `.skip N, FILL` 的第二参数，导致 `DEFINE_ASM_FUNC`（8 处）整段 asm 作废，
+  里面定义的 nop_func 等符号变成 UND weak→被发成 SHN_ABS→relocs 拒绝。
+  已修这两处 asmx bug：nop_func 现在正确生成 `FUNC GLOBAL DEFAULT 1`，
+  999/999 编译 + vmlinux 链接成功，nop_func 的 relocs 错误消除。
+  剩余 `arch_rethook_trampoline` 等是更复杂的顶层 asm（SAVE_REGS_STRING、
+  UNWIND_HINT_FUNC 等大量指令），迷你汇编器翻译不了——端到端（阶段 5）
+  必须继续扩充 asmx 的指令覆盖，或为这类符号提供真实段定义。
 - 阶段 2（HOSTCC kbuild 全链 + modpost）已打通；objcopy/ar 子集已完成并各自
   经构建链集成验证（bzImage+qemu）；剩余 AS、LD 未完成。
 - 用户的完整目标尚未达成——中间产物（仅 CC、或 CC+kallsyms）是实质进展，不是终点。
