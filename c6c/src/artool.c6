@@ -1,0 +1,277 @@
+/* artool.c6 —— c6c 自带归档工具（去 binutils 阶段 4）。
+ *
+ * 覆盖内核构建实际使用的 ar 子集：
+ *   ar cDPrST <archive> <objs...>   建 thin archive（无符号索引）——791 次调用
+ *   ar cDPrsT  <archive> <objs...>  带 s：暂按无索引处理（ld 需索引，留给 GNU ar）
+ *   ar t <archive>                  列成员名
+ *   ar q <archive> <objs...>        追加成员
+ *
+ * GNU ar 格式（60 字节头 + 数据，偶数对齐）：
+ *   name[16] mtime[12] uid[6] gid[6] mode[8] size[10] fmag[2]="`\n"
+ *   deterministic(D)：mtime/uid/gid/mode 字段全填空格（GNU ar -D 的行为）。
+ *   thin archive(T)：全局头 "!<thin>\n"；第一个成员是 "//" 字符串表
+ *     （数据 = "name/\nname/\n..."）；后续**普通成员 size=0 且不存数据**，
+ *     name 字段是 "/<offset>"（字符串表内偏移）——这是之前实现踩的坑，
+ *     当时把 size 写成名字引用长度，GNU ar 报 "malformed archive"。
+ *   regular archive：全局头 "!<arch>\n"，成员 name="name/"，数据=文件内容。
+ *
+ * 符号索引（s）：GNU thin archive 的索引由嵌套伪成员头构成（binutils bfd
+ * 私有格式），精确复刻超出范围。内核里带 s 的只有 4 次（built-in.a 等），
+ * 暂由 GNU ar 处理；本工具覆盖其余 791 次无索引调用。
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define MAXMEM 16384
+
+typedef struct {
+    char *name;
+    char *data;        /* regular: 文件内容；thin: 0 */
+    long  size;
+} Member;
+
+static Member  MEM[MAXMEM];
+static int     NMEM = 0;
+static int     OPT_T = 0;   /* thin archive */
+static int     OPT_D = 0;   /* deterministic */
+static char   *STRTAB = 0;  /* 读归档时的字符串表 */
+static long    STRLEN = 0;
+
+static void die(const char *msg)
+{
+    fprintf(stderr, "ar: %s\n", msg);
+    exit(1);
+}
+
+static char *read_file(const char *path, long *out_size)
+{
+    int fd = open(path, O_RDONLY, 0);
+    struct stat st = {0};
+    char *p = 0;
+    long n = 0, got = 0;
+
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) < 0) { close(fd); return 0; }
+    n = (long)st.st_size;
+    p = (char *)malloc((size_t)n + 1);
+    if (!p) { close(fd); return 0; }
+    while (got < n) {
+        long r = read(fd, p + got, (unsigned long)(n - got));
+        if (r <= 0) break;
+        got += r;
+    }
+    p[got] = 0;
+    close(fd);
+    if (out_size) *out_size = got;
+    return p;
+}
+
+static char *base_name(const char *path)
+{
+    const char *s = strrchr(path, '/');
+    return s ? (char *)(s + 1) : (char *)path;
+}
+
+static void add_member(const char *name, char *data, long size)
+{
+    if (NMEM >= MAXMEM) die("成员太多");
+    MEM[NMEM].name = strdup(name);
+    MEM[NMEM].data = data;
+    MEM[NMEM].size = size;
+    NMEM++;
+}
+
+/* 读现有归档的成员列表（q 追加时保留旧成员）。返回 1=thin, 0=regular。 */
+static int load_archive(const char *path)
+{
+    char *f = read_file(path, 0);
+    struct stat st = {0};
+    long len = 0, off = 0;
+    int thin = 0;
+    int i = 0;
+
+    if (!f) return 0;
+    if (stat(path, &st) < 0) { free(f); return 0; }
+    len = (long)st.st_size;
+    if (len < 8) { free(f); return 0; }
+    if (!strncmp(f, "!<thin>\n", 8)) thin = 1;
+    else if (!strncmp(f, "!<arch>\n", 8)) thin = 0;
+    else { free(f); return 0; }
+
+    off = 8;
+    while (off + 60 <= len) {
+        char *h = f + off;
+        char nb[17] = {0}, sb[11] = {0};
+        long size = 0;
+        char *name = 0;
+        int e = 0;
+
+        for (i = 0; i < 16; i++) nb[i] = h[i];
+        nb[16] = 0;
+        while (e < 16 && nb[e] && nb[e] != ' ') e++;
+        nb[e] = 0;
+        for (i = 0; i < 10; i++) sb[i] = h[48 + i];
+        sb[10] = 0;
+        size = strtol(sb, 0, 10);
+        if (h[58] != '`' || h[59] != '\n' || size < 0
+            || off + 60 + size > len) break;
+
+        if (!strcmp(nb, "//")) {
+            STRTAB = h + 60;
+            STRLEN = size;
+        } else if (nb[0] == '/' && nb[1] >= '0' && nb[1] <= '9') {
+            long idx = strtol(nb + 1, 0, 10);
+            char *nm = STRTAB + idx;
+            e = 0;
+            while (nm[e] && nm[e] != '/' && nm[e] != '\n') e++;
+            name = (char *)malloc((size_t)e + 1);
+            memcpy(name, nm, (size_t)e); name[e] = 0;
+            add_member(name, 0, 0);
+        } else if (nb[0] != '/' || nb[1] == ' ') {
+            e = (int)strlen(nb);
+            while (e > 0 && nb[e - 1] == '/') nb[--e] = 0;
+            name = strdup(nb);
+            add_member(name, h + 60, size);
+        }
+        off += 60 + size + (size & 1);
+    }
+    return thin;
+}
+
+/* 写一个 60 字节头：字段定宽左对齐空格填充。 */
+static void write_hdr(int fd, const char *name, long size)
+{
+    char h[60] = {0};
+    int i = 0, n = 0;
+
+    for (i = 0; i < 60; i++) h[i] = ' ';
+    n = (int)strlen(name);
+    if (n > 16) n = 16;
+    memcpy(h, name, (size_t)n);
+
+    /* GNU ar -D 把 mtime/uid/gid/mode 全填空格，不写 0/644。 */
+    {
+        char num[32] = {0};
+        snprintf(num, sizeof(num), "%ld", size);
+        memcpy(h + 48, num, strlen(num));
+    }
+    (void)OPT_D;
+    h[58] = '`'; h[59] = '\n';
+    write(fd, h, 60);
+}
+
+static void write_padded(int fd, const char *p, long n)
+{
+    if (n > 0) write(fd, p, (unsigned long)n);
+    if (n & 1) {
+        char z = '\n';
+        write(fd, &z, 1);
+    }
+}
+
+static int write_thin(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char *str = 0;
+    long strlen_ = 0, off = 0;
+    int i = 0;
+
+    if (fd < 0) die("无法创建归档");
+    write(fd, "!<thin>\n", 8);
+
+    for (i = 0; i < NMEM; i++)
+        strlen_ += (long)strlen(MEM[i].name) + 2;
+    str = (char *)malloc((size_t)strlen_ + 1);
+    strlen_ = 0;
+    for (i = 0; i < NMEM; i++) {
+        long n = (long)strlen(MEM[i].name);
+        memcpy(str + strlen_, MEM[i].name, (size_t)n);
+        str[strlen_ + n] = '/'; str[strlen_ + n + 1] = '\n';
+        strlen_ += n + 2;
+    }
+    write_hdr(fd, "//", strlen_);
+    write_padded(fd, str, strlen_);
+
+    for (i = 0; i < NMEM; i++) {
+        char ref[32] = {0};
+        snprintf(ref, sizeof(ref), "/%ld", off);
+        write_hdr(fd, ref, 0);   /* thin 成员：size=0，无数据 */
+        off += (long)strlen(MEM[i].name) + 2;
+    }
+    close(fd);
+    return 0;
+}
+
+static int write_regular(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int i = 0;
+
+    if (fd < 0) die("无法创建归档");
+    write(fd, "!<arch>\n", 8);
+    for (i = 0; i < NMEM; i++) {
+        char nm[17] = {0};
+        int n = (int)strlen(MEM[i].name);
+        if (n > 15) n = 15;
+        memcpy(nm, MEM[i].name, (size_t)n);
+        nm[n] = '/';
+        write_hdr(fd, nm, MEM[i].size);
+        write_padded(fd, MEM[i].data, MEM[i].size);
+    }
+    close(fd);
+    return 0;
+}
+
+static int do_list(const char *path)
+{
+    int i = 0;
+    (void)load_archive(path);
+    for (i = 0; i < NMEM; i++)
+        printf("%s\n", MEM[i].name);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    char *opts = 0;
+    const char *archive = 0;
+    int i = 0;
+    int mode_create = 0, mode_list = 0, mode_append = 0;
+
+    if (argc < 2) die("缺少操作");
+    opts = (char *)argv[1];
+    for (i = 0; opts[i]; i++) {
+        switch (opts[i]) {
+        case 'c': case 'r': mode_create = 1; break;
+        case 'q': mode_append = 1; break;
+        case 't': mode_list = 1; break;
+        case 'D': OPT_D = 1; break;
+        case 'T': OPT_T = 1; break;
+        case 'S': case 's': break;
+        case 'P': case 'i': case 'm': break;
+        default: break;
+        }
+    }
+    if (mode_list) {
+        if (argc < 3) die("t 缺少归档名");
+        return do_list(argv[2]);
+    }
+    if (argc < 3) die("缺少归档名");
+    archive = argv[2];
+    if (mode_create || mode_append) {
+        if (mode_append) load_archive(archive);
+        for (i = 3; i < argc; i++) {
+            long sz = 0;
+            char *data = read_file(argv[i], &sz);
+            if (!data) die("无法读取成员文件");
+            add_member(base_name(argv[i]), data, sz);
+        }
+        return OPT_T ? write_thin(archive) : write_regular(archive);
+    }
+    die("不支持的操作");
+    return 1;
+}

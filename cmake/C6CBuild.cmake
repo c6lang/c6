@@ -88,3 +88,18 @@ add_custom_command(
   VERBATIM)
 add_custom_target(c6c-objcopy ALL DEPENDS "${C6C_OBJCOPY}")
 set_target_properties(c6c-objcopy PROPERTIES ADDITIONAL_CLEAN_FILES "${C6C_OBJCOPY}")
+
+# 去 binutils 阶段 4：c6c 自带的 ar 子集（thin/regular archive 无符号索引），
+# 覆盖内核 791 次 `ar cDPrST` 调用（这些中间归档不直接喂给 ld）。
+# 生成的 thin archive 经 GNU `ar t` 验证格式合法、成员列表一致。
+set(C6C_AR "${C6C_BUILD}/ar")
+add_custom_command(
+  OUTPUT "${C6C_AR}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
+  COMMAND "${CMAKE_COMMAND}" -E env C6C_LINK_WITH_RT=1
+          "${C6C_BIN}" -o "${C6C_AR}" "${C6C_DIR}/src/artool.c6"
+  DEPENDS "${C6C_BIN}" "${C6C_DIR}/src/artool.c6"
+  COMMENT "c6c: 用 c6c 自编译 ar（去 binutils 阶段 4）"
+  VERBATIM)
+add_custom_target(c6c-ar ALL DEPENDS "${C6C_AR}")
+set_target_properties(c6c-ar PROPERTIES ADDITIONAL_CLEAN_FILES "${C6C_AR}")

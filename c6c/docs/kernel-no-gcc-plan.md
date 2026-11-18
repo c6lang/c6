@@ -1,6 +1,6 @@
 # 完全用 c6c 替代 gcc 构建 Linux 内核：分阶段路线
 
-> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC kbuild 全链 + modpost）已打通；阶段 4 的 objcopy 子集已完成；阶段 3（AS）与 LD/AR 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
+> **状态**：阶段 1（CC）已验证完成；阶段 2（HOSTCC kbuild 全链 + modpost）已打通；阶段 4 的 objcopy/ar 子集已完成；阶段 3（AS）与 LD 未开始 · **索引**：[文档索引](../../docs/README.md) · **关联**：[design.md](design.md) §15/§16、[CHANGELOG](../../CHANGELOG.md)
 
 ## 目标
 
@@ -73,6 +73,12 @@
 - 扩展 ld.c6：自定义段布局（vmlinux.lds.S 的 SECTIONS 语法）、--gc-sections、
   .a 归档、kallsyms 两遍链接、符号版本、orphan 段处理。
 - 补 ELF 归档（ar）与段抽取（objcopy）。
+  - **ar 子集已完成**（`c6c/src/artool.c6`）：`ar cDPrST` 建 thin archive、
+    `ar cDPrsT` 暂按无索引处理、`ar t` 列成员、`ar q` 追加。覆盖内核 791 次
+    无索引归档调用（这些中间归档不直接喂 ld，故不需 GNU 的符号索引）。
+    生成的 thin archive 经 **GNU `ar t` 验证格式合法、成员列表一致**。
+    CMake 目标 `c6c-ar` 用 c6c 自编译。符号索引（4 次带 s 的 built-in.a）
+    仍由 GNU ar 处理。
   - **objcopy 子集已完成**（`c6c/src/objcopy.c6`）：`-O binary`（-R 排除 section、
     -S 忽略）支持 ELF32/ELF64 小端，摊平 PT_LOAD 为裸二进制。内核的
     setup.bin / realmode.bin / vmlinux.bin 三个输出与 GNU objcopy **逐字节一致**
