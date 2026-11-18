@@ -858,6 +858,18 @@ static int ax_insn(void)
         img_u8(&AX_IM, 0xFA);
         return 1;
     }
+    /* pushfq/popfq：内核 UNWIND_HINT / SAVE_REGS_STRING 顶层 asm 常用。
+     * 不在 AX_FAM 表里（它们无操作数、无后缀），直接认整名。编码 9c / 9d。 */
+    if (strcmp(mn, "pushfq") == 0 || strcmp(mn, "pushfl") == 0) {
+        if (isn != 0) return 0;
+        img_u8(&AX_IM, 0x9C);
+        return 1;
+    }
+    if (strcmp(mn, "popfq") == 0 || strcmp(mn, "popfl") == 0) {
+        if (isn != 0) return 0;
+        img_u8(&AX_IM, 0x9D);
+        return 1;
+    }
     if (strcmp(mn, "ret") == 0) {
         if (isn >= 1 && o1.kind == AXK_IMM) {
             img_u8(&AX_IM, 0xC2);

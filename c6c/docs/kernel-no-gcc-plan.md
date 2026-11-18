@@ -109,9 +109,12 @@
   里面定义的 nop_func 等符号变成 UND weak→被发成 SHN_ABS→relocs 拒绝。
   已修这两处 asmx bug：nop_func 现在正确生成 `FUNC GLOBAL DEFAULT 1`，
   999/999 编译 + vmlinux 链接成功，nop_func 的 relocs 错误消除。
-  剩余 `arch_rethook_trampoline` 等是更复杂的顶层 asm（SAVE_REGS_STRING、
-  UNWIND_HINT_FUNC 等大量指令），迷你汇编器翻译不了——端到端（阶段 5）
-  必须继续扩充 asmx 的指令覆盖，或为这类符号提供真实段定义。
+  又修了 `pushfq`/`popfq`（rethook SAVE_REGS_STRING 用）——最小复现里
+  `arch_rethook_trampoline` 已能正确生成 `FUNC GLOBAL DEFAULT 1`。
+  最后一个障碍是 `pushq $symbol`（fake return address）：asmx 的 `$` 只认
+  数字立即数，符号立即数令整段作废；且 X64.fix 的符号重定位统一是
+  R_X86_64_PC32，而 `pushq $sym` 需要 R_X86_64_32S（绝对）——正确实现要
+  跨 asmx/x64/obj 加绝对重定位类型。端到端（阶段 5）必须解决这一处。
 - 阶段 2（HOSTCC kbuild 全链 + modpost）已打通；objcopy/ar 子集已完成并各自
   经构建链集成验证（bzImage+qemu）；剩余 AS、LD 未完成。
 - 用户的完整目标尚未达成——中间产物（仅 CC、或 CC+kallsyms）是实质进展，不是终点。
