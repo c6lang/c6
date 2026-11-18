@@ -170,5 +170,13 @@
   `call __SCT__WARN_trap`（真实直接调用）错误地生成了 `call *%r11`。
   c6c cgroup.o 里 `UND __SCK__WARN_trap` 是罪魁：DCE=2 下该 UND 符号被转
   pseudo/stub 0，`call *%r11` 的函数指针=0 → #PF(CR2=0)。
-  修复方向：`__SCK__WARN_trap` 应像 `__SCK__tp_func_*` 一样保护，或 c6c
-  不该把 static call 生成成间接 trampoline 调用。
+  **推翻 static_call 假设**：用当前修复后的 c6c 重新链接验证，
+  `__SCK__WARN_trap` 数据第一个 qword = 0xffffffff88aa3a40（__WARN_trap
+  有效地址），static_call 初始化正常。但其后启动仍在同一个 `call *%r11`
+  （#PF CR2=0、R11=0）崩溃——与 static_call 无关。
+  **真正的 codegen bug**：c6c cgroup.o 里大量 `lea 0x0(%rip),%rax`（无重定位），
+  它取的是「下一条指令地址」而非目标符号（如 __warn_printk/函数指针）。
+  崩溃序列：0x83140bf4 `lea 0x0(%rip),%rax` → 存 -0xe30 → 0x83140c99
+  `mov -0xe30(%rbp),%r11` → `call *%r11` 调用指令自身 → 无限递归/栈溢出 →
+  RIP=0 #PF。c6c 后端对函数/全局符号取址错误生成 RIP-relative 0 偏移，
+  丢失符号重定位。剩余：在后端定位何时应发 `lea symbol(%rip)` 重定位。
