@@ -7,6 +7,31 @@
 
 ## 0.6.3 — 2026-11-17
 
+### c6c 的 `.o` 首次链接进 Linux vmlinux 并成功启动
+
+实测里程碑：用 c6c 编译的 ET_REL `.o` 替换内核里 6 个 `.c` 的目标文件
+（`lib/ctype.c`、`clz_tab.c`、`math/div64.c`、`math/int_pow.c`、
+`math/int_sqrt.c`、`uuid.c`），走 kbuild 正常链接出 vmlinux/bzImage，在 qemu
+里启动——打印 `Linux version`、初始化控制台与网络协议栈、走到与 gcc 基线
+完全相同的终点（本环境无 rootfs，VFS panic）。加上最小 initramfs 时观察到
+`Run /init as init process` 与 `Attempted to kill init! exitcode=0x00000000`，
+证明内核完成启动并执行了用户态 `/init`。可复现脚本：`c6c/tests/kernel-vmlinux.sh`。
+
+解除的具体链接 blocker：c6c 的 `-c` 无条件发射带 `SHF_ALLOC` 的空
+`.init_array` / `.fini_array`，内核 `CONFIG_LD_ORPHAN_WARN_LEVEL=error`
+直接以 `unplaced orphan section` 拒链。GCC 编的普通 C `.o` 根本没有这两个
+段。改成：空表发射成 `SHT_NULL`（索引不变，链接器忽略），非空时照旧发
+真正的 `INIT_ARRAY`——有构造函数的程序行为不变。
+
+**还没达成的部分（诚实记录）**：这不是"999 个内核 TU 全部 c6c 编译"。
+c6c 不做内联优化，内核头文件里上万个 `static/extern inline` 会全量发射成
+全局符号，`native_save_fl` 等与真实定义 `multiple definition`，无法链接。
+纯粹的数据表 / 简单函数 TU 才不触发。完整内核需给 c6c 补内联展开或死代码
+消除——这是编译器级工程，不是构建脚本能绕过的。
+
+验证：`fast` 全绿、selfhost fixpoint 逐字节一致；`kernel-vmlinux.sh` 端到端
+PASS（自动替换、链接、启动验证、恢复基线）。
+
 ### C 前端：内核高频内联汇编现在真正生成机器码（之前整条被静默丢弃）
 
 上一节记的"完整可运行内核二进制产不出，根因是 native 后端不支持内联汇编"，

@@ -679,8 +679,11 @@ static void obj_write(const char *path)
                                          * "这个栈不用可执行" */
             ty = OBJ_SHT_PROGBITS;
         } else if (i == OBJ_SEC_INIT || i == OBJ_SEC_FINI) {
-            ty = (i == OBJ_SEC_INIT) ? OBJ_SHT_INIT_ARRAY : OBJ_SHT_FINI_ARRAY;
-            flags = OBJ_SHF_ALLOC | OBJ_SHF_WRITE;
+            /* 空表发成 SHT_NULL：GCC 编的普通 C `.o` 根本没有 .init_array，
+             * 而带 ALLOC 的空 INIT_ARRAY 会被内核链接脚本当成 unplaced orphan
+             * （CONFIG_LD_ORPHAN_WARN_LEVEL=error）直接拒链。索引不能删（后面
+             * 的 .rela.sh_info 按常数指回），把 type 置 0、flag 清零即可让
+             * 链接器忽略它；有构造函数时照旧发真正的 INIT_ARRAY。 */
             if (i == OBJ_SEC_INIT) {
                 sz = init.n;
                 off = off_init;
@@ -688,8 +691,15 @@ static void obj_write(const char *path)
                 sz = fini.n;
                 off = off_fini;
             }
-            align = 8;
-            ent = 8;
+            if (!sz) {
+                ty = 0;                 /* SHT_NULL：链接器忽略 */
+                align = 1;
+            } else {
+                ty = (i == OBJ_SEC_INIT) ? OBJ_SHT_INIT_ARRAY : OBJ_SHT_FINI_ARRAY;
+                flags = OBJ_SHF_ALLOC | OBJ_SHF_WRITE;
+                align = 8;
+                ent = 8;
+            }
         } else if (OBJ_DEBUG && (i == OBJ_SEC_DEBUG_ABBREV || i == OBJ_SEC_DEBUG_INFO
                                  || i == OBJ_SEC_DEBUG_LINE || i == OBJ_SEC_DEBUG_STR)) {
             ObjBuf *b = NULL;
@@ -725,7 +735,6 @@ static void obj_write(const char *path)
             align = 8;
             ent = 24;
         } else if (i == OBJ_SEC_RELA_INIT || i == OBJ_SEC_RELA_FINI) {
-            ty = OBJ_SHT_RELA;
             if (i == OBJ_SEC_RELA_INIT) {
                 sz = relai.n;
                 off = off_relai;
@@ -735,9 +744,16 @@ static void obj_write(const char *path)
                 off = off_relaf;
                 info = OBJ_SEC_FINI;
             }
-            link = 5;                   /* .symtab */
-            align = 8;
-            ent = 24;
+            if (!sz) {
+                ty = 0;                 /* 空表的重定位段同样是 SHT_NULL */
+                info = 0;               /* NULL 段的 sh_info 必须是 0，否则 readelf 告警 */
+                align = 1;
+            } else {
+                ty = OBJ_SHT_RELA;
+                link = 5;               /* .symtab */
+                align = 8;
+                ent = 24;
+            }
         }
         ob_u32(&f, sh_name[i]);
         ob_u32(&f, ty);

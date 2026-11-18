@@ -531,6 +531,15 @@ op 种类的好处是 C99/LLVM 后端一行都不用改（它们本来就把 `IR
 `sysret`/`ud2`/`pause` 等）在 `asmx.c6` 里按机器码直接编码。带操作数的端口
 I/O（`inb`/`outb`）尚未覆盖。
 
+**`-c` 产物与内核链接**：GCC 编的普通 C `.o` 没有 `.init_array`；c6c 以前
+无条件发一个带 `SHF_ALLOC` 的空 `INIT_ARRAY`，内核
+`CONFIG_LD_ORPHAN_WARN_LEVEL=error` 会以 `unplaced orphan section` 拒链。
+现在空表发成 `SHT_NULL`（段索引不动，链接器忽略），非空才发真表——有
+构造函数的程序行为不变。这样 c6c 的 `.o` 能被内核链接脚本接受；实测
+6 个纯数据/简单函数 TU 替换后 vmlinux 能启动（`c6c/tests/kernel-vmlinux.sh`）。
+完整内核仍受限于"c6c 不做内联优化"：`static/extern inline` 全量发射成全局
+符号会与真实定义冲突，需补内联/死代码消除才能覆盖全部 TU。
+
 ## 16 镜像、回填与落盘
 
 native 后端的内存模型：一个 `Image`（`u8 *p / u32 n / u32 cap`），1.5 倍增长。
