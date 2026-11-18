@@ -252,3 +252,14 @@
   (rdi) → -0x10 rbp → __va(real_mode_data) → copy_bootdata。参数正确，
   #PF 纯粹是 direct map 页未映射。疑点收敛到早期页表（head_64.S 早期映射
   vs c6c 更大镜像布局）。
+
+
+  **#DF 机制定位（2026-11-20）**：int trace 显示 #PF(CR2=ffff888000014770)
+  投递时直接 #DF(v=08)，early_idt_handler_array 入口（0xa88028c0）从未执行。
+  CR3=0x1f646000，IDT=fffffff...a7a04000。根因：早期 IDT 表 bringup_idt_table
+  （arch/x86/boot/startup/gdt_idt.c）静态全 0，startup_64_load_idt 只加载空表；
+  真正的 vector 门由 idt_setup_early_traps()（idt.c:335 set_intr_gate(i,
+  early_idt_handler_array[i])）在 setup_arch 里填充。已验证 setup.o 里
+  idt_setup_early_traps 的 E8 call + PLT32 重定位存在（符号 WEAK DEFINED，
+  不被 weak-only DCE NOP）。疑点：c6c 生成的 idt_setup_early_traps 内
+  early_idt_handler_array 符号地址或 set_intr_gate 写入有误，导致 IDT 门仍空。
