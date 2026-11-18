@@ -77,6 +77,10 @@
     -S 忽略）支持 ELF32/ELF64 小端，摊平 PT_LOAD 为裸二进制。内核的
     setup.bin / realmode.bin / vmlinux.bin 三个输出与 GNU objcopy **逐字节一致**
     （17980 / 25188 / 15013376 bytes）。CMake 目标 `c6c-objcopy` 用 c6c 自编译。
+  - **构建链集成验证**：用 `OBJCOPY=c6c/build/objcopy make arch/x86/boot/bzImage`
+    重建，生成的 setup.bin/vmlinux.bin 与 gcc 基线逐字节相同，bzImage 不变；
+    qemu 启动打印 `Linux version`/`Console:`/5×`NET: Registered` 并走到预期的
+    无 rootfs panic——与 gcc 基线一致。objcopy 这个 binutils 角色已可替代。
 - **验证**：`LD=c6c-ld` 链接出 vmlinux，qemu 启动一致。
 
 ## 阶段 5：端到端
