@@ -115,9 +115,16 @@
   `$sym` 翻译成 `lea sym(%rip), %rax; pushq %rax`，复用 PC32 重定位；
   还支持 `$(3*8)` 这类简单算术立即数。`arch_rethook_trampoline` 已正确
   生成 `FUNC GLOBAL DEFAULT 1`。999/999 编译 + vmlinux 链接成功，fast 全绿。
-  新障碍：tracepoint/static-call 的 `__SCK__tp_func_*` 符号（另一类顶层 asm）
-  仍是 UND weak→SHN_ABS，bzImage 的 relocs 步报 Invalid absolute relocation。
-  端到端（阶段 5）需继续按顶层 asm 种类逐个补齐 asmx。
+  新障碍 __SCK__tp_func_*（tracepoint 顶层 asm）曾导致 relocs 报错；
+  根因是 UND weak→SHN_ABS 的符号仍带 R_X86_64_64 数据重定位（内核 relocs
+  拒绝 ABS 符号的绝对重定位）。已修：保留 ABS 符号表项（kallsyms 遍次一致
+  性需要），但对 pseudo 符号跳过 R_X86_64_64 重定位——SCK 错误已消除，
+  999/999 编译 + vmlinux 链接成功，fast 全绿。
+  新障碍 paddr_vmcoreinfo_note：__weak 函数（有 EXPORT_SYMBOL）在 c6c 链接
+  遍次里被 GC 成 ABS 0，其 R_X86_64_64 重定位仍被 relocs 拒绝。需修链接器
+  对 weak defined 符号的 GC 策略。端到端（阶段 5）仍待完成。
+  实验发现 C6C_KERNEL_WEAK_UND=1（完全关 ABS 化）会导致 kallsyms 不一致，
+  不可用——ABS 符号表项是 kallsyms 一致性的必要条件。
 - 阶段 2（HOSTCC kbuild 全链 + modpost）已打通；objcopy/ar 子集已完成并各自
   经构建链集成验证（bzImage+qemu）；剩余 AS、LD 未完成。
 - 用户的完整目标尚未达成——中间产物（仅 CC、或 CC+kallsyms）是实质进展，不是终点。

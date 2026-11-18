@@ -543,6 +543,7 @@ static void obj_write(const char *path)
     u32 *map = NULL;            /* X64 符号 id → ELF 符号下标 */
     u8 *emit = NULL;            /* 内核模式：UND 且未被重定位引用的符号不发表项 */
     u8 *seen = NULL;            /* 数据段里已落过重定位的字节（去重） */
+    u8 *pseudo_syms = NULL;     /* 内核模式 UND weak → SHN_ABS 的符号 id */
     u32 i = 0;
     u32 nlocal = 0;
     u32 off_text = 0;
@@ -594,7 +595,9 @@ static void obj_write(const char *path)
      * （--emit-relocs）保留、kallsyms 中间遍次丢弃，导致一致性检查失败。
      * 没被引用就完全不发，两边就一致；非内核模式行为不变。 */
     emit = (u8 *)calloc(X64.nsym ? X64.nsym : 1, 1);
-    if (!emit) {
+    pseudo_syms = (u8 *)calloc(X64.nsym ? X64.nsym : 1, 1);
+    if (!emit || !pseudo_syms) {
+        free(pseudo_syms);
         free(map);
         ob_str_free(&str);
         ob_str_free(&shstr);
@@ -647,8 +650,10 @@ static void obj_write(const char *path)
          * 发成强 UND 会全量链接 undefined。
          * WEAK UND：有强定义的符号（.S、其他 TU）链接器仍正常解析；确实
          * 缺失的就是 gcc 也优化掉的不可达引用，填 0 无害。qemu 启动验证。 */
-        if (!s->defined && !local && getenv("C6C_KERNEL_DCE"))
+        if (!s->defined && !local && getenv("C6C_KERNEL_DCE")) {
             pseudo = 1;
+            pseudo_syms[i] = 1;
+        }
         bind = (u8)(local ? OBJ_STB_LOCAL
                     : (s->is_weak || pseudo) ? OBJ_STB_WEAK : OBJ_STB_GLOBAL);
         if (s->defined && s->is_data && !s->is_asm) {
@@ -664,7 +669,7 @@ static void obj_write(const char *path)
              * 全标 NOTYPE 的话链接器只能瞎猜。 */
             type = OBJ_STT_OBJECT;
         }
-        if (pseudo) {
+        if (pseudo && !getenv("C6C_KERNEL_WEAK_UND")) {
             /* 内核模式未解析的 weak 引用：发成 SHN_ABS value=0。
              * 普通 UND weak 在中间遍次被链接器丢弃（值 0、无定义），
              * 但最终链接带 --emit-relocs 会保留，导致 kallsyms 的
@@ -740,6 +745,12 @@ static void obj_write(const char *path)
                     DFIX_SYM[i], X64.nsym, off);
             continue;
         }
+        /* 内核模式 UND weak → SHN_ABS 的符号：值固定 0，链接器直接填常量。
+         * 若仍发 R_X86_64_64，内核 RELOCS 工具会报
+         * "Invalid absolute R_X86_64_64 relocation"（它不接受 ABS 符号的
+         * 绝对重定位）。符号表项保留 ABS 以维持 kallsyms 遍次一致性。 */
+        if (pseudo_syms[DFIX_SYM[i]])
+            continue;
         ob_rela_add(&relad, off, map[DFIX_SYM[i]], OBJ_R_X86_64_64, DFIX_ADD[i]);
     }
     for (i = 0; i < C99_NRL; i++) {
@@ -1053,6 +1064,7 @@ static void obj_write(const char *path)
 
     free(map);
     free(emit);
+    free(pseudo_syms);
     free(seen);
     free(relat.p);
     free(relad.p);
