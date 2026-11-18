@@ -46,7 +46,7 @@ int main(void)
 完整可运行示例见 [examples/err_demo.c6](../../examples/err_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/err_demo.c6
+./c6c/build/c6c -run examples/err_demo.c6
 ```
 
 `err` 速查：
@@ -235,7 +235,7 @@ int handle(const char *s)
 完整可运行示例见 [examples/try_demo.c6](../../examples/try_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/try_demo.c6
+./c6c/build/c6c -run examples/try_demo.c6
 ```
 
 语法规范（EBNF）见 [docs/reference/grammar.md](../reference/grammar.md)。

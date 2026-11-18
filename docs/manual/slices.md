@@ -57,7 +57,7 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 完整可运行示例见 [examples/slice_demo.c6](../../examples/slice_demo.c6)：
 
 ```sh
-./tcc/c6 -B tcc -run examples/slice_demo.c6
+./c6c/build/c6c -run examples/slice_demo.c6
 ```
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。

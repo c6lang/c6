@@ -1291,8 +1291,8 @@ app.cli      0x6101
 - std 模块的号段内置在编译器里，`errbase.def` 里写 `std.*` 是错误（C126）。
 
 ```sh
-./tcc/c6 -B tcc -I . -emit-errbase       # 钉住当前能看见的所有模块
-./tcc/c6 -B tcc -run app/main.c6         # 读 errbase.def，id 不再变
+./tcc/c6 -B tcc -I . -emit-errbase       # 钉住模块（tcc 形态专用，需 -DC6_ENABLE_TCC=ON）
+./c6c/build/c6c -run app/main.c6         # 读 errbase.def，id 不再变
 cmake --build build --target errcheck                             # 表是最新的、约束都还在报错
 ```
 

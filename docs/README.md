@@ -4,6 +4,16 @@
 >
 > 文档按「你现在是什么角色」分三条路。全部文档都只有一个事实来源，互相之间用相对链接引用。
 
+## tcc 与 c6c 的边界
+
+tcc 已从默认构建与交付中退场（`C6_ENABLE_TCC` 默认 `OFF`）：默认编译器是 `c6c`，
+命令示例一律用 `./c6c/build/c6c`。`tcc/` 源码仍保留，只有两个角色——tests1 /
+tests2 / c-testsuite 的**编译语料**，以及 c6c 的**差分 oracle**（`build-tcc`、
+`tests1-check` / `tests2-check`；`build-tcc` 还要宿主 cc 编一个参考 tcc 来产
+`libtcc1.a`）。默认构建下没有 `tcc/c6`、不产出 `libtcc`；需要旧 tcc 形态时用
+`-DC6_ENABLE_TCC=ON`，那条路径的代码原样保留。本文索引里标「tcc 形态」的文档
+与命令只在该开关打开后有效。
+
 ## 三条读者路径
 
 ### 1. 我是使用者：写 c6 代码
@@ -49,8 +59,8 @@
 | [../c6c/README.md](../c6c/README.md) | c6c 自举编译器总入口 | 现行 | c6c 编译与验收 |
 | [../c6c/docs/management.md](../c6c/docs/management.md) | c6c 工程管理规范（清单/锁/打包/固件） | 现行 | 用 c6c 管理工程 |
 | [../c6c/docs/acceptance.md](../c6c/docs/acceptance.md) | c6c 四条验收命令与数字 | 现行 | 查 c6c 验收基线 |
-| [reference/c99-backend.md](reference/c99-backend.md) | C99 输出后端 | 现行 | 跨平台、自举 |
-| [reference/llvm-backend.md](reference/llvm-backend.md) | LLVM IR 后端 | 现行 | 交叉编译 |
+| [reference/c99-backend.md](reference/c99-backend.md) | C99 输出后端（c6c 默认 + tcc 形态） | 现行 | 跨平台、自举 |
+| [reference/llvm-backend.md](reference/llvm-backend.md) | LLVM IR 后端（tcc 形态；c6c 仅 `--emit-llvm`） | 现行（需 `C6_ENABLE_TCC=ON`） | 交叉编译 |
 | [design/plan.md](design/plan.md) | 语言设计总方案 | 现行 | 改语义前 |
 | [design/implementation-notes.md](design/implementation-notes.md) | 实现说明与实现位置 | 现行 | 改代码 |
 | [design/gc-design.md](design/gc-design.md) | 引用计数 GC 设计 | 已落地 | 动托管引用 |

@@ -80,7 +80,7 @@ void drop(struct File *self) { close(self->fd); }
 `__c6_gc_live()` 自证「全程没有泄漏」（`rc=0` 才算过）：
 
 ```sh
-./tcc/c6 -B tcc -run examples/gc_demo.c6
+./c6c/build/c6c -run examples/gc_demo.c6
 ```
 
 代价与尺寸（x86_64，热缓存，跨 TU 不内联）：`@T` 的一次加/减约 2.2 ns，
