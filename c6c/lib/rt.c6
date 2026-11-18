@@ -5850,4 +5850,175 @@ int getopt_long(int argc, char **argv, const char *shortopts,
     return -1;
 }
 
+/* scanf 家族：host tools（gen_init_cpio 等）用 sscanf 解析配置行。
+ * 支持 %s/%d/%i/%o/%u/%x/%c/%n/%%、宽度、'*' 抑制、h/l/ll 长度修饰、
+ * 前导空白跳过（%c/%n 除外）。返回成功赋值数，输入早尽返回 EOF 或已赋值数。 */
+static int c6c_ws(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+int vsscanf(const char *s, const char *fmt, va_list ap)
+{
+    long si = 0;
+    long fi = 0;
+    int assigned = 0;
+
+    while (fmt[fi]) {
+        char fc = fmt[fi];
+
+        if (fc == '%') {
+            int suppress = 0;
+            long width = 0;
+            int longs = 0;          /* 0=默认int 1=long 2=long long -1=short */
+            char conv = 0;
+
+            fi++;
+            if (fmt[fi] == '*') { suppress = 1; fi++; }
+            while (fmt[fi] >= '0' && fmt[fi] <= '9') {
+                width = width * 10 + (fmt[fi] - '0');
+                fi++;
+            }
+            if (fmt[fi] == 'h') { longs = -1; fi++;
+                if (fmt[fi] == 'h') fi++;
+            } else if (fmt[fi] == 'l') { longs = 1; fi++;
+                if (fmt[fi] == 'l') { longs = 2; fi++; }
+            } else if (fmt[fi] == 'L') { longs = 2; fi++; }
+            conv = fmt[fi];
+            if (!conv)
+                break;
+            fi++;
+
+            if (conv == '%') {
+                if (s[si] != '%')
+                    return assigned ? assigned : -1;
+                si++;
+                continue;
+            }
+            /* %n 不消耗输入，也不计入返回值（C 标准），记录目前读过的字符数 */
+            if (conv == 'n') {
+                int *pi = suppress ? 0 : va_arg(ap, int *);
+
+                if (pi) *pi = (int)si;
+                continue;
+            }
+            if (conv != 'c' && conv != '[')
+                while (c6c_ws((unsigned char)s[si]) && s[si]) si++;
+            if (!s[si])
+                return assigned ? assigned : -1;
+
+            if (conv == 'c') {
+                long w = width ? width : 1;
+                long k = 0;
+                char *pc = suppress ? 0 : va_arg(ap, char *);
+
+                for (k = 0; k < w && s[si]; k++, si++)
+                    if (pc) pc[k] = s[si];
+                if (!suppress) assigned++;
+            } else if (conv == 's') {
+                char *dst = suppress ? 0 : va_arg(ap, char *);
+                long cap = width ? width : 0x7FFFFFFF;
+                long k = 0;
+
+                while (k < cap && s[si] && !c6c_ws((unsigned char)s[si])) {
+                    if (dst) dst[k] = s[si];
+                    si++; k++;
+                }
+                if (dst) dst[k] = 0;
+                if (k == 0)
+                    return assigned ? assigned : -1;
+                if (!suppress) assigned++;
+            } else {
+                /* 数值：%d/%i/%o/%u/%x，手动按基数解析 */
+                int neg = 0;
+                unsigned long val = 0;
+                int base = 10;
+                int any = 0;
+                long maxd = width ? width : 0x7FFFFFFF;
+                long nd = 0;
+
+                if (conv == 'o') base = 8;
+                else if (conv == 'x' || conv == 'X') base = 16;
+                else if (conv == 'i') base = 0;
+                if (s[si] == '+' || s[si] == '-') {
+                    neg = (s[si] == '-'); si++; nd++;
+                }
+                if (base == 0) {
+                    if (s[si] == '0' && (s[si + 1] == 'x' || s[si + 1] == 'X')) {
+                        base = 16; si += 2; nd += 2;
+                    } else if (s[si] == '0') { base = 8; }
+                    else { base = 10; }
+                }
+                if (base == 16 && s[si] == '0' && (s[si + 1] == 'x' || s[si + 1] == 'X')) {
+                    si += 2; nd += 2;
+                }
+                while (nd < maxd && s[si]) {
+                    int d;
+                    char cc = s[si];
+
+                    if (cc >= '0' && cc <= '9') d = cc - '0';
+                    else if (cc >= 'a' && cc <= 'f') d = cc - 'a' + 10;
+                    else if (cc >= 'A' && cc <= 'F') d = cc - 'A' + 10;
+                    else break;
+                    if (d >= base) break;
+                    val = val * (unsigned long)base + (unsigned long)d;
+                    any = 1; si++; nd++;
+                }
+                if (!any)
+                    return assigned ? assigned : -1;
+                if (!suppress) {
+                    if (conv == 'd' || conv == 'i') {
+                        if (longs == 2) *(long long *)va_arg(ap, long long *) =
+                            neg ? -(long long)val : (long long)val;
+                        else if (longs == 1) *(long *)va_arg(ap, long *) =
+                            neg ? -(long)val : (long)val;
+                        else if (longs == -1) *(int *)va_arg(ap, int *) =
+                            neg ? -(int)val : (int)val;
+                        else *(int *)va_arg(ap, int *) = neg ? -(int)val : (int)val;
+                    } else {
+                        if (longs == 2) *(unsigned long long *)va_arg(ap, unsigned long long *) = val;
+                        else if (longs == 1) *(unsigned long *)va_arg(ap, unsigned long *) = val;
+                        else if (longs == -1) *(unsigned int *)va_arg(ap, unsigned int *) = (unsigned int)val;
+                        else *(unsigned int *)va_arg(ap, unsigned int *) = (unsigned int)val;
+                    }
+                    assigned++;
+                }
+            }
+        } else if (c6c_ws((unsigned char)fc)) {
+            while (c6c_ws((unsigned char)s[si]) && s[si]) si++;
+            fi++;
+        } else {
+            if (s[si] != fc)
+                return assigned ? assigned : -1;
+            si++; fi++;
+        }
+    }
+    return assigned;
+}
+
+int sscanf(const char *s, const char *fmt, ...)
+{
+    int r = 0;
+    va_list ap = 0;
+
+    va_start(ap, fmt);
+    r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int scanf(const char *fmt, ...)
+{
+    char line[4096] = {0};
+    int r = 0;
+    va_list ap = 0;
+
+    if (!fgets(line, sizeof(line), stdin))
+        return -1;
+    va_start(ap, fmt);
+    r = vsscanf(line, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 #endif /* _C6C_RT_C6 */

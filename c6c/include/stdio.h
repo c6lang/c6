@@ -22,6 +22,9 @@ typedef struct __c6c_FILE FILE;
 
 int printf(const char *fmt, ...);
 int fprintf(FILE *f, const char *fmt, ...);
+int scanf(const char *fmt, ...);
+int sscanf(const char *s, const char *fmt, ...);
+int vsscanf(const char *s, const char *fmt, va_list ap);
 int sprintf(char *dst, const char *fmt, ...);
 int snprintf(char *dst, size_t cap, const char *fmt, ...);
 int vprintf(const char *fmt, va_list ap);
