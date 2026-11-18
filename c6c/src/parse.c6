@@ -22935,6 +22935,11 @@ static void gen_one_global(u32 ty, Declarator *d)
      * 于是代码读 `D+83` 拿到 0（LLVM 后端上一整类"静态初值读出来是 0"的
      * 现象都出自这里）。分配到的 goff 先抄进局部量，后面只用它。 */
     goff = s->goff;
+    /* `void __weak (*pm_power_off)(void);`：weak 修饰的是函数指针**变量**，
+     * 走数据符号路径。不设 STB_WEAK 就和 arch/x86 的强定义 multiple definition。
+     * 函数定义的 weak 在 24037 附近单独处理，这里覆盖数据/变量定义。 */
+    if (SAW_WEAK && (u32)s->val < X64.nsym)
+        X64.sym[(u32)s->val].is_weak = 1;
     /* `__thread`：存储照旧在数据段里（初始化器一条都不用改），只是访问换成
      * `%fs + goff`，并把 [goff, goff+sz) 记进 TLS 影像范围。 */
     if (PA_TLS) {
