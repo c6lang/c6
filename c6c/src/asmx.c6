@@ -873,6 +873,61 @@ static int ax_insn(void)
         img_u8(&AX_IM, 0x05);
         return 1;
     }
+    /* ---- 内核常用的系统/特权指令 ----
+     * 这些都没有显式操作数：输入/输出值靠固定寄存器约束（"=a"/"c"/"d"）
+     * 在段首/段尾由 ax_binds_in/out 搬到帧槽，模板里只写助记符。
+     * 以前它们整条被当作"翻不动"静默丢掉，含 asm 的内核函数于是变成空壳。 */
+    if (strcmp(mn, "cpuid") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0xA2); return 1;
+    }
+    if (strcmp(mn, "rdtsc") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x31); return 1;
+    }
+    if (strcmp(mn, "rdtscp") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x01); img_u8(&AX_IM, 0xF9); return 1;
+    }
+    if (strcmp(mn, "wrmsr") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x30); return 1;
+    }
+    if (strcmp(mn, "rdmsr") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x32); return 1;
+    }
+    if (strcmp(mn, "swapgs") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x01); img_u8(&AX_IM, 0xF8); return 1;
+    }
+    if (strcmp(mn, "xgetbv") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x01); img_u8(&AX_IM, 0xD0); return 1;
+    }
+    if (strcmp(mn, "xsetbv") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x01); img_u8(&AX_IM, 0xD1); return 1;
+    }
+    if (strcmp(mn, "lfence") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0xAE); img_u8(&AX_IM, 0xE8); return 1;
+    }
+    if (strcmp(mn, "mfence") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0xAE); img_u8(&AX_IM, 0xF0); return 1;
+    }
+    if (strcmp(mn, "sfence") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0xAE); img_u8(&AX_IM, 0xF8); return 1;
+    }
+    if (strcmp(mn, "cli") == 0) {
+        img_u8(&AX_IM, 0xFA); return 1;
+    }
+    if (strcmp(mn, "sti") == 0) {
+        img_u8(&AX_IM, 0xFB); return 1;
+    }
+    if (strcmp(mn, "iretq") == 0) {
+        img_u8(&AX_IM, 0x48); img_u8(&AX_IM, 0xCF); return 1;
+    }
+    if (strcmp(mn, "sysret") == 0 || strcmp(mn, "sysretq") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x07); return 1;
+    }
+    if (strcmp(mn, "ud2") == 0) {
+        img_u8(&AX_IM, 0x0F); img_u8(&AX_IM, 0x0B); return 1;
+    }
+    if (strcmp(mn, "pause") == 0) {
+        img_u8(&AX_IM, 0xF3); img_u8(&AX_IM, 0x90); return 1;
+    }
     if (strcmp(mn, "cqto") == 0 || strcmp(mn, "cltd") == 0 || strcmp(mn, "cqo") == 0) {
         img_u8(&AX_IM, 0x48);
         img_u8(&AX_IM, 0x99);

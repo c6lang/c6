@@ -7,6 +7,34 @@
 
 ## 0.6.3 — 2026-11-17
 
+### C 前端：内核高频内联汇编现在真正生成机器码（之前整条被静默丢弃）
+
+上一节记的"完整可运行内核二进制产不出，根因是 native 后端不支持内联汇编"，
+根因查清并修掉了第一层：**不是汇编器翻不动，而是操作数组解析在 `::` 上卡住，
+导致整条 asm 被静默丢弃**。
+
+- 词法器把 `::` 合成**单个** `TK_PUNCT`；原 `try_stmt_asm()` 用
+  `pa_accept_ch(':')` 逐段匹配，遇到 `asm("wrmsr" :: "c"(m), ...)` 直接失败 →
+  `ok=0` → 整组 token 吞掉、一条机器码都不发。改成 `pa_asm_sep()` 状态机，
+  `::` 当两个冒号处理（中间那段操作数表为空）。
+- `asm_one_operand()` 此前只认 `m`/`r`，内核常用的固定寄存器约束
+  `a/b/c/d/S/D` 全被拒。补上物理寄存器表（按宽度选 `%al/%eax/%rax` 等）；
+  输出约束经 `ax_binds_out()` 写回帧槽，输入约束经 `ax_binds_in()` 从帧槽装值。
+- `asmx.c6` 补上 17 条无操作数系统指令编码：`rdtsc`(0F 31)、`wrmsr`(0F 30)、
+  `rdmsr`、`cpuid`(0F A2)、`swapgs`、`lfence/mfence/sfence`、`cli/sti`、
+  `xgetbv/xsetbv`、`iretq/sysret`、`ud2`、`pause` 等。
+
+实测（`/tmp/ia2.c`）：`c6c -c` 的 `.o` 反汇编出现 `0f 31 rdtsc`、
+`0f 30 wrmsr`、`0f a2 cpuid`；`wrmsr` 前三条 `mov` 把实参装进
+`%rcx/%rax/%rdx`，`cpuid` 后四条 `mov` 把 `%rax/%rbx/%rcx/%rdx` 写回——
+固定约束的搬值/写回语义都对（之前只剩空壳栈帧操作）。
+
+回归：`fast` 全绿（LLVM 差分 87/0、ctu、c99suite），`selfhost` 的
+`c6c2 == c6c3` 逐字节 fixpoint。
+
+**还没跨越的坎**：带操作数的端口 I/O（`inb`/`outb` 的 `%dx`/`%al`）尚未覆盖，
+完整内核链接/启动仍需 `.S`、ld 脚本、kbuild、objtool 等工程项。
+
 ### 合并 main 后修复的两个兼容性回归
 
 把 main 合进内核前端分支之后，两处"各自都正确、合起来不兼容"的改动暴露出来：
