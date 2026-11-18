@@ -19013,6 +19013,13 @@ static void gen_one_local(u32 ty, Declarator *d)
         gs = sym_find(nm, sd.nlen);
         if (!gs)
             return;
+        /* 局部 static 改名成 `<函数>.<N>` 后走 gen_one_global，那条路的
+         * `char s[]="lit"` 分支按普通全局创建数据符号、没设 STB_LOCAL。
+         * 两个 TU 的同名 static 局部变量会 multiple definition（内核里
+         * `task_index_to_char.4` 就是这样撞的）。这里按新名字补本地化。 */
+        if ((u32)gs->val < X64.nsym)
+            X64.sym[(u32)gs->val].is_static = 1;
+        gs->is_static = 1;
         ls = sym_add(d->name, d->nlen, gs->type, SC_GLOBAL);
         ls->goff = gs->goff;
         ls->val = gs->val;
@@ -23859,6 +23866,12 @@ static void gen_decl_from_spec(u32 base)
             int fscope_static = (SCOPE && !SCOPE->up && PA_STATIC);
             int had_proto = 0;
 
+            /* 内核模式：inline 函数本地化（发射名带 TU 后缀）。c6c 不做内联，
+             * 会在每个 TU 全量发射 inline 函数体；GCC 的 inline 语义是"每个 TU
+             * 一份、不跨 TU 冲突"，而 c6c 以前发成全局符号，导致 `native_save_fl`
+             * 等与真实定义 multiple definition。按 static 的路子本地化即可。 */
+            if (PA_KERNEL_MODE && PA_INLINE_SEEN && SCOPE && !SCOPE->up)
+                fscope_static = 1;
             enf = fscope_static ? tu_static_name(nm) : nm;
             s = sym_find(nm, d.nlen);
             if (s && s->is_func && ty_func_nparams(s->type) > 0)
