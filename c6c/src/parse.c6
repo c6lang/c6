@@ -22748,6 +22748,13 @@ static void gen_one_global(u32 ty, Declarator *d)
         s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
         s->goff = data_alloc(ty_size(ty), ty_align_of(ty));
         s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+        /* `static const char x[] = "lit"`（内核里极常见）走这条字符串专用路，
+         * 提前 return 不会经过下面 22887 的文件作用域 static 分支——漏设
+         * STB_LOCAL，两个 TU 的同名 static 表就 multiple definition。 */
+        if (SCOPE && !SCOPE->up && PA_STATIC) {
+            s->is_static = 1;
+            X64.sym[(u32)s->val].is_static = 1;
+        }
         memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off,
                (size_t)ty_size(ty) < (size_t)(WIDE_LIT ? n * 4 : n)
                ? (size_t)ty_size(ty) : (size_t)(WIDE_LIT ? n * 4 : n));
@@ -22776,6 +22783,10 @@ static void gen_one_global(u32 ty, Declarator *d)
             s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
             s->goff = data_alloc(ty_size(ty), ty_align_of(ty));
             s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+            if (SCOPE && !SCOPE->up && PA_STATIC) {
+                s->is_static = 1;
+                X64.sym[(u32)s->val].is_static = 1;
+            }
             memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off,
                    (size_t)ty_size(ty) < (size_t)(STR_LIT_ESZ * n)
                    ? (size_t)ty_size(ty) : (size_t)(STR_LIT_ESZ * n));
