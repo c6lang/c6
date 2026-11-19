@@ -45,6 +45,12 @@ static int LL_TMP;          /* SSA 临时名计数器（每个函数清零） */
 
 static void llvm_set_mode(void) { LL_MODE = 1; }
 static int llvm_mode(void) { return LL_MODE; }
+
+/* 同一符号在多个模块/TU 里被重复发射（native 后端按名字 intern、后写覆盖
+ * 先写）。LLVM IR 里重复 define 直接被 clang 拒绝，这里按符号 id 去重；
+ * fnseq 在去重之前推进，避免 &&label 数据重定位的序号错位。 */
+#define LL_SEEN_MAX 16384
+static u8 LL_SEEN[LL_SEEN_MAX];
 static void llvm_set_noprefix(void) { LL_NOPREFIX = 1; }
 
 /* 和 tcc 的 --emit-llvm 对接时要能用裸符号名（rtos-c6 的 C 侧按原名调用）。 */
@@ -247,6 +253,11 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
     if (X64.fnseq < LL_FNSEQ_MAX) {
         LL_FNSEQ_SYM[X64.fnseq] = func_sym;
         LL_FNSEQ_OK[X64.fnseq] = 1;
+    }
+    if (func_sym < LL_SEEN_MAX) {
+        if (LL_SEEN[func_sym])
+            return;
+        LL_SEEN[func_sym] = 1;
     }
 
     /* 形参一律 i64；变参函数带 `...`（va_list 走真 ABI） */
