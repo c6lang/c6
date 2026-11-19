@@ -976,6 +976,26 @@ static int ax_insn(void)
         return 1;
     }
 
+    /* bsr r, r/m：0F BD /r（REX.W 为 bsrq，66 为 16 位）。
+     * 内核 __fls()/fls64() 的 `bsr %1,%0` / `bsrq %1,%q0` 靠它：
+     * AT&T 源在前、目的在后 —— o1=源(r/m)，o2=目的寄存器，
+     * ModRM.reg=目的(o2)，ModRM.rm=源(o1)。不认识 → 整段 asm 被丢
+     * → x 不变 → fls64(x)=x+1 → roundup_pow_of_two() 返回 1
+     * → percpu unit_size=1 → pcpu_dump_alloc_info 里 apl=0 → 除零。 */
+    if (strncmp(mn, "bsr", 3) == 0 &&
+        (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w')) {
+        int csz = 8;
+
+        if (mn[3] == 'l') csz = 4;
+        else if (mn[3] == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind != AXK_REG && o1.kind != AXK_MEM)
+            return 0;
+        ax_emit_rm(0x0F, 0xBD, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
     /* cmpxchg r/m, r（隐含 rax=expected）：0F B1 /r（字节 0F B0 /r）。
      * 内核 __raw_try_cmpxchg 的 `lock cmpxchgq %new, %ptr` 靠它；配合
      * `=@ccz` 输出（setz）得到 success。o1=源寄存器，o2=目的内存。 */
