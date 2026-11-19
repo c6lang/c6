@@ -22,7 +22,12 @@ static void be_emit_fn(IrFn *f, u32 func_sym);
 static void pa_emit_fn(IrFn *f, u32 func_sym)
 {
     ir_optimize(f);
-    if (C99_MODE || llvm_mode())
+    if (C99_MODE) {
+        /* 让 C99 后端知道数据段 VA 区间：kpool 里指向数据段的常量要翻成
+         * `D + off`（native 后端镜像就映射在 0x400000，不需要翻）。 */
+        c99_set_data_range((u64)ELF_BASE_VA + (u64)ELF_HDR, (u64)DATA_IMG.n);
+        be_emit_fn(f, func_sym);
+    } else if (llvm_mode())
         be_emit_fn(f, func_sym);
     else
         x64_compile(&X64, f, func_sym);
@@ -23024,14 +23029,34 @@ static void c99_emit_data(void)
     FILE *f = C99_OUT;
     u32 i = 0;
     u32 last = 0;
+    u32 part = 0;
+    u32 cnt = 0;
 
     for (i = 0; i < DATA_IMG.n; i++)
         if (DATA_IMG.p[i])
             last = i + 1;
+    /* 单个函数里塞几万条 D[i]=v 会让 wasm 编译器报
+     * `local count too large`（LLVM 把每条语句的临时值算成局部变量）。
+     * 按每 500 个非零字节拆一个函数；主函数依次调用。 */
+    for (i = 0; i < last; i++) {
+        if (!DATA_IMG.p[i])
+            continue;
+        if (cnt == 0) {
+            if (part)
+                fprintf(f, "}\n\n");
+            fprintf(f, "static void c6c_init_data_%u(void)\n{\n", part);
+            part++;
+        }
+        fprintf(f, "  D[%u] = %u;\n", i, (unsigned)DATA_IMG.p[i]);
+        cnt++;
+        if (cnt == 500)
+            cnt = 0;
+    }
+    if (part)
+        fprintf(f, "}\n\n");
     fprintf(f, "static void c6c_init_data(void)\n{\n");
-    for (i = 0; i < last; i++)
-        if (DATA_IMG.p[i])
-            fprintf(f, "  D[%u] = %u;\n", i, (unsigned)DATA_IMG.p[i]);
+    for (i = 0; i < part; i++)
+        fprintf(f, "  c6c_init_data_%u();\n", i);
     for (i = 0; i < NDFIX; i++) {
         char sn[256] = {0};
 
@@ -24783,7 +24808,7 @@ static int pa_finish(const char *out)
             fprintf(stderr, "c6c: 写不了 %s\n", out);
             return 1;
         }
-        c99_prologue();
+        c99_prologue(DATA_IMG.n);
         /* 先补所有函数的前向声明（函数体是流式发的，调用点可能在前） */
         for (i = 0; i < C99_NFN; i++) {
             u32 k2 = 0;

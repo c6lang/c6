@@ -77,6 +77,29 @@ static int c99_seen_mark(u32 sym)
     return 1;
 }
 
+/* 数据段的 VA 区间，由 parse.c6 在发射前设置（DATA_IMG 定义在 sym.c6，
+ * 本文件在它之前 include，看不见）。IR_CONSTK 里指向数据段的常量在 native
+ * 后端是 0x400000+off 的裸 VA（镜像就映射在那儿），但 C99 后端的 D[] 是
+ * 宿主 C 编译器分配的地址，必须翻成 `D + off`，否则就是个野指针。 */
+static u64 C99_DATA_LO;
+static u64 C99_DATA_HI;
+static void c99_set_data_range(u64 lo, u64 n)
+{
+    C99_DATA_LO = lo;
+    C99_DATA_HI = lo + n;
+}
+
+/* 把一个 kpool 常量翻成 C 表达式：数据段 VA → D + off，其余照旧 */
+static void c99_emit_kconst(FILE *out, u32 dst, u64 v)
+{
+    if (C99_DATA_HI > C99_DATA_LO && v >= C99_DATA_LO && v < C99_DATA_HI)
+        fprintf(out, "  R(%u) = (uint64_t)(uintptr_t)(D + %llu);\n", dst,
+                (unsigned long long)(v - C99_DATA_LO));
+    else
+        fprintf(out, "  R(%u) = (uint64_t)%lluULL;\n", dst,
+                (unsigned long long)v);
+}
+
 /* C6C_LLVM_WASM=1：C99 后端也走 wasm 友好输出（syscall 声明 + asm 桩子）。
  * Emscripten 目标下 x86 内联汇编、裸 syscall 都不合法。 */
 static int c99_wasm_mode(void)
@@ -237,8 +260,7 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
             break;
         }
         case IR_CONSTK:
-            fprintf(out, "  R(%u) = (uint64_t)%lluULL;\n", o->dst,
-                    (unsigned long long)f->kpool[o->imm]);
+            c99_emit_kconst(out, o->dst, f->kpool[o->imm]);
             break;
         case IR_MOV:
             fprintf(out, "  R(%u) = R(%u);\n", o->dst, o->a);
@@ -576,7 +598,7 @@ static void c99_blobs(void)
     }
 }
 
-static void c99_prologue(void)
+static void c99_prologue(u32 dn)
 {
     fprintf(C99_OUT,
             "/* 由 c6c 的 C99 后端生成（不要手改） */\n"
@@ -624,7 +646,6 @@ static void c99_prologue(void)
             "/* 虚拟寄存器的家就是帧槽：native 后端就是这么落的，\n"
             "   变量被提升成 vreg 之后又会按槽号取地址，两边必须是同一块内存。 */\n"
             "#define R(i) (*(uint64_t*)(rbp - 16 * (long)(i) - 16))\n"
-            "static unsigned char D[8u << 20];\n"
             "static unsigned char c6_alloca_buf[4u << 20];\n"
             "static unsigned long c6_alloca_at;\n"
             "static void *c6_alloca(uint64_t n)\n"
@@ -637,5 +658,10 @@ static void c99_prologue(void)
             "    return c6_alloca_buf + a;\n"
             "}\n"
             "\n");
+    /* D 段按实际数据大小分配。原先写死 8u<<20，但多 TU / 模块重复
+     * 实例化时 DATA_IMG 可达数十 MB（实测 spin 全量 58MB），初始化
+     * 与函数体里的 D[>8M] 全部越界写，gcc/wasm 都踩坏内存。 */
+    fprintf(C99_OUT, "static unsigned char D[%uu];\n",
+            dn > (8u << 20) ? dn : (8u << 20));
     c99_blobs();
 }
