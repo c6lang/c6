@@ -108,6 +108,16 @@ static int c99_wasm_mode(void)
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
+/* wasm 下只有这两个函数真正用 va_arg；其余即使 is_variadic 也不生成 va_list */
+static int c99_real_variadic(const char *nm)
+{
+    return strcmp(nm, "s_c6c_vfmt") == 0 || strcmp(nm, "s_vsscanf") == 0
+        || strcmp(nm, "s_dprintf") == 0 || strcmp(nm, "s_fprintf") == 0
+        || strcmp(nm, "s_printf") == 0 || strcmp(nm, "s_scanf") == 0
+        || strcmp(nm, "s_snprintf") == 0 || strcmp(nm, "s_sprintf") == 0
+        || strcmp(nm, "s_sscanf") == 0;
+}
+
 /* 符号名：ELF 符号可能是 `printf`、`a$b`、`.L1` 这些，统一改成合法 C 标识符 */
 static void c99_sym(u32 sym, char *buf, size_t n)
 {
@@ -201,12 +211,25 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     /* 形参一律 uint64_t；变参函数用 ...（c6c 的变参也全是 64 位整数） */
     /* 一律带 `...`：调用的地方用的是"无原型 + 强制转换"的写法，
      * 定义这边也必须是同一个原型，否则 C 会报原型冲突。 */
-    fprintf(out, "uint64_t %s(", nm);
-    for (k = 0; k < f->nparams; k++)
-        fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
-    if (f->nparams == 0)
-        fprintf(out, "uint64_t p0");
-    fprintf(out, ", ...)\n{\n");
+    /* wasm 下统一函数签名：call_indirect 要求函数表里所有签名精确一致，
+     * 而真变参函数在 wasm 里签名不同，混用会 "function signature mismatch"。
+     * c6c_vfmt/vsscanf 是仅有的两个真用 va_arg 的函数，且只被直接调用，
+     * 保留它们的变参签名；其余一律 8 个定参（实测最多 7 个实参）。 */
+    if (c99_wasm_mode() && !c99_real_variadic(nm)) {
+        fprintf(out, "uint64_t %s(", nm);
+        for (k = 0; k < 8; k++)
+            fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
+        fprintf(out, ")\n{\n");
+        for (k = f->nparams; k < 8; k++)
+            fprintf(out, "  (void)p%u;\n", k);
+    } else {
+        fprintf(out, "uint64_t %s(", nm);
+        for (k = 0; k < f->nparams; k++)
+            fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
+        if (f->nparams == 0)
+            fprintf(out, "uint64_t p0");
+        fprintf(out, ", ...)\n{\n");
+    }
     if (f->nparams == 0)
         fprintf(out, "  (void)p0;\n");
 
@@ -216,7 +239,8 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     frame = (frame + 15u) & ~15u;
     fprintf(out, "  unsigned char FR[%u];\n", frame + 64);
     fprintf(out, "  unsigned char *rbp = FR + %u;\n", frame);
-    if (f->is_variadic)
+    if (f->is_variadic && (!c99_wasm_mode()
+        || c99_real_variadic(nm)))
         fprintf(out, "  va_list ap;\n");
     fprintf(out, "  memset(FR, 0, sizeof FR);\n");
     /* 形参落到帧槽里：函数体里对参数的引用是 "取槽地址再 load"，
@@ -224,10 +248,13 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     for (k = 0; k < f->nparams; k++)
         fprintf(out, "  c6_st8(rbp + (int)%d, p%u);\n",
                 (int)(-16 * (int)(f->params[k] + 1)), k);
-    if (f->is_variadic && f->nparams > 0)
-        fprintf(out, "  va_start(ap, p%u);\n", f->nparams - 1);
-    else if (f->is_variadic)
-        fprintf(out, "  va_start(ap, 0);\n");
+    if (f->is_variadic && (!c99_wasm_mode()
+        || c99_real_variadic(nm))) {
+        if (f->nparams > 0)
+            fprintf(out, "  va_start(ap, p%u);\n", f->nparams - 1);
+        else
+            fprintf(out, "  va_start(ap, 0);\n");
+    }
 
     for (i = 0; i < f->n; i++) {
         IrOp *o = &f->ops[i];
@@ -448,14 +475,33 @@ c99_addr_tail:
                 c99_sym(o->imm, sn, sizeof(sn));
                 /* 函数是流式发出去的，调用点可能在前——块作用域里补一条
                  * 老式声明（无原型）就够了，链接期再对上真正的定义。 */
-                fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))%s)(", o->dst, sn);
+                if (c99_wasm_mode() && !c99_real_variadic(sn))
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))%s)(", o->dst, sn);
+                else
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))%s)(", o->dst, sn);
             } else {
-                fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))R(%u))(", o->dst, o->a);
+                if (c99_wasm_mode())
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))R(%u))(", o->dst, o->a);
+                else
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))R(%u))(", o->dst, o->a);
             }
-            for (j = 0; j < na && j < 64; j++)
-                fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
-            if (na == 0)
-                fprintf(out, "0");
+            if (c99_wasm_mode() && (o->op != IR_CALL || !c99_real_variadic(sn))) {
+                for (j = 0; j < na && j < 64; j++)
+                    fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
+                if (na == 0) {
+                    fprintf(out, "0");
+                    for (j = 1; j < 8; j++)
+                        fprintf(out, ", 0");
+                } else {
+                    for (; j < 8; j++)
+                        fprintf(out, ", 0");
+                }
+            } else {
+                for (j = 0; j < na && j < 64; j++)
+                    fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
+                if (na == 0)
+                    fprintf(out, "0");
+            }
             fprintf(out, ");\n");
             na = 0;
             break;
