@@ -3066,6 +3066,15 @@ static int PACK_SAVE[32];
 static int NPACK_SAVE;
 static int SAW_ALIGN;
 static int ALIGN_SAVE[32];
+/* 文件作用域声明符尾部的 `__aligned(N)`（如内核 __page_aligned_bss）：
+ * skip_attributes 把它记进 SAW_ALIGN，gen_decl_from_spec 在 parse_declarator
+ * 返回后抄到这里，由 gen_one_global 消费。以前全局量的 data_alloc 只用类型的
+ * 自然对齐、忽略这个属性——内核 `static pte_t bm_pte[] __page_aligned_bss`
+ * 被放到页内偏移 0x310，而页表按页基址寻址，PTE 落进错误的页 → 早期 #PF。 */
+static int DECL_ALIGN_REQ;
+/* .o 里 .data 段的 sh_addralign：取所有全局量对齐要求的最大值，obj.c6 用它
+ * 写段头，保证链接器把段放到满足对齐的地址。 */
+static u32 GLOB_MAX_ALIGN = 8;
 
 /* 只看类型时（模板实参 `Vect@int v;` 里的 `int`）不要把后面的标识符
  * 当成声明符的名字吃掉。 */
@@ -23417,7 +23426,16 @@ static void gen_one_global(u32 ty, Declarator *d)
     }
     s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
     sz = ty_size(ty) ? ty_size(ty) : 8;
-    s->goff = data_alloc(sz, ty_align_of(ty));
+    {
+        u32 al = ty_align_of(ty);
+        /* 声明符尾部的 `__aligned(N)` 提高对齐要求（内核 __page_aligned_bss）。 */
+        if ((u32)DECL_ALIGN_REQ > al)
+            al = (u32)DECL_ALIGN_REQ;
+        if (al > GLOB_MAX_ALIGN)
+            GLOB_MAX_ALIGN = al;
+        s->goff = data_alloc(sz, al);
+    }
+    DECL_ALIGN_REQ = 0;
     /* 文件作用域的 static：发射名带 TU 后缀，两个 TU 的同名 static 是
      * 两段互不相干的数据（符号表里仍是短名，见 tu_static_name） */
     if (SCOPE && !SCOPE->up && PA_STATIC) {
@@ -24379,6 +24397,11 @@ static void gen_decl_from_spec(u32 base)
         PA_MGD_KIND = base_mgd_kind;
         PA_TLS = base_tls;
         ty = parse_declarator(base, &d);
+        /* 声明符尾部的 `__aligned(N)` 由 parse_declarator 里的 skip_attributes
+         * 记进 SAW_ALIGN；抄出来给下面 gen_one_global 分配存储时用。函数声明
+         * 分支不用它，随它进函数体前会被下一次 parse 清掉。 */
+        DECL_ALIGN_REQ = SAW_ALIGN;
+        SAW_ALIGN = 0;
         /* tcc 口径：隐式 int 只对非函数声明告警（见 PA_II_PENDING）。 */
         if (PA_II_PENDING && !d.is_func)
             pa_warn_tcc("type defaults to int");

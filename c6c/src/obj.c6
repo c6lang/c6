@@ -998,7 +998,9 @@ static void obj_write(const char *path)
             flags = OBJ_SHF_ALLOC | OBJ_SHF_WRITE;
             sz = DATA_IMG.n;
             off = off_data;
-            align = 8;
+            /* 全局量的 `__aligned(N)`（内核 __page_aligned_bss 要 4096）取最大：
+             * 链接器据此把整个 .data 段放到满足对齐的地址，段内偏移也已按 N 对齐。 */
+            align = GLOB_MAX_ALIGN;
         } else if (i == 3) {            /* .rela.text */
             ty = OBJ_SHT_RELA;
             sz = relat.n;
