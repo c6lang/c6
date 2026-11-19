@@ -22804,9 +22804,19 @@ static void pa_emit_deferred(void)
         for (i = 0; i < f->n; i++) {
             u32 t = 0;
 
-            if (f->ops[i].op != IR_CALL)
+            if (f->ops[i].op == IR_CALL) {
+                t = f->ops[i].imm;
+            } else if (f->ops[i].op == IR_ADDR && (f->ops[i].flags & 2)) {
+                /* 函数指针：cmp_ex_search 作为 bsearch(..., cmp) 的参数被
+                 * `addr [f2] #sym` 取地址，并非 IR_CALL。只看 IR_CALL 会把
+                 * 这类函数当死代码不发射 → 链接后符号为 0 → 间接调用跳 0
+                 * 崩溃（early_fixup_exception → search_extable → bsearch）。
+                 * flags&2 表示 imm 是符号 id；sym2def 只对函数 def 非 0，
+                 * 数据/字符串符号自动跳过。 */
+                t = f->ops[i].imm;
+            } else {
                 continue;
-            t = f->ops[i].imm;
+            }
             if (t < X64.nsym && sym2def[t] && !DEF_FNS[sym2def[t] - 1].emitted) {
                 DEF_FNS[sym2def[t] - 1].emitted = 1;
                 if (nwork < NDEF)

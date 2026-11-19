@@ -317,3 +317,23 @@
   剩余：第 2 次 #PF 是 early_fixup_exception→__inline_bsearch 的 call *%r11
   跳到 0x2300000（= KASLR 偏移本身，未加基址的指针）。疑为 KASLR 重定位
   bug，下一步用 nokaslr 验证。
+
+
+  ★★★ 再进一步：函数指针 DCE 修复，内核启动到 printk（2026-11-20）★★★
+  (3) parse.c6 两遍发射的传递闭包原来只沿 IR_CALL 标记可达；函数指针
+      （`bsearch(..., cmp_ex_search)` 的 `addr [f2] #sym`）被当死代码不发射，
+      链接后符号=0，early_fixup_exception→search_extable→bsearch 的
+      `call *%r11` 跳 0 崩溃。修复：传递闭包也沿 IR_ADDR(flags&2) 的符号
+      imm 标记可达（sym2def 对数据符号为 0，自动跳过）。
+  验证：cmp_ex_search 在 vmlinux 有定义；qemu 指令数 22617→36017，异常
+  从 3 次 #PF 降到仅 1 次（正常处理），到达 printk_ringbuffer 的
+  desc_reserve——内核启动到 printk 子系统。
+
+  剩余根因（已定位）：`arch_try_cmpxchg` 用 `"=@ccz"(success)` 条件码输出
+  约束 + `lock cmpxchg` 内联汇编（arch/x86/include/asm/cmpxchg.h 的
+  __raw_try_cmpxchg）。c6c 的 asmx 不支持 @cc 约束/cmpxchg/命名操作数，
+  整条 asm 被跳过 → success 恒为 0 → desc_reserve 的
+  `while(!try_cmpxchg())` 死循环。atomic CAS 是内核基础原语（自旋锁、
+  调度器、printk），必须解决。
+  方案候选：a) asmx 增加 lock cmpxchg + setz + parse @cc/命名操作数支持；
+  b) 前端把 try_cmpxchg asm 映射到已有 __c6_at_cas runtime。
