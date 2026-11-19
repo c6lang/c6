@@ -20509,12 +20509,14 @@ static int try_stmt_asm(void)
     int isn = 0;
 
     memset(ASM_OPNAME, 0, sizeof(ASM_OPNAME));
-    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")))
+    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")
+          || PA_IS_IDENT("asm_inline")))
         return 0;
     pa_advance();
     while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
            || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
-           || PA_IS_IDENT("__inline__") || PA_IS_IDENT("goto")) {
+           || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")
+           || PA_IS_IDENT("goto")) {
         if (PA_IS_IDENT("goto"))
             isn = 1;
         pa_advance();
@@ -20586,12 +20588,13 @@ static int try_toplevel_asm(void)
     u32 tlen = 0;
     u32 idx = 0;
 
-    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")))
+    if (!(PA_IS_IDENT("asm") || PA_IS_IDENT("__asm") || PA_IS_IDENT("__asm__")
+          || PA_IS_IDENT("asm_inline")))
         return 0;
     pa_advance();
     while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
            || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
-           || PA_IS_IDENT("__inline__")) {
+           || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")) {
         pa_advance();
     }
     if (!pa_is_ch('(')) {
