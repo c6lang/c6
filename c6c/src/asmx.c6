@@ -934,6 +934,48 @@ static int ax_insn(void)
     else
         size = 32;
 
+    /* bts r/m, r / bts r/m, imm8：0F AB /r（寄存器位号）或 0F BA /4 ib。
+     * 内核 arch_set_bit() 的 `btsq %1,%0`（o1=位号 nr，o2=位基 addr）靠它。
+     * 以前不认识 bts → 整段 asm 被丢 → set_bit() 空操作 → apic_maps 全 0
+     * → topology_init_possible_cpus() 除零。ModRM.reg=位号，ModRM.rm=位基。 */
+    if (strncmp(mn, "bts", 3) == 0 &&
+        (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w')) {
+        int csz = 8;
+
+        if (mn[3] == 'l') csz = 4;
+        else if (mn[3] == 'w') csz = 2;
+        if (o2.kind != AXK_MEM && o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind == AXK_REG) {
+            ax_emit_rm(0x0F, 0xAB, o1.reg, &o2, csz == 8, csz == 2);
+            return 1;
+        }
+        if (o1.kind == AXK_IMM) {
+            ax_emit_rm(0x0F, 0xBA, 4, &o2, csz == 8, csz == 2);
+            img_u8(&AX_IM, (u32)o1.disp & 0xff);
+            return 1;
+        }
+        return 0;
+    }
+
+    /* popcnt r, r/m：0F B8 /r（REX.W 为 64 位，66 为 16 位）。
+     * 内核 __arch_hweight32/64 的 `popcntq %[val], %[cnt]` 靠它：
+     * AT&T 源在前、目的在后 —— o1=源(r/m)，o2=目的寄存器，
+     * ModRM.reg=目的(o2)，ModRM.rm=源(o1)。以前不认识 → hweight 恒 0
+     * → bitmap_weight 返回 0 → topology 除零。 */
+    if (strncmp(mn, "popcnt", 6) == 0 &&
+        (mn[6] == 0 || mn[6] == 'q' || mn[6] == 'l' || mn[6] == 'w')) {
+        int csz = 8;
+
+        if (mn[6] == 'l') csz = 4;
+        else if (mn[6] == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        img_u8(&AX_IM, 0xF3);       /* popcnt 必须带 F3 前缀 */
+        ax_emit_rm(0x0F, 0xB8, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
     /* cmpxchg r/m, r（隐含 rax=expected）：0F B1 /r（字节 0F B0 /r）。
      * 内核 __raw_try_cmpxchg 的 `lock cmpxchgq %new, %ptr` 靠它；配合
      * `=@ccz` 输出（setz）得到 success。o1=源寄存器，o2=目的内存。 */
