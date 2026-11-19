@@ -131,6 +131,11 @@ static int c99_wasm_mode(void)
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
+/* wasm 统一签名长度：call_indirect 要求函数表签名一致，所有非真变参
+ * 函数都发成这个数量的 uint64_t 定参。原来写死 8，但游戏里出现 9 参
+ * 函数（draw_box），导致 p8 未声明 / 调用点参数过多。留余量到 12。 */
+#define C99_WASM_NARGS 12
+
 /* wasm 下只有这两个函数真正用 va_arg；其余即使 is_variadic 也不生成 va_list */
 static int c99_real_variadic(const char *nm)
 {
@@ -240,10 +245,10 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
      * 保留它们的变参签名；其余一律 8 个定参（实测最多 7 个实参）。 */
     if (c99_wasm_mode() && !c99_real_variadic(nm)) {
         fprintf(out, "uint64_t %s(", nm);
-        for (k = 0; k < 8; k++)
+        for (k = 0; k < C99_WASM_NARGS; k++)
             fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
         fprintf(out, ")\n{\n");
-        for (k = f->nparams; k < 8; k++)
+        for (k = f->nparams; k < C99_WASM_NARGS; k++)
             fprintf(out, "  (void)p%u;\n", k);
     } else {
         fprintf(out, "uint64_t %s(", nm);
@@ -499,12 +504,12 @@ c99_addr_tail:
                 /* 函数是流式发出去的，调用点可能在前——块作用域里补一条
                  * 老式声明（无原型）就够了，链接期再对上真正的定义。 */
                 if (c99_wasm_mode() && !c99_real_variadic(sn))
-                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))%s)(", o->dst, sn);
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))%s)(", o->dst, sn);
                 else
                     fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))%s)(", o->dst, sn);
             } else {
                 if (c99_wasm_mode())
-                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))R(%u))(", o->dst, o->a);
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))R(%u))(", o->dst, o->a);
                 else
                     fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))R(%u))(", o->dst, o->a);
             }
@@ -513,10 +518,10 @@ c99_addr_tail:
                     fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
                 if (na == 0) {
                     fprintf(out, "0");
-                    for (j = 1; j < 8; j++)
+                    for (j = 1; j < C99_WASM_NARGS; j++)
                         fprintf(out, ", 0");
                 } else {
-                    for (; j < 8; j++)
+                    for (; j < C99_WASM_NARGS; j++)
                         fprintf(out, ", 0");
                 }
             } else {
