@@ -721,7 +721,7 @@ static void obj_write(const char *path)
         int boot_call = s->name
             && (strcmp(s->name, "start_kernel") == 0
                 || strcmp(s->name, "x86_64_start_reservations") == 0);
-        if (!s->defined && !local && getenv("C6C_KERNEL_DCE")
+        if (!s->defined && getenv("C6C_KERNEL_DCE")
             && (!dfix_target || sck_stub) && !boot_call) {
             pseudo = 1;
             pseudo_syms[i] = 1;
