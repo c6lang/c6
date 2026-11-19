@@ -24814,6 +24814,12 @@ static int pa_finish(const char *out)
             u32 k2 = 0;
 
             fprintf(cf, "uint64_t %s(", C99_FNNAME[i]);
+            if (c99_wasm_mode() && !c99_real_variadic(C99_FNNAME[i])) {
+                for (k2 = 0; k2 < 8; k2++)
+                    fprintf(cf, "%suint64_t", k2 ? ", " : "");
+                fprintf(cf, ");\n");
+                continue;
+            }
             for (k2 = 0; k2 < C99_FNNP[i]; k2++)
                 fprintf(cf, "%suint64_t", k2 ? ", " : "");
             if (C99_FNNP[i] == 0)
