@@ -996,6 +996,29 @@ static int ax_insn(void)
         return 1;
     }
 
+    /* tzcnt r, r/m：F3 0F BC /r；bsf r, r/m：0F BC /r。
+     * 内核 __ffs()/variable__ffs() 的 `tzcnt %1,%0` 靠它。以前不认识 →
+     * 整段 asm 被丢 → __ffs(x)=x → find_next_zero_bit() 对全 0 位图
+     * 返回 size → pcpu_find_zero_area() 找不到空间 → kmem_cache_init()
+     * 无限重建 chunk，启动卡死。AT&T 源在前目的在后：o1=源，o2=目的。 */
+    if ((strncmp(mn, "tzcnt", 5) == 0 || strncmp(mn, "bsf", 3) == 0) &&
+        (mn[0] == 't' ? (mn[5] == 0 || mn[5] == 'q' || mn[5] == 'l' || mn[5] == 'w')
+                      : (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w'))) {
+        int csz = 8;
+        char suf = (mn[0] == 't') ? mn[5] : mn[3];
+
+        if (suf == 'l') csz = 4;
+        else if (suf == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind != AXK_REG && o1.kind != AXK_MEM)
+            return 0;
+        if (mn[0] == 't')
+            img_u8(&AX_IM, 0xF3);       /* tzcnt 必须带 F3 前缀 */
+        ax_emit_rm(0x0F, 0xBC, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
     /* cmpxchg r/m, r（隐含 rax=expected）：0F B1 /r（字节 0F B0 /r）。
      * 内核 __raw_try_cmpxchg 的 `lock cmpxchgq %new, %ptr` 靠它；配合
      * `=@ccz` 输出（setz）得到 success。o1=源寄存器，o2=目的内存。 */
