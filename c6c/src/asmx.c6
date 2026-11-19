@@ -28,6 +28,7 @@
 #define AXK_MEM  3
 #define AXK_SYM  4      /* 光秃秃的符号：分支目标 */
 #define AXK_GOTO 5      /* `%l[name]`：asm goto 的 C 标号 */
+#define AXK_CR   6      /* `%cr0`..`%cr15`：控制寄存器（reg 里存 cr 号） */
 
 /* 一条外部重定位：kind 0 = 符号（走 X64.fix，按 rel32 回填），
  * kind 1 = 函数内标号（走 X64.lbl_fix，由 x64_patch_labels 回填）。 */
@@ -528,6 +529,25 @@ static int ax_operand(AxOp *o)
         AX_P++;
         if (!ax_word())
             return 0;
+        /* `%cr0`..`%cr15`：控制寄存器。ax_reg_of 只认通用寄存器，遇到 crN
+         * 会失败 → ax_body 作废整段 asm → native_read_cr2/cr3 返回 0 →
+         * 早期 #PF 的 physaddr 变成 -PAGE_OFFSET → early_make_pgtable 失败 →
+         * 内核启动即 halt、串口无输出。这里单独认 crN。 */
+        if (AX_WLEN >= 3 && AX_WBUF[0] == 'c' && AX_WBUF[1] == 'r') {
+            int cr = 0;
+            u32 j = 2;
+
+            while (j < AX_WLEN && AX_WBUF[j] >= '0' && AX_WBUF[j] <= '9') {
+                cr = cr * 10 + (AX_WBUF[j] - '0');
+                j++;
+            }
+            if (j == AX_WLEN && cr < 16) {
+                o->kind = AXK_CR;
+                o->reg = cr;
+                o->size = 64;
+                return 1;
+            }
+        }
         {
             int sz = 0;
             int r = ax_reg_of(&sz);
@@ -914,6 +934,91 @@ static int ax_insn(void)
     else
         size = 32;
 
+    /* bts r/m, r / bts r/m, imm8：0F AB /r（寄存器位号）或 0F BA /4 ib。
+     * 内核 arch_set_bit() 的 `btsq %1,%0`（o1=位号 nr，o2=位基 addr）靠它。
+     * 以前不认识 bts → 整段 asm 被丢 → set_bit() 空操作 → apic_maps 全 0
+     * → topology_init_possible_cpus() 除零。ModRM.reg=位号，ModRM.rm=位基。 */
+    if (strncmp(mn, "bts", 3) == 0 &&
+        (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w')) {
+        int csz = 8;
+
+        if (mn[3] == 'l') csz = 4;
+        else if (mn[3] == 'w') csz = 2;
+        if (o2.kind != AXK_MEM && o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind == AXK_REG) {
+            ax_emit_rm(0x0F, 0xAB, o1.reg, &o2, csz == 8, csz == 2);
+            return 1;
+        }
+        if (o1.kind == AXK_IMM) {
+            ax_emit_rm(0x0F, 0xBA, 4, &o2, csz == 8, csz == 2);
+            img_u8(&AX_IM, (u32)o1.disp & 0xff);
+            return 1;
+        }
+        return 0;
+    }
+
+    /* popcnt r, r/m：0F B8 /r（REX.W 为 64 位，66 为 16 位）。
+     * 内核 __arch_hweight32/64 的 `popcntq %[val], %[cnt]` 靠它：
+     * AT&T 源在前、目的在后 —— o1=源(r/m)，o2=目的寄存器，
+     * ModRM.reg=目的(o2)，ModRM.rm=源(o1)。以前不认识 → hweight 恒 0
+     * → bitmap_weight 返回 0 → topology 除零。 */
+    if (strncmp(mn, "popcnt", 6) == 0 &&
+        (mn[6] == 0 || mn[6] == 'q' || mn[6] == 'l' || mn[6] == 'w')) {
+        int csz = 8;
+
+        if (mn[6] == 'l') csz = 4;
+        else if (mn[6] == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        img_u8(&AX_IM, 0xF3);       /* popcnt 必须带 F3 前缀 */
+        ax_emit_rm(0x0F, 0xB8, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
+    /* bsr r, r/m：0F BD /r（REX.W 为 bsrq，66 为 16 位）。
+     * 内核 __fls()/fls64() 的 `bsr %1,%0` / `bsrq %1,%q0` 靠它：
+     * AT&T 源在前、目的在后 —— o1=源(r/m)，o2=目的寄存器，
+     * ModRM.reg=目的(o2)，ModRM.rm=源(o1)。不认识 → 整段 asm 被丢
+     * → x 不变 → fls64(x)=x+1 → roundup_pow_of_two() 返回 1
+     * → percpu unit_size=1 → pcpu_dump_alloc_info 里 apl=0 → 除零。 */
+    if (strncmp(mn, "bsr", 3) == 0 &&
+        (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w')) {
+        int csz = 8;
+
+        if (mn[3] == 'l') csz = 4;
+        else if (mn[3] == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind != AXK_REG && o1.kind != AXK_MEM)
+            return 0;
+        ax_emit_rm(0x0F, 0xBD, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
+    /* tzcnt r, r/m：F3 0F BC /r；bsf r, r/m：0F BC /r。
+     * 内核 __ffs()/variable__ffs() 的 `tzcnt %1,%0` 靠它。以前不认识 →
+     * 整段 asm 被丢 → __ffs(x)=x → find_next_zero_bit() 对全 0 位图
+     * 返回 size → pcpu_find_zero_area() 找不到空间 → kmem_cache_init()
+     * 无限重建 chunk，启动卡死。AT&T 源在前目的在后：o1=源，o2=目的。 */
+    if ((strncmp(mn, "tzcnt", 5) == 0 || strncmp(mn, "bsf", 3) == 0) &&
+        (mn[0] == 't' ? (mn[5] == 0 || mn[5] == 'q' || mn[5] == 'l' || mn[5] == 'w')
+                      : (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w'))) {
+        int csz = 8;
+        char suf = (mn[0] == 't') ? mn[5] : mn[3];
+
+        if (suf == 'l') csz = 4;
+        else if (suf == 'w') csz = 2;
+        if (o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind != AXK_REG && o1.kind != AXK_MEM)
+            return 0;
+        if (mn[0] == 't')
+            img_u8(&AX_IM, 0xF3);       /* tzcnt 必须带 F3 前缀 */
+        ax_emit_rm(0x0F, 0xBC, o2.reg, &o1, csz == 8, csz == 2);
+        return 1;
+    }
+
     /* cmpxchg r/m, r（隐含 rax=expected）：0F B1 /r（字节 0F B0 /r）。
      * 内核 __raw_try_cmpxchg 的 `lock cmpxchgq %new, %ptr` 靠它；配合
      * `=@ccz` 输出（setz）得到 success。o1=源寄存器，o2=目的内存。 */
@@ -996,6 +1101,49 @@ static int ax_insn(void)
         img_u8(&AX_IM, 0x0F);
         img_u8(&AX_IM, 0x05);
         return 1;
+    }
+    /* 端口 I/O：inb/outb/inw/outw/inl/outl。内核 early_printk 和串口驱动
+     * 用 outb 往 0x3f8 写字节；以前不认识 → 整段 asm 作废 → 串口毫无输出。
+     * 编码：outb %al,%dx=EE / outw %ax,%dx=66 EF / outl %eax,%dx=EF；
+     *       inb %dx,%al=EC / inw %dx,%ax=66 ED / inl %dx,%eax=ED。 */
+    {
+        size_t ml = strlen(mn);
+        char wc = ml ? mn[ml - 1] : 0;
+        int isout = (ml >= 4 && mn[0] == 'o' && mn[1] == 'u' && mn[2] == 't');
+        int isin = (ml >= 3 && mn[0] == 'i' && mn[1] == 'n');
+
+        if ((isout || isin) && (wc == 'b' || wc == 'w' || wc == 'l') &&
+            isn == 2 && o1.kind == AXK_REG && o2.kind == AXK_REG) {
+            if (wc == 'w')
+                img_u8(&AX_IM, 0x66);
+            if (isout)
+                img_u8(&AX_IM, wc == 'b' ? 0xEE : 0xEF);
+            else
+                img_u8(&AX_IM, wc == 'b' ? 0xEC : 0xED);
+            return 1;
+        }
+    }
+    /* mov %crN,%reg / mov %reg,%crN：控制寄存器传送（0F 20 /r = 读，
+     * 0F 22 /r = 写，ModRM.reg=cr号、ModRM.rm=通用寄存器，强制 REX.W）。
+     * 内核 native_read_cr2()/read_cr3()/write_cr3() 用
+     *   asm volatile("mov %%cr3,%0" : "=r"(v))
+     * 以前 %cr3 不认识 → 整段 asm 静默作废、变量保持初值 0。 */
+    if (isn == 2 && (strcmp(mn, "mov") == 0 || strcmp(mn, "movq") == 0 ||
+                     strcmp(mn, "movl") == 0)) {
+        if (o1.kind == AXK_CR && o2.kind == AXK_REG) {
+            ax_rex(1, o1.reg, 0, o2.reg); /* cr → gpr：0F 20 /r */
+            img_u8(&AX_IM, 0x0F);
+            img_u8(&AX_IM, 0x20);
+            x_modrm(&AX_IM, 3, o1.reg & 7, o2.reg & 7);
+            return 1;
+        }
+        if (o1.kind == AXK_REG && o2.kind == AXK_CR) {
+            ax_rex(1, o2.reg, 0, o1.reg); /* gpr → cr：0F 22 /r */
+            img_u8(&AX_IM, 0x0F);
+            img_u8(&AX_IM, 0x22);
+            x_modrm(&AX_IM, 3, o2.reg & 7, o1.reg & 7);
+            return 1;
+        }
     }
     /* LGDT/LIDT/SGDT/SIDT：0F 01 /reg，一个内存操作数（desc_ptr）。
      * 内核 native_load_idt() 用 `asm volatile("lidt %0"::"m" (*dtr))`；

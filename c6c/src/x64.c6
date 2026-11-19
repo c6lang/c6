@@ -666,11 +666,21 @@ static void x64_func_begin(X64State *st, const char *name, u32 nslot)
         memset(st->lbl_gen, 0, sizeof(st->lbl_gen));
         st->cur_gen = 1;
     }
-    /* 序言：push rbp; mov rbp,rsp; sub rsp,frame */
+    /* 序言：rbp 必须保持在入口 rsp-8（原样），否则第 7 个起栈传形参的
+     * [rbp+16+i*8] 读取全错。callee-saved 寄存器改压在**帧槽下方**：
+     *   push rbp; mov rbp,rsp; sub rsp,frame;
+     *   push rbx,r12,r13,r14,r15,rax(dummy) —— 共 48 字节，rsp%16 回到 0。
+     * 内核 head_64.S 把 boot_params 放在 r15 跨 C 调用，必须保留。 */
     x_push(st->im, R_RBP);
     x_mov_rr64(st->im, R_RBP, R_RSP);
     if (st->frame)
         x_alu_ri64(st->im, 5, R_RSP, st->frame);   /* 81 /5 = sub */
+    x_push(st->im, R_RAX);                         /* 对齐填充（dummy） */
+    x_push(st->im, R_RBX);
+    x_push(st->im, R_R12);
+    x_push(st->im, R_R13);
+    x_push(st->im, R_R14);
+    x_push(st->im, R_R15);
 }
 
 /* 给已经编好的东西再挂一个名字（同一个 off/va）：
@@ -1112,7 +1122,15 @@ img_u8(im, 0x48);                           /* xor rsi, rdx */
     case IR_RET:
         if (o->type != IRT_VOID)
             x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
-        x_leave(im);
+        /* 逆序恢复序言压在帧下方的 r15,r14,r13,r12,rbx；
+         * 再用 add rsp,8 跳过 dummy（不能 pop rax，会毁返回值）。 */
+        x_pop(im, R_R15);
+        x_pop(im, R_R14);
+        x_pop(im, R_R13);
+        x_pop(im, R_R12);
+        x_pop(im, R_RBX);
+        x_alu_ri64(im, 0, R_RSP, 8);   /* 00 /0 = add rsp,8，跳 dummy */
+        x_leave(im);                  /* rsp=rbp; pop rbp -> rsp 指向返回地址 */
         x_ret(im);
         return 0;
     case IR_JMP:
