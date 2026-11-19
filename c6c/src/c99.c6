@@ -63,18 +63,41 @@ static int c99_mode(void) { return C99_MODE; }
 
 /* 同一符号在多个模块/TU 里会被重复发射（native 后端按名字 intern、后写
  * 覆盖先写，所以不重复）。C99 后端若照单全发，gcc 会报一堆 redefinition。
- * 这里按符号 id 去重：只发第一次，后续定义跳过。 */
-#define C99_SEEN_MAX 16384
-static u8 C99_SEEN[C99_SEEN_MAX];
+ *
+ * 原先按符号 id 去重，但跨 TU/模块的重复实例会拿到不同的 id（实测加入
+ * 第二个游戏 TU 时 s_sat_i64_21 出现 17 份同名定义），去重失效。改为按
+ * **符号名**去重：名字相同视为同一实现（native 后端也是按名字 intern）。
+ * 用开放寻址哈希表存已发射的名字，名字由 c99_sym 生成后传入。 */
+#define C99_SEEN_MAX 32768
+#define C99_SEEN_NAMELEN 256
+static char C99_SEEN_NAMES[C99_SEEN_MAX][C99_SEEN_NAMELEN];
 
-static int c99_seen_mark(u32 sym)
+static u32 c99_seen_hash(const char *s)
 {
-    if (sym >= C99_SEEN_MAX)
-        return 1;               /* 超表容量：照旧发出，交给 C 编译器判断 */
-    if (C99_SEEN[sym])
-        return 0;
-    C99_SEEN[sym] = 1;
-    return 1;
+    u32 h = 2166136261u;
+
+    while (*s)
+        h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h & (C99_SEEN_MAX - 1);
+}
+
+static int c99_seen_mark(const char *nm)
+{
+    u32 h = c99_seen_hash(nm);
+    u32 i = 0;
+
+    for (i = 0; i < C99_SEEN_MAX; i++) {
+        u32 k = (h + i) & (C99_SEEN_MAX - 1);
+        char *slot = C99_SEEN_NAMES[k];
+
+        if (!slot[0]) {
+            snprintf(slot, C99_SEEN_NAMELEN, "%s", nm);
+            return 1;               /* 首次发射 */
+        }
+        if (strcmp(slot, nm) == 0)
+            return 0;               /* 同名已发过，跳过 */
+    }
+    return 1;                       /* 表满：照旧发出，交给 C 编译器判断 */
 }
 
 /* 数据段的 VA 区间，由 parse.c6 在发射前设置（DATA_IMG 定义在 sym.c6，
@@ -200,8 +223,8 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     u32 av[64] = {0};
 
     c99_sym(func_sym, nm, sizeof(nm));
-    if (!c99_seen_mark(func_sym))
-        return;                 /* 同一符号已在前面发过，跳过重复定义 */
+    if (!c99_seen_mark(nm))
+        return;                 /* 同名符号已在前面发过，跳过重复定义 */
     if (C99_NFN < C99_FN_MAX) {
         snprintf(C99_FNNAME[C99_NFN], sizeof(C99_FNNAME[0]), "%s", nm);
         C99_FNNP[C99_NFN] = f->nparams;
