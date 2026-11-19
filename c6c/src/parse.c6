@@ -24981,6 +24981,14 @@ static int pa_finish(const char *out)
             u32 k2 = 0;
 
             fprintf(cf, "uint64_t %s(", C99_FNNAME[i]);
+            if (c99_wasm_mode() && !c99_real_variadic(C99_FNNAME[i])) {
+                /* wasm call_indirect 要求签名严格一致：非真变参函数一律
+                 * 声明成 8 定参（和 c99.c6 里的调用点 cast 对齐）。 */
+                for (k2 = 0; k2 < C99_WASM_NARGS; k2++)
+                    fprintf(cf, "%suint64_t", k2 ? ", " : "");
+                fprintf(cf, ");\n");
+                continue;
+            }
             for (k2 = 0; k2 < C99_FNNP[i]; k2++)
                 fprintf(cf, "%suint64_t", k2 ? ", " : "");
             if (C99_FNNP[i] == 0)

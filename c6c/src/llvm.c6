@@ -45,6 +45,43 @@ static int LL_TMP;          /* SSA 临时名计数器（每个函数清零） */
 
 static void llvm_set_mode(void) { LL_MODE = 1; }
 static int llvm_mode(void) { return LL_MODE; }
+
+/* 同一符号在多个模块/TU 里被重复发射（native 后端按名字 intern、后写覆盖
+ * 先写）。LLVM IR 里重复 define 直接被 clang 拒绝。原来按符号 id 去重，但
+ * 跨 TU 重复实例拿到不同 id（实测加入第二个游戏 TU 后 c6_col_abs_2421
+ * 出现 18 份同名 define）。改为按**符号名**去重（开放寻址哈希表）。
+ * fnseq 仍在去重之前推进，避免 &&label 数据重定位的序号错位。 */
+#define LL_SEEN_MAX 32768
+#define LL_SEEN_NAMELEN 256
+static char LL_SEEN_NAMES[LL_SEEN_MAX][LL_SEEN_NAMELEN];
+
+static u32 ll_seen_hash(const char *s)
+{
+    u32 h = 2166136261u;
+
+    while (*s)
+        h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h & (LL_SEEN_MAX - 1);
+}
+
+static int ll_seen_mark(const char *nm)
+{
+    u32 h = ll_seen_hash(nm);
+    u32 i = 0;
+
+    for (i = 0; i < LL_SEEN_MAX; i++) {
+        u32 k = (h + i) & (LL_SEEN_MAX - 1);
+        char *slot = LL_SEEN_NAMES[k];
+
+        if (!slot[0]) {
+            snprintf(slot, LL_SEEN_NAMELEN, "%s", nm);
+            return 1;
+        }
+        if (strcmp(slot, nm) == 0)
+            return 0;
+    }
+    return 1;
+}
 static void llvm_set_noprefix(void) { LL_NOPREFIX = 1; }
 
 /* 和 tcc 的 --emit-llvm 对接时要能用裸符号名（rtos-c6 的 C 侧按原名调用）。 */
@@ -52,6 +89,21 @@ static int llvm_noprefix(void) { return LL_NOPREFIX; }
 
 /* 符号名：ELF 符号可能是 `printf`、`a$b`、`.L1`，统一改成合法 LLVM 标识符。
  * 用户名字一律 `c6_` 前缀，内部辅助用具名 `__c6l_`，两边不会撞。 */
+/* 按原始符号名生成 LLVM 标识符（llvm_sym 的按 id 版本，用于汇编跳板名） */
+static void llvm_sym_name(const char *s, char *buf, size_t n)
+{
+    size_t i = 0, k = 0;
+
+    if (!LL_NOPREFIX) { buf[k++]='c'; buf[k++]='6'; buf[k++]='_'; }
+    for (i = 0; s[i] && k + 4 < n; i++) {
+        char c = s[i];
+        if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')
+            buf[k++] = c;
+        else { buf[k++]='_'; buf[k++]="0123456789abcdef"[(c>>4)&0xF]; buf[k++]= "0123456789abcdef"[c&0xF]; }
+    }
+    buf[k] = 0;
+}
+
 static void llvm_sym(u32 sym, char *buf, size_t n)
 {
     const char *s = (sym < X64.nsym && X64.sym[sym].name) ? X64.sym[sym].name : "?";
@@ -248,6 +300,8 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
         LL_FNSEQ_SYM[X64.fnseq] = func_sym;
         LL_FNSEQ_OK[X64.fnseq] = 1;
     }
+    if (!ll_seen_mark(nm))
+        return;                 /* 同名 define 已发过，跳过 */
 
     /* 形参一律 i64；变参函数带 `...`（va_list 走真 ABI） */
     fprintf(out, "define %si64 @%s(",
@@ -895,6 +949,21 @@ static void llvm_blobs(FILE *cf)
 
     if (NASMBLOB == 0)
         return;
+    /* wasm 目标没有 x86 汇编：跳过 GAS 文本，改为每个跳板发一个返回 0 的
+     * IR 函数（和 C99 后端的 c99_wasm_mode 桩子一致），这样 bitcast 引用
+     * 有定义、clang 不再报 "use of undefined value" / "cannot compile
+     * inline asm"。 */
+    if (getenv("C6C_LLVM_WASM")) {
+        fprintf(cf, "\n; wasm 汇编跳板桩子\n");
+        for (i = 0; i < NASMBLOB; i++) {
+            const AsmBlob *b = &ASMBLOBS[i];
+            char sn[300] = {0};
+
+            llvm_sym_name(b->name, sn, sizeof(sn));
+            fprintf(cf, "define i64 @%s(i64, ...) { ret i64 0 }\n", sn);
+        }
+        return;
+    }
     fprintf(cf, "\n; 汇编跳板\n");
     for (i = 0; i < NASMBLOB; i++) {
         const AsmBlob *b = &ASMBLOBS[i];
@@ -1131,19 +1200,60 @@ static int llvm_finish(const char *out)
     llvm_prologue(cf);
     llvm_emit_data(cf, dn);
     /* 外部符号：引用过但本模块没定义的，发一条 declare（调用点走 bitcast，
-     * 签名只作占位，不影响实参传递） */
-    for (i = 0; i < LL_NREF; i++) {
-        char sn[256] = {0};
-        int defined = 0;
+     * 签名只作占位，不影响实参传递）。注意不能只靠 LL_FNNAME 比对：跨 TU
+     * 引用 id 与定义 id 不同、生成的名字也可能不同，会造成 declare 和 define
+     * 同名但签名不一致（clang "invalid redefinition"）。这里从暂存流里扫出
+     * 所有真正的 define 名字来排除。 */
+    {
+        char *tmpbuf = NULL;
+        long tsz = 0;
 
-        llvm_sym(LL_REF[i], sn, sizeof(sn));
-        for (k = 0; k < LL_NFN; k++)
-            if (strcmp(LL_FNNAME[k], sn) == 0) {
-                defined = 1;
-                break;
+        if (LL_TMPNAME) {
+            FILE *tf = fopen(LL_TMPNAME, "rb");
+
+            if (tf) {
+                fseek(tf, 0, SEEK_END);
+                tsz = ftell(tf);
+                fseek(tf, 0, SEEK_SET);
+                tmpbuf = (char *)malloc((size_t)tsz + 1);
+                if (tmpbuf) {
+                    if (fread(tmpbuf, 1, (size_t)tsz, tf) != (size_t)tsz) {
+                        free(tmpbuf);
+                        tmpbuf = NULL;
+                    } else
+                        tmpbuf[tsz] = 0;
+                }
+                fclose(tf);
             }
-        if (!defined)
-            fprintf(cf, "declare i64 @%s(i64, ...)\n", sn);
+        }
+        for (i = 0; i < LL_NREF; i++) {
+            char sn[256] = {0};
+            char needle[300] = {0};
+            int defined = 0;
+
+            llvm_sym(LL_REF[i], sn, sizeof(sn));
+            snprintf(needle, sizeof(needle), "define i64 @%s(", sn);
+            if (tmpbuf && strstr(tmpbuf, needle))
+                defined = 1;
+            snprintf(needle, sizeof(needle), "define internal i64 @%s(", sn);
+            if (tmpbuf && strstr(tmpbuf, needle))
+                defined = 1;
+            /* wasm 模式下汇编跳板被发成 prologue 里的 define i64 @...，
+             * 不在暂存流里，直接按 blob 名字判断 */
+            if (getenv("C6C_LLVM_WASM")) {
+                u32 bi = 0;
+
+                for (bi = 0; bi < NASMBLOB; bi++) {
+                    char bn[300] = {0};
+
+                    llvm_sym_name(ASMBLOBS[bi].name, bn, sizeof(bn));
+                    if (strcmp(bn, sn) == 0) { defined = 1; break; }
+                }
+            }
+            if (!defined)
+                fprintf(cf, "declare i64 @%s(i64, ...)\n", sn);
+        }
+        free(tmpbuf);
     }
     fprintf(cf, "\n");
     fclose(LL_FNOUT);

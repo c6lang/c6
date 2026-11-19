@@ -61,6 +61,91 @@ static void c99_reloc_drop_range(u32 lo, u32 hi)
 static void c99_set_mode(void) { C99_MODE = 1; }
 static int c99_mode(void) { return C99_MODE; }
 
+/* 同一符号在多个模块/TU 里会被重复发射（native 后端按名字 intern、后写
+ * 覆盖先写，所以不重复）。C99 后端若照单全发，gcc 会报一堆 redefinition。
+ *
+ * 原先按符号 id 去重，但跨 TU/模块的重复实例会拿到不同的 id（实测加入
+ * 第二个游戏 TU 时 s_sat_i64_21 出现 17 份同名定义），去重失效。改为按
+ * **符号名**去重：名字相同视为同一实现（native 后端也是按名字 intern）。
+ * 用开放寻址哈希表存已发射的名字，名字由 c99_sym 生成后传入。 */
+#define C99_SEEN_MAX 32768
+#define C99_SEEN_NAMELEN 256
+static char C99_SEEN_NAMES[C99_SEEN_MAX][C99_SEEN_NAMELEN];
+
+static u32 c99_seen_hash(const char *s)
+{
+    u32 h = 2166136261u;
+
+    while (*s)
+        h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h & (C99_SEEN_MAX - 1);
+}
+
+static int c99_seen_mark(const char *nm)
+{
+    u32 h = c99_seen_hash(nm);
+    u32 i = 0;
+
+    for (i = 0; i < C99_SEEN_MAX; i++) {
+        u32 k = (h + i) & (C99_SEEN_MAX - 1);
+        char *slot = C99_SEEN_NAMES[k];
+
+        if (!slot[0]) {
+            snprintf(slot, C99_SEEN_NAMELEN, "%s", nm);
+            return 1;               /* 首次发射 */
+        }
+        if (strcmp(slot, nm) == 0)
+            return 0;               /* 同名已发过，跳过 */
+    }
+    return 1;                       /* 表满：照旧发出，交给 C 编译器判断 */
+}
+
+/* 数据段的 VA 区间，由 parse.c6 在发射前设置（DATA_IMG 定义在 sym.c6，
+ * 本文件在它之前 include，看不见）。IR_CONSTK 里指向数据段的常量在 native
+ * 后端是 0x400000+off 的裸 VA（镜像就映射在那儿），但 C99 后端的 D[] 是
+ * 宿主 C 编译器分配的地址，必须翻成 `D + off`，否则就是个野指针。 */
+static u64 C99_DATA_LO;
+static u64 C99_DATA_HI;
+static void c99_set_data_range(u64 lo, u64 n)
+{
+    C99_DATA_LO = lo;
+    C99_DATA_HI = lo + n;
+}
+
+/* 把一个 kpool 常量翻成 C 表达式：数据段 VA → D + off，其余照旧 */
+static void c99_emit_kconst(FILE *out, u32 dst, u64 v)
+{
+    if (C99_DATA_HI > C99_DATA_LO && v >= C99_DATA_LO && v < C99_DATA_HI)
+        fprintf(out, "  R(%u) = (uint64_t)(uintptr_t)(D + %llu);\n", dst,
+                (unsigned long long)(v - C99_DATA_LO));
+    else
+        fprintf(out, "  R(%u) = (uint64_t)%lluULL;\n", dst,
+                (unsigned long long)v);
+}
+
+/* C6C_LLVM_WASM=1：C99 后端也走 wasm 友好输出（syscall 声明 + asm 桩子）。
+ * Emscripten 目标下 x86 内联汇编、裸 syscall 都不合法。 */
+static int c99_wasm_mode(void)
+{
+    const char *v = getenv("C6C_LLVM_WASM");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+/* wasm 统一签名长度：call_indirect 要求函数表签名一致，所有非真变参
+ * 函数都发成这个数量的 uint64_t 定参。原来写死 8，但游戏里出现 9 参
+ * 函数（draw_box），导致 p8 未声明 / 调用点参数过多。留余量到 12。 */
+#define C99_WASM_NARGS 12
+
+/* wasm 下只有这两个函数真正用 va_arg；其余即使 is_variadic 也不生成 va_list */
+static int c99_real_variadic(const char *nm)
+{
+    return strcmp(nm, "s_c6c_vfmt") == 0 || strcmp(nm, "s_vsscanf") == 0
+        || strcmp(nm, "s_dprintf") == 0 || strcmp(nm, "s_fprintf") == 0
+        || strcmp(nm, "s_printf") == 0 || strcmp(nm, "s_scanf") == 0
+        || strcmp(nm, "s_snprintf") == 0 || strcmp(nm, "s_sprintf") == 0
+        || strcmp(nm, "s_sscanf") == 0;
+}
+
 /* 符号名：ELF 符号可能是 `printf`、`a$b`、`.L1` 这些，统一改成合法 C 标识符 */
 static void c99_sym(u32 sym, char *buf, size_t n)
 {
@@ -143,6 +228,8 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     u32 av[64] = {0};
 
     c99_sym(func_sym, nm, sizeof(nm));
+    if (!c99_seen_mark(nm))
+        return;                 /* 同名符号已在前面发过，跳过重复定义 */
     if (C99_NFN < C99_FN_MAX) {
         snprintf(C99_FNNAME[C99_NFN], sizeof(C99_FNNAME[0]), "%s", nm);
         C99_FNNP[C99_NFN] = f->nparams;
@@ -152,12 +239,25 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     /* 形参一律 uint64_t；变参函数用 ...（c6c 的变参也全是 64 位整数） */
     /* 一律带 `...`：调用的地方用的是"无原型 + 强制转换"的写法，
      * 定义这边也必须是同一个原型，否则 C 会报原型冲突。 */
-    fprintf(out, "uint64_t %s(", nm);
-    for (k = 0; k < f->nparams; k++)
-        fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
-    if (f->nparams == 0)
-        fprintf(out, "uint64_t p0");
-    fprintf(out, ", ...)\n{\n");
+    /* wasm 下统一函数签名：call_indirect 要求函数表里所有签名精确一致，
+     * 而真变参函数在 wasm 里签名不同，混用会 "function signature mismatch"。
+     * c6c_vfmt/vsscanf 是仅有的两个真用 va_arg 的函数，且只被直接调用，
+     * 保留它们的变参签名；其余一律 8 个定参（实测最多 7 个实参）。 */
+    if (c99_wasm_mode() && !c99_real_variadic(nm)) {
+        fprintf(out, "uint64_t %s(", nm);
+        for (k = 0; k < C99_WASM_NARGS; k++)
+            fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
+        fprintf(out, ")\n{\n");
+        for (k = f->nparams; k < C99_WASM_NARGS; k++)
+            fprintf(out, "  (void)p%u;\n", k);
+    } else {
+        fprintf(out, "uint64_t %s(", nm);
+        for (k = 0; k < f->nparams; k++)
+            fprintf(out, "%suint64_t p%u", k ? ", " : "", k);
+        if (f->nparams == 0)
+            fprintf(out, "uint64_t p0");
+        fprintf(out, ", ...)\n{\n");
+    }
     if (f->nparams == 0)
         fprintf(out, "  (void)p0;\n");
 
@@ -167,7 +267,8 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     frame = (frame + 15u) & ~15u;
     fprintf(out, "  unsigned char FR[%u];\n", frame + 64);
     fprintf(out, "  unsigned char *rbp = FR + %u;\n", frame);
-    if (f->is_variadic)
+    if (f->is_variadic && (!c99_wasm_mode()
+        || c99_real_variadic(nm)))
         fprintf(out, "  va_list ap;\n");
     fprintf(out, "  memset(FR, 0, sizeof FR);\n");
     /* 形参落到帧槽里：函数体里对参数的引用是 "取槽地址再 load"，
@@ -175,10 +276,13 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
     for (k = 0; k < f->nparams; k++)
         fprintf(out, "  c6_st8(rbp + (int)%d, p%u);\n",
                 (int)(-16 * (int)(f->params[k] + 1)), k);
-    if (f->is_variadic && f->nparams > 0)
-        fprintf(out, "  va_start(ap, p%u);\n", f->nparams - 1);
-    else if (f->is_variadic)
-        fprintf(out, "  va_start(ap, 0);\n");
+    if (f->is_variadic && (!c99_wasm_mode()
+        || c99_real_variadic(nm))) {
+        if (f->nparams > 0)
+            fprintf(out, "  va_start(ap, p%u);\n", f->nparams - 1);
+        else
+            fprintf(out, "  va_start(ap, 0);\n");
+    }
 
     for (i = 0; i < f->n; i++) {
         IrOp *o = &f->ops[i];
@@ -211,8 +315,7 @@ static void c99_emit_fn(IrFn *f, u32 func_sym)
             break;
         }
         case IR_CONSTK:
-            fprintf(out, "  R(%u) = (uint64_t)%lluULL;\n", o->dst,
-                    (unsigned long long)f->kpool[o->imm]);
+            c99_emit_kconst(out, o->dst, f->kpool[o->imm]);
             break;
         case IR_MOV:
             fprintf(out, "  R(%u) = R(%u);\n", o->dst, o->a);
@@ -400,14 +503,33 @@ c99_addr_tail:
                 c99_sym(o->imm, sn, sizeof(sn));
                 /* 函数是流式发出去的，调用点可能在前——块作用域里补一条
                  * 老式声明（无原型）就够了，链接期再对上真正的定义。 */
-                fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))%s)(", o->dst, sn);
+                if (c99_wasm_mode() && !c99_real_variadic(sn))
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))%s)(", o->dst, sn);
+                else
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))%s)(", o->dst, sn);
             } else {
-                fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))R(%u))(", o->dst, o->a);
+                if (c99_wasm_mode())
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))R(%u))(", o->dst, o->a);
+                else
+                    fprintf(out, "  R(%u) = ((uint64_t(*)(uint64_t, ...))R(%u))(", o->dst, o->a);
             }
-            for (j = 0; j < na && j < 64; j++)
-                fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
-            if (na == 0)
-                fprintf(out, "0");
+            if (c99_wasm_mode() && (o->op != IR_CALL || !c99_real_variadic(sn))) {
+                for (j = 0; j < na && j < 64; j++)
+                    fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
+                if (na == 0) {
+                    fprintf(out, "0");
+                    for (j = 1; j < C99_WASM_NARGS; j++)
+                        fprintf(out, ", 0");
+                } else {
+                    for (; j < C99_WASM_NARGS; j++)
+                        fprintf(out, ", 0");
+                }
+            } else {
+                for (j = 0; j < na && j < 64; j++)
+                    fprintf(out, "%sR(%u)", j ? ", " : "", av[j]);
+                if (na == 0)
+                    fprintf(out, "0");
+            }
             fprintf(out, ");\n");
             na = 0;
             break;
@@ -504,6 +626,15 @@ static void c99_blobs(void)
 
     if (NASMBLOB == 0)
         return;
+    if (c99_wasm_mode()) {
+        u32 i = 0;
+
+        fprintf(C99_OUT, "\n/* wasm 汇编跳板桩子 */\n");
+        for (i = 0; i < NASMBLOB; i++)
+            fprintf(C99_OUT, "uint64_t s_%s(uint64_t, ...) { return 0; }\n",
+                    ASMBLOBS[i].name);
+        return;
+    }
     fprintf(C99_OUT, "\n/* 汇编跳板 */\n");
     for (i = 0; i < NASMBLOB; i++) {
         const AsmBlob *b = &ASMBLOBS[i];
@@ -541,7 +672,7 @@ static void c99_blobs(void)
     }
 }
 
-static void c99_prologue(void)
+static void c99_prologue(u32 dn)
 {
     fprintf(C99_OUT,
             "/* 由 c6c 的 C99 后端生成（不要手改） */\n"
@@ -549,6 +680,7 @@ static void c99_prologue(void)
             "#include <string.h>\n"
             "#include <stdarg.h>\n"
             "#include <unistd.h>\n"
+            "extern long syscall(long n, ...);\n"
             "\n"
             "typedef union { float f; uint32_t u; } c6_u32;\n"
             "typedef union { double d; uint64_t u; } c6_u64;\n"
@@ -588,7 +720,6 @@ static void c99_prologue(void)
             "/* 虚拟寄存器的家就是帧槽：native 后端就是这么落的，\n"
             "   变量被提升成 vreg 之后又会按槽号取地址，两边必须是同一块内存。 */\n"
             "#define R(i) (*(uint64_t*)(rbp - 16 * (long)(i) - 16))\n"
-            "static unsigned char D[8u << 20];\n"
             "static unsigned char c6_alloca_buf[4u << 20];\n"
             "static unsigned long c6_alloca_at;\n"
             "static void *c6_alloca(uint64_t n)\n"
@@ -601,5 +732,10 @@ static void c99_prologue(void)
             "    return c6_alloca_buf + a;\n"
             "}\n"
             "\n");
+    /* D 段按实际数据大小分配。原先写死 8u<<20，但多 TU / 模块重复
+     * 实例化时 DATA_IMG 可达数十 MB（实测 spin 全量 58MB），初始化
+     * 与函数体里的 D[>8M] 全部越界写，gcc/wasm 都踩坏内存。 */
+    fprintf(C99_OUT, "static unsigned char D[%uu];\n",
+            dn > (8u << 20) ? dn : (8u << 20));
     c99_blobs();
 }
