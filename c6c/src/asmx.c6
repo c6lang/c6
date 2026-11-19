@@ -28,6 +28,7 @@
 #define AXK_MEM  3
 #define AXK_SYM  4      /* 光秃秃的符号：分支目标 */
 #define AXK_GOTO 5      /* `%l[name]`：asm goto 的 C 标号 */
+#define AXK_CR   6      /* `%cr0`..`%cr15`：控制寄存器（reg 里存 cr 号） */
 
 /* 一条外部重定位：kind 0 = 符号（走 X64.fix，按 rel32 回填），
  * kind 1 = 函数内标号（走 X64.lbl_fix，由 x64_patch_labels 回填）。 */
@@ -528,6 +529,25 @@ static int ax_operand(AxOp *o)
         AX_P++;
         if (!ax_word())
             return 0;
+        /* `%cr0`..`%cr15`：控制寄存器。ax_reg_of 只认通用寄存器，遇到 crN
+         * 会失败 → ax_body 作废整段 asm → native_read_cr2/cr3 返回 0 →
+         * 早期 #PF 的 physaddr 变成 -PAGE_OFFSET → early_make_pgtable 失败 →
+         * 内核启动即 halt、串口无输出。这里单独认 crN。 */
+        if (AX_WLEN >= 3 && AX_WBUF[0] == 'c' && AX_WBUF[1] == 'r') {
+            int cr = 0;
+            u32 j = 2;
+
+            while (j < AX_WLEN && AX_WBUF[j] >= '0' && AX_WBUF[j] <= '9') {
+                cr = cr * 10 + (AX_WBUF[j] - '0');
+                j++;
+            }
+            if (j == AX_WLEN && cr < 16) {
+                o->kind = AXK_CR;
+                o->reg = cr;
+                o->size = 64;
+                return 1;
+            }
+        }
         {
             int sz = 0;
             int r = ax_reg_of(&sz);
@@ -996,6 +1016,49 @@ static int ax_insn(void)
         img_u8(&AX_IM, 0x0F);
         img_u8(&AX_IM, 0x05);
         return 1;
+    }
+    /* 端口 I/O：inb/outb/inw/outw/inl/outl。内核 early_printk 和串口驱动
+     * 用 outb 往 0x3f8 写字节；以前不认识 → 整段 asm 作废 → 串口毫无输出。
+     * 编码：outb %al,%dx=EE / outw %ax,%dx=66 EF / outl %eax,%dx=EF；
+     *       inb %dx,%al=EC / inw %dx,%ax=66 ED / inl %dx,%eax=ED。 */
+    {
+        size_t ml = strlen(mn);
+        char wc = ml ? mn[ml - 1] : 0;
+        int isout = (ml >= 4 && mn[0] == 'o' && mn[1] == 'u' && mn[2] == 't');
+        int isin = (ml >= 3 && mn[0] == 'i' && mn[1] == 'n');
+
+        if ((isout || isin) && (wc == 'b' || wc == 'w' || wc == 'l') &&
+            isn == 2 && o1.kind == AXK_REG && o2.kind == AXK_REG) {
+            if (wc == 'w')
+                img_u8(&AX_IM, 0x66);
+            if (isout)
+                img_u8(&AX_IM, wc == 'b' ? 0xEE : 0xEF);
+            else
+                img_u8(&AX_IM, wc == 'b' ? 0xEC : 0xED);
+            return 1;
+        }
+    }
+    /* mov %crN,%reg / mov %reg,%crN：控制寄存器传送（0F 20 /r = 读，
+     * 0F 22 /r = 写，ModRM.reg=cr号、ModRM.rm=通用寄存器，强制 REX.W）。
+     * 内核 native_read_cr2()/read_cr3()/write_cr3() 用
+     *   asm volatile("mov %%cr3,%0" : "=r"(v))
+     * 以前 %cr3 不认识 → 整段 asm 静默作废、变量保持初值 0。 */
+    if (isn == 2 && (strcmp(mn, "mov") == 0 || strcmp(mn, "movq") == 0 ||
+                     strcmp(mn, "movl") == 0)) {
+        if (o1.kind == AXK_CR && o2.kind == AXK_REG) {
+            ax_rex(1, o1.reg, 0, o2.reg); /* cr → gpr：0F 20 /r */
+            img_u8(&AX_IM, 0x0F);
+            img_u8(&AX_IM, 0x20);
+            x_modrm(&AX_IM, 3, o1.reg & 7, o2.reg & 7);
+            return 1;
+        }
+        if (o1.kind == AXK_REG && o2.kind == AXK_CR) {
+            ax_rex(1, o2.reg, 0, o1.reg); /* gpr → cr：0F 22 /r */
+            img_u8(&AX_IM, 0x0F);
+            img_u8(&AX_IM, 0x22);
+            x_modrm(&AX_IM, 3, o2.reg & 7, o1.reg & 7);
+            return 1;
+        }
     }
     /* LGDT/LIDT/SGDT/SIDT：0F 01 /reg，一个内存操作数（desc_ptr）。
      * 内核 native_load_idt() 用 `asm volatile("lidt %0"::"m" (*dtr))`；
