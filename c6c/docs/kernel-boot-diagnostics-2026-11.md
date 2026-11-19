@@ -30,11 +30,15 @@
      内核/DCE 上下文中未完整清零，`.ctor`（偏移 24）残留栈垃圾 8。
      已在 /tmp/c6c-min 用命名局部（c6c 对 `&local` 会 `rep stos` 清零）绕过，
      故障消失，启动推进到时钟源函数指针 fault（下一处待查）。
-   - 复合字面量/指定初始化器的局部聚合对象未零初始化未提及字段：
-     独立复现 `&(struct A){.align=256}` 只写偏移 0，余下字节保留栈垃圾；
-     而 `struct A a = {}` 会发出 `rep stos` 清零。这是一般性 c6c 正确性缺陷，
-     推荐修复点：`gen_init_obj` / `gen_local_braced_new`（parse.c6 ~18770）
-     在聚合初始化前先按 `ty_size` 清零目标，或补齐 `init_leaf_walk` 的零填充。
+   - ~~复合字面量未零初始化未提及字段~~ **已修复（commit db38cea）**：
+     表达式位置的 `(T){...}` 现在先 `gen_zero_obj(addr, ty_size(ty))` 再铺
+     初始化器。复现器确认发出 `rep stos` 清零 40 字节；内核用修复后的 c6c
+     重编 `workqueue.c`、不施加任何源码 workaround，`pool_workqueue` 的
+     `ctor=0x8` 故障消失。
+   - **下一处 fault（未定位）**：`tk_clock_read` 里 `call *%r11` 跳到
+     `0xffffffff84800baa`（rodata 区，近 `__end_rodata_aligned`），CR2 同值。
+     `clocksource_jiffies.read` 在 ELF 里合法（`jiffies_read`），怀疑是
+     timekeeping 选中的另一个 clocksource 的 `.read` 被初始化器缺陷污染。
 
 2. **工具链依赖未消除**：
    - c6c 没有独立汇编器；`.S`（含 ELF32/16 位实模式）仍用 GNU as。

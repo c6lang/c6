@@ -2510,6 +2510,7 @@ static int cm_expand(int role)
 static u32 parse_typename(void);
 static void gen_decl_from_spec(u32 base);
 static u32 gen_unary(void);
+static void gen_zero_obj(u32 addr, u32 sz);
 static void init_skip_value(void);
 static void init_skip_expr(void);
 static void skip_attributes(void);
@@ -14653,6 +14654,10 @@ typedef struct InitSave InitSave;
 
                 slot = frame_slots_for(capn * esz);
                 irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
+                /* 复合字面量未显式初始化的元素必须是 0（C99 6.5.2.5p7）：
+                 * 先整块清零，再铺初始化器。否则栈上残留垃圾，例如内核
+                 * &(struct kmem_cache_args){ .align = 256 } 的 .ctor 拿到 8。 */
+                gen_zero_obj(addr, capn * esz);
                 gen_init_obj(addr, ty_array(et, capn), 0);
                 /* 复合字面量是左值（`&(int[]){…}` 要能取地址） */
                 PEND_LVAL = 1;
@@ -14666,6 +14671,8 @@ typedef struct InitSave InitSave;
             }
             slot = frame_slots_for(ty_size(ty));
             irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
+            /* 同上：结构体复合字面量先把未提及的成员清零（.ctor 拿到 8 的修复）。 */
+            gen_zero_obj(addr, ty_size(ty));
             gen_init_obj(addr, ty, 0);
             PEND_LVAL = 1;
             PEND_TY = ty;
