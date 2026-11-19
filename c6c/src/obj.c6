@@ -589,6 +589,7 @@ static void obj_write(const char *path)
     u8 *emit = NULL;            /* 内核模式：UND 且未被重定位引用的符号不发表项 */
     u8 *seen = NULL;            /* 数据段里已落过重定位的字节（去重） */
     u8 *pseudo_syms = NULL;     /* 内核模式 UND weak → ret stub 的符号 id */
+    u8 *call_target = NULL;     /* 内核模式：被存活 E8 call 引用的 UND 符号 id */
     u32 weak_stub_off = 0;      /* .text 末尾 ret stub 的偏移 */
     u32 i = 0;
     u32 nlocal = 0;
@@ -649,12 +650,27 @@ static void obj_write(const char *path)
      * 没被引用就完全不发，两边就一致；非内核模式行为不变。 */
     emit = (u8 *)calloc(X64.nsym ? X64.nsym : 1, 1);
     pseudo_syms = (u8 *)calloc(X64.nsym ? X64.nsym : 1, 1);
-    if (!emit || !pseudo_syms) {
+    call_target = (u8 *)calloc(X64.nsym ? X64.nsym : 1, 1);
+    if (!emit || !pseudo_syms || !call_target) {
+        free(call_target);
         free(pseudo_syms);
         free(map);
         ob_str_free(&str);
         ob_str_free(&shstr);
         return;
+    }
+    /* DCE 压缩后仍存活的 E8 call 是真实调用（指向 weak UND 的不可达调用已在
+     * obj_dce_stub_dead 里 NOP 掉、fixup 丢弃）。这类 UND 符号必须发成真正的
+     * WEAK UND（SHN_UNDEF）交给链接器：若照旧发成指向 ret stub 的 WEAK **定义**，
+     * 当真实定义在别的 TU 也是 WEAK（如 jiffies.c 的 clocksource_default_clock）
+     * 时 GNU ld 会挑 ret stub，call 落到 ret 后拿到栈垃圾。 */
+    if (getenv("C6C_KERNEL_DCE")) {
+        for (i = 0; i < X64.nfix; i++) {
+            u32 fp = X64.fix[i].patch;
+            if (fp > 0 && fp <= CODE_IMG.n && CODE_IMG.p[fp - 1] == 0xE8
+                && X64.fix[i].sym < X64.nsym)
+                call_target[X64.fix[i].sym] = 1;
+        }
     }
     if (getenv("C6C_KERNEL_DCE")) {
         for (i = 0; i < X64.nsym; i++)
@@ -741,7 +757,13 @@ static void obj_write(const char *path)
              * 全标 NOTYPE 的话链接器只能瞎猜。 */
             type = OBJ_STT_OBJECT;
         }
-        if (pseudo && !getenv("C6C_KERNEL_WEAK_UND")) {
+        /* 真实 call 目标不能发成 ret stub 的 WEAK 定义：真实定义若也是 WEAK，
+         * GNU ld 会挑这个 stub。发成 WEAK UND（shndx=UNDEF）让链接器解析：
+         * 有真实定义（强/弱）就用它，确实缺失的则解析为 0（这些调用都在
+         * gcc 会常量折叠掉的不可达分支里，运行期不执行）。保留 data/非调用
+         * 引用的 ret stub 语义。 */
+        int pseudo_stub = pseudo && !call_target[i];
+        if (pseudo_stub && !getenv("C6C_KERNEL_WEAK_UND")) {
             /* 内核模式未解析的 weak 引用：指向 .text 末尾的 `ret` stub。
              * 不能发成 SHN_ABS 0——代码里 call 它会跳地址 0 崩溃（gcc 会
              * 常量折叠掉这些不可达调用，c6c 保留了）。stub 在所有遍次
@@ -757,7 +779,7 @@ static void obj_write(const char *path)
         }
         ob_sym_add(local ? &loc : &glob, ob_str(&str, s->name),
                    (u8)((bind << 4) | type), shndx,
-                   (pseudo && weak_stub_off && !getenv("C6C_KERNEL_WEAK_UND"))
+                   (pseudo_stub && weak_stub_off && !getenv("C6C_KERNEL_WEAK_UND"))
                        ? weak_stub_off : ob_sym_value(s));
     }
     nlocal = loc.n;
@@ -1159,6 +1181,7 @@ static void obj_write(const char *path)
     free(map);
     free(emit);
     free(pseudo_syms);
+    free(call_target);
     free(seen);
     free(relat.p);
     free(relad.p);
