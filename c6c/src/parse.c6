@@ -20243,6 +20243,34 @@ static const char *asm_mem_text(u32 k)
  * 操作数自己的 '('，此时剩下的配对 ')' 数是 2 而不是 1）。 */
 static u32 ASM_UNBAL;
 
+/* 给输出操作数（"=a"/"+a"/"=@cc"）找左值的**真实帧槽偏移**。
+ * 传入的是 gen_expr() 留下的 PEND_ADDR（一个 IR_ADDR 的 dst value）。
+ * 若该 value 来自帧内 IR_ADDR（flags 没有 bit1/bit2），其 imm 就是
+ * [rbp+imm] 的字节偏移——这才是变量本身存放的位置。
+ * 找到返回 1 并写 *slot，否则返回 0（调用方退回 value_of 临时槽）。
+ *
+ * 为什么需要：value_of() 会发一条 IR_LOAD，把变量值读进新临时槽；
+ * asmx 的输出写回若落到这个临时槽，后续语句重新 gen_expr 该变量时
+ * 又发一条 LOAD 从变量原槽读，拿到的还是旧值。try_cmpxchg 的 __old
+ * 就是这么在失败后得不到更新、导致 desc_reserve 无限自旋的。 */
+static int asm_addr_slot(u32 addr_value, u32 *slot)
+{
+    u32 i = 0;
+
+    if (!addr_value)
+        return 0;
+    for (i = FN.n; i > 0; i--) {
+        IrOp *o = &FN.ops[i - 1];
+
+        if (o->op == IR_ADDR && o->dst == addr_value
+            && !(o->flags & 1) && !(o->flags & 2)) {
+            *slot = o->imm;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* 一个操作数：`"约束"(表达式)`。成功返回 1，并且把绑定/替换文本填好。
  * 只支持内存操作数（`m`）和只读寄存器操作数（`r`）：
  *   - `m`：把表达式的**地址**装进中转寄存器，模板里的 %N 换成 `(%r10)`；
@@ -20329,6 +20357,7 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
          * store 编码到 reg 字段（asmx 里 ax_binds_out 解释）：
          *   reg = 100 + ccval 表示 cc 输出。 */
         u32 a = 0;
+        u32 slot = 0;
 
         (void)gen_expr();
         if (!PEND_LVAL)
@@ -20337,7 +20366,8 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
         PEND_LVAL = 0;
         if (*nbinds >= ASM_OPMAX)
             return 0;
-        binds[*nbinds].disp = X64_SLOT(a);
+        /* setcc 结果写回变量本身：优先用真实帧槽，退回地址值槽。 */
+        binds[*nbinds].disp = asm_addr_slot(a, &slot) ? slot : X64_SLOT(a);
         binds[*nbinds].reg = 100 + ccval;
         binds[*nbinds].store = 1;
         otext[*nbinds] = (char *)"";
@@ -20381,15 +20411,25 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
     } else if (fix >= 0) {
         u32 v = 0;
         u32 sz = 0;
+        u32 addr_val = 0;
+        u32 slot = 0;
+        int have_addr = 0;
 
-        v = value_of(gen_expr());
+        v = gen_expr();
+        if (iso && PEND_LVAL) {
+            addr_val = PEND_ADDR;
+            have_addr = 1;
+        }
+        v = value_of(v);
         sz = ty_size(GEN_TY);
         if (*nbinds >= ASM_OPMAX)
             return 0;
-        binds[*nbinds].disp = X64_SLOT(v);
+        /* 输出约束（"=a"/"+a"）：asm 结果写回变量真实帧槽，使后续语句
+         * 重新求值该变量时能读到更新值（try_cmpxchg 的 __old 就是靠这个）。
+         * 纯输入操作数仍用 value_of 的临时槽。 */
+        binds[*nbinds].disp = (have_addr && asm_addr_slot(addr_val, &slot))
+                                  ? slot : X64_SLOT(v);
         binds[*nbinds].reg = ASM_FIXNUM[fix];
-        /* 输出约束（"=a"）要在 asm 之后把物理寄存器写回帧槽；
-         * ax_binds_out() 就是干这个的，以前只有内存输出用得上。 */
         binds[*nbinds].store = iso;
         otext[*nbinds] = (char *)(sz <= 1 ? ASM_FIX8[fix]
                                   : sz <= 4 ? ASM_FIX32[fix] : ASM_FIX64[fix]);
@@ -20516,7 +20556,14 @@ static int try_stmt_asm(void)
     while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
            || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
            || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")
+           || PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")
            || PA_IS_IDENT("goto")) {
+        /* 内核里 asm_inline 展开为 `asm inline __attribute__((...)) volatile`，
+         * 属性夹在 asm 和 volatile 之间；不跳过会把整条 asm 吞到分号丢弃。 */
+        if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
+            skip_attributes();
+            continue;
+        }
         if (PA_IS_IDENT("goto"))
             isn = 1;
         pa_advance();
@@ -20594,7 +20641,12 @@ static int try_toplevel_asm(void)
     pa_advance();
     while (PA_IS_IDENT("volatile") || PA_IS_IDENT("__volatile__")
            || PA_IS_IDENT("__volatile") || PA_IS_IDENT("inline")
-           || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")) {
+           || PA_IS_IDENT("__inline") || PA_IS_IDENT("__inline__")
+           || PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
+        if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
+            skip_attributes();
+            continue;
+        }
         pa_advance();
     }
     if (!pa_is_ch('(')) {
