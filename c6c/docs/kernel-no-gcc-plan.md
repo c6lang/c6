@@ -337,3 +337,19 @@
   调度器、printk），必须解决。
   方案候选：a) asmx 增加 lock cmpxchg + setz + parse @cc/命名操作数支持；
   b) 前端把 try_cmpxchg asm 映射到已有 __c6_at_cas runtime。
+
+
+  ★★★ atomic CAS 支持：asmx 增加 @cc 命名操作数 + lock cmpxchg（2026-11-20）★★★
+  (4) `__raw_try_cmpxchg` 的 `lock cmpxchgq` + `"=@ccz"(success)` 条件码输出
+      约束 + `%[name]` 命名操作数，c6c 以前全不支持，整条 asm 被跳过 →
+      success 恒 0 → printk_ringbuffer 的 desc_reserve do-while 空转。
+      修复：
+      - parse.c6: asm_operand_list 认 `[name]` 前缀；asm_subst 替换 `%[name]`；
+        asm_one_operand 识别 `=@ccz/=@ccne` 输出（记 reg=100+ccval）；
+      - asmx.c6: 识别 `lock` 前缀发 0xF0；新增 cmpxchg r/m,r 编码
+        (0F B1 /r)；ax_binds_out 在普通写回之后按 ZF 发 setz/setnz 写回。
+      最小用例验证生成 `f0 4d 0f b1 0b lock cmpxchg %r9,(%r11)` + `sete %al`；
+      vmlinux 出现约 5000 条 cmpxchg；ctest 通过。
+  剩余：内核仍无串口输出，卡在 printk_ringbuffer_desc_reserve 附近。IR dump
+  显示多处 `const #0; br` 循环（前端 bug，与 @cc 无关，CAS 修复前就存在），
+  正在定位（switch(size) 常量折叠 / barrier / try_cmpxchg 控制流）。
