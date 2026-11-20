@@ -20331,6 +20331,10 @@ static u32 ASM_UNBAL;
  * 污染 token 流，导致大量内核 TU 编译失败。 */
 static int ASM_HAS_CR;
 
+/* asm 模板为空串（`""`）：内核 RELOC_HIDE() 的 `__asm__("" : "=r"(p) : "0"(x))`
+ * 只借约束把 x 的值送进 p，没有任何指令。放行 '=r' 输出 + 数字匹配约束。 */
+static int ASM_EMPTY_TPL;
+
 /* 给输出操作数（"=a"/"+a"/"=@cc"）找左值的**真实帧槽偏移**。
  * 传入的是 gen_expr() 留下的 PEND_ADDR（一个 IR_ADDR 的 dst value）。
  * 若该 value 来自帧内 IR_ADDR（flags 没有 bit1/bit2），其 imm 就是
@@ -20377,6 +20381,7 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
     int fix = -1;
     int iscc = 0;                   /* `=@ccz` 条件码输出 */
     int ccval = 0;                  /* 0=setz(ZF), 1=setnz(!ZF) */
+    int match = -1;                 /* `"0"` 数字匹配约束：绑到输出操作数 0 的寄存器 */
     const char *cs = NULL;
     u32 cl = 0;
 
@@ -20434,13 +20439,23 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
         else if (cs[k] == 'D') fix = 5;
         else if (cs[k] == 'i' || cs[k] == 'n' || cs[k] == 'g')
             return 0;               /* 立即数/通用约束：不支持 */
+        else if (cs[k] >= '0' && cs[k] <= '9') {
+            /* 数字匹配约束 `"0"`：绑到输出操作数 N 的寄存器。只在空模板
+             * asm 中放行（RELOC_HIDE），内容是把输入值送进输出槽。 */
+            if (!ASM_EMPTY_TPL)
+                return 0;
+            match = cs[k] - '0';
+            isreg = 1;
+        }
     }
     /* 只允许 +r/&r 读写输出走通用寄存器路径：isreg 分支已有把结果写回真实
      * 帧槽的处理（4412314）。纯 '=r' 输出仍按原样拒绝，避免 uaccess 等
-     * 约束被误解析（曾导致 412 文件编译失败）。 */
-    if (iso && isreg && !ASM_HAS_CR && !rw)
+     * 约束被误解析（曾导致 412 文件编译失败）。空模板 asm（RELOC_HIDE）
+     * 是例外：模板无指令，输出靠数字匹配输入送值。 */
+    if (iso && isreg && !ASM_HAS_CR && !rw && !ASM_EMPTY_TPL)
         return 0;
-    if (iso && !mem && fix < 0 && !iscc && !(isreg && ASM_HAS_CR) && !rw)
+    if (iso && !mem && fix < 0 && !iscc && !(isreg && ASM_HAS_CR) && !rw
+        && !ASM_EMPTY_TPL)
         return 0;
     pa_advance();
     if (!pa_is_ch('('))
@@ -20504,7 +20519,10 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
          * 把 CR2 值留给后面的 return，否则写进临时槽仍读到旧值 0。 */
         binds[*nbinds].disp = (iso && asm_addr_slot(addr_val, &slot))
                                   ? slot : X64_SLOT(v);
-        binds[*nbinds].reg = ASM_REGNUM[*nbinds];
+        /* 数字匹配约束 `"0"`：输入装进输出操作数 0 的同一个物理寄存器，
+         * 这样 ax_binds_out 把该寄存器写回输出槽就等于 `out = in`。
+         * 绑定按出现顺序装入（输出先、匹配输入后），最终寄存器里是输入值。 */
+        binds[*nbinds].reg = ASM_REGNUM[match >= 0 ? match : *nbinds];
         binds[*nbinds].store = iso;
         if (ty_size(GEN_TY) <= 4)
             otext[*nbinds] = (char *)ASM_REG32[*nbinds];
@@ -20696,6 +20714,7 @@ static int try_stmt_asm(void)
         ok = 0;
     }
     ASM_HAS_CR = 0;
+    ASM_EMPTY_TPL = (tpl && tlen == 0); /* RELOC_HIDE 的 `__asm__("")` */
     if (tpl) {
         u32 ci = 0;
 
