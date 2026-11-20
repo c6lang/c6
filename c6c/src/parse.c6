@@ -16941,7 +16941,12 @@ static u32 pa_str_paren_depth(void)
     }
     if (depth == 0 || pa_peek(k)->kind != TK_STR)
         return 0;
-    k++;
+    /* 相邻字符串字面量在翻译阶段拼成一个：`("system." "sockprotoname")`
+     * （内核 net/socket.c 的 XATTR_NAME_SOCKPROTONAME）。老实现只跳过一个
+     * TK_STR 就去找 `)`，第二个串让它返回 0，值掉进常量表达式报
+     * "这里要一个常量表达式"。把紧挨着的 TK_STR 全跳过去。 */
+    while (pa_peek(k)->kind == TK_STR)
+        k++;
     {
         u32 d = depth;
 

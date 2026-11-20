@@ -761,3 +761,34 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 本会话第八个真实 c6c bug（前七个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
   RELOC_HIDE、属性函数指针 typedef、空实参 ##），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 48 轮：第九个真实 c6c bug —— 括号里相邻字符串字面量
+
+### 症状
+- 用第 47 轮编译器全树重编 **2459/2942**。剩余失败里 `net/socket.c` 报
+  `include/uapi/linux/xattr.h:48: 这里要一个常量表达式` + 一串
+  `这里要 ')'（当前是 '"sockprotoname"'）`。
+- 内核 `XATTR_NAME_SOCKPROTONAME` = `("system." "sockprotoname")`：括号里
+  两个相邻字符串字面量（翻译阶段拼成一个）。
+
+### 根因（`parse.c6:pa_str_paren_depth()`）
+- 这个前瞻helper认 `("n")` / `(("n"))` 这种"括号里包着字符串"的形状，
+  但只跳过**一个** TK_STR 就去找 `)`。相邻两个串时第二个让它返回 0，
+  于是带括号的字符串初始化器掉进常量表达式求值，报错。
+
+### 修复（`c6c/src/parse.c6`）
+- `pa_str_paren_depth()` 把紧挨着的 TK_STR **全跳过去**再找 `)`。
+
+### 验证（均通过）
+- 最小复现：结构体指针字段初始化 `.n = ("a" "b")` 修复前 rc=1、修复后 rc=0；
+  普通指针 `const char *p = ("a" "b")` 仍 rc=0。
+- 实际受影响的 `net/socket.c` 修复后用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；前两个修复
+  （空实参 ##、属性 typedef）的最小用例仍 rc=0。
+- （发现文档之外：无长度数组 `char s[] = ("a" "b")` 仍不走这条 helper、
+  仍报错，但内核当前失败 TU 里没有这种形状，未在本轮处理。）
+
+### 状态
+- 本会话第九个真实 c6c bug（前八个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量），
+  已修并验证。目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
