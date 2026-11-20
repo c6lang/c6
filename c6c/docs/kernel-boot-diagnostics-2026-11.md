@@ -918,3 +918,31 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
   括号内相邻字符串、字符串常量三元、`&*NULL`、offsetof），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 53 轮：修复第 51 轮 offsetof 引入的复合字面量回归
+
+### 症状与定位
+- 全树重编仍是 2464/2942（无净增）。追查发现第 51 轮为 neighbour.c 加的
+  offsetof 快路径**过宽**：它在 `& ( ( typename` 前缀就把整条交给 const_expr，
+  于是 `&((struct A){ .x = 1 })`（复合字面量取地址）被误认成 offsetof，
+  const_expr 在 `{` 上报"这里要 ')'（当前是 '{'）"。
+- 对照实验：`&((struct A){…})` 在第 50 轮编译器 rc=0、第 51 轮 rc=1——
+  确认为**本会话自己引入的回归**，不是 c6c 原有 bug。
+
+### 修复（`c6c/src/parse.c6`）
+- 新增纯前瞻 `pa_is_offsetof_ahead(start)`：从类型名处扫前瞻窗口，
+  `->`/`.` 成员链先出现判为 offsetof（返回 1），`{` 先出现判为复合字面量
+  （返回 0），交回 gen_glob_compound_addr 正常处理。
+- 三处 offsetof 快路径（gen_glob_obj / init_body / 标量全局）都加此判据。
+
+### 验证（均通过）
+- `&((struct A){…})`、`&((T[]){…}[0].x)` 等最小用例：第 51 轮 rc=1 → 修复后 rc=0。
+- 前序修复用例（offsetof、&string、字符串三元、&*NULL）仍全 rc=0。
+- 实际受影响 TU：`net/core/neighbour.c`、`8250_pci.c` 用全内核标志编译 rc=0。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；全树重编 2464（不倒退）。
+
+### 状态
+- 第 13 个已验证修复（本轮为回归修正）。i915_pmu.c 的
+  `&((T[]){…})[0].attr` 复合字面量+下标+成员链是 c6c 既有未实现特性
+  （第 50 轮也不支持），非回归，未在本轮处理。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。

@@ -16951,6 +16951,25 @@ bad:
     glob_addr_skip_rest();
 }
 
+/* 当前游标在 `&`（或前面的成组括号）：判断后面是不是 `((T *)0)->member`
+ * 这种 offsetof 形状，而不是 `((T[]){…})` 复合字面量。纯前瞻、不吃 token。
+ * 两者前缀都是 `& ( ( typename`，区别在类型闭括号之后：offsetof 是
+ * `0 ) -> | .`，复合字面量是 `{`；前瞻窗口里谁先出现就判谁。 */
+static int pa_is_offsetof_ahead(int start)
+{
+    int q = 0;
+
+    for (q = start; q < PA_LOOK - 1 && pa_peek(q); q++) {
+        Tok *t = pa_peek(q);
+
+        if (t->kind == TK_PUNCT && TOK_EQ(t, "{"))
+            return 0;                       /* 复合字面量 */
+        if (t->kind == TK_PUNCT && (TOK_EQ(t, "->") || tok_eq(t, ".")))
+            return 1;                       /* 成员链 = offsetof */
+    }
+    return 0;
+}
+
 /* `("n")` / `(("n"))`：括号里只包着一个字符串字面量。返回括号层数（不是这种
  * 形状就是 0），纯前瞻、只读。
  * `const char *p = ("n");` 以前 `(` 直接落到常量表达式求值里，报"这里要一个
@@ -17224,7 +17243,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
          * 常量"。在 `&` 被吃掉之前就把整条交给常量求值器。 */
         if (pa_is_ch('&') && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
             && TOK_EQ(pa_peek(1), "(") && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT
-            && TOK_EQ(pa_peek(2), "(") && pa_peek(3) && is_typename_tok(pa_peek(3))) {
+            && TOK_EQ(pa_peek(2), "(") && pa_peek(3) && is_typename_tok(pa_peek(3))
+            && pa_is_offsetof_ahead(3)) {
             i64 offv = const_expr();
 
             glob_store(goff, off, ty, (u64)offv);
@@ -18425,7 +18445,8 @@ static void init_body(u32 top)
                             && TOK_EQ(pa_peek(lp + 1), "(")
                             && pa_peek(lp + 2) && pa_peek(lp + 2)->kind == TK_PUNCT
                             && TOK_EQ(pa_peek(lp + 2), "(")
-                            && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))) {
+                            && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))
+                            && pa_is_offsetof_ahead((int)lp + 3)) {
                             i64 offv = 0;
                             u32 j = 0;
 
@@ -23837,7 +23858,8 @@ static void gen_one_global(u32 ty, Declarator *d)
                 && TOK_EQ(pa_peek(lp + 1), "(")
                 && pa_peek(lp + 2) && pa_peek(lp + 2)->kind == TK_PUNCT
                 && TOK_EQ(pa_peek(lp + 2), "(")
-                && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))) {
+                && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))
+                && pa_is_offsetof_ahead((int)lp + 3)) {
                 i64 offv = 0;
                 u32 j = 0;
 
