@@ -158,3 +158,17 @@ per-CPU 走命名地址空间（__seg_gs），c6c 把 __seg_gs 当 no-op → per
 CONFIG_CC_HAS_NAMED_AS**（因 c6c 无命名地址空间语义），配合已实现的
 `%gs:` 段前缀，per-CPU 访问即可正确生成。全树 2424 个 C 文件的完整
 重编/链接/启动留待后续（仍需命名段 + 内核级链接器）。
+
+## 第 37 轮：全树链接剩余障碍 = DCE 丢弃「仅被数据引用」的 static 函数
+用新编译器（含 %gs:）+ 关 named-AS 重编全树 2424 个 C 文件成功，
+`vmlinux.o` 含 24577 条 `%gs:` 指令（per-CPU 已正确）。
+补 399 个 `__SCT__` 桩后，最终 ld 链接仍剩 **214 个未定义符号**，
+例如 `thermal_genl_event_tz_delete`、`acpi_button_resume`、
+`console_callback`、`blank_screen_t`。这些在整个 vmlinux.a 里都只有 U、
+没有定义——它们是各 .c 里的 static 函数，只通过**数据中的函数指针**
+（file_operations / work_struct / notifier 等结构）被引用，没有直接 call
+边。c6c 两遍 DCE 的可达性只沿调用图 + 直接数据重定位走，没把这类
+「仅数据引用」的 static 函数纳入可达集，于是整函数被剔除 → 链接 undefined。
+这是 kernel-mode DCE 的系统性缺口：可达性分析需要把所有**被重定位引用
+的符号**（R_X86_64_64/PC32 的目标）都当作 root，而不只是 E8 call 目标。
+附加问题：ld 报 orphan `.eh_frame` 无放置（链接脚本严格 orphan-handling）。
