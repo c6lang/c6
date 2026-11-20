@@ -3791,7 +3791,16 @@ static i64 const_unary(void)
                     || TOK_EQ(tk, "_Alignof") || TOK_EQ(tk, "alignof")
                     || TOK_EQ(tk, "typeof") || TOK_EQ(tk, "__typeof__")
                     || TOK_EQ(tk, "__typeof")) {
+                    /* `struct tag` / `union tag` / `enum tag`：tag 名是类型的一部分，
+                     * 不是普通变量。内核 include/linux/overflow.h 的 __DEFINE_FLEX
+                     * 用 `_Static_assert(__builtin_constant_p(sizeof(struct T)), …)`；
+                     * 老扫描器把 `struct` 后的 tag 当普通标识符 → ok=0 → 断言假失败
+                     * （net/mac80211/spectmgmt.c 编不过）。跳过 tag。 */
                     pa_advance();
+                    if ((TOK_EQ(tk, "struct") || tok_eq(tk, "union")
+                         || tok_eq(tk, "enum"))
+                        && pa_cur()->kind == TK_IDENT)
+                        pa_advance();
                     continue;
                 }
                 /* 普通变量/函数名：不是常量 */

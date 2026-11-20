@@ -1015,3 +1015,28 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十四个真实 c6c bug（前十三个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 56 轮：第十五个真实 c6c bug —— __builtin_constant_p 把 struct tag 当变量
+
+### 症状与根因
+- `net/mac80211/spectmgmt.c` 的 `_Static_assert(__builtin_constant_p(sizeof(struct T)), …)`
+  假失败。最小复现：`_Static_assert(__builtin_constant_p(sizeof(struct mytag)), …)`
+  在 gcc 通过、c6c 失败。
+- `const_unary()` 里 `__builtin_constant_p` 的 token 扫描器：`struct`/`union`/`enum`
+  算类型关键字放过去，但紧跟其后的 **tag 名**（词法上是 TK_IDENT）被当成
+  普通变量 → ok=0 → 常量判定假失败。内核 include/linux/overflow.h 的
+  __DEFINE_FLEX 正是这种形状。
+
+### 修复（`c6c/src/parse.c6`）
+- 扫描器遇到 struct/union/enum 关键字后，若紧跟 TK_IDENT（tag 名）一并跳过。
+
+### 验证（均通过）
+- 最小复现 `sizeof(struct mytag)`、`sizeof(struct mytag *)` 修复前 rc=1、
+  修复后 rc=0（与 gcc 一致）；枚举/sizeof(int) 用例仍 rc=0。
+- 真实 TU 的 `_Static_assert "must be constant count"` 错误**消失**（该 TU 仍
+  因另一个 `__builtin_choose_expr` 常量求值问题编不过，非本 bug）。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；全树重编 2464（不倒退）。
+
+### 状态
+- 第十五个真实 c6c bug（前十四个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
