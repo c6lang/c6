@@ -104,3 +104,29 @@
 正确；`__update_freelist_slow` 的 `slab->freelist=NULL` 是正确 64 位存储；
 窄化高字校验与命名 AS config 开关均无效。命名段支持仍是 c6c 真实缺口
 （影响 `.init.setup` 等），但不是当前 panic 的直接原因。
+
+## 第 34 轮：GDB 捕获坏 freelist 指针的精确调用路径
+用 QEMU `-s -S` + GDB 在 `get_freepointer` 入口设条件断点
+（`($rsi>>32)==8`），捕获到坏对象 `0x00000008001530c0` 的完整调用栈：
+```
+#0  get_freepointer
+#1  alloc_single_from_partial
+#2  get_from_partial_node
+#3  get_from_partial
+#4  ___slab_alloc
+#5  slab_alloc_node
+#6  __do_kmalloc_node
+#7  __kmalloc_noprof
+```
+即坏指针不是来自 per-CPU sheaf，而是来自 **partial slab 的 `slab->freelist`**。
+`alloc_single_from_partial` 里 `object = slab->freelist` 读到
+`0x8001530c0`（低半正确、高半被写成 8），随后
+`slab->freelist = get_freepointer(s, object)` 的 `rep movsb`
+从 `0x8001530f0` 读而 #PF。反汇编确认：
+- `freelist_ptr_encode` 代码正确（零填返回 temp + 64 位存 ptr）；
+- `set_freepointer` 里 `mov 0x0(%rax),%edx` 是加载 32 位 `unsigned int
+  s->offset`（偏移 0x28），正确；
+- `CONFIG_SLAB_FREELIST_HARDENED` 未启用，encode 就是纯指针拷贝。
+下一个待查点：是谁把高半字 8 写进了那个对象的 freelist 槽
+（先前观察点指向 `__alloc_workqueue` 的 int 字段写 rax=0xffff888000153094、
+edx=8，需确认这是否为合法对象数据写 → 双重分配，还是 c6c 存储宽度错误）。
