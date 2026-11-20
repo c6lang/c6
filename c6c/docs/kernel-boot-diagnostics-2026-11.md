@@ -220,3 +220,26 @@ Booting the kernel (entry_offset: 0x167dc7e0).    <- 进入内核入口后崩溃
   RIP 落在指令中途）。属早期启动的 c6c 代码生成/重定位问题，需继续定位。
 - 注意：全树 vmlinux 里有**多份同名函数副本**（lockdep_hardirqs_off 至少 4 处），
   是 DCE 兜底按名字跨 TU 标记所致，可能是隐患。
+
+## 第 39 轮：全树早期崩溃根因链（QEMU -d int + GDB 条件断点）
+用 `qemu -d int` 抓到 2258 次 #PF + 1 次 #DF，逐条 addr2line 定位：
+1. **fault #0**（预期内）：`memcpy_orig` 读 `__va(real_mode_data)=0xffff888000014770`
+   ——这是 x86_64 早期页表 fixup（`early_make_pgtable`）故意触发的 fault，正常。
+2. 后续 `pud_offset`/`pmd_offset`/`clear_pages`/`get_bios_ebda` 的 fault 也属早期
+   映射/`asm` 探测，属正常路径。
+3. **fault #5 起**：RIP 落在 `__c6_tls_len`（`wakeup_64.o` 数据符号区）且
+   CR2=0x3c ——执行流跳进了数据区（间接跳转目标被破坏，或 KASLR 后地址
+   归因偏移；QEMU 报的 RIP 落在指令中途，倾向后者）。
+4. **fault #6..#2258**：`print_stop_info+0x1aa` 处 `mov 0x0(%rax),%rdx`，
+   RAX=0（NULL 解引用）——内核已 panic，但 panic 打印路径自己又 #PF，
+   递归 2258 次、SP 每次减 ~0x4770，最终栈溢出触发 #DF
+   (`check_exception old:0xe new:0xe`)。
+GDB 条件断点（`break *memcpy_orig if $rsi==0xffff888000014770`）确认
+`copy_bootdata(__va(real_mode_data))` 的 codegen **正确**：参数 `%rdi` 正确
+spill 到 `-0x10(%rbp)` 再经指针 load 作为 memcpy 源，0xffff888000014770
+就是 real_mode_data，非 c6c bug。
+`__c6_tls_img/__c6_tls_len` 是 c6c 每 TU 生成的局部 TLS 记账格（2412 份），
+设计如此，非故障源。
+**结论**：触发 panic 的真正首因仍未锁定（在 fault #5 附近），但已排除
+copy_bootdata/TLS/entry-point 三类嫌疑；panic 打印路径 NULL 解引用导致的
+递归 #PF 是放大故障的次要问题。启动仍不可达用户态，目标未完成。
