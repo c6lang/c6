@@ -58,6 +58,12 @@
    又被分配给了 workqueue**：双重分配 / 陈旧 freelist。问题在 c6c 的 slab
    快路径 fastpath（this_cpu cmpxchg 弹 freelist 时没有正确推进），而不是
    单纯的存储宽度错误。需要检查 `slab_alloc_node` 快路径的 cmpxchg 序列。
+   更深层根因（同一 section 属性缺陷）：c6c 构建的 vmlinux 里 `.data..percpu`
+   段是空的（size=0、0 个符号），GCC 基线同段 0x2b858 字节 / 4096 对齐；
+   c6c 产物里 `%gs:`/`%fs:` 前缀指令数均为 0（GCC 基线 54261 条 `%gs:`）。
+   DEFINE_PER_CPU 靠 section 属性落 `.data..percpu`，被丢弃后所有 per-CPU
+   变量（含 SLUB 的 cpu_sheaves）丢失/错位 → 快路径拿到错误 sheaf → 同一
+   对象被分配两次。双重分配是「section 属性丢失」的下游症状。
 
 2. `__attribute__((section("...")))` 被 c6c 的 `skip_attributes()` 静默丢弃
    （parse.c6 的 `sa_is_kw` 表无 `section`，属性体扫描无对应分支，落到通用
