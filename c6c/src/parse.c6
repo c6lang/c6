@@ -17529,7 +17529,7 @@ static void gen_init_braced(u32 addr, u32 ty, u32 off)
  *
  * 叶子表放不下（超大对象）时整个引擎退回旧实现，保证不会因此编错。
  */
-#define INIT_LF_MAX 16384
+#define INIT_LF_MAX 65536
 static u32 LF_OFF[INIT_LF_MAX];
 static u32 LF_TY[INIT_LF_MAX];
 static u32 LF_BITS[INIT_LF_MAX];
