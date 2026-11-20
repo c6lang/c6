@@ -255,3 +255,22 @@ copy_bootdata/TLS/entry-point 三类嫌疑；panic 打印路径 NULL 解引用�
   QEMU/GDB 把代码 RIP 归到它是符号化伪影，非执行流跳进数据。
 - **待办**：`print_stop_info` 的 NULL 解引用递归 #PF 是 panic 后的放大器；
   真正触发 panic 的首因在 fault #0-#5 之间，需要更细的单步/看门点定位。
+
+### 第 39 轮最终定位：首个真实 #PF 的 faulting RIP 在 .data 的 __c6_tls_* 区
+GDB `break exc_page_fault` 抓到**第一次**内核态 #PF 的 pt_regs：
+```
+faulting RIP = 0xffffffff96633e90   (= __c6_tls_len, .data 段, 0 长 OBJECT 标签)
+CR2          = 0x3c
+backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_stop_info
+```
+即 CPU 执行流跳到了 `.data` 里的 c6c TLS 记账格区（`.LC132..__c6_tls_delta` 一串
+局部标签紧邻），执行数据字节后立刻 #PF(CR2=0x3c)，随后 panic 打印路径自己 NULL
+解引用递归 2258 次栈溢出 #DF。
+**假设**：c6c 的 TLS 模拟（`__c6_tls_img/len/delta`，%fs 段，见 parse.c6:2542）
+在每个 TU 生成一份，依赖 **c6c 自己的 ld.c6** 做合并（ld.c6:1026 扫描同名符号并把
+影像拼起来）。全树我们是用 **GNU ld** 手动链的，GNU ld 不会做 c6c 的 TLS 合并，
+2412 份局部 __c6_tls_* 各自为政，某个函数指针/跳转目标可能落进这个数据区 →
+执行流跳进 .data。这解释了为什么最小树（用 c6c 自带 ld 链）能到 console 而
+全树（GNU ld 手动链）早期就崩。
+**下一步**：用 c6c 自带的 ld.c6 链接全树（而非 GNU ld），或先关掉 TLS 模拟
+（内核不用 __thread 时）验证该假设。这是把全树从「能链」推向「能启动」的关键。
