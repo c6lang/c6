@@ -543,6 +543,18 @@ static void obj_dce_stub_dead(void)
                 && !X64.sym[X64.fix[i2].sym].is_static
                 && X64.sym[X64.fix[i2].sym].is_weak)
                 drop = 1;
+            /* `__bad_size_call_parameter` / `__bad_copy_from` / `__bad_udelay` …
+             * 是内核里只声明、从不定义的非法分支助手：gcc 在编译期把不可达
+             * switch 分支连同调用一起折叠掉，c6c 不做常量传播、保留了调用。
+             * 它们是普通 extern（is_weak=0），上面的 weak 规则不生效；call 目标
+             * 改发 WEAK UND 后解析成 0，call 到 0 会 #PF。这些助手按约定永不
+             * 该执行，直接 NOP 掉调用。 */
+            if (!drop && is_call && getenv("C6C_KERNEL_DCE")
+                && X64.fix[i2].sym < X64.nsym
+                && !X64.sym[X64.fix[i2].sym].defined
+                && X64.sym[X64.fix[i2].sym].name
+                && strncmp(X64.sym[X64.fix[i2].sym].name, "__bad", 5) == 0)
+                drop = 1;
 
             if (drop) {
                 u32 p = X64.fix[i2].patch;
