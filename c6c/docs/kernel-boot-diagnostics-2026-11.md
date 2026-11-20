@@ -398,3 +398,38 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 本轮再清掉一个真实 c6c bug（范围设计符叶表溢出），混合对象集消除，
   启动越过 percpu 初始化。目标未达成：未进 userspace，GNU as/ld/host tools
   依赖仍在。
+
+---
+
+## Round 41 (再续)：asmx 缺 `btr` 指令 → clear_bit 空操作 → pcpu 分组死循环
+
+### 现象
+- INIT_LF_MAX 修复后启动越过 start_kernel/setup_per_cpu_areas 的入口，但 COM1
+  标记显示卡在 `pcpu_build_alloc_info` 的 CPU 分组循环（119012 次/30 s）。
+- 标记 `TOP mask0=00000001` → `cpumask_clear_cpu(cpu,&mask)` 后 `BAI-MASK0=00000001`：
+  位根本没清掉，`cpumask_empty()` 永远为假 → 死循环。
+
+### 根因
+- `clear_bit()` → `arch_clear_bit()` 的内联汇编用 `btr`（`LOCK_PREFIX __ASM_SIZE(btr)`
+  / `andb %b1,%0`）。c6c 的 `asmx.c6` 认识 `bts`/`popcnt`/`bsr` 等位操作指令，
+  **唯独不认识 `btr`**：`ax_insn()` 翻译失败 → 整段 asm 被静默丢弃
+  → `arch_clear_bit()` 只剩帧槽算术、没有一条写内存的指令 → clear_bit 空操作。
+- 最小复现：`asm volatile("btr %1,%0":"+m"(g):"Ir"(3))` 后 g 不变（rc=1）；
+  输入-only `"m"` 操作数正常，说明不是约束问题，是助记符不认识。
+- 对照 `bts`：0F AB /r（reg 位号）/ 0F BA /4 ib（imm）。`btr` 应为
+  0F B3 /r / 0F BA /6 ib。
+
+### 修复
+- `c6c/src/asmx.c6` 在 `bts` 分支后新增 `btr` 分支（0F B3 /r、0F BA /6 ib），
+  结构完全镜像 `bts`。
+
+### 验证
+- 三个最小用例（lock btr +m、+r btr、plain btr +m）全部 rc=0。
+- 全树重编 2425/2952，GNU ld 重链成功（需补 2 个静态调用桩符号，与 c6c 改动无关）。
+- COM1 标记：`BAI-MASK0=00000000`（位已清），分组循环正常退出
+  （`BAI05 post-grouploop` → `EMB02` → … → `EMB06 post-fcall`），
+  不再死循环。启动仍在后续 percpu 初始化处停顿（新问题，待查）。
+
+### 状态
+- 本轮第三个真实 c6c bug（位操作助记符缺失）已修并验证。目标未达成：未进
+  userspace；GNU as/ld/host tools 依赖仍在。

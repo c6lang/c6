@@ -982,6 +982,31 @@ static int ax_insn(void)
         return 0;
     }
 
+    /* btr r/m, r / btr r/m, imm8：0F B3 /r（寄存器位号）或 0F BA /6 ib。
+     * 内核 arch_clear_bit() 的 `btrq %1,%0`（o1=位号 nr，o2=位基 addr）靠它。
+     * 以前不认识 btr → 整段 asm 被丢 → clear_bit() 空操作 → cpumask 的位
+     * 永远清不掉 → pcpu_build_alloc_info() 的分组循环死循环。
+     * ModRM.reg=位号，ModRM.rm=位基（与 bts 的 /4 对应，btr 是 /6）。 */
+    if (strncmp(mn, "btr", 3) == 0 &&
+        (mn[3] == 0 || mn[3] == 'q' || mn[3] == 'l' || mn[3] == 'w')) {
+        int csz = 8;
+
+        if (mn[3] == 'l') csz = 4;
+        else if (mn[3] == 'w') csz = 2;
+        if (o2.kind != AXK_MEM && o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind == AXK_REG) {
+            ax_emit_rm(0x0F, 0xB3, o1.reg, &o2, csz == 8, csz == 2);
+            return 1;
+        }
+        if (o1.kind == AXK_IMM) {
+            ax_emit_rm(0x0F, 0xBA, 6, &o2, csz == 8, csz == 2);
+            img_u8(&AX_IM, (u32)o1.disp & 0xff);
+            return 1;
+        }
+        return 0;
+    }
+
     /* popcnt r, r/m：0F B8 /r（REX.W 为 64 位，66 为 16 位）。
      * 内核 __arch_hweight32/64 的 `popcntq %[val], %[cnt]` 靠它：
      * AT&T 源在前、目的在后 —— o1=源(r/m)，o2=目的寄存器，
