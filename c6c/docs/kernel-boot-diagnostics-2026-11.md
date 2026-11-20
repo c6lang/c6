@@ -514,3 +514,55 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 
 ### 状态
 - 目标未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 41 轮续：临时树被清空后的重建与 #DE 排查（结论未定）
+
+### 背景：验证环境丢失
+- 会话中途 `/tmp/linux-7.4-rc3` 与所有 `/tmp` 编译产物、脚本、插桩源、日志被清空
+  （非代码改动所致）。已提交的五个真实修复（DCE 别名、INIT_LF_MAX、btr、
+  bt/@ccc、RELOC_HIDE）都在 git 里，未受影响。
+- kernel.org 对 7.4-rc3 tar.gz 反爬（"Making sure you're not a bot"），
+  GitHub codeload 单连接限速约 8KB/s、不支持 Range，`git clone --depth 1`
+  走 GnuTLS 报 recv error -110。CDN（cdn.kernel.org）只有发布版，无 -rc。
+  最终用带 sha256 校验的 aria2c 从 CDN 下载 **linux-7.3.tar.xz** 重建了树，
+  但**这是 7.3 + defconfig，不是原验证用的 7.4-rc3 + 原 config**。
+
+### 重建尝试（均为验证脚手架，非仓库改动）
+- 重新编译 c6c（`/tmp/c6c-m20/c6c`，含五个已提交修复）；最小 RELOC_HIDE
+  用例 rc=0 复核通过。
+- 从 `make -n vmlinux`（touch 源码强制列出）harvest 2942 个 TU，用正确
+  的 per-TU `-DKBUILD_BASENAME/-DKBUILD_MODNAME/-DKBUILD_MODFILE` 与
+  `-D__KBUILD_MODNAME` 全量重编：**2429/2942 通过**（接近原验证的
+  2425/2952）。缺 `__KBUILD_MODNAME` 曾导致 `__mod_device_table__kmod_*
+  ___KBUILD_MODNAME__*` 重复符号——这是脚手架漏传 define，不是 c6c bug。
+- 换入 c6c .o、补静态调用桩、relaxed GNU ld 链出 vmlinux/bzImage。
+
+### 关键发现：全树 #DE 未能定性为 c6c bug
+- 全 c6c 重建树启动停在 `setup_arch` 附近（COM1 标记 M04/M01），
+  QEMU `-d int` 显示 **#DE（除零）** 位于 `topology_init_possible_cpus`
+  的 `DIV_ROUND_UP(cntb, cnta)`，`cnta = domain_weight(TOPO_PKG_DOMAIN)=0`
+  即 APIC domain bitmap 未填充。
+- 对照实验（决定性）：
+  1. 纯 gcc 基线的同一棵树 → 正常走到 VFS panic（打印
+     `Max. logical packages: 1`）。
+  2. 干净 gcc 树里**只换入 c6c 的 topology.o** → 正常越过 topology
+     （同样打印 `Max. logical packages: 1`，走到 VFS panic）。
+  3. 全 c6c 重建树 → #DE。
+  - 结论：c6c 的 `topology.c` 本身编译正确；#DE 需要多个 c6c .o 的交互
+    才出现。把 common.c/apic.c/smpboot.c/smp.c 单独换回 gcc 仍未消除。
+- 由于重建树的内核版本（7.3）、config（defconfig）、链接脚手架（458 个
+  宽 `.quad 0` 桩、relaxed ld、modpost 绕过）与原验证环境差异过大，
+  **无法可靠地把该 #DE 归因于某个 c6c bug**：宽桩把 `__SCK__*` 等符号
+  定义成 0、静态调用被破坏，都可能是诱因。按"不臆造修复"原则，本轮
+  **不为这个未定性的 #DE 提交任何 c6c 改动**。
+
+### 其余观察
+- `lib/klist.c` 用 c6c 编出的 `klist_add_head/tail` 是 local(`t`)，
+  gcc 是 global(`T`)——这是已知的文件作用域 static/inline 符号本地化限制
+  （见 kernel-vmlinux.sh 的 KNOWN LIMITS），非新 bug。
+
+### 状态
+- 五个已验证的真实 c6c 修复仍全部在 git 中，启动进度仍以到达
+  `M20 pre (mm_core_init)` 为准。目标未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在。下一步需先恢复原 7.4-rc3 树与原 config
+  才能继续定位 mm_core_init 之后的停顿。
