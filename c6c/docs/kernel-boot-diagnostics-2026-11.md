@@ -1149,3 +1149,25 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十七个真实 c6c bug（前十六个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 62 轮：第十八个真实 c6c bug —— switch case 容量不足
+
+### 症状与根因
+- `arch/x86/entry/syscall_64.c`（4 个 TU）报 20+ 条"case 只能出现在 switch 里"，
+  而 `case` 明明在 `switch (nr) { #include <asm/syscalls_64.h> }` 里。
+- `parse.c6` 的 `SW_MAXCASE 160`：内核 x64_sys_call() 一个 switch 有 470+
+  个 case（syscalls_64.h），超出上限后 case 被当成"不在 switch 里"——
+  误导性错误。170-case 最小复现恰好报 10 条（170-160），坐实容量问题。
+
+### 修复（`c6c/src/parse.c6`）
+- `SW_MAXCASE` 160 → 1024（覆盖内核 syscall 表，SwState 为静态数组，内存可承受）。
+
+### 验证（均通过）
+- 170-case 复现修复前 rc=1（10 条错）、修复后 rc=0；switch 运行语义
+  （case 0/1/default）真跑 rc=0。
+- 实际 TU `syscall_64.c` 用全内核标志编译 **rc=0**（227616 字节 .o）。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 第十八个真实 c6c bug（前十七个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。

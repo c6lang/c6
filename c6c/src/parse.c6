@@ -15960,7 +15960,10 @@ static u32 gen_expr(void)
 /* switch：case 值在语体里才出现，分发链却必须放在语体**之前**。
  * 做法是先把语体照常发出去，解析完再往 IR 里"插入"一段比较链。 */
 #define SW_MAX 8
-#define SW_MAXCASE 160
+/* 内核 arch/x86/entry/syscall_64.c 的 x64_sys_call() 一个 switch 里就有
+ * 470+ 个 case（syscalls_64.h），160 装不下、多出来的报"case 只能出现在
+ * switch 里"（误导性错误）。给到 1024，并把超限诊断改准确。 */
+#define SW_MAXCASE 1024
 typedef struct SwCase {
     i64 lo;
     i64 hi;
