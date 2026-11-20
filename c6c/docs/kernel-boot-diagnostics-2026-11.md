@@ -354,3 +354,47 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   percpu 初始化的 `nr_groups=0` BUG 不再出现，启动推进到下一段早期初始化。
 - 目标未达成：串口仍停在 `Linux version`；下游 `memcpy`/oops 路径、GNU as/ld/host
   tools 依赖均未消除。该 `memcpy` 问题留待后续轮次。
+
+---
+
+## Round 41 (续)：`INIT_LF_MAX` 太小 → `numa.c` 编译失败 → 早期 #PF
+
+### 现象
+- 上一修复（DCE 别名）后首个 #UD 消失，但启动仍停在 `Linux version`，
+  GDB 抓到一次未 fixup 的 #PF：CR2=`0x98560025`、RIP=`early_cpu_to_node+0x...`，
+  栈顶 `show_fault_oops ← exc_page_fault`。
+- `x86_cpu_to_node_map_early_ptr` 运行期值是 `0x98560025`——即
+  `x86_cpu_to_node_map_early_map`（`0xffffffff98560020`）的低 32 位、高位被清零，
+  于是 `early_per_cpu_ptr(x86_cpu_to_node_map)[cpu]` 读到低地址触发 #PF。
+
+### 根因
+- `mm_percpu.o` 里 `pcpu_build_alloc_info` 的 call 目标 `cpu_to_nd_fn` →
+  `early_cpu_to_node`（定义在 `arch/x86/mm/numa.c`）。
+- 全树编译日志里 `FAIL|arch/x86/mm/numa.c|rc=1`：c6c 编译 `numa.c` 失败，
+  树里 `numa.o` 是 GCC 基线遗留的（06:09 时间戳），与 c6c 的 `setup_percpu.o`
+  混用。混合对象集下 early_ptr 数据初始化被破坏。
+- c6c 编译 `numa.c` 失败的首错在 `numa.c:49`：
+  `s16 __apicid_to_node[MAX_LOCAL_APIC] = { [0 ... MAX_LOCAL_APIC-1] = NUMA_NO_NODE };`
+  `MAX_LOCAL_APIC=32768`。最小复现：范围设计符上界 ≤16384 编过，≥16385 报
+  "这里要一个常量表达式"。
+- `parse.c6:17532` `INIT_LF_MAX 16384`：叶子表只装 16384 项，超出后 `LF_TRUNC=1`，
+  整块退回旧初始化实现；旧实现不认 `[a ... b]` 设计符（23435 行注释也提到
+  顶过 16384 会退回、长度算成 0），于是整段初始化器解析崩掉。
+
+### 修复
+- `c6c/src/parse.c6`：`INIT_LF_MAX 16384 → 65536`。静态叶表 4 个数组约 1 MB，
+  编译器可承受。
+
+### 验证
+- 最小复现 `short a[32768] = { [0 ... 32767] = -1 }` 编过。
+- `numa.c` 用 c6c 编译成功（90873 字节代码）。
+- 全树重编 2425/2952（比上轮 2424 多一个，正是 `numa.c`），GNU ld 重链成功。
+- QEMU `nokaslr` 启动：GDB 断点确认越过 `start_kernel` 与 `setup_per_cpu_areas`，
+  **只剩 4 次正常早期 #PF，不再有 #UD 级联、不再进 `show_fault_oops`**。
+  串口仍停在 `Linux version`（后续早期初始化待查）。
+- 前端回归在本环境缺 `build/c6c`/`stddef.h` 无法运行（与改动无关）。
+
+### 状态
+- 本轮再清掉一个真实 c6c bug（范围设计符叶表溢出），混合对象集消除，
+  启动越过 percpu 初始化。目标未达成：未进 userspace，GNU as/ld/host tools
+  依赖仍在。
