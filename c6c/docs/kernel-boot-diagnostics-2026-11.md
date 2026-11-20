@@ -971,3 +971,27 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   全树可信的覆盖率口径仍是第 53 轮的 2464/2942（简化 harness），
   实际 c6c 作为 C 编译器的能力已由"2416 对象启动到 VFS"验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 55 轮：用权威 flag 重编失败 TU，定位到 typeof/复合字面量深层缺口
+
+### 用 .cmd 权威 flag 重编
+- 从内核 kbuild 的 `.cmd` 文件提取每个失败 TU 的**确切** `-I`/`-D`/`-include`，
+  重编之前 harness 漏掉的 478 个 TU：修正 flag 正则（`-include` 必须带空格，
+  否则误抓 `-include-dirs`）后 **380/478 编过**，剩 98 个。
+- 98 个里绝大多数仍是脚手架：44 个 syscall_64.c（生成文件）、35 个
+  `未定义的符号 rsp`（这些是**成功**编译的提示信息被当成首错）、e1000e/sound
+  缺 include、vdso32 缺 CONFIG_X86_32 fallback、生成文件等。
+
+### 发现的真实 c6c bug（本轮未修，需更深工作）
+- `_Static_assert(__is_array(((const int[]){1,2})))` 在 gcc 通过、c6c 失败
+  （"must be array"）。根因：`__is_array(a)=!__same_type((a),&(a)[0])` 靠
+  "typeof 不退化数组"区分数组/指针；c6c 的 typeof 遇到**复合字面量数组**
+  仍退化成指针（`parse.c6` 的 mark_lval/数组退化路径），命名数组正常。
+- 影响 1 个 i915 display TU（非启动路径）。尝试在数组退化处尊重 NO_DECAY
+  未能修复（复合字面量走另一条 GEN_TY 路径），**已回退未验证改动**，
+  不留半成品。留待后续专门处理 typeof_expr 的复合字面量类型传播。
+
+### 状态
+- 第 13 个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
+  c6c 作为 C 编译器能力已由"2416 对象启动到 VFS"验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
