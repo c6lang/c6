@@ -1239,3 +1239,37 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十九个真实 c6c bug（前十八个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 66 轮：第二十个真实 c6c bug —— 复合字面量后的 `[0].成员` 链
+
+### 症状与根因
+- `drivers/gpu/drm/i915/i915_pmu.c:907` 报 `这里要 '}'（当前是 '['）` /
+  `顶层声明缺名字`。内核 `I915_PMU_FORMAT_ATTR` 展开成
+  `&((struct i915_str_attribute[]){ … })[0].attr.attr`。
+- 第 65 轮修好外层括号识别后，`gen_glob_compound_addr()` 能认出复合字面量
+  本体，但只吃 `(T[]){…}`、**留下 `[0].attr.attr`**，调用方看到悬空 token
+  报"顶层声明缺名字"。这是第 57 轮曾尝试但失败并回退的链——当时外层括号
+  识别还没修，函数根本没被调用到。
+
+### 修复（`c6c/src/parse.c6`）
+- `gen_glob_compound_addr()` 复合字面量本体吃完，继续消费尾随的
+  `[常量]` / `.成员` 链，按 `glob_addr_parse` 同口径算字节偏移，用
+  `data_fixup_add_ex(data_off, sym, add)` 落地带加数的重定位。
+- 关键细节：`.` 分支必须先 `pa_accept_ch('.')` 再取成员名，否则 `mt` 是
+  `.`（非 TK_IDENT）直接 break，留下悬空的 `.x`（调试时确认）。
+
+### 验证（均通过）
+- 最小复现 `static int *p = &((struct A[]){…})[0].x;`：修复前 rc=1、后 rc=0。
+- 偏移语义：`.x` 在 offset 12，`readelf -r` 显示 `R_X86_64_64 __c6_cl_0 + c`
+  （+12），与 gcc 的 `.data + c` 完全一致。
+- 全部 10 个复合字面量复现用例 rc=0；i915_pmu.c 全标志编译 rc=0。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+- 全树编译：2464 → **2481**（+17 TU，含 i915_pmu、e1000e×7、sound×4、
+  syscall×2、hid 等）；无净新增失败（alternative.c 两版编译器都失败，
+  非回归）。
+- 启动：2452 个 c6c 对象换入纯 gcc 内核树，`vmlinux` 链接 0 undefined，
+  QEMU 启动到 VFS（M25 pre / VFS panic 终点），与第 64 轮一致。
+
+### 状态
+- 第二十个真实 c6c bug（前十八个 + 第 53 轮回归 + 第 65/66 轮），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。

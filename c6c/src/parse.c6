@@ -16608,6 +16608,9 @@ static int gen_glob_compound_addr(u32 data_off)
 {
     u32 cty = 0;
     u32 ex = 0;
+    u32 clsym = 0;
+    int have_sym = 0;
+    i64 add = 0;
 
     if (!pa_is_compound_lit())
         return 0;
@@ -16651,7 +16654,8 @@ static int gen_glob_compound_addr(u32 data_off)
          * (char[SIZE]){0}, .size = SIZE }`）。这一趟会重建叶子表 LF_*，而外层
          * 正在遍历同一张表——所以 gen_glob_braced_new 自己进来先快照、出去还原。 */
         gen_glob_braced_new(soff, cty, 0);
-        data_fixup_add(data_off, sym);
+        clsym = sym;
+        have_sym = 1;
     } else {
         /* 零字节对象（`&(empty_s){}`）：没有字节要写 */
         pa_advance();                    /* { */
@@ -16660,6 +16664,44 @@ static int gen_glob_compound_addr(u32 data_off)
     }
     while (ex--)
         pa_expect_ch(')');
+
+    /* 复合字面量后面常跟下标/成员链：`&((struct T[]){…})[0].m` ——内核
+     * i915_pmu.c 的 `I915_PMU_FORMAT_ATTR` 就是 `&((struct i915_str_attribute[]){
+     * …})[0].attr.attr`。地址是匿名对象基址加常量偏移（C99 6.6p9）。以前这里
+     * 只吃复合字面量本体，留下 `[0].attr.attr`，调用方看到悬空 token 报
+     * "这里要 '}' / 顶层声明缺名字"。偏移与 glob_addr_parse 的成员链同口径。 */
+    if (have_sym) {
+        u32 cur = cty;
+        int saved = CONST_NOREF;
+
+        CONST_NOREF = 1;
+        while (pa_is_ch('[') || pa_is_ch('.')) {
+            if (pa_accept_ch('[')) {
+                i64 idx = const_expr();
+                u32 et = ty_is_array(cur) ? ty_target(cur) : 0;
+
+                pa_expect_ch(']');
+                if (!et)
+                    break;
+                add += idx * (i64)ty_size(et);
+                cur = et;
+            } else if (pa_accept_ch('.')) {
+                Tok *mt = pa_cur();
+                u32 mty = 0, moff = 0;
+
+                if (mt->kind != TK_IDENT || !ty_is_agg(cur)
+                    || !agg_find_promoted(cur, tok_data(mt), mt->len, &mty, &moff))
+                    break;
+                pa_advance();
+                add += (i64)moff;
+                cur = mty;
+            } else {
+                break;
+            }
+        }
+        CONST_NOREF = saved;
+        data_fixup_add_ex(data_off, clsym, add);
+    }
     return 1;
 }
 
