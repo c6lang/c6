@@ -792,3 +792,35 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 本会话第九个真实 c6c bug（前八个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
   RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量），
   已修并验证。目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 49 轮：第十个真实 c6c bug —— 字符串字面量作常量表达式
+
+### 症状
+- 用第 48 轮编译器全树重编 **2460/2942**。剩余失败里
+  `net/netfilter/nf_conntrack_sip.c:382` 一串 `这里要一个常量表达式`。
+- 内核 `SIP_HDR` 宏：
+  `.clen = (__cname) ? sizeof(__cname)-1 : 0`。当 `__cname` 是字符串字面量
+  （如 `"f"`）时，静态初始化器里的三元条件要求把字符串当常量求值。
+
+### 根因（`parse.c6:const_unary()`）
+- 常量求值器认 TK_NUM / TK_CHAR / 标识符 / sizeof，但**不认 TK_STR**——
+  直接掉到末尾报"这里要一个常量表达式"。gcc 里字符串字面量的值是它的
+  地址（非零常量），三元条件为真。
+
+### 修复（`c6c/src/parse.c6`）
+- `const_unary()` 加 TK_STR 分支：用 `str_lit_data()` 把字符串写进数据段
+  （顺带拼好相邻字面量），设 `CONST_TY` 为 `char *`，返回其虚拟地址
+  （用 `ELF_BASE_VA + ELF_HDR + off`，因为 `DATA_VA` 宏在本文件后面才定义）。
+
+### 验证（均通过）
+- 最小复现：`.x = ("f") ? 7 : 9` 修复前 rc=1、修复后 rc=0；纯整数三元、
+  `sizeof` 分支三元仍 rc=0；真跑读 `h.x == 7` rc=0。
+- 实际受影响的 `nf_conntrack_sip.c` 用全内核标志（含 `KBUILD_MODFILE`）
+  编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 本会话第十个真实 c6c bug（前九个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
+  括号内相邻字符串），已修并验证。目标仍未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在。

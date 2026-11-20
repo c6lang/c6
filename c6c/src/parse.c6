@@ -4006,6 +4006,19 @@ static i64 const_unary(void)
         pa_advance();
         return v;
     }
+    if (pa_cur()->kind == TK_STR) {
+        /* 字符串字面量的值是它的地址，是常量（且非零）。内核
+         * include/linux/netfilter/nf_conntrack_sip.h 的 SIP_HDR 宏里
+         * `.clen = (name) ? sizeof(name)-1 : 0` 拿字符串当三元条件，
+         * 静态初始化器里走常量求值——老实现不认 TK_STR，报"这里要一个
+         * 常量表达式"（nf_conntrack_sip.c 等编不过）。把字符串写进数据段、
+         * 返回其地址即可；相邻字面量由 str_lit_data 一并拼好。 */
+        u32 so = str_lit_data();
+
+        CONST_TY = ty_ptr(ty_char());
+        /* DATA_VA 宏在本文件后面才定义，这里直接用它的展开式。 */
+        return (i64)(ELF_BASE_VA + ELF_HDR + (u64)so);
+    }
     if (pa_cur()->kind == TK_IDENT) {
         Sym *s = sym_find(tok_data(pa_cur()), pa_cur()->len);
 
