@@ -1434,9 +1434,10 @@ static int pp_next(Tok *out)
             pp_do_pragma_op();
             continue;
         }
-        /* 五个内建宏先按"长度 8..11 且以 __ 开头"过滤：绝大多数标识符是普通
-         * 名字，一次判断就能跳过 5 次字符串比较（profiler 里 pp_next 占 6%）。 */
-        if (!(out->len >= 8 && out->len <= 11 && tok_data(out)[0] == '_'
+        /* 内建宏先按"长度 8..13 且以 __ 开头"过滤：绝大多数标识符是普通
+         * 名字，一次判断就能跳过若干次字符串比较（profiler 里 pp_next 占 6%）。
+         * 上界放到 13 是为了收下 `__BASE_FILE__`（13 字符）。 */
+        if (!(out->len >= 8 && out->len <= 13 && tok_data(out)[0] == '_'
               && tok_data(out)[1] == '_')) {
             m = macro_find(out);
             hs = (Hide *)out->hs;
@@ -1478,6 +1479,31 @@ static int pp_next(Tok *out)
             int n = snprintf(buf, len, "\"%s\"", fn);
             *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
             return TK_STR;
+        }
+        if (TOK_EQ(out, "__BASE_FILE__")) {
+            /* GCC 预定义：最外层被编译的源文件（不是当前 #include 的文件），
+             * 整 TU 不变。内核 sound/core/seq/seq_lock.h 的
+             * snd_use_lock_sync 宏用它打印文件名。沿包含栈走到最底下那层
+             * 文件源即可；和普通标识符一样展开成字符串字面量。 */
+            Src *s = PP_TOP;
+            SrcFile *f = NULL;
+
+            while (s) {
+                if (s->is_file)
+                    f = s->f;            /* 一路覆盖，最后是最外层 */
+                s = s->up;
+            }
+            if (!f)
+                f = CUR_FILE;
+            {
+                const char *fn = f ? src_path_of(f) : "";
+                size_t len = strlen(fn) + 3;
+                char *buf = arena_alloc(&A_main, len);
+                int n = snprintf(buf, len, "\"%s\"", fn);
+
+                *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
+                return TK_STR;
+            }
         }
         m = macro_find(out);
         hs = (Hide *)out->hs;

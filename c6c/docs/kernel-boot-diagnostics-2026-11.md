@@ -1099,3 +1099,28 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 15 个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 60 轮：第十六个真实 c6c bug —— 预定义宏 __BASE_FILE__
+
+### 症状与根因
+- `sound/core/seq/seq_lock.h` 的 `snd_use_lock_sync` 宏用 `__BASE_FILE__`
+  打印文件名；c6c 报"未声明的标识符 '__BASE_FILE__'"（4 个 sound TU）。
+- 两个原因：
+  1. `pp.c6:pp_next()` 的内建宏快速过滤上界是 11 字符，`__BASE_FILE__`
+     （13 字符）被过滤掉、走成普通标识符；
+  2. 根本没有该宏的实现。
+
+### 修复（`c6c/src/pp.c6`）
+- 长度上界 11→13；新增 `__BASE_FILE__` 分支：沿包含栈 `PP_TOP->up` 走到
+  最外层文件源，展开成其路径字符串（GCC 语义：整 TU 恒为主源文件，
+  不同于 `__FILE__` 是当前 #include 文件）。
+
+### 验证（均通过）
+- `-E`：`#include` 的文件里 `__BASE_FILE__` = 主文件名、`__FILE__` = 当前头文件名
+  （与 gcc 一致）；最小复现 rc=1→rc=0。
+- 真实 TU `sound/core/seq/seq_clientmgr.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 第十六个真实 c6c bug（前十五个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
