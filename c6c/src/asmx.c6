@@ -117,6 +117,7 @@ typedef struct AxOp {
     int indirect;
     int have_disp;
     int disp;           /* 只支持 32 位范围内的位移（够用） */
+    int seg;            /* 段前缀字节：0x65(gs)/0x64(fs)/0 */
     const char *sym;
     u32 symlen;
 } AxOp;
@@ -511,6 +512,27 @@ static int ax_operand(AxOp *o)
         return 1;
     }
     if (*AX_P == '%') {
+        /* `%gs:disp` / `%fs:disp`：x86 段覆盖前缀（per-CPU 访问）。
+         * GCC 把 per-CPU 变量编成 `%gs:offset`，c6c 以前不认整段 asm 作废。
+         * 认下前缀字节，后面的位移/基址照常当内存操作数解析。 */
+        if ((AX_P + 4 <= AX_E) &&
+            ((AX_P[1] == 'g' && AX_P[2] == 's') || (AX_P[1] == 'f' && AX_P[2] == 's')) &&
+            AX_P[3] == ':') {
+            int seg = (AX_P[1] == 'g') ? 0x65 : 0x64;  /* GS / FS */
+            AX_P += 4;
+            ax_sp();
+            if (!ax_operand(o))
+                return 0;
+            /* `%gs:0x28` 的裸位移被 ax_operand 当立即数；段覆盖下它是内存地址 */
+            if (o->kind == AXK_IMM) {
+                o->kind = AXK_MEM;
+                o->reg = -1;        /* 绝对 disp32：ax_rm 发 SIB base=5 */
+                o->idx = -1;
+                o->size = 0;
+            }
+            o->seg = seg;
+            return 1;
+        }
         /* `%l[name]`：asm goto 的 C 标号 */
         if (AX_P + 2 < AX_E && AX_P[1] == 'l' && AX_P[2] == '[') {
             u32 n = 0;
@@ -657,6 +679,8 @@ static void ax_rm(int regf, AxOp *m)
 /* opcode(+ModRM) 形式：[0x66][REX][op1][op2][ModRM/SIB/disp] */
 static void ax_emit_rm(u8 op1, u8 op2, int regf, AxOp *m, int w, int p66)
 {
+    if (m && m->seg)
+        img_u8(&AX_IM, (u32)m->seg);   /* 段前缀必须在 REX 之前 */
     if (p66)
         img_u8(&AX_IM, 0x66);
     ax_rex_for(regf, m, w);
