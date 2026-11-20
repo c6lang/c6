@@ -566,3 +566,25 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   `M20 pre (mm_core_init)` 为准。目标未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在。下一步需先恢复原 7.4-rc3 树与原 config
   才能继续定位 mm_core_init 之后的停顿。
+
+## 第 42 轮：已提交修复的字节级复核（无新 bug）
+
+### 验证（均通过）
+- 重新从 `c6c/src/c6c.c6` 编译出 c6c，含五个已提交修复。
+- `c6c/tests/asm-native-check.sh`（native 后端内联汇编机器码）：通过 10 / 失败 0。
+- 字节级核对：`btr` 编出 `4d 0f b3 1a`（0F B3 /r）、`bt` 编出
+  `4d 0f a3 1a`（0F A3 /r）——第 41 轮两个 bitops 修复生成的机器码正确。
+- `RELOC_HIDE` 最小用例（空模板 asm 的 `=r`/`"0"`）rc=0。
+
+### 环境/已知限制（非新 bug，未改动代码）
+- `c6c/tests/regression-c6c.sh` 全 92 例失败，系本环境缺
+  `tcc/include/stddef.h`（`size_t` 等无法解析）等头文件，与改动无关；
+  前端基线在完整环境为 89/89。
+- 全树重建仍停在 `topology_init_possible_cpus` 的 #DE（第 41 轮续已记），
+  因树为 7.3+defconfig 重建、桩/链接脚手架差异过大，未定性为 c6c bug。
+- `lib/klist.c` 的 `klist_add_head/tail` 在 c6c .o 里是 local(`t`)（gcc 为
+  global `T`），并伴随伪全局 `klist_node_klist_add_head`——已知的
+  static/inline 符号本地化限制，非新 bug。
+
+### 状态
+- 目标未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
