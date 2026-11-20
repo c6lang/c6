@@ -14693,7 +14693,8 @@ typedef struct InitSave InitSave;
                 PEND_LVAL = 1;
                 PEND_TY = ty_array(et, INIT_CNT_OK ? INIT_COUNT : 1);
                 PEND_ADDR = addr;
-                GEN_TY = ty_ptr(et);
+                /* typeof 要复合字面量的数组类型本身，不退化（NO_DECAY） */
+                GEN_TY = NO_DECAY ? PEND_TY : ty_ptr(et);
                 /* 复合字面量是后缀表达式的一部分：`(int[]){7,8}[1]`、
                  * `(struct P){1,2}.y` 都要接着走后缀链（C99 6.5.2）。 */
                 init_restore(&isv);
@@ -14707,7 +14708,7 @@ typedef struct InitSave InitSave;
             PEND_LVAL = 1;
             PEND_TY = ty;
             PEND_ADDR = addr;
-            GEN_TY = ty_is_array(ty) ? ty_ptr(ty_target(ty)) : ty;
+            GEN_TY = ty_is_array(ty) ? (NO_DECAY ? ty : ty_ptr(ty_target(ty))) : ty;
             /* 同上：复合字面量后面可以直接跟 `.成员`/`[下标]` */
             init_restore(&isv);
             return gen_postfix_ops(addr);

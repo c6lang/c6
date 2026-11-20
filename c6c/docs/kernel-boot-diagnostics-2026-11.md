@@ -995,3 +995,23 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 第 13 个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
   c6c 作为 C 编译器能力已由"2416 对象启动到 VFS"验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 55 轮续：第十四个真实 c6c bug —— typeof 里复合字面量数组退化
+
+### 修复（`c6c/src/parse.c6`）
+- 上一轮定位的 `__is_array(((const int[]){1,2}))` 假失败，根因在复合字面量
+  表达式路径：两处把 `GEN_TY` 设成 `ty_ptr(...)`（数组退化成指针），
+  而 `parse_typeof()` 设的 `NO_DECAY` 标志没被尊重（函数指示符路径本来就
+  尊重了）。让这两处也按 `NO_DECAY` 保留数组类型本身。
+
+### 验证（均通过）
+- `_Static_assert(__is_array(((const int[]){1,2})))`：修复前 rc=1、修复后 rc=0
+  （与 gcc 一致）；`sizeof`/typeof 命名数组、字符串三元、复合字面量取地址
+  等前序用例仍 rc=0。
+- 真实 TU `intel_display_power_map.c` 里 `_Static_assert "must be array"`
+  **消失**（该 TU 仍因另一个"复合字面量做初始化器"问题编不过，非本 bug）。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；全树重编 2464（不倒退）。
+
+### 状态
+- 第十四个真实 c6c bug（前十三个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
