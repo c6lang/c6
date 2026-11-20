@@ -729,3 +729,35 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 本会话第七个真实 c6c bug（前六个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
   RELOC_HIDE、属性函数指针 typedef），已修并验证。目标仍未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在。
+
+## 第 47 轮：第八个真实 c6c bug —— 带外层括号的复合字面量地址初始化器
+
+### 症状
+- 用第 46 轮编译器全树重编 **2455/2942**（比上轮 2445 多 10）。
+  剩余失败里 `include/linux/hwmon.h:444` 报 `这里要 ')'（当前是 '{'）`（3 个 TU）。
+- 内核 `HWMON_CHANNEL_INFO(stype, ...)` 宏展开成
+  `(&(const struct hwmon_channel_info){ .type=…, .config=(const u32[]){…} })`。
+
+### 根因（`parse.c6:gen_glob_obj` 的文件作用域地址初始化器解析）
+1. 剥"整条地址常量外层括号"的循环只认 `&` 后面是 TK_IDENT（`(&name)`），
+   `&(` 后跟复合字面量时外括号不剥，`amp` 看不到 `&`。
+2. `&(name)` 那条把 `const`（类型关键字，词法上是 TK_IDENT）错当名字，
+   于是 `&(const struct T){…}` 被剥成 `&const`。
+3. `gen_glob_compound_addr()` 成功后直接 return，没吃掉第 1 步剥掉的
+   外层 `)`，`amp_paren` 悬空 → 下一条声明报"顶层声明缺名字"。
+
+### 修复（`c6c/src/parse.c6`，三处）
+- 外层括号剥离：`&` 后面是标识符 **或** `(`（复合字面量）都剥。
+- `&(name)` 剥离：加 `is_typename_tok()` 排除类型关键字。
+- 复合字面量地址成功后：把 `amp_paren` 记的 `)` 补吃掉再 return。
+
+### 验证（均通过）
+- 最小用例：宏展开的 `(&(const struct S){…})` 修复前 rc=1、修复后 rc=0；
+  `-E` 输出正确；真跑（读 `p->type`）rc=0。无宏的 `&(T){…}` 仍 rc=0（无回归）。
+- 受影响的 2 个非 i915 hwmon TU 修复后编过（i915_hwmon 仍缺 i915 include 目录，
+  属脚手架）。回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 本会话第八个真实 c6c bug（前七个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。

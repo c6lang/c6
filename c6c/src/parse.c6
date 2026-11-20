@@ -17171,8 +17171,14 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 
             while (pa_peek(k0)->kind == TK_PUNCT && TOK_EQ(pa_peek(k0), "("))
                 k0++;
-            if (k0 == 0 || !(pa_peek(k0)->kind == TK_PUNCT && TOK_EQ(pa_peek(k0), "&"))
-                || pa_peek(k0 + 1)->kind != TK_IDENT)
+            if (k0 == 0 || !(pa_peek(k0)->kind == TK_PUNCT && TOK_EQ(pa_peek(k0), "&")))
+                break;
+            /* `&` 后面要么是名字（`(&name)`），要么是复合字面量
+             * `(&(const struct T){…})`（内核 HWMON_CHANNEL_INFO 宏展开后
+             * 正是这种：外层括号里 & 后跟 `(`，老判断只认 TK_IDENT，
+             * 外括号不剥、amp 看不到 &，3 个 hwmon TU 编不过）。两者都剥。 */
+            if (pa_peek(k0 + 1)->kind != TK_IDENT
+                && !(pa_peek(k0 + 1)->kind == TK_PUNCT && TOK_EQ(pa_peek(k0 + 1), "(")))
                 break;
             pa_advance();          /* 一层 `(` */
             amp_paren++;
@@ -17191,9 +17197,12 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             for (; amp; ) {
                 u32 k = 1;
 
-                if (!pa_is_ch('(') || pa_peek(k)->kind != TK_IDENT)
+                if (!pa_is_ch('(') || pa_peek(k)->kind != TK_IDENT
+                    || is_typename_tok(pa_peek(k)))
                     break;
-                /* 括号里是 `名字 (.成员 | [常量])*`，且整体只有一层括号 */
+                /* 括号里是 `名字 (.成员 | [常量])*`，且整体只有一层括号。`const`
+                 * 等类型关键字词法上也是 TK_IDENT，不能当成 `&(name)` 的名字——
+                 * 否则 `&(const struct T){…}` 会被错剥成 `&const`（复合字面量）。 */
                 while (pa_peek(k)->kind == TK_IDENT
                        || (pa_peek(k)->kind == TK_PUNCT
                            && (TOK_EQ(pa_peek(k), ".") || TOK_EQ(pa_peek(k), "[")))) {
@@ -17232,8 +17241,18 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
                 (void)pd;
             }
         }
-        if (amp && gen_glob_compound_addr(goff + off))
+        if (amp && gen_glob_compound_addr(goff + off)) {
+            /* `(&(T){…})`：外层成组括号在前面剥掉了（amp_paren 记着数），
+             * 复合字面量本体吃完还得把那几个 `)` 补回去，否则下一条声明
+             * 从悬空的 `)` 开始，报"顶层声明缺名字"。普通的 `&(T){…}`
+             * amp_paren=0，这里自然空转。 */
+            while (amp_paren > 0 && pa_is_ch(')')) {
+                pa_advance();
+                amp_paren--;
+            }
+            amp_paren = 0;
             return;
+        }
         ak = glob_addr_start(amp);
         if (ak) {
             glob_addr_parse(goff + off, amp, ak == 2, (int)amp_paren);
