@@ -1077,3 +1077,25 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - `.S` 汇编仍需 GNU as；vmlinux 链接仍需 GNU ld（c6c 自带 ld 无内核链接脚本
   支持）；objtool/modpost 等 host tools 仍由 gcc 构建。
 - 命名地址空间（CONFIG_CC_HAS_NAMED_AS）走 `%gs:` 规避路径，非原生支持。
+
+## 第 59 轮：评估 GNU ld 依赖缺口（结构性，未改动）
+
+### c6c 自带链接器现状
+- `c6c -o prog a.o b.o` 能把多个 ET_REL 链成可跑的 ET_EXEC（最小多 TU 用例
+  真跑 rc=0，说明重定位/符号解析/合成 _start 都正常）。
+- 但 `ld.c6` 的能力边界决定它**无法直接链接内核**：
+  * `LD_MAXOBJ 64`（内核 2435 个 .o）；
+  * 只归并固定几段（.text/.rodata/.data/.bss/.init_array/.fini_array），
+    内核大量自定义段（.init.text、.data..percpu、异常表等）会被丢掉；
+  * 文件偏移与 VA 恒等映射、入口是合成 _start——内核需要高半部链接地址
+    和自定义链接脚本（vmlinux.lds.S）。
+- 结论：替代 GNU ld 是一个**大型独立工程**，剩余轮次无法可靠完成；
+  按"不臆造修复"原则，不改代码。
+
+### 附带尝试（已回退）
+- 试修 i915_pmu.c 的 `&((T[]){…})[0].member` 复合字面量链（gen_glob_compound_addr
+  折进偏移），未奏效且可能影响其他用例，**已回退**，不留半成品。
+
+### 状态
+- 15 个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
