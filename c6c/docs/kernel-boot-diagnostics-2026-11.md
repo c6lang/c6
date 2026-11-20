@@ -243,3 +243,15 @@ spill 到 `-0x10(%rbp)` 再经指针 load 作为 memcpy 源，0xffff888000014770
 **结论**：触发 panic 的真正首因仍未锁定（在 fault #5 附近），但已排除
 copy_bootdata/TLS/entry-point 三类嫌疑；panic 打印路径 NULL 解引用导致的
 递归 #PF 是放大故障的次要问题。启动仍不可达用户态，目标未完成。
+
+### 第 39 轮补充：环境对照与 relocs 排除
+- **GCC 基线对照**：同一 QEMU 命令下 `/tmp/gcc-baseline/arch/x86/boot/bzImage`
+  正常启动（25001B 串口、Linux version 7.4.0-rc3、跑到 VFS no-rootfs panic）。
+  证明配置/QEMU/BIOS 环境正常，早期崩溃是 **c6c 代码生成**特异问题。
+- **KASLR relocs 排除**：手动重链的全树 vmlinux 无 RELA（ld 静态解析完毕），
+  `arch/x86/tools/relocs` 产出 8 字节空表（正确）。曾怀疑 piggy 缺 relocs 表
+  导致 KASLR 重定位错误，补上 8 字节空表后仍崩在同一处——排除该因素。
+- `__c6_tls_len` 实为 `.data` 段 0 长度 OBJECT 标签（readelf 确认 section 9），
+  QEMU/GDB 把代码 RIP 归到它是符号化伪影，非执行流跳进数据。
+- **待办**：`print_stop_info` 的 NULL 解引用递归 #PF 是 panic 后的放大器；
+  真正触发 panic 的首因在 fault #0-#5 之间，需要更细的单步/看门点定位。
