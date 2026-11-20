@@ -3421,6 +3421,20 @@ static i64 const_unary(void)
                 pa_expect_ch(')');
                 extra--;
             }
+        } else if (pa_cur()->kind == TK_STR) {
+            /* `&"string"`：`&#option` 宏展开成 `&"PARPORT_SERIAL"`（内核
+             * drivers/tty/serial/8250/8250_pci.c 的 REPORT_CONFIG），字符串
+             * 字面量的地址是常量。`str_lit_data()` 把相邻串拼好写进数据段，
+             * 返回地址；extra 里记着前面剥掉的 `(`（宏的括号），逐个补回。 */
+            u32 str_off = str_lit_data();
+            u64 va = ELF_BASE_VA + ELF_HDR + (u64)str_off;
+
+            while (extra > 0) {
+                pa_expect_ch(')');
+                extra--;
+            }
+            CONST_TY = ty_ptr(ty_char());
+            return (i64)va;
         } else if (pa_cur()->kind == TK_IDENT
                    && (sbase = sym_find(tok_data(pa_cur()), pa_cur()->len)) != NULL
                    && sbase->kind == SC_GLOBAL) {

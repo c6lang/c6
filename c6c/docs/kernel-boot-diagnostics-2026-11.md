@@ -889,3 +889,32 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
   括号内相邻字符串、字符串常量三元、`&*NULL`），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 52 轮：第十三个真实 c6c bug —— `&"string"` 常量地址
+
+### 症状
+- 用第 51 轮编译器全树重编 **2463/2942**。剩余失败里
+  `drivers/tty/serial/8250/8250_pci.c` 报"常量表达式里只支持 &((T *)0)->member
+  形式的取地址" + 一串 `这里要 ')'（当前是 '"PARPORT_SERIAL"'）`。
+- 内核 `REPORT_CONFIG(option)` = `... (kernel_ulong_t)&#option`，展开成
+  `&"PARPORT_SERIAL"`（字符串字面量取地址，是常量）。
+
+### 根因（`parse.c6:const_unary()` 的 `&` 分支）
+- 认 `&((T *)0)->m`、`&全局`，但 `&` 后面直接是 TK_STR 时落到
+  `pa_error("只支持 &((T *)0)->member")`。gcc 里字符串地址是常量。
+
+### 修复（`c6c/src/parse.c6`）
+- `&` 分支加 TK_STR：`str_lit_data()` 把字符串写进数据段（拼好相邻串），
+  返回其虚拟地址；补吃掉宏外层括号 `extra`。
+
+### 验证（均通过）
+- 最小复现（`&#option` 宏）：修复前 rc=1、修复后 rc=0；`&*NULL`、
+  字符串三元、offsetof 嵌套的前序修复用例仍 rc=0。
+- 实际受影响的 `8250_pci.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 本会话第十三个真实 c6c bug（前十二个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
+  括号内相邻字符串、字符串常量三元、`&*NULL`、offsetof），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
