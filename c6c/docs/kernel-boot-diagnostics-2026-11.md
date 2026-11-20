@@ -609,3 +609,35 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   且用 `--allow-multiple-definition` 链接（桩可能覆盖真实定义），**确认
   #DE 是重建脚手架（桩/链接）假象，而非可定位的单个 c6c bug**。
   按"不臆造修复"原则不为它改代码。
+
+## 第 43 轮：#DE 定性为脚手架假象；2416 个 c6c 对象无桩启动成功
+
+### 决定性实验
+- 先确认 `__SCT__*` 静态调用桩**不是** c6c bug：c6c 编译
+  `kernel/sched/core.c`（开/关 DCE 两种）与 gcc 的符号完全一致
+  （都是 `U __SCT__preempt_schedule` + `__UNIQUE_ID_addressable_*`）；
+  SCT trampoline 由头文件里的内联汇编定义，c6c 正常发射（全树 1159 个已定义）。
+- 干净 bisect（**纯 gcc 树 + 只换入 c6c .o，不补任何桩**）：
+  - 只换 `topology`+`common` → 启动正常，打印完整 `CPU topo:`（qemu rc=0）。
+  - 换入**全部 2416 个 c6c C TU**（保留 gcc 的 .S 与 host tools），
+    vmlinux 链接 **零 undefined symbol**（唯一的链接失败来自 modpost 的
+    section-mismatch 警告，绕过即可）。
+  - 该内核 QEMU 启动：打印 `Linux version`、完整 `CPU topo:`、5 个
+    `NET: Registered` 协议族、COM1 标记走完 `M01`…`M25`，一路到
+    `VFS: Unable to mount root fs`（本环境无 rootfs 的预期终点）。
+- 结论：第 41/42 轮全树 #DE 是**验证脚手架假象**——当时因编译失败排除了
+  约 500 个 .o，又把 431 个未定义符号统一桩成 `.quad 0` 数据并用
+  `--allow-multiple-definition` 链接，桩覆盖了真实定义所致。
+  **不是 c6c 的 C 编译 bug**；不为它改代码。
+
+### 范围界定（阶段 B 口径）
+- 本次成功覆盖 c6c 编译的全部 2416 个内核 C TU（CC 角色），但：
+  - `.S` 汇编仍由 GNU as 汇编（arch/x86/boot、realmode、vdso 等）；
+  - 链接仍用 GNU ld（含 `-z muldefs` 本次未用，干净树零未定义符号）；
+  - objtool/modpost 等 host tools 仍由 gcc 构建。
+- 因此目标仍未达成（未进 userspace、仍有 gcc/as/ld 依赖），但证明
+  **c6c 作为 C 编译器已能把几乎整个内核编到可启动、功能完整**。
+
+### 状态
+- 五个已提交的真实 c6c 修复不变。目标未达成；下一步的真正缺口是
+  GNU as（.S）、GNU ld、gcc host tools 与命名地址空间支持。
