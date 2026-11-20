@@ -141,3 +141,20 @@ asmx.c6 现已支持 `%gs:disp` / `%fs:disp` 段覆盖前缀（commit `665962b`�
 c6c-tests2 无新增回归（仍 5 条已知意外失败 + 99_fastcall 运行期信号）。
 注意：当前最小树是 UP，per-CPU 走普通指针不用 `%gs:`，故此修复不直接改变
 最小树的启动行为；它对 CONFIG_SMP 内核（完整树）的 per-CPU 访问是必需的。
+
+## 第 37 轮：SMP 全树 per-CPU 编译路径已打通（实验验证）
+完整树（/tmp/linux-7.4-rc3）是 CONFIG_SMP=1 + CONFIG_CC_HAS_NAMED_AS=1，
+per-CPU 走命名地址空间（__seg_gs），c6c 把 __seg_gs 当 no-op → per-CPU 全错。
+实验：临时 undef autoconf.h 里的 CONFIG_CC_HAS_NAMED_AS，让内核回退到
+`%%gs:` 内联汇编路径，用新 c6c（含 %gs: 段前缀支持）编译
+`kernel/sched/core.c` 成功，产出 **27 条 `%gs:` 指令**，例如：
+```
+65 4d 0f b1 08   cmpxchg %r9,%gs:(%r8)     (this_cpu_cmpxchg)
+65 49 ff 02      incq %gs:(%r10)           (this_cpu_inc)
+65 4d 21 1a      and %r11,%gs:(%r10)
+```
+前缀字节 0x65 在 REX(0x4d) 之前，编码正确。autoconf.h 已恢复。
+这给出一条可行路线：**SMP 内核用 c6c 编译时需关闭
+CONFIG_CC_HAS_NAMED_AS**（因 c6c 无命名地址空间语义），配合已实现的
+`%gs:` 段前缀，per-CPU 访问即可正确生成。全树 2424 个 C 文件的完整
+重编/链接/启动留待后续（仍需命名段 + 内核级链接器）。
