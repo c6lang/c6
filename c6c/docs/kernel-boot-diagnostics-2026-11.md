@@ -195,3 +195,28 @@ c6c 编译后，`nm drivers/thermal/thermal_netlink.o` 显示该符号为 `U`（
 - bzImage 尚未产出：`make bzImage` 会重新 LD vmlinux 并再次触发 `.eh_frame`
   strict orphan 错误；需手动 objcopy → gzip → mkpiggy 路径，且 kallsyms 多遍
   构建仍需 GCC 工具链参与。
+
+## 第 38 轮：全树 bzImage 首次构建成功 + 启动到内核入口
+### 构建路径（全部手动，规避 make 重链 kallsyms）
+1. `objcopy -R .comment -S vmlinux vmlinux_elf.bin`（**关键**：必须保留 ELF 头，
+   先前误用 `-O binary` 导致 decompressor 报 "Kernel is not a valid ELF file"）
+2. `gzip -n -c` → `mkpiggy` → `gcc -c piggy.S`（piggy.o 是唯一 GCC 产物，仅为 decompressor 桩）
+3. 用内核 `.vmlinux.cmd` 里的**原始 ld 命令**链 compressed/vmlinux（含 libstub/lib.a、startup/lib.a）
+4. `objcopy -O binary` → `dd setup.bin bs=4k` + `cat vmlinux.bin` → bzImage（75.5MB）
+### 启动结果
+```
+Decompressing Linux... Parsing ELF... Performing relocations... done.
+Booting the kernel (entry_offset: 0x167dc7e0).    <- 进入内核入口后崩溃
+```
+`nokaslr` 路径反而在 decompressor 里 "uncompression error"（次要问题）。
+### GDB + QEMU -d int 定位早期崩溃
+- 双重故障 `#DF`（`check_exception old: 0xe new: 0xe`），RIP `0xffffffff8394eede`
+  （在 `lockdep_hardirqs_off` 的 `push %r12` 中途），RBP 是**代码地址** `0xffffffff8394d2a8`，
+  SP `0xffffffffeea5c9e8`（与正常内核栈 `0xffffffff961f...` 不同）。
+- GDB 断点在 `lockdep_hardirqs_off` 命中，调用者 `irqentry_enter_from_kernel_mode`
+  (`0xffffffff8396655e`，`call` 从 `0xffffffff83966559`)，此时 rdi=0、栈健康。
+- 结论：不是函数自身截断（GDB 单步所有指令正常），而是**进入该函数前的某处
+  破坏了栈/RBP**，或 KASLR 重定位后运行时字节与 vmlinux 文件不一致（QEMU 报的
+  RIP 落在指令中途）。属早期启动的 c6c 代码生成/重定位问题，需继续定位。
+- 注意：全树 vmlinux 里有**多份同名函数副本**（lockdep_hardirqs_off 至少 4 处），
+  是 DCE 兜底按名字跨 TU 标记所致，可能是隐患。
