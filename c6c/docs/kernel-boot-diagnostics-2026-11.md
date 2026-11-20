@@ -306,3 +306,51 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - c6c 前端 89/89 通过；pm/serv 类失败与本次改动无关（新 /tmp 构建目录的路径相关用例）。
 - 目标未达成：仍需让内核越过 percpu 初始化进入 userspace，且 GNU as/ld/host tools 依赖未消除。
+
+---
+
+## Round 41：`obj.c6` DCE 入口别名误判 → `bitmap_copy` 被 stub、`nr_groups=0`
+
+### 现象
+- 上轮 ud2 落在 `pcpu_setup_first_chunk`。用 `nokaslr` GDB 断点确认：
+  `PCPU_SETUP_BUG_ON(ai->nr_groups <= 0)` 触发，首个 #UD IP = `pcpu_setup_first_chunk+0x...`。
+- 追 `ai->nr_groups` 为什么是 0：`pcpu_build_alloc_info` 里 `mask` 经
+  `cpumask_copy(&mask, cpu_possible_mask)`（`bitmap_copy` → `memcpy`）后仍是全 0
+  （`nr_cpu_ids=65`、`__cpu_possible_mask` bit0+bit6 置位），group 计数循环一次都不进。
+- 反汇编 `mm/percpu.o`：`cpumask_copy` 里本该 `call bitmap_copy` 的位置是 5 条 `0x90`，
+  无重定位；`bitmap_copy` 入口是单条 `0xC3`（ret stub），后面整段函数体还在。
+  而 `arch/x86/kernel/apic/vector.o` 的同名 `cpumask_copy` 是正常的
+  `call bitmap_copy` + `R_X86_64_PC32`。
+
+### 根因（obj.c6 `obj_dce_stub_dead`）
+- `static inline` 包装会生成**两个同址别名符号**：`cpumask_copy` 与
+  `cpumask_cpumask_copy` 都在 `0x26dae`。
+- `mark`（可达性）只落在调用点 fixup 指向的那一个名字上（这里是
+  `cpumask_cpumask_copy` 被 `pcpu_build_alloc_info` 的 call 标记）；
+  二进制 search 找 fixup 的 `owner` 时挑中同址的另一个别名 `cpumask_copy`（未标记）。
+- 于是闭包不跟进 `cpumask_copy` 里的 call → `bitmap_copy` 仍判死 → 入口写 `0xC3`；
+  压缩 fixup 时又因 owner=未标记 static 把这条 call 的 `E8 rel32` NOP 化。
+- 入口 stub 循环里本来有 `alive_alias` 检查（同址任一符号标记即视为活），
+  但**闭包和 fixup 压缩两处没有**，三处不一致。
+
+### 修复
+- 新增 `sym_off_alive(mark, o)`：同址任一已定义非数据符号被标记即视为活。
+- 闭包与 fixup 压缩的 `!mark[o]` 判定都改为 `!mark[o] && !sym_off_alive(mark, o)`。
+- 注意 `mark` 类型是 `u8 *`（调试时误写成 `u32 *` 读到 4 字节垃圾，已修正）。
+
+### 验证
+- 单文件重编 `mm/percpu.c`：`bitmap_copy` 首字节 `0xC3 → 0x55`，
+  `cpumask_copy` 的 call 位置出现 `E8` + `R_X86_64_PC32 bitmap_copy-4`。
+- 全树重编 2424/2952（与修复前一致），GNU ld 重链成功（仅 objtool ELF size 警告）。
+- 链接镜像里该 call 解析为 `call ffffffff85277e77 <bitmap_copy>`（原 NOP 处）。
+- QEMU `nokaslr` 启动：GDB 断点确认**不再触发 `pcpu_setup_first_chunk` 的 BUG**
+  （该断点不再命中）；故障前移到一条页错误 oops 路径
+  `exc_page_fault → show_fault_oops → _printk → vsnprintf → memcpy`，
+  首个 #UD 落在 GNU as 构建的 `memcpy_orig+0x14`（`call __memcpy` 落到
+  NOP 填充区后跳进指令中间），属于**新的、不同的**下游问题。
+
+### 状态
+- 本轮成果：清除了一个真实的 c6c 代码生成 bug（DCE 入口别名误判），
+  percpu 初始化的 `nr_groups=0` BUG 不再出现，启动推进到下一段早期初始化。
+- 目标未达成：串口仍停在 `Linux version`；下游 `memcpy`/oops 路径、GNU as/ld/host
+  tools 依赖均未消除。该 `memcpy` 问题留待后续轮次。
