@@ -1212,3 +1212,30 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
   本轮无源码改动（仅文档），工作树干净。
+
+## 第 65 轮：第十九个真实 c6c bug —— 复合字面量被外层括号遮住
+
+### 症状与根因
+- `drivers/gpu/drm/i915/display/intel_display_power_map.c` 报
+  `这里要一个常量表达式` / `这里要 ')'（当前是 '{'）`。
+- 内核 `__LIST_INLINE_ELEMS(t, …)` 展开成 `((t[]){ … })`——复合字面量外
+  多套一层括号。`pa_is_compound_lit()` 第一条分支要求 peek(1) 直接是
+  类型名，多一个 `(` 就落到第二条分支；后者不认 `[N]` 数组声明符，于是
+  在全局初始化器里被当成普通表达式、在 `{` 上报常量表达式错误。
+- 缩小实验：单层 `(struct S[]){…}` 编过、双层 `((struct S[]){…})` 失败；
+  `sizeof(...)` / 函数体内 / `-E` 都正常，只在全局初始化器路径触发。
+
+### 修复（`c6c/src/parse.c6`）
+- `pa_is_compound_lit()` 第一条分支：非破坏性地跳过连续的 `((` 再从带
+  类型名的那层开始认（`pa_take_paren_type_ex` 本就会吃掉这些 `(` 并让
+  调用方补回 `)`）。
+
+### 验证（均通过）
+- 9 个复现用例（单/双层括号、标量/花括号元素、结构体成员、`ARRAY_SIZE`）
+  修复前 rc=1、修复后全 rc=0。
+- 实际 TU `intel_display_power_map.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；全树重编 2464（不倒退）。
+
+### 状态
+- 第十九个真实 c6c bug（前十八个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。

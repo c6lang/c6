@@ -16450,13 +16450,23 @@ static int pa_compound_lit_str_body(void)
 static int pa_is_compound_lit(void)
 {
     int i = 0;
+    int base = 0;
 
     if (!pa_is_ch('('))
         return 0;
+    /* 宏常把整个复合字面量多括一层：内核 intel_display_power_map.c 的
+     * `__LIST_INLINE_ELEMS(t, …)` 展开成 `((t[]){ … })`。先**非破坏性**地
+     * 跳过连续的 `((`，从真正带类型名的那层开始认；`pa_take_paren_type_ex`
+     * 本来就会把这些 `(` 一并吃掉、返回多出来的个数让调用方补回 `)`。 */
+    while (pa_peek(base) && pa_peek(base)->kind == TK_PUNCT
+           && tok_eq(pa_peek(base), "(") && pa_peek(base + 1)
+           && pa_peek(base + 1)->kind == TK_PUNCT
+           && tok_eq(pa_peek(base + 1), "("))
+        base++;
     /* 元组/单类型都能这么认：`(int, int){…}`、`(struct S){…}`、`(int){…}`
      * ——括号里是类型、闭括号后面紧跟 `{`。 */
-    if (is_typename_tok(pa_peek(1))) {
-        /* depth 从 1 起：下标 0 的那个 `(` 已经站在里面了。以前从 0 起，
+    if (is_typename_tok(pa_peek(base + 1))) {
+        /* depth 从 1 起：下标 base 的那个 `(` 已经站在里面了。以前从 0 起，
          * 闭括号一到就把 depth 数成 -1，于是 `(struct s){ ((0)) }` 里
          * 花括号体中的括号对把 depth 拉回 0、提前 return 一个 false——
          * 复合字面量认不出来，值被当成标量送进 const_expr，在 `{` 上
@@ -16466,7 +16476,7 @@ static int pa_is_compound_lit(void)
         int q = 0;
         int comma = 0;
 
-        for (q = 1; q < PA_LOOK; q++) {
+        for (q = base + 1; q < PA_LOOK; q++) {
             Tok *t = pa_peek(q);
 
             if (t->kind != TK_PUNCT)
