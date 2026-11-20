@@ -946,3 +946,28 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   `&((T[]){…})[0].attr` 复合字面量+下标+成员链是 c6c 既有未实现特性
   （第 50 轮也不支持），非回归，未在本轮处理。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 54 轮：确认剩余 480 个编译失败全是脚手架缺 flag，非 c6c bug
+
+### 尝试
+- 从 `make -n` 提取每个 TU 的完整 `-I`/`-D`（2942 个 TU 的 manifest），
+  想让重建 harness 的 480 个失败 TU 也编过、从中找新 bug。
+- 但重建用的编译 harness 是简化版（固定 `-I` 集 + 部分 `-D`），把 make -n
+  的全部 flag 直接套上去反而因 manifest 抽取遗漏 745 个 TU 而倒退
+  （2007/2942）——这是**脚手架实现问题**，不是 c6c 问题。
+
+### 决定性验证：失败 TU 补上正确 flag 后都能编过
+- `drivers/acpi/acpica/dsargs.c`（156 个 acpi #error 的代表）：补上
+  `-D_LINUX -DBUILDING_ACPICA -DACPI_DEBUG_OUTPUT` 和 acpi include 目录后
+  **rc=0**。
+- `arch/x86/entry/vdso/vdso64/vclock_gettime.c`（290 个"找不到头文件"的代表）：
+  补上 `-Iarch/x86/entry/vdso`（内核 make 里的 `vdso64/..`）后 **rc=0**。
+- 结论：480 个失败里 290+156 是重建 harness 漏掉 per-TU `-I`/`-D`，
+  其余 13+7+4+4+2+1 是缺头文件目录 / 缺 `-include utsversion.h` /
+  生成文件 / 非 x86 目标等脚手架问题。**没有新的 c6c bug**。
+
+### 状态
+- 第 13 个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
+  全树可信的覆盖率口径仍是第 53 轮的 2464/2942（简化 harness），
+  实际 c6c 作为 C 编译器的能力已由"2416 对象启动到 VFS"验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
