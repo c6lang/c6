@@ -1040,3 +1040,23 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十五个真实 c6c bug（前十四个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 57 轮：__builtin_choose_expr 失败未能最小复现（无新代码改动）
+
+### 调查
+- `net/mac80211/spectmgmt.c` 在第 56 轮修掉 `_Static_assert "must be constant"`
+  后，仍报 `include/linux/overflow.h:437: 这里要 ')'（当前是 '('）`——
+  `struct_size` 里的 `__builtin_choose_expr(__is_constexpr(count), …)`。
+- 尝试逐级复现：简化版 `__builtin_choose_expr`、`__is_constexpr` 的
+  `(sizeof(int)==sizeof(*(8?…)))` trick、嵌套 `flex_array_size` 的
+  `__must_be_array`（内含 `_Static_assert(sizeof(struct{…}))`）——
+  **全部 rc=0**，与 gcc 一致。
+- 结论：该错误不是可独立复现的 `__builtin_choose_expr` bug，而是该巨大 TU
+  里多层宏展开/其他未定位问题的级联。按"不臆造修复"原则，本轮**不改代码**。
+- 第 56 轮的 `__builtin_constant_p` 跳过 struct tag 修复是正确的独立修复，保留。
+
+### 状态
+- 第十五个已验证修复 + 第 53 轮回归修正保持不变；本轮无代码改动。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+  剩余轮次应聚焦真正的结构性缺口（.S 汇编、内核链接脚本、host tools），
+  而非追逐不可复现的级联错误。
