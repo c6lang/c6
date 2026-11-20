@@ -20,6 +20,12 @@
 - **NOP 只声明不定义的 `__bad*` 助手**（7d0e92f）：`__bad_size_call_parameter`
   等是 gcc 折叠掉的不可达分支助手，c6c 保留了调用；普通 extern（is_weak=0）
   不触发原有 weak-call NOP 规则，WEAK UND 后解析成 0，故显式 NOP。
+- **两遍发射可达集按名字兜底**（78504f5）：前向声明 `static bool f();` 与后面
+  定义落成不同符号 id，调用点指向 UND 的那个 → 定义被 DCE 当死函数剔除 →
+  链接后 `call 0`。内核 `page_contains_unaccepted`（CONFIG_UNACCEPTED_MEMORY
+  关闭的 `#else` 分支）即此形。IR_CALL 目标无直接 def 映射且为 UND 时，按名字
+  （含 TU 前缀后缀）兜底标记同 TU 的 static 定义可达。page_alloc.o 里该符号
+  从 `U` 变 `t`，`call 0` panic 消失。
 
 验收：`cmake --build out --target c6c -j8` 通过；`ctest -R c6c-tests2`
 失败项与基线一致（119_random_stuff / 138_arm64_encoding / 61_integers /
@@ -32,12 +38,14 @@
   出现 `mem auto-init` 等真实 boot 日志（此前只有早期 COM1 直写的一行 banner）。
 
 ## 未达成 / 根因已定位
-1. **内核仍未真正可启动**：当前在 `__free_pages_core` 的
-   `call page_contains_unaccepted` 处 NULL 调用 #PF。根因：
-   `page_contains_unaccepted` 在最小配置里**没有定义**，是 WEAK UND，
-   链接解析成 0，直接 `call 0`。gcc 会常量折叠掉这条分支，c6c 保留。
-   这与 `__bad*` 同类：需要 NOP 掉「无定义且不可达」的调用，但纯编译期
-   无法预知哪些符号最终无定义（需链接期处理）。
+1. **内核仍未真正可启动**：`call 0` 与弱符号 fault 已全部消除，当前在
+   `get_freepointer`（slub.c）的 `rep movsb` 读 freelist 指针处 #PF，
+   CR2=`0x00000008001530f0`。坏指针低 32 位 `0x001530f0` 正常、高 32 位
+   变成 `0x00000008`（应 `0xffff8880`）——这是最初就有的深层 SLUB
+   freelist 高级字破坏（先前用命名局部绕过 ctor=0x8 时它也出现）。
+   复合字面量、弱符号、可达集三处编译器缺陷修复后它成为最后一个拦路 bug。
+   根因未定位：怀疑 c6c 某处把 `sizeof(freeptr_t)=8` 或 `rep movsb` 计数 8
+   写进了指针高半字。需要继续二分 slub.o 的写路径。
 
 2. `__attribute__((section("...")))` 被 c6c 的 `skip_attributes()` 静默丢弃
    （parse.c6 的 `sa_is_kw` 表无 `section`，属性体扫描无对应分支，落到通用
