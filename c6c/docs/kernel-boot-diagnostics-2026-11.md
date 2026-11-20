@@ -700,3 +700,32 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 六个已提交的真实 c6c 修复全部保留。目标未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在；c6c 自带链接器不支持内核链接脚本。
+
+## 第 46 轮：第七个真实 c6c bug —— 空实 참여 `##` 的粘贴语义
+
+### 症状
+- 全量 497 个失败 TU 归类：290 个缺头文件、156 个 acpi #error、12 个未定义符号
+  均为脚手架；但 9 个网络 TU 报 `include/net/ipv6.h:1: 这里要 ')'`
+  （当前是 ')SNMP_INC_STATS64'），是真实预处理 bug。
+
+### 根因
+- 内核 `_DEVINC(net, statname, mod, idev, field)` 用 `mod##SNMP_INC_STATS64`，
+  `IP6_INC_STATS` 传**空** mod。GCC 语义：`##` 一边为空时是无操作，另一边原样留下。
+- `macro.c6:expand_macro()` 里空实参不产生任何 token，但随后的 `##` 分支照样把
+  右边 token 粘到 `r[n-1]`（前一个**无关** token，如 `{`），生成坏 token
+  `{SNMP_INC_STATS64` / `)SNMP_INC_STATS64`，连锁 9 个 TU 编不过。
+
+### 修复（`c6c/src/macro.c6`）
+- `expand_macro()` 加 `empty_lhs` 标志：形参紧邻 `##` 且实参为空时置位；
+  `##` 分支见该标志则把右边作为独立 token 追加、不粘贴，然后清标志。
+
+### 验证（均通过）
+- 最小复现（空 `mod##SNMP_INC_STATS64`）：修复前 rc=1，修复后 rc=0；
+  `-E` 输出从坏 token 变为正确展开 `(((n)->mib)+((5)))`；非空粘贴仍 rc=0。
+- 9 个此前失败的 ipv6.h 相关 TU：修复后 **9/9 全部编过**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13（前六个修复不受影响）。
+
+### 状态
+- 本会话第七个真实 c6c bug（前六个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef），已修并验证。目标仍未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在。

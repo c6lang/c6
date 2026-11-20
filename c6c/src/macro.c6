@@ -385,6 +385,7 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
     Tok **aexp = NULL;
     u32 *naexp = NULL;
     u32 i = 0;
+    int empty_lhs = 0;   /* `##` 左边是空实参：本次 ## 无操作，右边原样留下 */
 
     if (m->is_func && nargs > 0) {
         aexp = arena_zalloc(&A_main, (size_t)nargs * sizeof(Tok *));
@@ -429,6 +430,22 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
             } else {
                 rhs = m->body[i];
                 got = 1;
+            }
+            if (empty_lhs) {
+                /* 左操作数是空实参：## 无操作，右边作为独立 token 留下，
+                 * 绝不能粘到 r[n-1]（前一个无关 token）上。 */
+                empty_lhs = 0;
+                if (got) {
+                    if (n + 1 > cap) {
+                        u32 ncap = cap * 2 + 8;
+                        Tok *nr = exp_alloc(ncap);
+                        memcpy(nr, r, (size_t)n * sizeof(Tok));
+                        r = nr;
+                        cap = ncap;
+                    }
+                    r[n++] = rhs;
+                }
+                continue;
             }
             if (was_variadic) {
                 /* `__VA_ARGS__` 参与 `##` 有两种截然不同的语义，必须分开看
@@ -504,6 +521,12 @@ static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, 
             Tok *use = ap;
             u32 un = an;
             u32 k = 0;
+
+            /* `##` 左边是空实参：标记本次 ## 无操作。GCC 语义是右边原样留下，
+             * 不是粘到前一个无关 token 上（内核 include/net/ipv6.h 的
+             * `mod##SNMP_INC_STATS64`，IP6_INC_STATS 传空 mod）。 */
+            if (adj_paste && an == 0)
+                empty_lhs = 1;
 
             if (!adj_paste && aexp && pi < nargs) {
                 use = aexp[pi];
