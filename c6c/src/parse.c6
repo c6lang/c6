@@ -17271,6 +17271,22 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             amp_paren = 0;
             return;
         }
+        /* `&(*(T *)0)`：`&*` 抵消，值就是 `(T *)0` = 空指针常量。内核
+         * drivers/tty/sysrq.c 的 `sysrq_showlocks_op (*(const struct sysrq_key_op *)NULL)`
+         * 被 `&sysrq_showlocks_op` 取地址时 gcc 折叠成 NULL；老实现只认
+         * `&全局/函数`，这里报"全局地址初始化器只支持 &全局/函数"、
+         * sysrq.c 编不过。把 `& ( * (T *)0 )` 整段吃掉、存 0 即可。 */
+        if (amp && pa_is_ch('(') && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
+            && TOK_EQ(pa_peek(1), "*")) {
+            i64 nullv = 0;
+
+            pa_advance();              /* ( */
+            pa_advance();              /* * */
+            nullv = const_expr();      /* (T *)0 → 0 */
+            pa_expect_ch(')');
+            glob_store(goff, off, ty, (u64)nullv);
+            return;
+        }
         ak = glob_addr_start(amp);
         if (ak) {
             glob_addr_parse(goff + off, amp, ak == 2, (int)amp_paren);

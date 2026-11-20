@@ -824,3 +824,35 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
   括号内相邻字符串），已修并验证。目标仍未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在。
+
+## 第 50 轮：第十一个真实 c6c bug —— `&*` 取址抵消成空指针常量
+
+### 症状
+- 用第 49 轮编译器全树重编 **2461/2942**。剩余失败里
+  `drivers/tty/sysrq.c:223` 报"全局地址初始化器只支持 &全局/函数" +
+  "这里要一个常量表达式"。
+- 内核 `sysrq_showlocks_op (*(const struct sysrq_key_op *)NULL)`，被
+  `&sysrq_showlocks_op` 取地址；C 里 `&*E` 等价于 `E`，gcc 折叠成 NULL。
+
+### 根因（`parse.c6:gen_glob_obj` 的 `&` 地址常量路径）
+- 只认 `&全局`/`&函数`/`&(name)`/`&((T*)0)->member` 等形状，遇到
+  `&(*(T *)0)` 落到 `pa_error("全局地址初始化器只支持 &全局/函数")`。
+
+### 修复（`c6c/src/parse.c6`）
+- 在 `glob_addr_start()` 之前识别 `& ( * (T *)0 )`：`&*` 抵消，吃掉整段、
+  用 `const_expr()` 求 `(T *)0`（得 0），存 0 作为空指针常量。
+
+### 验证（均通过）
+- 最小复现（宏展开的 `&op_null`，`op_null=(*(struct op*)0)`）：
+  修复前 rc=1、修复后 rc=0。
+- 实际受影响的 `drivers/tty/sysrq.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13；前三个修复的最小用例
+  （空实参 ##、外层括号复合字面量、字符串三元常量）仍 rc=0。
+- （已知边界：直接写 `&(*(T*)0)` 不走宏的极个别形状仍报错，但内核当前
+  失败 TU 里没有这种写法，未在本轮处理。）
+
+### 状态
+- 本会话第十一个真实 c6c bug（前十个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
+  括号内相邻字符串、字符串常量三元），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
