@@ -1171,3 +1171,26 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十八个真实 c6c bug（前十七个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 63 轮：最终集成复核（全部 18 修复）
+
+### 已验证
+- 用含全部 18 个修复的最新编译器 `/tmp/c6c-swfix` 重跑 10 个历史最小复现
+  （paste_empty / cl8 / ternconst / offnested / ampstr / isarray2 / constp3 /
+  basefile / paste_fnmacro / swcase170）——**全部 rc=0**，无一回归。
+- 全树重编仍为 2464/2942（策展 harness 固定 flag，不变）。
+- 用 `.cmd` 权威 flag 补编第 56~58 轮新修的 TU（sound/core/seq 4 个、
+  e1000e 若干、syscall_64.c）——**新增 12 个可编译对象**，对象集达 2474。
+
+### 说明
+- 试图把这 12 个新对象换入内核做最终启动验证，但该长时间脚本被中断
+  （signal 9），临时内核树停在 `make clean` 后的状态、无 vmlinux/bzImage；
+  按"不跑长测试循环"的收工纪律未重启整个 swap。
+- 第 56 轮的完整启动验证（15 修复、2435 对象、Linux version + 完整 CPU
+  topo + 5×NET + M25 + VFS panic）已通过；其后 3 个修复（__BASE_FILE__、
+  ## 多 token、SW_MAXCASE）都是纯前端改动，已由各自复现 + 全树重编验证，
+  不改变已编对象的代码生成。
+
+### 状态
+- 18 个真实 c6c bug 全部修复并提交；本轮无源码改动（仅文档）。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
