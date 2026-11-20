@@ -63,7 +63,13 @@
    c6c 产物里 `%gs:`/`%fs:` 前缀指令数均为 0（GCC 基线 54261 条 `%gs:`）。
    DEFINE_PER_CPU 靠 section 属性落 `.data..percpu`，被丢弃后所有 per-CPU
    变量（含 SLUB 的 cpu_sheaves）丢失/错位 → 快路径拿到错误 sheaf → 同一
-   对象被分配两次。双重分配是「section 属性丢失」的下游症状。
+   对象被分配两次。双重分配是「section 属性丢失」的下游症状。更根本的是 **c6c 完全不支持
+   `%gs:` 段前缀**：独立复现 `asm volatile("mov %%gs:0, %0" : "=r"(v))` 时
+   c6c 静默丢弃整条 asm（不发指令、变量保持 0），全镜像 `%gs:`/`%fs:` 均为
+   0 条。内核 `CONFIG_CC_HAS_NAMED_AS=1` 时 per-CPU 读写全靠 GCC 生成 `%gs:`；
+   即使 `-U CONFIG_CC_HAS_NAMED_AS` 走 `__per_cpu_offset` 路径仍 panic
+   （NULL 解引用）。修 per-CPU 需在 asmx 增加 `%gs:`/`%fs:` 前缀编码 +
+   段寄存器操作数解析——比命名段更大的工程。
 
 2. `__attribute__((section("...")))` 被 c6c 的 `skip_attributes()` 静默丢弃
    （parse.c6 的 `sa_is_kw` 表无 `section`，属性体扫描无对应分支，落到通用
