@@ -1124,3 +1124,28 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第十六个真实 c6c bug（前十五个 + 第 53 轮回归修正），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 61 轮：第十七个真实 c6c bug —— ## 多 token 实参丢尾部
+
+### 症状与根因
+- `drivers/net/ethernet/intel/e1000e/*`（7 个 TU）报"未声明的标识符
+  'E1000_TXDCTL'"。
+- 内核 `#define er32(reg) __er32(hw, E1000_##reg)`，调用 `er32(TXDCTL(0))`：
+  实参 `reg` 有 `TXDCTL` `(` `0` `)` 四个 token。`##` 应把左边 `E1000_` 和
+  首个 token 粘成 `E1000_TXDCTL`，其余 `( 0 )` 原样留下、再重新展开成
+  函数式宏。`macro.c6` 的 `##` 分支只取 `ap[0]`、丢掉后三个 token，
+  拼出的 `E1000_TXDCTL` 没有实参、不再展开 → 未声明标识符。
+
+### 修复（`c6c/src/macro.c6`）
+- `##` 右操作数为多 token 实参时：首个 token 参与粘贴，其余 token
+  （`rhs_rest`）原样追加到结果流，使后续重新展开能带上 `( 0 )`。
+
+### 验证（均通过）
+- 最小复现：`er32(TXDCTL(0))` 修复前 c6c -E 得 `__er32(E1000_TXDCTL)`、
+  rc=1；修复后得 `__er32(((0)+0x100))`、rc=0（与 gcc 一致）。
+- 实际 TU `82571.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 第十七个真实 c6c bug（前十六个 + 第 53 轮回归修正），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
