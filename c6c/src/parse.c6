@@ -23129,6 +23129,34 @@ static void pa_emit_deferred(void)
                 DEF_FNS[sym2def[t] - 1].emitted = 1;
                 if (nwork < NDEF)
                     work[nwork++] = sym2def[t] - 1;
+            } else if (t < X64.nsym && !sym2def[t] && !X64.sym[t].defined
+                       && X64.sym[t].name && X64.sym[t].name[0]) {
+                /* 前向声明（`static bool f();`）与后面的定义可能落成不同的
+                 * 符号 id：调用点指向前者（UND），sym2def 只登记后者，直接
+                 * 映射落空 → 定义被当死函数剔除 → 链接后符号为 UND、调用
+                 * 解析成 0 #PF（内核 mm/page_alloc.c 的 page_contains_unaccepted
+                 * 即此形）。同一 TU 里 static 函数名唯一，按名字兜底标记。 */
+                u32 di = 0;
+
+                for (di = 0; di < NDEF; di++) {
+                    DefFn *dd = &DEF_FNS[di];
+                    const char *dn = NULL;
+
+                    if (!dd->is_static || !dd->sym || dd->sym >= X64.nsym)
+                        continue;
+                    dn = X64.sym[dd->sym].name;
+                    /* static 函数可能被冠以 TU 名前缀（page_page_contains_unaccepted
+                     * 与引用点 page_contains_unaccepted 同址），故用后缀匹配。 */
+                    if (dn && !dd->emitted
+                        && (strcmp(dn, X64.sym[t].name) == 0
+                            || (strlen(dn) > strlen(X64.sym[t].name)
+                                && strcmp(dn + strlen(dn) - strlen(X64.sym[t].name),
+                                          X64.sym[t].name) == 0))) {
+                        dd->emitted = 1;
+                        if (nwork < NDEF)
+                            work[nwork++] = di;
+                    }
+                }
             }
         }
     }
