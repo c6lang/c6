@@ -23073,9 +23073,36 @@ static void pa_emit_deferred(void)
     for (i = 0; i < NDTOR; i++)
         if (DTORS[i] < X64.nsym && sym2def[DTORS[i]])
             DEF_FNS[sym2def[DTORS[i]] - 1].emitted = 1;
-    for (i = 0; i < NDFIX; i++)
-        if (DFIX_SYM[i] < X64.nsym && sym2def[DFIX_SYM[i]])
-            DEF_FNS[sym2def[DFIX_SYM[i]] - 1].emitted = 1;
+    for (i = 0; i < NDFIX; i++) {
+        u32 ds = DFIX_SYM[i];
+
+        if (ds >= X64.nsym)
+            continue;
+        if (sym2def[ds]) {
+            DEF_FNS[sym2def[ds] - 1].emitted = 1;
+        } else if (!X64.sym[ds].defined && X64.sym[ds].name && X64.sym[ds].name[0]) {
+            /* 数据段函数指针（如 thermal_genl_cmd[] 中的 static 函数）可能
+             * 指向前向声明的符号 id，与定义的符号 id 不同 → sym2def 落空
+             * → 定义被 DCE 剔除 → 链接期 undefined。同 TU 内 static 函数名
+             * 唯一，按名字/后缀兜底标记（与 IR_CALL 的兜底一致）。 */
+            u32 di = 0;
+            const char *dn = NULL;
+
+            for (di = 0; di < NDEF; di++) {
+                DefFn *dd = &DEF_FNS[di];
+
+                if (!dd->is_static || !dd->sym || dd->sym >= X64.nsym)
+                    continue;
+                dn = X64.sym[dd->sym].name;
+                if (dn && !dd->emitted
+                    && (strcmp(dn, X64.sym[ds].name) == 0
+                        || (strlen(dn) > strlen(X64.sym[ds].name)
+                            && strcmp(dn + strlen(dn) - strlen(X64.sym[ds].name),
+                                      X64.sym[ds].name) == 0)))
+                    dd->emitted = 1;
+            }
+        }
+    }
     for (i = 0; i < NCLBL; i++)
         if (CLBL_FN[i] < NDEF)
             DEF_FNS[CLBL_FN[i]].emitted = 1;
@@ -23093,11 +23120,26 @@ static void pa_emit_deferred(void)
             DefFn *d = &DEF_FNS[i];
             const char *an = NULL;
 
-            if (!d->alias_sym || d->alias_sym >= X64.nsym)
-                continue;
-            an = X64.sym[d->alias_sym].name;
-            if (an && strcmp(an, ALIAS_TO[k]) == 0)
-                d->emitted = 1;
+            if (d->alias_sym && d->alias_sym < X64.nsym) {
+                an = X64.sym[d->alias_sym].name;
+                if (an && strcmp(an, ALIAS_TO[k]) == 0)
+                    d->emitted = 1;
+            }
+            /* 纯 alias 声明（`int f() __attribute__((alias("g")));`）没有函数体，
+             * 目标 g 是普通 static 定义、自身没有 alias_sym，上面的匹配接不住。
+             * g 只经别名在数据数组里被引用、无直接 call 边 → 两遍 DCE 把它剔除
+             * → alias_apply 报「未定义的符号 g」→ 链接期 undefined（内核
+             * drivers/thermal/thermal_netlink.c 的 thermal_genl_event_tz_* 即此形）。
+             * 按目标自身名字（含 TU 名前缀后缀）兜底标记。 */
+            if (d->sym < X64.nsym) {
+                const char *dn = X64.sym[d->sym].name;
+                u32 tl = strlen(ALIAS_TO[k]);
+
+                if (dn && ((strcmp(dn, ALIAS_TO[k]) == 0)
+                           || (strlen(dn) > tl
+                               && strcmp(dn + strlen(dn) - tl, ALIAS_TO[k]) == 0)))
+                    d->emitted = 1;
+            }
         }
     }
     for (i = 0; i < NDEF; i++)
