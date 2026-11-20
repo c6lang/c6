@@ -802,6 +802,10 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
     switch (o->op) {
     case IR_NOP:
         return 0;
+    case IR_TRAP:                   /* ud2：真执行到就是未定义行为，必须陷阱 */
+        img_u8(im, 0x0F);
+        img_u8(im, 0x0B);
+        return 0;
     case IR_COMMENT:
         if (o->imm & AX_MARK)
             asmx_flush(st, o->imm & ~AX_MARK);

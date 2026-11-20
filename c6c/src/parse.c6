@@ -12377,31 +12377,22 @@ static u32 gen_postfix(void)
         pa_expect_ch('(');
         pa_expect_ch(')');
         {
-            u32 d = irfn_vreg(&FN);
-            u32 v = 0;
-
-            irfn_push(&FN, IR_CONST, IRT_I64, d, 0, 0, 0, 134);   /* sys_tgkill */
-            v = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_I64, v, 0, 0, 0, 60);     /* SIGABRT */
-            irfn_push(&FN, IR_CALL, IRT_I64, 0, v, d, 0, 1);
+            /* 直接发 ud2：之前这里用 IR_CALL imm=1 想做 tgkill 系统调用，
+             * 但 IR_CALL 的 imm 是**符号 id**，1 号符号恰好是内核构建里的
+             * __c6_tls_len（.data 里的零长对象），于是 BUG()/unreachable()
+             * 全部变成 `call __c6_tls_len` —— 跳进 .data 的零字节里崩溃。
+             * 陷阱语义用 IR_TRAP 表达，后端翻成 ud2。 */
+            irfn_push(&FN, IR_TRAP, IRT_VOID, 0, 0, 0, 0, 0);
         }
         GEN_TY = ty_void();
         return 0;
     }
     if (TOK_EQ(t, "__builtin_abort") || TOK_EQ(t, "__builtin_trap")) {
-        u32 d = 0;
 
         pa_advance();
         pa_expect_ch('(');
         pa_expect_ch(')');
-        d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_I64, d, 0, 0, 0, 134);
-        {
-            u32 v = irfn_vreg(&FN);
-
-            irfn_push(&FN, IR_CONST, IRT_I64, v, 0, 0, 0, 60);
-            irfn_push(&FN, IR_CALL, IRT_I64, 0, v, d, 0, 1);
-        }
+        irfn_push(&FN, IR_TRAP, IRT_VOID, 0, 0, 0, 0, 0);
         GEN_TY = ty_void();
         return 0;
     }
