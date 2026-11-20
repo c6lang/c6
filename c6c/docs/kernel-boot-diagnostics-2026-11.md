@@ -36,6 +36,12 @@
 - 最小全 c6c 内核在 QEMU（`-cpu Nehalem`）串口输出含 `Linux version`。
 - 弱符号修复后**真实 console 工作**：串口从 560 字节增至 5725 字节，
   出现 `mem auto-init` 等真实 boot 日志（此前只有早期 COM1 直写的一行 banner）。
+- **GNU ar 依赖已消除（最小构建）**：内核 vmlinux 最终链接用
+  `ld --whole-archive`，逐成员读取、不需要归档符号索引。因此把 kbuild 的
+  `AR` 包装器改成全部转发 c6c 自带 `ar`（原 `s` 选项回退 GNU `/usr/bin/ar`
+  是多余的）：最小全 c6c 树 `vmlinux.a`（thin、无 `/` 索引成员）由 c6c ar
+  生成，`ld -r --whole-archive` 链接成功，bzImage 启动串口仍 5779 字节含
+  `Linux version`。即最小构建链里 ar 环节不再需要 GNU binutils。
 
 ## 未达成 / 根因已定位
 1. **内核仍未真正可启动**：`call 0` 与弱符号 fault 已全部消除，当前在
