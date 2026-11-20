@@ -1060,3 +1060,20 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
   剩余轮次应聚焦真正的结构性缺口（.S 汇编、内核链接脚本、host tools），
   而非追逐不可复现的级联错误。
+
+## 第 58 轮：最终集成验证（全部 15 个修复后仍可启动）
+
+### 验证
+- 用含全部已提交修复的最新编译器（`c6c-constp`）全树重编 **2464/2942**，
+  干净换入 **2435 个 c6c .o**（vmlinux rc=0、0 undefined symbol）。
+- QEMU `nokaslr` 启动：打印 `Linux version`、完整 `CPU topo:` 各域、
+  **5 个 `NET: Registered`** 协议族、COM1 标记走到 `M25`，一路到
+  `VFS: Unable to mount root fs`（本环境无 rootfs 的预期终点）。
+- 结论：第 41~56 轮的 15 个 parser/asmx/macro/obj 修复**未引入启动回归**；
+  c6c 作为 C 编译器把几乎整个内核编到可启动、功能完整，稳定复现。
+
+### 目标剩余缺口（未达成）
+- 未进 userspace（无 rootfs 环境，终点是 VFS panic）。
+- `.S` 汇编仍需 GNU as；vmlinux 链接仍需 GNU ld（c6c 自带 ld 无内核链接脚本
+  支持）；objtool/modpost 等 host tools 仍由 gcc 构建。
+- 命名地址空间（CONFIG_CC_HAS_NAMED_AS）走 `%gs:` 规避路径，非原生支持。
