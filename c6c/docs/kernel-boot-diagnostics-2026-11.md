@@ -674,3 +674,29 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 - 这是本会话第六个真实 c6c bug（前五个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
   RELOC_HIDE），已修并验证。目标仍未达成：未进 userspace；GNU as/ld/host tools
   依赖仍在；c6c 自带链接器（ld-check 13/13）尚不支持内核链接脚本。
+
+## 第 45 轮：第 44 轮修复的全树复核（无回归）
+
+### 全树重编覆盖提升
+- 用第 44 轮修好的编译器（`/tmp/c6c-fpfix`）按正确 per-TU 标志重编全部
+  2942 个内核 C TU：**PASS 2445 / FAIL 497**，比修复前的 2429 多 16 个
+  （14 个 EFI stub TU + 2 个连带），证明修复在真实全树生效。
+
+### 剩余失败归类（均无新 bug）
+- `acpi.h` 的 `#error`（约 156 例）：脚手架漏传 `-DBUILDING_ACPICA`
+  （内核 `drivers/acpi/acpica/Makefile` 里 `ccflags-y` 定义），非 c6c bug。
+- i915 的解析错误：级联自 `找不到头文件 'i915_reg_defs.h'` 等——脚手架漏传
+  `-Idrivers/gpu/drm/i915` per-TU include 目录，非 c6c bug。
+- 函数指针/属性各种变体（`struct` 成员、`__attribute__` 前后置）最小用例全过。
+
+### 启动复核（无回归）
+- 用修复后的编译器重编的 2416 个 c6c .o（干净换入 gcc 树、无桩）启动：
+  `Linux version` + 完整 `CPU topo:` + **5 个 `NET: Registered`** + COM1 标记
+  走到 `M25` + 预期 VFS panic——与第 43 轮基线一致，第 44 轮修复未引入回归。
+- 注意：把新编出的 EFI stub .o 也换入时会引入 `absolute symbol` /
+  `__SCT__` 未定义（EFI stub 段的特殊 ABI），属链接脚手架问题，非 c6c bug；
+  启动复核按第 43 轮口径排除 EFI libstub。
+
+### 状态
+- 六个已提交的真实 c6c 修复全部保留。目标未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在；c6c 自带链接器不支持内核链接脚本。
