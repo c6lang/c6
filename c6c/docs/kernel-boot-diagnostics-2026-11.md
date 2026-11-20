@@ -182,3 +182,16 @@ c6c 编译后，`nm drivers/thermal/thermal_netlink.o` 显示该符号为 `U`（
 函数/数据仅被数据段函数指针引用。修复方向：`pa_emit_deferred` 的可达根需
 额外纳入「被数据重定位（DFIX/IR_ADDR 之外的数据初始化）引用的符号」，
 或在 obj 层把这类 UND 按名字在产生它的 TU 内找定义并保留。
+
+## 第 37 轮重大进展：全树 vmlinux 成功链接（重大里程碑）
+两项 DCE 修复（数据引用 static + alias 目标 static，commit `023aa30`）落地后：
+- 全树非 SCT 未定义符号从 **214 → 16**（剩余 16 个全是链接脚本定义的边界符号
+  `__initcall*_start`、`__start_orc_unwind`、`init_stack` 等，由 vmlinux.lds 解析）。
+- 补 399 个 `__SCT__` 桩后，`ld -T arch/x86/kernel/vmlinux.lds` 成功产出
+  **410MB 的 x86-64 ET_EXEC vmlinux**（ELF 64-bit LSB executable, statically linked）。
+- `vmlinux.o` 含 24577 条 `%gs:` 指令，per-CPU 访问已正确。
+- 唯一残留：`--orphan-handling=warn` 下 `.eh_frame` 被放到 `.eh_frame`（无害，
+  `--fatal-warnings` 才报错）。
+- bzImage 尚未产出：`make bzImage` 会重新 LD vmlinux 并再次触发 `.eh_frame`
+  strict orphan 错误；需手动 objcopy → gzip → mkpiggy 路径，且 kallsyms 多遍
+  构建仍需 GCC 工具链参与。
