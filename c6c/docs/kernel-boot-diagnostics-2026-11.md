@@ -92,3 +92,15 @@
    - 从 DATA_IMG 挖出具名字节并重写 `st_value` / `r_offset`。
 3. 逐段排查后续启动 fault。
 4. 新建汇编器与内核级链接器（最大工作量）。
+
+## 更正：per-CPU 根因判断对当前最小树不成立（第 33 轮）
+上文把启动 panic 归因于「section 属性丢失 → `.data..percpu` 空 → per-CPU
+错位」以及「缺 `%gs:` 段前缀」，这对当前最小树不成立：该树是 UP
+（`CONFIG_SMP` 未定义、`CONFIG_NR_CPUS=1`），percpu.h 的 UP 路径
+`__my_cpu_ptr(ptr) = (ptr)` 是普通指针，不用 `%gs:`；实测 `alloc_from_pcs`
+中 `%gs:` 计数为 0、全镜像无 `__per_cpu_offset`。所以空的 `.data..percpu`
+与缺 `%gs:` 在 UP 下都不直接致错，双重分配真正成因仍未定位。
+已通过原生复现/反汇编排除：sheaf `size--` 回填正确；freelist encode/decode
+正确；`__update_freelist_slow` 的 `slab->freelist=NULL` 是正确 64 位存储；
+窄化高字校验与命名 AS config 开关均无效。命名段支持仍是 c6c 真实缺口
+（影响 `.init.setup` 等），但不是当前 panic 的直接原因。
