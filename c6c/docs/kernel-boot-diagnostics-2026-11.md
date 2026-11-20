@@ -596,7 +596,12 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   - QEMU 正常打印 `Linux version`、完整 `CPU topo:` 各域信息；
   - COM1 标记走完 `M01`…`M25`（含 `M20 post`，即越过 `mm_core_init`）；
   - 一路初始化到 `VFS: Unable to mount root fs`（本环境无 rootfs 的预期终点），
-    与纯 gcc 基线终点一致。
+    与纯 gcc 基线终点一致。串口实测 `NET: Registered` 5 个协议族
+    （NETLINK/ROUTE、INET、UNIX、INET6、PACKET），满足
+    `tests/kernel-vmlinux.sh` 的启动判据（Linux version ≥1 且 NET ≥3）。
+    注意这是**阶段 B 口径**：2132 个 c6c ET_REL .o + 约 60 个 gcc .o
+    （cpu/apic/setup），链接仍用 GNU ld、汇编 .S 仍用 GNU as、host tools
+    仍由 gcc 构建——不是"全内核 c6c 独立构建"。
   - 这是对第 41 轮五个真实修复（尤其 RELOC_HIDE、bt/@ccc、btr）的强验证：
     **绝大多数内核 C TU 用 c6c 编译后，内核仍能启动到用户态前的最后一步**。
 - 对 #DE 的二分定位：只恢复 cpu/ 或只恢复 apic/ 仍停在 `setup_arch`（M01）；
