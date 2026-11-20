@@ -20406,6 +20406,8 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
                 ccval = 0;          /* setz/sete：ZF=1 成功 */
             else if (c0 == 'n' && (cs[k + 4] == 'z' || cs[k + 4] == 'e'))
                 ccval = 1;          /* setnz/setne：ZF=0 */
+            else if (c0 == 'c')     /* setc：CF=1（variable_test_bit 的 `=@ccc`） */
+                ccval = 2;
             else
                 return 0;           /* 其它 cc 暂不支持，整段跳过 */
             iscc = 1;
