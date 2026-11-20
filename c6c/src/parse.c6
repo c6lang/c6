@@ -8391,8 +8391,20 @@ static u32 parse_declarator(u32 base, Declarator *d)
         d->ptr_depth++;
         skip_attributes();
     }
-    if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT
-        && (TOK_EQ(pa_peek(1), "*") || tok_eq(pa_peek(1), "("))) {
+    /* `(` 后面可以先跟一个 `__attribute__((...))` 再跟 `*`：
+     *     typedef int (__attribute__((ms_abi)) *fp_t)(int);
+     * 这时 pa_peek(1) 是标识符而不是 `*`，老判断认不出嵌套声明符，把 `(` 当成
+     * 函数参数表、typedef 登记成 `int()`，fp_t 就不是类型名了——后面每个用
+     * 到它的声明跟着全崩（内核 drivers/firmware/efi/libstub/efistub.h 的
+     * efi_pci_io_protocol_cfg_t 就让 15+ 个 TU 编不过）。把"属性打头"也算进
+     * 嵌套声明符，进分支后用 skip_attributes() 吃掉属性。 */
+    if (pa_is_ch('(')
+        && ((pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
+             && (TOK_EQ(pa_peek(1), "*") || tok_eq(pa_peek(1), "(")))
+            || (pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+                && (tok_eq(pa_peek(1), "__attribute__")
+                    || tok_eq(pa_peek(1), "__attribute")
+                    || tok_eq(pa_peek(1), "__extension__"))))) {
         /* 嵌套声明符 (*name)(…)：括号里的 `*` 比外面的后缀更"紧"，
          * 而**外层**的指针反而套在最里面（贴着 base）。
          *

@@ -641,3 +641,36 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 五个已提交的真实 c6c 修复不变。目标未达成；下一步的真正缺口是
   GNU as（.S）、GNU ld、gcc host tools 与命名地址空间支持。
+
+## 第 44 轮：第六个真实 c6c bug —— 属性打头的函数指针 typedef
+
+### 症状
+- 全量编译 513 个失败 TU 里，有一类是**真实语法 bug**（非脚手架缺头文件）：
+  `drivers/firmware/efi/libstub/efistub.h:763` 报
+  `这里要 ';'（当前是 'read'）`，波及 14+ 个 EFI stub TU。
+- 根因源码：`typedef efi_status_t (__efiapi *efi_pci_io_protocol_cfg_t)(...)`，
+  其中 `__efiapi` 展开成 `__attribute__((ms_abi))`。
+
+### 根因
+- `parse_declarator()` 认嵌套声明符 `(*name)(...)` 时，只接受 `(` 后面
+  **紧跟** `*` 或 `(`。当写成 `(__attribute__((ms_abi)) *fp_t)` 时，`(` 后面
+  是 `__attribute__`，判断落空，`(` 被误当成函数参数表，typedef 被登记成
+  `int()`，名字 `fp_t` 不是类型名，后续所有用到它的声明连锁崩溃。
+
+### 修复（`c6c/src/parse.c6`）
+- 扩展嵌套声明符判断：`(` 后面若先是 `__attribute__` / `__attribute` /
+  `__extension__` 也认作嵌套声明符；进分支后由 `parse_declarator()` 开头的
+  `skip_attributes()` 正常吃掉属性，其余逻辑不变。
+
+### 验证（均通过）
+- 最小复现 `typedef int (__attribute__((ms_abi)) *fp_t)(int);` + 结构体成员
+  + 调用：修复前 rc=1（编不过），修复后 rc=0；无 stdlib 真跑 rc=0（返回 42）。
+- 14 个此前失败的 EFI stub TU：修复后 **14/14 全部编过**。
+- 编译器回归：`asm-native-check` 10/10、`ld-check` 13/13（五个已提交修复不受影响）。
+- 其余失败 TU 归类为脚手架问题（i915 缺 per-TU include 目录、`acpi.h` 直接
+  包含的 #error），非 c6c bug。
+
+### 状态
+- 这是本会话第六个真实 c6c bug（前五个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE），已修并验证。目标仍未达成：未进 userspace；GNU as/ld/host tools
+  依赖仍在；c6c 自带链接器（ld-check 13/13）尚不支持内核链接脚本。
