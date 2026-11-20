@@ -17201,6 +17201,28 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             pa_advance();          /* 一层 `(` */
             amp_paren++;
         }
+        /* `&((T *)0)->m` / `&((T *)0)->a[i]`：经典 offsetof 写法，值就是成员
+         * 偏移（整数常量）。内核 net/core/neighbour.c 的
+         * NEIGH_PARMS_DATA_OFFSET(index) = &((struct neigh_parms *)0)->data[index]
+         * 正是这种。const_unary 的 `&` 分支本来就完整支持这个形状（含常量下标），
+         * 但下面 glob_addr_start 会把第二层 `(` 后的 `struct`（关键字词法上是
+         * TK_IDENT）当成全局符号名，落进 glob_addr_parse 报 "'&struct' 不是地址
+         * 常量"。在 `&` 被吃掉之前就把整条交给常量求值器。 */
+        if (pa_is_ch('&') && pa_peek(1) && pa_peek(1)->kind == TK_PUNCT
+            && TOK_EQ(pa_peek(1), "(") && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT
+            && TOK_EQ(pa_peek(2), "(") && pa_peek(3) && is_typename_tok(pa_peek(3))) {
+            i64 offv = const_expr();
+
+            glob_store(goff, off, ty, (u64)offv);
+            /* 宏可能把整条地址括起来 `( &((T *)0)->m[i] )`：上面那段
+             * `(&name…)`  stripping 已经记在 amp_paren，这里补吃右括号。 */
+            while (amp_paren > 0 && pa_is_ch(')')) {
+                pa_advance();
+                amp_paren--;
+            }
+            amp_paren = 0;
+            return;
+        }
         amp = pa_accept_ch('&');
         /* `&(name)`：取的是**自己**。内核 include/linux/list.h:27 的
          *     #define LIST_HEAD_INIT(name) { &(name), &(name) }
@@ -18373,6 +18395,36 @@ static void init_body(u32 top)
                     Tok *vt = pa_cur();
                     Sym *gs = NULL;
 
+                    /* 花括号初始化器里的 `( &((T *)0)->m[i] )`：外层 `(` 包着
+                     * offsetof。整条交给 const_expr（它的 & 分支支持带下标成员
+                     * 偏移），否则下面 `(void)pa_accept_ch('&')` 看不见 `&`、
+                     * const_expr 又只吃到外层括号，留下悬空的 `)`。 */
+                    {
+                        u32 lp = 0;
+
+                        while (pa_peek(lp) && pa_peek(lp)->kind == TK_PUNCT
+                               && TOK_EQ(pa_peek(lp), "("))
+                            lp++;
+                        if (lp > 0 && pa_peek(lp) && pa_peek(lp)->kind == TK_PUNCT
+                            && TOK_EQ(pa_peek(lp), "&")
+                            && pa_peek(lp + 1) && pa_peek(lp + 1)->kind == TK_PUNCT
+                            && TOK_EQ(pa_peek(lp + 1), "(")
+                            && pa_peek(lp + 2) && pa_peek(lp + 2)->kind == TK_PUNCT
+                            && TOK_EQ(pa_peek(lp + 2), "(")
+                            && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))) {
+                            i64 offv = 0;
+                            u32 j = 0;
+
+                            for (j = 0; j < lp; j++)
+                                pa_advance();
+                            offv = const_expr();
+                            for (j = 0; j < lp; j++)
+                                pa_expect_ch(')');
+                            for (k = lo; k <= hi && k < n; k++)
+                                glob_store(INIT_GOFF, boff + k * esz, et, (u64)offv);
+                            continue;
+                        }
+                    }
                     (void)pa_accept_ch('&');
                     vt = pa_cur();
                     if (vt->kind == TK_IDENT)
@@ -23751,8 +23803,40 @@ static void gen_one_global(u32 ty, Declarator *d)
     /* `&x` / 函数名 / `&arr[0]` / `A + 2` / `&s.m` 这类地址常量：留给布局后回填。
      * 加数（成员偏移、常量下标）在 glob_addr_parse 里就算好，三个后端共用。 */
     if (ty_is_ptr(ty)) {
-        int amp = pa_accept_ch('&');
+        int amp = 0;
         int ak = 0;
+
+        /* `&((T *)0)->m[i]`（offsetof，内核 net/core/neighbour.c 的
+         * NEIGH_PARMS_DATA_OFFSET）：在 `&` 被吃掉之前整条交给 const_expr，
+         * 它的 `&` 分支本来就支持带常量下标的成员偏移。否则下面的
+         * glob_addr_start 把 `struct` 当符号名，报"'&struct' 不是地址常量"。 */
+        {
+            u32 lp = 0;
+
+            /* 宏里常把整条地址括起来：`( &((T *)0)->m[i] )`。先数前导 `(`。 */
+            while (pa_peek(lp) && pa_peek(lp)->kind == TK_PUNCT
+                   && TOK_EQ(pa_peek(lp), "("))
+                lp++;
+            if (pa_peek(lp) && pa_peek(lp)->kind == TK_PUNCT
+                && TOK_EQ(pa_peek(lp), "&")
+                && pa_peek(lp + 1) && pa_peek(lp + 1)->kind == TK_PUNCT
+                && TOK_EQ(pa_peek(lp + 1), "(")
+                && pa_peek(lp + 2) && pa_peek(lp + 2)->kind == TK_PUNCT
+                && TOK_EQ(pa_peek(lp + 2), "(")
+                && pa_peek(lp + 3) && is_typename_tok(pa_peek(lp + 3))) {
+                i64 offv = 0;
+                u32 j = 0;
+
+                for (j = 0; j < lp; j++)
+                    pa_advance();              /* 前导 `(` */
+                offv = const_expr();           /* &((T *)0)->m[i] */
+                for (j = 0; j < lp; j++)
+                    pa_expect_ch(')');
+                glob_store(s->goff, 0, ty, (u64)offv);
+                return;
+            }
+        }
+        amp = pa_accept_ch('&');
 
         if (amp && gen_glob_compound_addr(s->goff))
             return;

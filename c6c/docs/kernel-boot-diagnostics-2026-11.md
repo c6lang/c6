@@ -856,3 +856,36 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
   RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
   括号内相邻字符串、字符串常量三元），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 51 轮：第十二个真实 c6c bug —— `&((T *)0)->m[i]` offsetof 被地址路径误认
+
+### 症状
+- 用第 50 轮编译器全树重编 **2462/2942**。剩余失败里
+  `net/core/neighbour.c:3776` 报 `'&struct' 不是地址常量`。
+- 内核 `NEIGH_PARMS_DATA_OFFSET(index) = (&((struct neigh_parms *)0)->data[index])`，
+  是经典 offsetof 写法（带常量下标），gcc 直接折叠成整数偏移。
+
+### 根因
+- `const_unary` 的 `&` 分支本来就完整支持 `&((T *)0)->m[i]`（含下标），但全局
+  初始化器的**地址常量快路径**（`gen_glob_obj` / `gen_one_global` / 花括号
+  指定初始化器三处）先拦截：`glob_addr_start` 把第二层 `(` 后的 `struct`
+  （关键字词法上是 TK_IDENT）当成全局符号名，`glob_addr_parse` 报
+  `'&struct' 不是地址常量`。
+
+### 修复（`c6c/src/parse.c6`，三处快路径）
+- 在 `&` 被吃掉之前识别 `( & ( ( typename * ) 0 ) ->成员[下标] )` 形状
+  （含宏常见的外层括号），整条交给 `const_expr()`（它的 `&` 分支已支持），
+  结果当整数偏移存进指针槽；补吃掉外层 `)`。
+- 三处：标量全局指针、嵌套聚合指定初始化器字段、`gen_glob_obj` 的 amp 段。
+
+### 验证（均通过）
+- 6 个最小用例：`&((T*)0)->m`、`->m[i]`、宏外层括号、嵌套花括号指定初始化器、
+  `&*NULL`、字符串三元常量——修复前 rc=1 的现在全 rc=0。
+- 实际受影响的 `net/core/neighbour.c` 用全内核标志编译 **rc=0**。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+
+### 状态
+- 本会话第十二个真实 c6c bug（前十一个：DCE 别名、INIT_LF_MAX、btr、bt/@ccc、
+  RELOC_HIDE、属性函数指针 typedef、空实参 ##、外层括号复合字面量、
+  括号内相邻字符串、字符串常量三元、`&*NULL`），已修并验证。
+  目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
