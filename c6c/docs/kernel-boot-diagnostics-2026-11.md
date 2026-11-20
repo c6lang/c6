@@ -1194,3 +1194,21 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 18 个真实 c6c bug 全部修复并提交；本轮无源码改动（仅文档）。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 64 轮：最终启动验证（全部 18 修复，2447 个 c6c 对象）
+
+### 背景
+- 第 63 轮的 swap 被中断（signal 9），临时内核树停在 make clean 后、无
+  vmlinux/bzImage。本轮续接完成，并把第 56~58 轮新修的 12 个 TU 的 .o
+  纳入对象集。
+
+### 验证（通过）
+- 干净重建 gcc 基线后换入 **2447 个 c6c .o**（比上一版多 12 个：sound/seq、
+  e1000e、syscall_64.c），vmlinux 链接 rc=0、**0 undefined symbol**。
+- QEMU `nokaslr` 启动：Linux version、完整 CPU topo、**5 个 NET: Registered**、
+  COM1 标记走到 **M25**，终点 VFS panic（无 rootfs 的预期终点）。
+- 结论：18 个修复全部集成后内核仍可启动，无回归；编译器覆盖率提升。
+
+### 状态
+- 目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+  本轮无源码改动（仅文档），工作树干净。
