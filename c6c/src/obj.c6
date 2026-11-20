@@ -361,6 +361,29 @@ static u32 ob_data_owner(u32 off)
  * 符号集"。defined 的 local 函数符号若从未被引用，就是死函数——把它的入口
  * 改写成一条 ret（0xC3），并丢弃落在它区间内的 fixup。不动函数布局、不改
  * 符号表，所以其它代码的偏移和重定位完全不受影响。 */
+/* 同一入口可能有多个别名符号（static inline 包装：cpumask_copy /
+ * cpumask_cpumask_copy、native_load_idt / desc_ptr_native_load_idt）。可达性
+ * mark 只会落在调用点 fixup 指向的那一个名字上；用二分找 owner 时若挑中同址
+ * 另一个未标记的别名，就会把活函数误判成死：闭包不跟进它的 fixup（目标函数
+ * 被错误 stub 成 ret），压缩 fixup 时又把活函数体内的 call NOP 掉。
+ * 内核里这条链具体是 pcpu_build_alloc_info → cpumask_copy → bitmap_copy，
+ * 后者变 ret 后 mask 拷不过去、nr_groups=0，启动直接 BUG。
+ * 入口别名任一被标记即视为活，和上面入口 stub 的 alive_alias 检查保持一致。 */
+static int sym_off_alive(u8 *mark, u32 o)
+{
+    u32 a;
+
+    if (o == 0xffffffffu)
+        return 0;
+    for (a = 0; a < X64.nsym; a++) {
+        X64Sym *t = &X64.sym[a];
+
+        if (mark[a] && t->defined && !t->is_data && t->off == X64.sym[o].off)
+            return 1;
+    }
+    return 0;
+}
+
 static void obj_dce_stub_dead(void)
 {
     u8 *mark = NULL;
@@ -475,7 +498,9 @@ static void obj_dce_stub_dead(void)
                 u32 o = owner[i2];
                 u32 t = X64.fix[i2].sym;
 
-                if (o == NONE || !mark[o] || t >= X64.nsym || mark[t])
+                if (o == NONE || t >= X64.nsym || mark[t])
+                    continue;
+                if (!mark[o] && !sym_off_alive(mark, o))
                     continue;
                 mark[t] = 1;
                 changed = 1;
@@ -518,7 +543,8 @@ static void obj_dce_stub_dead(void)
         k = 0;
         for (i2 = 0; i2 < X64.nfix; i2++) {
             u32 o = owner[i2];
-            int drop = (o != NONE && !mark[o] && X64.sym[o].is_static);
+            int drop = (o != NONE && !mark[o] && !sym_off_alive(mark, o)
+                        && X64.sym[o].is_static);
 
             /* 内核模式 UND weak → SHN_ABS 0 的符号：代码若 call 它，链接器把
              * rel32 解析成跳到地址 0，早期启动崩溃（gcc 会常量折叠掉这些
