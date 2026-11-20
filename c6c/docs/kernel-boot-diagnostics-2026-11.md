@@ -44,8 +44,14 @@
    变成 `0x00000008`（应 `0xffff8880`）——这是最初就有的深层 SLUB
    freelist 高级字破坏（先前用命名局部绕过 ctor=0x8 时它也出现）。
    复合字面量、弱符号、可达集三处编译器缺陷修复后它成为最后一个拦路 bug。
-   根因未定位：怀疑 c6c 某处把 `sizeof(freeptr_t)=8` 或 `rep movsb` 计数 8
-   写进了指针高半字。需要继续二分 slub.o 的写路径。
+   **根因已用条件硬件观察点定位**：坏值 `0x00000008001530c0` 被
+   `__alloc_workqueue+0x2936` 的 `mov %edx,0x0(%rax)` 写入（rax=
+   `0xffff888000153094`，即 freelist 槽的高半字；edx=8）。这是
+   `pool_workqueue` 对象的一个合法 int 字段写入——说明对象
+   `0xffff888000153060`（freelist 槽在 +0x30）**同时挂在 SLUB freelist 上
+   又被分配给了 workqueue**：双重分配 / 陈旧 freelist。问题在 c6c 的 slab
+   快路径 fastpath（this_cpu cmpxchg 弹 freelist 时没有正确推进），而不是
+   单纯的存储宽度错误。需要检查 `slab_alloc_node` 快路径的 cmpxchg 序列。
 
 2. `__attribute__((section("...")))` 被 c6c 的 `skip_attributes()` 静默丢弃
    （parse.c6 的 `sa_is_kw` 表无 `section`，属性体扫描无对应分支，落到通用
