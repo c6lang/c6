@@ -172,3 +172,13 @@ CONFIG_CC_HAS_NAMED_AS**（因 c6c 无命名地址空间语义），配合已实
 这是 kernel-mode DCE 的系统性缺口：可达性分析需要把所有**被重定位引用
 的符号**（R_X86_64_64/PC32 的目标）都当作 root，而不只是 E8 call 目标。
 附加问题：ld 报 orphan `.eh_frame` 无放置（链接脚本严格 orphan-handling）。
+
+### 具体佐证（第 37 轮）
+`drivers/thermal/thermal_netlink.c:273` 的
+`static int thermal_genl_event_tz_delete(struct param *p)` 只出现在数据数组
+`thermal_genl_cmd[]`（第 293 行）的函数指针里，无直接 call 边。该文件经
+c6c 编译后，`nm drivers/thermal/thermal_netlink.o` 显示该符号为 `U`（未定义）
+而非定义——两遍 DCE 把它剔除了。其余 213 个未定义符号同类：都是 static
+函数/数据仅被数据段函数指针引用。修复方向：`pa_emit_deferred` 的可达根需
+额外纳入「被数据重定位（DFIX/IR_ADDR 之外的数据初始化）引用的符号」，
+或在 obj 层把这类 UND 按名字在产生它的 TU 内找定义并保留。
