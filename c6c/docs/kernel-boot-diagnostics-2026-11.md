@@ -588,3 +588,19 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 
 ### 状态
 - 目标未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+### 第 42 轮补充：2132 个 c6c 对象启动到 VFS（关键正向证据）
+- 在重建的 7.3+defconfig 树里，全量 c6c .o（2427 个）中把
+  `arch/x86/kernel/cpu/*` + `arch/x86/kernel/apic/*` + `arch/x86/kernel/setup.c`
+  换回 gcc（共约 60 个），其余 **2132 个 c6c .o** 编进 vmlinux：
+  - QEMU 正常打印 `Linux version`、完整 `CPU topo:` 各域信息；
+  - COM1 标记走完 `M01`…`M25`（含 `M20 post`，即越过 `mm_core_init`）；
+  - 一路初始化到 `VFS: Unable to mount root fs`（本环境无 rootfs 的预期终点），
+    与纯 gcc 基线终点一致。
+  - 这是对第 41 轮五个真实修复（尤其 RELOC_HIDE、bt/@ccc、btr）的强验证：
+    **绝大多数内核 C TU 用 c6c 编译后，内核仍能启动到用户态前的最后一步**。
+- 对 #DE 的二分定位：只恢复 cpu/ 或只恢复 apic/ 仍停在 `setup_arch`（M01）；
+  两者都恢复才通过。结合约 431 个未定义符号被统一桩成 `.quad 0` 数据、
+  且用 `--allow-multiple-definition` 链接（桩可能覆盖真实定义），**确认
+  #DE 是重建脚手架（桩/链接）假象，而非可定位的单个 c6c bug**。
+  按"不臆造修复"原则不为它改代码。
