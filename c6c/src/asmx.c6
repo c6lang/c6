@@ -982,6 +982,31 @@ static int ax_insn(void)
         return 0;
     }
 
+    /* bt r/m, r / bt r/m, imm8：0F A3 /r（寄存器位号）或 0F BA /4 ib。
+     * 内核 variable_test_bit() 的 `bt %2,%1` + `=@ccc` 输出靠它：把位号处
+     * 的值放进 CF，随后 ax_binds_out 用 setc 写回 bool。以前不认识 bt →
+     * 整段 asm 被丢 → test_bit() 恒 0 → cpu_possible(0) 假 → percpu 初始化
+     * 的 PCPU_SETUP_BUG_ON(!cpu_possible(cpu)) 触发。 */
+    if (strncmp(mn, "bt", 2) == 0 &&
+        (mn[2] == 0 || mn[2] == 'q' || mn[2] == 'l' || mn[2] == 'w')) {
+        int csz = 8;
+
+        if (mn[2] == 'l') csz = 4;
+        else if (mn[2] == 'w') csz = 2;
+        if (o2.kind != AXK_MEM && o2.kind != AXK_REG)
+            return 0;
+        if (o1.kind == AXK_REG) {
+            ax_emit_rm(0x0F, 0xA3, o1.reg, &o2, csz == 8, csz == 2);
+            return 1;
+        }
+        if (o1.kind == AXK_IMM) {
+            ax_emit_rm(0x0F, 0xBA, 4, &o2, csz == 8, csz == 2);
+            img_u8(&AX_IM, (u32)o1.disp & 0xff);
+            return 1;
+        }
+        return 0;
+    }
+
     /* btr r/m, r / btr r/m, imm8：0F B3 /r（寄存器位号）或 0F BA /6 ib。
      * 内核 arch_clear_bit() 的 `btrq %1,%0`（o1=位号 nr，o2=位基 addr）靠它。
      * 以前不认识 btr → 整段 asm 被丢 → clear_bit() 空操作 → cpumask 的位
@@ -1797,15 +1822,15 @@ static void ax_binds_out(void)
     for (i = 0; i < AX_NBIND; i++)
         if (AX_BIND[i].store && AX_BIND[i].reg < 100)
             x_st64(&AX_IM, R_RBP, AX_BIND[i].disp, AX_BIND[i].reg);
-    /* 第二遍：cc 输出。setz/setnz %al; movzbl %al,%eax; mov %rax,slot。
-     * ZF 由紧邻的前一条 cmpxchg/test 设置。 */
+    /* 第二遍：cc 输出。setz/setnz/setc %al; movzbl %al,%eax; mov %rax,slot。
+     * ZF 由紧邻的前一条 cmpxchg/test 设置；CF 由 bt 设置。 */
     for (i = 0; i < AX_NBIND; i++) {
         if (AX_BIND[i].store && AX_BIND[i].reg >= 100) {
-            int cc = AX_BIND[i].reg - 100;      /* 0=setz, 1=setnz */
+            int cc = AX_BIND[i].reg - 100;      /* 0=setz, 1=setnz, 2=setc */
 
             img_u8(&AX_IM, 0x0F);
-            img_u8(&AX_IM, (u8)(0x94 + cc));
-            img_u8(&AX_IM, 0xC0);               /* setz/setnz %al */
+            img_u8(&AX_IM, (u8)(cc == 2 ? 0x92 : 0x94 + cc));  /* setc=0x92 */
+            img_u8(&AX_IM, 0xC0);               /* setcc %al */
             img_u8(&AX_IM, 0x0F);
             img_u8(&AX_IM, 0xB6);
             img_u8(&AX_IM, 0xC0);               /* movzbl %al,%eax */

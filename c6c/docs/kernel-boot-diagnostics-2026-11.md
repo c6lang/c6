@@ -433,3 +433,40 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 本轮第三个真实 c6c bug（位操作助记符缺失）已修并验证。目标未达成：未进
   userspace；GNU as/ld/host tools 依赖仍在。
+
+---
+
+## Round 41 (再再续)：asmx 缺 `bt` + `@ccc` → test_bit 恒 0 → percpu BUG_ON
+
+### 现象
+- btr 修复后启动推进到 `pcpu_setup_first_chunk()`，但卡在 `SF06 post-unitmap-init`
+  之后、`SF07 post-grouploops` 之前。
+- 组内标记：`SF07d possible=00000000`——`cpu_possible(0)` 返回 0（应为 1），
+  `SF07e post-possible` 不出现，`PCPU_SETUP_BUG_ON(!cpu_possible(cpu))` 触发。
+
+### 根因
+- `cpu_possible()` → `cpumask_test_cpu()` → `test_bit()` → `arch_test_bit()`：
+  变量位号走 `variable_test_bit()`，其内联汇编是 `bt %2,%1` + `=@ccc`(oldbit)，
+  即把位值放进 CF、用 setc 写回 bool。
+- c6c 两处都不支持：
+  1. `asmx.c6` 没有 `bt` 助记符（只有 bts/btr）→ 整段 asm 被丢；
+  2. `parse.c6:asm_one_operand()` 的 `@cc` 输出只认 `z/e`/`nz/ne`，
+     不认 `c`（carry）→ 返回 0 整段跳过。
+- 结果 `test_bit()` 恒 0 → cpu_possible(0) 假 → BUG_ON。
+- 最小复现：`asm volatile("bt %2,%1":"=@ccc"(r):"m"(g),"Ir"(0))` 返回 0（位已置 1）。
+
+### 修复
+- `c6c/src/parse.c6`：`@cc` 解析加 `c0=='c'` → `ccval=2`（setc）。
+- `c6c/src/asmx.c6`：`ax_binds_out()` 的 cc 输出支持 `cc==2` → setc 操作码 0x92；
+  新增 `bt` 指令分支（0F A3 /r 寄存器位号，0F BA /4 ib 立即数位号）。
+
+### 验证
+- 最小用例：bt @ccc 位已置→真、位未置→假，两个都通过。
+- 全树重编 2425/2952，GNU ld 重链成功（补 3 个静态调用桩，与 c6c 改动无关）。
+- COM1 标记：`SF07d possible=00000001`、`SF07e post-possible` 出现，
+  `SF07 post-grouploops` → `SF08` → `SF09` → `EMB11 post-setupfirst`：
+  `pcpu_setup_first_chunk()` 正常完成。启动仍在后续初始化停顿（新问题）。
+
+### 状态
+- 本轮第四个真实 c6c bug（bt/@ccc 缺失）已修并验证。目标未达成：未进
+  userspace；GNU as/ld/host tools 依赖仍在。
