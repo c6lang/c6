@@ -470,3 +470,47 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 本轮第四个真实 c6c bug（bt/@ccc 缺失）已修并验证。目标未达成：未进
   userspace；GNU as/ld/host tools 依赖仍在。
+
+---
+
+## Round 41 (再再再续)：asm 空模板 `=r` + `"0"` 匹配约束 → RELOC_HIDE 失效 → percpu 写越界
+
+### 现象
+- bt 修复后 `pcpu_setup_first_chunk()` 完成，但卡在 `setup_per_cpu_areas()`
+  的 `for_each_possible_cpu` 循环：`SPCb post-offset` 后不再有 `SPCc`。
+- QEMU `-d int`：`#PF`（e=0002 写）CR2=`ffff8880e542a000`，随后 `#UD` 级联、
+  递归栈溢出。`RAX=RDX=CR2=ffff8880e542a000`——写入值(`per_cpu_offset`)
+  与写入地址相同，且该地址未映射。
+
+### 根因
+- 故障指令 `mov %rdx,0x0(%rax)` 对应 `per_cpu(this_cpu_off, cpu) = per_cpu_offset(cpu)`。
+- `per_cpu()` → `SHIFT_PERCPU_PTR()` → `RELOC_HIDE()`，其定义在
+  `include/linux/compiler-gcc.h`：`__asm__("" : "=r"(__ptr) : "0"(ptr));`
+  ——空模板 asm，靠 `=r` 输出 + `"0"` 数字匹配约束把 `ptr` 送进 `__ptr`。
+- c6c 两处都不支持：
+  1. `parse.c6:asm_one_operand()` 拒绝纯 `=r` 输出（除非 ASM_HAS_CR/`+r`）→
+     整段 asm 被跳过，`__ptr` 留在初值 0；
+  2. `"0"` 数字匹配约束不认识 → 同样整段跳过。
+- 结果 `RELOC_HIDE(ptr, off)` 退化成 `0 + off = off`，`per_cpu(this_cpu_off,cpu)`
+  的地址变成裸 `per_cpu_offset`，写到未映射的 percpu 首地址 → #PF → #UD 级联。
+- 最小复现：`__asm__("" : "=r"(ptr) : "0"(&g))` 的 `ptr+g_off` 与
+  `&g+g_off` 不等（返回 1）。
+
+### 修复
+- `parse.c6`：新增 `ASM_EMPTY_TPL`（模板为空串时为 1）；
+  `asm_one_operand()` 在空模板下放行 `=r` 输出与 `"0"`..`"9"` 匹配约束；
+  `isreg` 分支对匹配约束用输出操作数 N 的物理寄存器
+  （`ASM_REGNUM[match]`），使绑定装入时匹配输入覆盖该寄存器，
+  `ax_binds_out()` 写回输出槽即 `out = in`。
+
+### 验证
+- 最小用例：修复前 rc=1（错），修复后 rc=0（对）。
+- 全树重编 2425/2952，GNU ld 重链成功（补 42 个静态调用桩，与 c6c 无关）。
+- COM1 标记：`SPCc post-thiscpu` 之后整个 `setup_per_cpu_areas` 完成
+  （SPC04/05），start_kernel 一路推进到 `M20 pre (mm_core_init)`，
+  QEMU 45s 内 rc=0 正常退出（此前都是 rc=124 超时）。这是本轮第五个真实
+  c6c bug，影响面覆盖整个内核所有 RELOC_HIDE 用点。启动尚未进 userspace
+  （停在 mm_core_init），后续仍有新问题。
+
+### 状态
+- 目标未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
