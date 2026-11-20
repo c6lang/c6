@@ -274,3 +274,35 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 全树（GNU ld 手动链）早期就崩。
 **下一步**：用 c6c 自带的 ld.c6 链接全树（而非 GNU ld），或先关掉 TLS 模拟
 （内核不用 __thread 时）验证该假设。这是把全树从「能链」推向「能启动」的关键。
+
+## 第 40 轮：定位并修复 `__builtin_unreachable` 误变成 `call __c6_tls_len`（重大进展）
+
+### 根因（前端 gen_postfix）
+- `parse.c6` 的 `__builtin_unreachable` / `__builtin_abort` 分支原本发
+  `IR_CALL imm=1`，注释说是 tgkill 系统调用。但 `IR_CALL.imm` 是**符号 id**，
+  1 号符号恰好是内核构建里每 TU 生成的 `__c6_tls_len`（.data 里的零长记账对象）。
+- 结果：内核里所有 `BUG()` / `unreachable()` / `__builtin_trap()` 全部被编成
+  `call __c6_tls_len` → 跳进 .data 的零字节。此前全树 `mm/percpu.o` 有 **23 处**
+  `R_X86_64_PC32 __c6_tls_len-4` 的 call（无 DCE 时 43 处），正是首个真正的 #PF
+  （RIP 落 .data、CR2=0x3c）与后续 2258 次递归 #PF+#DF 的根因。
+- 用 `irfn_push` 的返回地址（`-no-pie` 构建 + addr2line）确认 43 处全部来自
+  `parse.c6:12390` 这一处 `IR_CALL imm=1`。
+
+### 修复
+- `parse.c6`：两处改发 `IR_TRAP`（不再伪造系统调用）。
+- `x64.c6`：`x64_emit_ir` 增加 `IR_TRAP` → `ud2`（0F 0B）。
+- 验证：重编 `mm/percpu.o` 后 `__c6_tls_len` 重定位 **23 → 0**，出现 24 条 `ud2`。
+
+### 全树重建 + 启动（关键结果）
+- 用修复版编译器重编 2424 个 vmlinux C 源，GNU ld 重链出 426MB vmlinux + 80MB bzImage。
+- QEMU 启动：**零 #DF、零 panic 递归**。串口干净地打印到
+  `Linux version 7.4.0-rc3 ...`，不再崩溃在早期入口。这是首次全树启动越过早期
+  #DF 级联。
+- 仍有 3 次 #UD（我们新发的 ud2 正确陷阱），落在 `pcpu_setup_first_chunk` 附近——
+  说明该 BUG 分支被真实触发（percpu 初始化仍有 c6c 代码生成问题），但现在是明确的
+  ud2 陷阱而非跳进 .data 乱执行，故障归因清晰。
+- 收尾后 60 秒串口停在 `Linux version`（后续早期初始化仍待查）。
+
+### 状态
+- c6c 前端 89/89 通过；pm/serv 类失败与本次改动无关（新 /tmp 构建目录的路径相关用例）。
+- 目标未达成：仍需让内核越过 percpu 初始化进入 userspace，且 GNU as/ld/host tools 依赖未消除。
