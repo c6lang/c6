@@ -1273,3 +1273,40 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第二十个真实 c6c bug（前十八个 + 第 53 轮回归 + 第 65/66 轮），已修并验证。
   目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+## 第 67 轮：CV_* 编译期常量表补齐（__is_constexpr 检测）
+
+### 症状与根因
+- `net/mac80211/spectmgmt.c` 的 `__builtin_choose_expr(__is_constexpr(x), …)`
+  判不出常量分支。缩小实验发现 `__is_constexpr(1u<<7)`、`__is_constexpr(
+  (0)>(7))`、`__is_constexpr(sizeof(struct{int a;}))`、`__is_constexpr(!0)`
+  全失败，而 `__is_constexpr(7)`、`(u32)7` 成功。
+- 根因：CV_* 表（只服务空指针常量判定 `E_NPC`）只在字面量、二进制运算、
+  整型强转三处 `cv_set`。**移位、一元负号、比较、sizeof、逻辑非**的结果
+  从没进表，于是 `__is_constexpr()` 里 `(long)(x)*0l` 折不出 0，三元式
+  类型落到 void*，`sizeof(int) == sizeof(void* 解引用)` 恒假。
+
+### 修复（`c6c/src/parse.c6`，5 处）
+- `gen_shift_one` / 一元 `-` / sizeof+alignof：常量结果 `cv_set`（与 gen_bin2
+  同口径，用 `cv_fit` 归一）。
+- `gen_cmp3`：常量比较按 IRCC_* 折出 0/1 进表，同步 `E_NPC`（和 ir.c6 的
+  IR_CMP 折叠一致）。
+- 一元 `!`：常量结果 `cv_set(cva == 0)`。
+
+### 验证（均通过）
+- 6 组 `__is_constexpr` 表达式（含 `<<`、比较、sizeof、一元负号、`!`）全 rc=0；
+  非常量 `!__is_constexpr(x)` 仍 rc=0（没误判）。
+- `_Static_assert` 里 `&&` / `__builtin_ctzll(128u)==7` 常量折叠本来正常（const_expr
+  路径），确认没被这次改动影响。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+- 全树：2481 → **2482**（spectmgmt.c 新过），无净新增失败。
+- 启动：2453 个 c6c 对象，`vmlinux` 链接 0 undefined，QEMU 到 VFS（M25 pre）。
+
+### 未完（留待后续轮）
+- i915 display 十几个 TU 仍卡在更后面的 `!IS_POWER_OF_2(GENMASK)` 断言——
+  这次只修到 `__is_constexpr` 本身；`__builtin_ctzll` / `&&` 在**常量上下文**
+  （const_expr）已能折，但 GENMASK 复合表达式里还有别的缺口没定位。
+- 目标仍未达成：未进 userspace；GNU as/ld/host tools 依赖仍在。
+
+### 状态
+- 第 21 组 c6c 修复（前二十个真 bug + 第 53 轮回归 + 第 65/66 轮），已修并验证。

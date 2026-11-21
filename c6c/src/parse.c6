@@ -14384,6 +14384,14 @@ static u32 gen_unary(void)
             irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), t2, d, 0, 0, 0);
             d = t2;
         }
+        /* 一元负号结果同样进 CV_* 表：`__is_constexpr(-1 + 8)` 里 `-1` 得是
+         * 编译期常量，后面 `+8` 才折得出 0，否则又是 void* 那条岔路。 */
+        {
+            u64 ca = 0, cr = 0;
+
+            if (cv_get(a, &ca) && cv_fold(IR_SUB, 0, ca, ty, &cr))
+                cv_set(d, cv_fit(cr, ty));
+        }
         GEN_TY = ty;
         return d;
         }
@@ -14409,10 +14417,16 @@ static u32 gen_unary(void)
         u32 a = value_of(gen_unary());
         u32 z = irfn_vreg(&FN);
         u32 d = irfn_vreg(&FN);
+        u64 cva = 0;
+        int ka = cv_get(a, &cva);
 
         irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
         irfn_push(&FN, IR_CMP, IRT_U64, d, a, z, 0, IRCC_EQ);
         irfn_setcc(&FN, IRCC_EQ);
+        /* `!常量` 进 CV_* 表：IS_POWER_OF_2 / __is_constexpr 都用 `!` 把
+         * 常量判断折到空指针常量那条路上。 */
+        if (ka)
+            cv_set(d, cva == 0);
         GEN_TY = ty_int();
         return d;
     }
@@ -14606,6 +14620,9 @@ static u32 gen_unary(void)
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0,
                   is_align ? (u32)ty_align_of(ty) : ty_size(ty));
+        /* sizeof/alignof 是编译期整型常量，要进 CV_* 表。否则 `__is_constexpr`
+         * 里的 `sizeof(struct{...})` 被当运行期值，GENMASK 常量断言挂掉。 */
+        cv_set(d, is_align ? (u64)ty_align_of(ty) : (u64)ty_size(ty));
         GEN_TY = ty_ulong();
         return d;
     }
@@ -14988,6 +15005,8 @@ static u32 cmp_common_ty(u32 aty, u32 bty)
 static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty)
 {
     u32 d = 0;
+    u64 cva = 0, cvb = 0;
+    int ka = cv_get(a, &cva), kb = cv_get(b, &cvb);
 
     if (ty_is_float(cty)) {
         /* 浮点比较：**浮点**操作数要先转成公共宽度，不能只截位。以前这里和
@@ -15015,6 +15034,29 @@ static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty)
     else
         irfn_push(&FN, IR_CMP, IRT_U64, d, a, b, 0, cc);
     irfn_setcc(&FN, cc);
+    /* 常量比较也要进 CV_* 表：`__is_constexpr()` 里 `((typeof(u32))(-1)) < 1`
+     * 这类比较是编译期常量，折不出来就整条认成运行期值、三元式落 void*，
+     * 内核 reg_bits.h 的 GENMASK 断言全挂（和 ir.c6 的 IR_CMP 折叠同口径）。 */
+    if (ka && kb && !ty_is_float(cty)) {
+        i64 sa = (i64)cva, sb = (i64)cvb;
+        u64 r = 0;
+
+        switch (cc) {
+        case IRCC_EQ: r = cva == cvb; break;
+        case IRCC_NE: r = cva != cvb; break;
+        case IRCC_LT: r = sa < sb; break;
+        case IRCC_LE: r = sa <= sb; break;
+        case IRCC_GT: r = sa > sb; break;
+        case IRCC_GE: r = sa >= sb; break;
+        case IRCC_ULT: r = cva < cvb; break;
+        case IRCC_ULE: r = cva <= cvb; break;
+        case IRCC_UGT: r = cva > cvb; break;
+        case IRCC_UGE: r = cva >= cvb; break;
+        default: break;
+        }
+        cv_set(d, r);
+        E_NPC = (r == 0);
+    }
     GEN_TY = ty_int();
     return d;
 }
@@ -15304,6 +15346,16 @@ static u32 gen_shift_one(u32 a, u32 aty, u8 op, u32 b)
 
         irfn_push(&FN, IR_TRUNC, ir_ty_of(aty), t2, d, 0, 0, 0);
         d = t2;
+    }
+    /* 移位结果也要进 CV_* 编译期常量表。否则 `1u << 7` 这类常量被当成
+     * 运行期值：`__is_constexpr()` 里 `(long)(x) * 0l` 折不出 0，空指针常量
+     * 判不出来，三元式类型落到 void*，内核 reg_bits.h 的 GENMASK 常量断言
+     * 一律失败（i915 display 十几个 TU 编不过）。和 gen_bin2 同口径。 */
+    {
+        u64 ca = 0, cb = 0, cr = 0;
+
+        if (cv_get(a, &ca) && cv_get(b, &cb) && cv_fold(op, ca, cb, aty, &cr))
+            cv_set(d, cv_fit(cr, aty));
     }
     GEN_TY = aty;
     return d;
