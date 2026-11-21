@@ -1339,3 +1339,31 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第 22 组 c6c 修复，已修并验证。目标仍未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在。
+
+## 第 69 轮：第二十二个真实 c6c bug —— __builtin_strlen 不解码转义
+
+### 症状与根因
+- 8 个 TU（ahci、drm_print、i915_mitigations、hid-*、i2c-i801）卡在
+  `_Static_assert(sizeof(info)-1 == __builtin_strlen(info), "MODULE_INFO ... embedded NUL")`。
+- `__builtin_strlen` 的常量层和 gen 层都直接数 token 原始字符：`"a\nb"`
+  数成 4（a、反斜杠、n、b），而 `sizeof("a\nb")-1` 是 3（编译期 \n 解成 1 字节）。
+- 有的模块描述带转义，于是断言假失败。
+
+### 修复（`c6c/src/parse.c6`）
+- 新增 `str_lit_byte_len(Tok*)`：复用 `esc_decode`，按发射器的同一口径解码
+  （简单转义、\x/\0/八进制、\u/\U 窄串按 UTF-8 重编码、源码 UTF-8 多字节），
+  并在**第一个 NUL 处停止**（保留内嵌 NUL 断言的检测能力）。
+- `__builtin_strlen` 的常量分支（3739）和 gen 分支（12359）都改用它。
+
+### 验证（均通过）
+- 复现：`sizeof(s)-1 == strlen(s)` 对 `"a\nb"`、`"a\tb"`、`"a\\b"`、
+  `"a\"b"`、`"\x41"`、`"a\101b"` 全 rc=0；`"a\0b"` 仍 rc=1（正确报错）；
+  `strlen("a\0b")==1`。
+- 8 个实际 TU 全 rc=0（ ahci 另需 KBUILD_MODFILE，那是 harness 缺 define，非 c6c bug）。
+- 回归：asm-native 10/10、ld-check 13/13。
+- 全树：2485 → **2493**（+8，即上述 TU），无净新增失败。
+- 启动：2464 个 c6c 对象，vmlinux 0 undefined，QEMU 到 VFS（M25 pre）。
+
+### 状态
+- 第 22 组 c6c 修复，已修并验证。目标仍未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在。

@@ -3245,6 +3245,72 @@ static u32 esc_decode(const char **pp, const char *end)
     return (u32)(u8)*p;
 }
 
+/* 字符串字面量的**解码后字节数**（窄串口径，和 emit_string_literal_run /
+ * sizeof("…") 完全一致）。`__builtin_strlen("a\nb")` 要数 3 字节，不能数
+ * token 里 "\\n" 的 4 个字符——内核 moduleparam.h 的 MODULE_INFO 断言
+ * `sizeof(info)-1 == __builtin_strlen(info)` 遇到带转义的模块描述就假失败
+ * （drivers/ata/ahci.c 等 8 个 TU）。 walks 一遍 esc_decode，窄串非 ASCII
+ * 码点按 UTF-8 重新编码，正好对上发射器。 */
+static u32 str_lit_byte_len(Tok *t)
+{
+    const char *s = tok_data(t);
+    const char *end = s + t->len;
+    const char *base = s;
+    u32 n = 0;
+    int kind = 0;
+
+    while (s < end && *s != '"')
+        s++;                                   /* 跳 L/u/U/u8 前缀 */
+    if (s < end) {
+        u32 pre = (u32)(s - base);
+
+        if (pre > 0 && !(pre == 2 && base[0] == 'u' && base[1] == '8'))
+            kind = (base[0] == 'u') ? 2 : 4;
+        s++;
+    }
+    while (s + 1 < end) {
+        u32 ch = 0;
+        int ucn = 0;
+        int utf8 = 0;
+
+        if (*s == '\\') {
+            const char *p = s + 1;
+
+            ch = esc_decode(&p, end);
+            ucn = ESC_IS_UCN;
+            s = p;
+        } else {
+            ch = (u32)(u8)*s;
+            s++;
+            if (ch >= 0xC0) {                  /* 源码里的 UTF-8 多字节序列 */
+                u32 need = (ch >= 0xF0) ? 3 : (ch >= 0xE0) ? 2 : 1;
+                u32 acc = ch & ((need == 2) ? 0x0F : (need == 1) ? 0x1F : 0x07);
+                u32 k = 0;
+
+                for (k = 0; k < need && s < end; k++) {
+                    acc = (acc << 6) | ((u32)(u8)*s & 0x3F);
+                    s++;
+                }
+                ch = acc;
+                utf8 = 1;
+            }
+        }
+        if (kind == 0 && ch == 0)
+            break;                             /* 内嵌 NUL：strlen 到此为止 */
+        if (kind == 0 && (ucn || utf8) && ch >= 0x80) {
+            if (ch < 0x800)
+                n += 2;
+            else if (ch < 0x10000)
+                n += 3;
+            else
+                n += 4;
+        } else {
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /* 字符常量：跳过 L/u/U 前缀，按"多字节累积"处理 'ab' 这种写法 */
 static i64 char_lit_val(Tok *t)
 {
@@ -3689,21 +3755,10 @@ static i64 const_unary(void)
         pa_advance();
         pa_advance();
         if (pa_cur()->kind == TK_STR) {
-            /* 字面量长度：去掉两侧引号，相邻串要连着算 */
+            /* 字面量长度：解转义、相邻串连着算。不能数 token 原始字符——
+             * `"a\nb"` 是 3 字节而不是 token 里的 4 个字符。 */
             while (pa_cur()->kind == TK_STR) {
-                Tok *t = pa_cur();
-                const char *d = tok_data(t);
-                u32 i = 0;
-                u32 n = t->len;
-
-                while (i < n && d[i] != '"')
-                    i++;                 /* 跳过 L/u/U/u8 前缀 */
-                if (i < n) {
-                    i++;
-                }
-                if (n > i && d[n - 1] == '"')
-                    n--;
-                ln += (u64)(n - i);
+                ln += (u64)str_lit_byte_len(pa_cur());
                 pa_advance();
             }
         } else {
@@ -12332,18 +12387,7 @@ static u32 gen_postfix(void)
             pa_advance();              /* 名字 */
             pa_advance();              /* ( */
             while (pa_cur()->kind == TK_STR) {
-                Tok *t0 = pa_cur();
-                const char *d = tok_data(t0);
-                u32 i = 0;
-                u32 nn = t0->len;
-
-                while (i < nn && d[i] != '"')
-                    i++;               /* 跳过 L/u/U/u8 前缀 */
-                if (i < nn)
-                    i++;               /* 跳过开引号 */
-                if (nn > i && d[nn - 1] == '"')
-                    nn--;              /* 去掉闭引号 */
-                ln += nn - i;
+                ln += str_lit_byte_len(pa_cur());   /* 解转义，和 sizeof 同口径 */
                 pa_advance();
             }
             pa_expect_ch(')');
