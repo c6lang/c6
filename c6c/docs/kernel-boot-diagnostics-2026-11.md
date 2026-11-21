@@ -1310,3 +1310,32 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 
 ### 状态
 - 第 21 组 c6c 修复（前二十个真 bug + 第 53 轮回归 + 第 65/66 轮），已修并验证。
+
+## 第 68 轮：第二十一个真实 c6c bug —— 常量内建路径悬空 Tok*
+
+### 症状与根因
+- i915 display 十几个 TU 卡在 `!IS_POWER_OF_2(GENMASK_U32(h,l))` 断言。
+- 第 67 轮补齐 CV 表后 `__is_constexpr(GENMASK)` 已过；缩小到
+  `__builtin_ctzll(TMAX)` 失败，而 `__builtin_ctzll(255u)`、
+  `__builtin_ctzll((TBASE-1)+TBASE)`（直接内联）都过。
+- 差别是**宏展开的长度**：`TMAX` 宏含 sizeof/typeof 一长串 token，`const_expr()`
+  解析实参时展开宏、往 token 窗口压入新 token，`Tok *bt = pa_cur()`（在第 67 行
+  内建常量分支开头取的）随之失效。之后 `TOK_EQ(bt, "__builtin_ctzll")`
+  判错 → `isctz=0` → ctz 走成 clz → 断言假失败。本文件 gen_path 那条早有
+  "宽度后缀要在 pa_advance() 前读" 的同类教训，常量层一直漏了。
+
+### 修复（`c6c/src/parse.c6`）
+- 位运算内建（clz/ctz/ffs/popcount）常量分支：在 `pa_advance()`/`const_expr()`
+  **之前**把内建身份（`isffs`/`isctz`/`ispop`/`w0`）算好存进局部变量，
+  后面一律用局部变量，不再引用可能失效的 `bt`。
+
+### 验证（均通过）
+- `ctz-iso2` / `p2-real3` / `ce-test` 三个复现用例全 rc=0（修复前 ctz 断言失败）。
+- 实际 `intel_bw.c` 全内核标志编译 **rc=0**（修复前卡 IS_POWER_OF_2）。
+- 回归：`asm-native-check` 10/10、`ld-check` 13/13。
+- 全树：2482 → **2485**（+3 TU：intel_pstate、i915_hwmon、intel_pcode），无净新增失败。
+- 启动：2456 个 c6c 对象，`vmlinux` 链接 0 undefined，QEMU 到 VFS（M25 pre）。
+
+### 状态
+- 第 22 组 c6c 修复，已修并验证。目标仍未达成：未进 userspace；
+  GNU as/ld/host tools 依赖仍在。

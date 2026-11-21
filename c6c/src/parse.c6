@@ -3588,6 +3588,28 @@ static i64 const_unary(void)
         u64 x0 = 0;
         u32 w0 = 64;
         i64 r0 = 0;
+        /* 内建身份必须在 pa_advance()/const_expr() **之前**定下来：`const_expr()`
+         * 解析实参时会展开宏、往 token 窗口压新 token，pa_cur() 指向的 bt 可能
+         * 已经失效（本文件 gen_path 那条就有同样教训）。内核 GENMASK 的
+         * `__bf_shf`（=__builtin_ctzll）实参是个带 sizeof/typeof 的长宏，正是
+         * 这种情形——bt 失效后 isctz 判错，ctz 走成 clz，断言假失败。 */
+        int isffs = (TOK_EQ(bt, "__builtin_ffs") || TOK_EQ(bt, "__builtin_ffsl")
+                     || TOK_EQ(bt, "__builtin_ffsll"));
+        int isctz = (TOK_EQ(bt, "__builtin_ctz") || TOK_EQ(bt, "__builtin_ctzl")
+                     || TOK_EQ(bt, "__builtin_ctzll"));
+        int ispop = (TOK_EQ(bt, "__builtin_popcount") || TOK_EQ(bt, "__builtin_popcountl")
+                     || TOK_EQ(bt, "__builtin_popcountll"));
+
+        if (TOK_EQ(bt, "__builtin_clz") || TOK_EQ(bt, "__builtin_ctz")
+            || TOK_EQ(bt, "__builtin_clzl") || TOK_EQ(bt, "__builtin_ctzl")
+            || TOK_EQ(bt, "__builtin_ffs") || TOK_EQ(bt, "__builtin_ffsl")
+            || TOK_EQ(bt, "__builtin_popcount"))
+            w0 = 32;
+        else if (TOK_EQ(bt, "__builtin_clzll") || TOK_EQ(bt, "__builtin_ctzll")
+                 || TOK_EQ(bt, "__builtin_ffsll")
+                 || TOK_EQ(bt, "__builtin_popcountl")
+                 || TOK_EQ(bt, "__builtin_popcountll"))
+            w0 = 64;
 
         pa_advance();
         pa_advance();
@@ -3595,26 +3617,13 @@ static i64 const_unary(void)
          * `__builtin_clzll(CT_STATE_MAX - 1)`、`__builtin_clzll(n)` 都带运算。 */
         x0 = (u64)const_expr();
         pa_expect_ch(')');
-        if (TOK_EQ(bt, "__builtin_clz") || TOK_EQ(bt, "__builtin_ctz")
-            || TOK_EQ(bt, "__builtin_ffs"))
-            w0 = 32;
-        else if (TOK_EQ(bt, "__builtin_clzll") || TOK_EQ(bt, "__builtin_ctzll")
-                 || TOK_EQ(bt, "__builtin_ffsll"))
-            w0 = 64;
-        else if (TOK_EQ(bt, "__builtin_popcount"))
-            w0 = 32;
-        if (TOK_EQ(bt, "__builtin_popcount") || TOK_EQ(bt, "__builtin_popcountl")
-            || TOK_EQ(bt, "__builtin_popcountll")) {
+        if (ispop) {
             u32 i2 = 0;
 
             for (i2 = 0; i2 < 64; i2++)
                 r0 += (i64)((x0 >> i2) & 1ULL);
         } else {
             u32 i2 = 0;
-            int isffs = (TOK_EQ(bt, "__builtin_ffs") || TOK_EQ(bt, "__builtin_ffsl")
-                         || TOK_EQ(bt, "__builtin_ffsll"));
-            int isctz = (TOK_EQ(bt, "__builtin_ctz") || TOK_EQ(bt, "__builtin_ctzl")
-                         || TOK_EQ(bt, "__builtin_ctzll"));
             u64 xm = (w0 >= 64) ? x0 : (x0 & ((1ULL << w0) - 1ULL));
 
             if (isffs) {
