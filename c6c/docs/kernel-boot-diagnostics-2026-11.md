@@ -1367,3 +1367,26 @@ backtrace: exc_page_fault -> handle_page_fault -> __die -> show_regs -> print_st
 ### 状态
 - 第 22 组 c6c 修复，已修并验证。目标仍未达成：未进 userspace；
   GNU as/ld/host tools 依赖仍在。
+
+## 第 70 轮勘察：host tools 依赖与 c6c 自带运行时
+
+### 剩余 449 个编译失败全是 harness scaffolding，不是 c6c bug
+- 156 个 ACPICA TU：`drivers/acpi/acpica/Makefile:6` 有 `ccflags-y := -D_LINUX -DBUILDING_ACPICA`，
+  harness 没带这俩 flag，`include/acpi/platform/aclinux.h:18` 的 `#error` 就触发了。
+- 130 个 i915 display TU：harness 只加了 `-I$(dirname src)`（display/），
+  缺 `-Idrivers/gpu/drm/i915`（`i915_reg_defs.h` 在那儿）。
+- VDSO 一批：`#include "common/vclock_gettime.c"` 需要 `-Iarch/x86/entry/vdso`。
+- 结论：c6c 前端本身对这些 TU 没有新 bug；要扩大覆盖只需在 harness 补 per-dir flag。
+
+### c6c 能独立编译 host 程序（自带运行时，不需要 libc/gcc）
+- `C6C_RT=<worktree>/c6c/lib/rt.c6 c6c -I<worktree>/c6c/include -o prog prog.c`
+  编译并运行成功（`printf`/参数都正常），产物静态链接、无 interpreter。
+- 真实 host tool：`scripts/basic/fixdep.c`、`scripts/mod/mk_elfconfig.c` 编译成功。
+- 与 gcc 版 fixdep 在同一 depfile 上输出**逐字节相同**（rc/输出全一致）。
+- `scripts/kallsyms.c` 暂失败：缺 `getline`、`isascii`（c6c 运行时的 libc 面还没覆盖）。
+
+### 后续方向（目标仍未达成的部分）
+1. 给 c6c 运行时补 `getline`/`isascii` 等 libc 面，让 kallsyms 等 host tool 可编。
+2. 用 per-dir flag 扩展 harness，把 449 个 scaffolding 失败 TU 纳入 c6c 覆盖。
+3. `.S` 汇编（c6c 无独立 .S assembler）与最终链接（c6c ld.c6 不支持 linker script、
+   LD_MAXOBJ=64、VA=offset 恒等布局）仍是硬依赖 GNU as/ld，尚未触碰。
