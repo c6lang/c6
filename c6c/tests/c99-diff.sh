@@ -19,6 +19,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok=0
 bad=0
+skip=0
 badlist=""
 # 只有 native 后端能跑的用例（`native-only.txt` 一行一个文件名）：
 # 目前是 `__thread`——C99/LLVM 后端还没发"构造函数里调 c6c_tls_setup()"那条，
@@ -26,6 +27,12 @@ badlist=""
 for f in "$CORPUS"/*.c; do
     name=$(basename "$f" .c)
     if [ -f "$CORPUS/native-only.txt" ] && grep -qx "$name" "$CORPUS/native-only.txt"; then
+        continue
+    fi
+    # 仅编译用例（`/* compile-only */`，通常没有 main）：比不了"标准输出 + 退出码"，
+    # 和 llvm-diff.sh 一样如实跳过（run.sh 那边会按 -fsyntax-only 单独验）。
+    if grep -q 'compile-only' "$f"; then
+        skip=$((skip + 1))
         continue
     fi
     if ! timeout -k 5 "$TMO" "$C6C" "$f" -o "$TMP/$name.n" >"$TMP/$name.nlog" 2>&1; then
@@ -48,7 +55,7 @@ for f in "$CORPUS"/*.c; do
     ok=$((ok + 1))
 done
 
-echo "c6c: C99 后端 vs native 后端（$CORPUS）：一致 $ok / 不一致 $bad"
+echo "c6c: C99 后端 vs native 后端（$CORPUS）：一致 $ok / 不一致 $bad / 跳过 $skip"
 if [ "$bad" -ne 0 ]; then
     echo "c6c: 不一致项：$badlist"
     exit 1
