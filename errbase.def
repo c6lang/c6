@@ -24,6 +24,7 @@ protoc6.protofile        0x6109
 tu.c6mod                 0x6102
 tu.err_code              0x6107
 tu.err_ids               0x6108
+tu.foreach_module        0x610a
 tu.generic_scope         0x6103
 tu.imp                   0x6104
 tu.module                0x6105
