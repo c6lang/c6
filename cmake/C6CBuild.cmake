@@ -15,11 +15,12 @@ if(C6_ENABLE_TCC)
     COMMAND ${CMAKE_COMMAND} -E env ${_c6c_ld_env}
             "${C6C_STAGE0}" -B "${C6_TCC_DIR}" -g -o "${C6C_BIN}"
             "${C6C_DIR}/src/c6c.c6"
-    # 只列源码，不列 "${C6C_STAGE0}"：tcc/c6 是 tcc-build 这个 custom target
-    # 现场 make 出来的，没有 OUTPUT 规则；把它写进 DEPENDS 会让 make 报
-    # "No rule to make target .../tcc/c6"（CI 的 test 矩阵就是这么红的）。
-    # 先后顺序由下面的 add_dependencies(c6c tcc-build) 保证。
-    DEPENDS ${C6C_SRCS}
+    # 依赖 tcc-build 这个 **target**（不是文件 tcc/c6）：tcc/c6 是它现场
+    # make 出来的，没有 OUTPUT 规则，写成文件会让 make 报
+    # "No rule to make target .../tcc/c6"；写成 target 则 CMake 会给**所有**
+    # 消费 ${C6C_BIN} 的目标（c6c / c6c-opt / c6c-objcopy / c6c-ar …）都加上
+    # 目标级依赖，不会出现"objcopy 先跑、tcc/c6 还没生成"的抢跑。
+    DEPENDS ${C6C_SRCS} tcc-build
     COMMENT "c6c: 用 ${C6C_STAGE0} 编出自举编译器 (c6c/build/c6c)"
     VERBATIM)
 else()
