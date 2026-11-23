@@ -9961,6 +9961,24 @@ static u32 call_emit_sym(Sym *fs)
     return x64_sym(&X64, emit_name(tu_static_name(mn)));
 }
 
+/* native / LLVM 的聚合按值返回不发隐藏指针（见 agg_ret_abi）：被调方把
+ * **自己帧里**那个对象的地址交回来。返回后同层再跑一次调用就会盖掉同一片
+ * 帧（可失败调用中间还夹着 __tcc_err_flag_get），调用方随后再搬返回值就搬到
+ * 别人的帧上——json 解析出来对象是空的（`n` 被 0 盖住）就是这么来的。
+ * 拿到聚合返回值的每个调用点都立刻搬进调用方自己的临时量。 */
+static u32 keep_agg_ret(u32 dst)
+{
+    if (!C99_MODE && ty_is_agg(GEN_TY) && ty_size(GEN_TY) > 0) {
+        u32 tv = irfn_vreg(&FN);
+
+        irfn_push(&FN, IR_ADDR, IRT_PTR, tv, 0, 0, 0,
+                  X64_SLOT(frame_slots_for(ty_size(GEN_TY))));
+        irfn_push(&FN, IR_COPY, IRT_U8, tv, dst, 0, 0, ty_size(GEN_TY));
+        return tv;
+    }
+    return dst;
+}
+
 static u32 gen_call(Sym *fs)
 {
     /* 记下这次调用可不可失败：catch / 表达式语句要据此判断 */
@@ -10201,6 +10219,7 @@ static u32 gen_call(Sym *fs)
     if (ty_func_variadic(fs->type))
         FN.ops[FN.n - 1].flags |= 1;   /* 变参调用（本地约定：浮点也走整型寄存器） */
     GEN_TY = ty_target(fs->type);
+    dst = keep_agg_ret(dst);
     E_WAS_CALL = 1;
     return dst;
 }
@@ -10609,7 +10628,7 @@ static u32 gen_postfix_ops(u32 v)
             if (ty_func_variadic(ft))
                 FN.ops[FN.n - 1].flags |= 1;
             GEN_TY = ty_target(ft);
-            v = dst;
+            v = keep_agg_ret(dst);
             continue;
         }
         /* 任务句柄上的内建成员：`t->wait()` / `t->done()` / `t->kind()` /
@@ -11009,7 +11028,7 @@ static u32 gen_postfix_ops(u32 v)
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = ty_target(ms->type);
                     PEND_LVAL = 0;
-                    v = dst2;
+                    v = keep_agg_ret(dst2);
                     continue;
                 }
                 /* 接收者是模板实例时，方法可能是**函数模板**
@@ -11099,7 +11118,7 @@ static u32 gen_postfix_ops(u32 v)
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = ty_target(ms->type);
                     PEND_LVAL = 0;
-                    v = dst3;
+                    v = keep_agg_ret(dst3);
                     continue;
                 }
                 pa_error("结构体没有成员 '%.*s'", (int)mlen, mname);
@@ -12955,7 +12974,7 @@ static u32 gen_postfix(void)
                     GEN_TY = ty_target(fs->type);
                     E_WAS_CALL = 1;
                     PEND_LVAL = 0;
-                    return gen_postfix_ops(dst2);
+                    return gen_postfix_ops(keep_agg_ret(dst2));
                 }
             }
         }
@@ -21987,6 +22006,19 @@ static void gen_stmt(void)
                               X64_SLOT(frame_slots_for(rsz)));
                     irfn_push(&FN, IR_COPY, IRT_U8, raddr, v, 0, 0, rsz);
                     v = raddr;
+                }
+                if (!C99_MODE && ty_is_agg(CUR_RET_TY) && ty_size(CUR_RET_TY)
+                    && !ty_is_agg(rty)) {
+                    /* `return err(...)`：本函数按聚合返回，调用方那边仍会照
+                     * native 的约定把返回值当**对象地址**整块搬。这里给一块
+                     * 自己的帧槽当地址，别让调用方拿错误 id 去解引用
+                     * （json 的 catch 路径就是 1 被当指针，段错误）。 */
+                    u32 rsz2 = ty_size(CUR_RET_TY);
+                    u32 rv2 = irfn_vreg(&FN);
+
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, rv2, 0, 0, 0,
+                              X64_SLOT(frame_slots_for(rsz2)));
+                    v = rv2;
                 }
                 v = ret_agg_copy(v);
                 defer_run(1, on_err);
