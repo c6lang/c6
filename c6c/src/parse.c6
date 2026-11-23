@@ -16638,7 +16638,12 @@ static int sizeof_inner_type_end(void)
 
 /* 复合字面量的类型里带 `[`（`(int[]){…}`、`(char[SIZE]){…}`）。只看不吃。
  * 这类字面量的**值是指针**，和 `(struct s){…}`（值就是那个对象）不一样，
- * 初始化器里要区别对待。 */
+ * 初始化器里要区别对待。
+ *
+ * `[:]` 是切片，不是数组：`(char[:]){p, n}` 的值就是那个 {指针, 长度}
+ * 对象本身（16 字节），不能当指针取地址——以前只看 `[` 就返回 1，于是
+ * `o->s = (Str){ (char[:]){p, n} }` 把切片临时量的**地址**写进了第一
+ * 个 8 字节槽，长度永远是 0（tar 的 `e.data.s.len == 0` 就是这么来的）。 */
 static int pa_compound_lit_array_type(void)
 {
     int depth = 1;
@@ -16654,8 +16659,13 @@ static int pa_compound_lit_array_type(void)
         if (tok_eq(t, "(")) {
             depth++;
         } else if (tok_eq(t, "[")) {
-            if (depth == 1)
-                return 1;
+            if (depth == 1) {
+                Tok *nx = pa_peek(q + 1);
+
+                /* `[:]` → 切片，接着扫后面的维度；其余（`[]` / `[N]`）是数组 */
+                if (!(nx->kind == TK_PUNCT && TOK_EQ(nx, ":")))
+                    return 1;
+            }
         } else if (tok_eq(t, ")")) {
             depth--;
             if (depth == 0)
