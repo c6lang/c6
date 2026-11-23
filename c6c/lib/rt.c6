@@ -2451,10 +2451,15 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
                 alt = 1;
             } else if (conv == 'u') {
                 /* c6c IR 的整数一律 64 位，变参也按 64 位传递；必须用
-                 * long long（恒 64 位），不能用 long（wasm32 ILP32 下仅 32 位）。 */
-                v = (unsigned long long)va_arg(ap, unsigned long long);
+                 * long long（恒 64 位），不能用 long（wasm32 ILP32 下仅 32 位）。
+                 * 但**没有长度修饰符**的 `%u` 在 C 里吃的是 unsigned int：
+                 * 高位是调用方留的符号扩展，得按 32 位截回来（`41/-21` 打
+                 * 成 18446744073709551615 就是少了这一步）。 */
+                v = longs ? (unsigned long long)va_arg(ap, unsigned long long)
+                          : (unsigned long long)(unsigned int)va_arg(ap, unsigned int);
             } else if (conv == 'd' || conv == 'i') {
-                long long sv = va_arg(ap, long long);
+                long long sv = longs ? va_arg(ap, long long)
+                                     : (long long)(int)va_arg(ap, int);
 
                 if (sv < 0) {
                     neg = 1;
@@ -2463,7 +2468,8 @@ long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
                     v = (unsigned long long)sv;
                 }
             } else {
-                v = (unsigned long long)va_arg(ap, unsigned long long);
+                v = longs ? (unsigned long long)va_arg(ap, unsigned long long)
+                          : (unsigned long long)(unsigned int)va_arg(ap, unsigned int);
                 base = (conv == 'o') ? 8 : 16;
                 upper = (conv == 'X');
             }
