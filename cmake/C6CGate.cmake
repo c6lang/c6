@@ -15,7 +15,7 @@
 add_custom_target(fast
   DEPENDS lint unit irtest hello ctest-c6c runflag testflag pmtest stage1check
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck asmnativecheck a64check archcheck
-          embedcheck pkgcheck tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
+          embedcheck pkgcheck bf16check tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
   COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2 / native 内联汇编机器码 / bf16 三后端）")
 
 add_custom_target(check-all-c6c
