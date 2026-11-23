@@ -9926,6 +9926,41 @@ static u32 sret_pass(u32 *args, u32 *narg, u32 fty)
     return addr;
 }
 
+/* 直接调用一个 **static** 函数时的发射符号。
+ *
+ * 首形参是"有名字的结构体指针"的函数按方法命名（`<结构体>_<函数名>`，见
+ * pa_finish 里那段），定义处会把符号换成真名。调用点如果还在定义之前
+ * （`static int f(S *p);` 前向声明、稍后才定义），发出来的是**短名**。
+ * native 靠 alias_apply() 复制偏移能接上，但 C99 / LLVM 是文本发射：
+ * 短名在目标文件里没有实体，`--emit-c` 出来的 C 直接编不过（json 的
+ * `s_jp_value_2` 未定义就是这条），native 那条短名也没有代码，调用会落到
+ * 空槽上（json 解析出来对象是空的）。
+ *
+ * 所以调用点也按定义处的口径先建真名符号（x64_sym 按名字 intern，和后面
+ * 定义处建的是同一条）。只处理 static：非 static 的短名要留给纯 C 的 TU
+ * 按原名调用（弱别名那套，见 tests/abi/method.c6）。 */
+static u32 call_emit_sym(Sym *fs)
+{
+    const char *tn = NULL;
+    char mn[320] = {0};
+
+    if (!fs || !fs->is_func || !fs->is_static || !fs->type)
+        return fs ? (u32)fs->val : 0;
+    if (ty_func_nparams(fs->type) < 1 || !ty_is_ptr(ty_func_param(fs->type, 0)))
+        return (u32)fs->val;
+    {
+        u32 st = ty_target(ty_func_param(fs->type, 0));
+
+        tn = tmpl_inst_name(st);
+        if (!tn)
+            tn = sym_tag_name(st);
+    }
+    if (!tn || !fs->name)
+        return (u32)fs->val;
+    snprintf(mn, sizeof(mn), "%s_%s", tn, fs->name);
+    return x64_sym(&X64, emit_name(tu_static_name(mn)));
+}
+
 static u32 gen_call(Sym *fs)
 {
     /* 记下这次调用可不可失败：catch / 表达式语句要据此判断 */
@@ -10161,7 +10196,7 @@ static u32 gen_call(Sym *fs)
         irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i], 0, 0, i);
     dst = irfn_vreg(&FN);
     irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(fs->type)), dst, 0, 0, 0,
-              (u32)fs->val);
+              call_emit_sym(fs));
     FN.ops[FN.n - 1].narg = (u8)narg;
     if (ty_func_variadic(fs->type))
         FN.ops[FN.n - 1].flags |= 1;   /* 变参调用（本地约定：浮点也走整型寄存器） */
