@@ -88,7 +88,7 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
   COMMAND "${CMAKE_COMMAND}" -E env C6C_LINK_WITH_RT=1
           "${C6C_BIN}" -o "${C6C_OBJCOPY}" "${C6C_DIR}/src/objcopy.c6"
-  DEPENDS "${C6C_BIN}" "${C6C_DIR}/src/objcopy.c6"
+  DEPENDS c6c "${C6C_DIR}/src/objcopy.c6"
   COMMENT "c6c: 用 c6c 自编译 objcopy（去 binutils 阶段 4）"
   VERBATIM)
 add_custom_target(c6c-objcopy ALL DEPENDS "${C6C_OBJCOPY}")
@@ -103,7 +103,7 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E make_directory "${C6C_BUILD}"
   COMMAND "${CMAKE_COMMAND}" -E env C6C_LINK_WITH_RT=1
           "${C6C_BIN}" -o "${C6C_AR}" "${C6C_DIR}/src/artool.c6"
-  DEPENDS "${C6C_BIN}" "${C6C_DIR}/src/artool.c6"
+  DEPENDS c6c "${C6C_DIR}/src/artool.c6"
   COMMENT "c6c: 用 c6c 自编译 ar（去 binutils 阶段 4）"
   VERBATIM)
 add_custom_target(c6c-ar ALL DEPENDS "${C6C_AR}")
