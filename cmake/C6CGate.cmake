@@ -13,15 +13,15 @@
 # c99test（51 条 gcc 差分，165 s）、build-tcc（编 tcc + 第三代 selfhost）。
 
 add_custom_target(fast
-  DEPENDS lint unit irtest hello ctest-c6c runflag testflag pmtest stage1check
+  DEPENDS lint unitcheck hello ctest-c6c runflag testflag pmtest stage1check
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck asmnativecheck a64check archcheck
-          embedcheck pkgcheck bf16check tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
-  COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2 / native 内联汇编机器码 / bf16 三后端）")
+          embedcheck pkgcheck tests2-check tests1-check ctutest c99suite ${C6C_LLVM_TARGETS}
+  COMMENT "c6c: fast（快速门禁 ≈40 s，含外部语料 c99suite / 上游 tests1·tests2 / native 内联汇编机器码 / tests/unit 单元测试（含 bf16 三后端））")
 
 add_custom_target(check-all-c6c
-  DEPENDS unit irtest hello ctest-c6c runflag testflag pmtest stage1check
+  DEPENDS unitcheck hello ctest-c6c runflag testflag pmtest stage1check
           objcheck ldcheck dyncheck sharedcheck printfcheck esccheck tmplcheck bcheck dbgcheck asmcheck asmnativecheck a64check archcheck
-          bf16check embedcheck pkgcheck ctutest selfhost selfhost-opt selftest stdtest diagtest c99test
+          embedcheck pkgcheck ctutest selfhost selfhost-opt selftest stdtest diagtest c99test
           c99suite ${C6C_LLVM_TARGETS} test-c6c build-tcc tests1-check tests2-check regression-c6c kernelvmlinux
   COMMENT "c6c: check-all-c6c（全量验收：fixpoint / 全部后端 / 语料 / 编出 tcc + 第三代 selfhost + c6c .o 链接 vmlinux 启动）")
 
