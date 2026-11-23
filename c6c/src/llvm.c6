@@ -1209,7 +1209,15 @@ static int llvm_finish(const char *out)
         long tsz = 0;
 
         if (LL_TMPNAME) {
-            FILE *tf = fopen(LL_TMPNAME, "rb");
+            FILE *tf = NULL;
+
+            /* 暂存流还在 stdio 缓冲里：不先刷一下，读到的只是前半截，
+             * 后面那些 define 看不见，于是给"本模块自己定义的函数"也发一条
+             * `declare i64 @f(i64, ...)`——签名和 define 对不上，llc 报
+             * "invalid redefinition"（c6c/tests/c/call.c、global_scalar.c）。 */
+            if (LL_FNOUT)
+                fflush(LL_FNOUT);
+            tf = fopen(LL_TMPNAME, "rb");
 
             if (tf) {
                 fseek(tf, 0, SEEK_END);
