@@ -5,6 +5,19 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 未发布
+
+### 单元测试统一到 `tests/unit/`（工程）
+
+- `check-all-c6c` / `fast` 里的 `unit` / `irtest` / `bf16check` 三条微目标合并成
+  一条 `unitcheck`：跑统一入口 `tests/unit/run.sh` —— 编译器内置自测（类型表 /
+  IR 编码）、IR dump 稳定、`tests/unit/cases/*.c6` 里每份自断言程序（`.meta`
+  写 `backends=native c99 llvm` 就把同一份断言在三后端各跑一遍，缺工具链如实
+  SKIP）。
+- bf16 的断言程序从 `c6c/tests/bf16_main.c6` 挪到 `tests/unit/cases/bf16.c6`，
+  三后端跑法进了 runner，不再单独维护 shell 脚本。
+- 加用例只放 `tests/unit/cases/`，不用动 CMake / CI。
+
 ## 0.6.5 — 2026-11-23
 
 ### 原生 `bf16` 标量类型（新特性）

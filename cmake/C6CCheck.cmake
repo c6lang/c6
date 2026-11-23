@@ -27,17 +27,13 @@ function(c6c_target name)
     VERBATIM)
 endfunction()
 
-# --- 2.1 内存内数据结构自测 / IR 稳定性 / ELF 骨架 ---
-c6c_target(unit
-  COMMAND "${C6C_BIN}" --type-selftest
-  COMMAND "${C6C_BIN}" --ir-selftest
-  COMMENT "c6c: unit（类型表 + IR 自测）")
-
-c6c_target(irtest
-  ENV C6C=${C6C_BIN} OUT=${C6C_BUILD}
-  COMMAND "${C6C_BIN}" --ir-selftest
-  COMMAND ./tests/ir-demo-stable.sh
-  COMMENT "c6c: irtest（IR 自测 + dump 稳定）")
+# --- 2.1 单元测试（统一入口：tests/unit/run.sh）---
+# 内置自测（类型表 / IR 编码）、IR dump 稳定、以及 tests/unit/cases/*.c6
+# 里每份自断言程序（`.meta` 里声明三后端就跑三遍）。加用例只改 tests/unit，
+# 不用动 CMake / CI。
+c6c_target(unitcheck ENV C6C=${C6C_BIN} ROOT=${C6C_ROOT} DEPENDS c6c-tcc-corpus
+  COMMAND "${C6C_ROOT}/tests/unit/run.sh"
+  COMMENT "c6c: unitcheck（tests/unit 单元测试：类型表/IR 自测 + IR 稳定 + 特性断言）")
 
 c6c_target(hello
   COMMAND "${C6C_BIN}" --hello "${C6C_BUILD}/hello"
@@ -80,7 +76,6 @@ c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)
 c6c_target(bcheck ENV C6C=${C6C_BIN} COMMAND ./tests/bcheck.sh)
 # 原生 bf16：2 字节存储 + RNE 舍入，native / C99 / LLVM 三个后端跑同一份断言；
 # 顺带钉住"`.c` 里 bf16 仍是普通标识符"这条软门控（老代码不能断）。
-c6c_target(bf16check ENV C6C=${C6C_BIN} COMMAND ./tests/bf16-check.sh)
 c6c_target(dbgcheck ENV C6C=${C6C_BIN} COMMAND ./tests/dbgcheck.sh)
 c6c_target(asmcheck ENV C6C=${C6C_BIN} COMMAND ./tests/asmcheck.sh)
 # native 后端直接发机器码的内联汇编回归（rdtsc/wrmsr/cpuid + 固定寄存器

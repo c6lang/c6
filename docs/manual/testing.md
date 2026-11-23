@@ -230,3 +230,32 @@ cmake --build build --target c99selfhost-tcc   # 同上，但生成的 C 也由 
 > `C6_EXT` 是编译期开关，`config.sig` 变化会让 `tcc-config` 比对后清掉旧目标文件。
 > 三条自举路线都复用配置阶段由 `tcc/CMakeLists.txt` 生成的配置，构建时不会再跑
 > `./configure`。
+
+---
+
+## 单元测试（`tests/unit/`）
+
+`check-all-c6c` 和 `fast` 里的单元级检查只有一条：`unitcheck`，入口是
+`tests/unit/run.sh`（`C6C=<被测编译器> ROOT=<仓库根>`）。它跑三块：
+
+1. **编译器内置自测**：`--type-selftest`（类型表的 hash-consing / 补全 / 限定符）
+   与 `--ir-selftest`（IR 记录的编解码与指纹）；
+2. **IR dump 稳定**：两次 `--ir-demo` 的输出必须逐字节相同（IR 是契约，编码变了
+   就是破坏兼容）；
+3. **`tests/unit/cases/*.c6`**：每份是一个自断言程序，退出码 0 = 通过。同名
+   `.meta` 里写 `backends=native c99 llvm` 时，runner 会把同一份断言在三个后端上
+   各跑一遍（C99 要宿主 `cc`、LLVM 要 `clang` + `tcc/libtcc1.a`，缺了就如实
+   `SKIP`，不会假绿）。
+
+加一条单元测试：把自断言的 `.c6` 放进 `tests/unit/cases/` 就行，**不用改
+CMake，也不用改 CI**；要三后端覆盖就再写一个同名 `.meta`：
+
+```sh
+# tests/unit/cases/bf16.meta
+backends=native c99 llvm
+```
+
+```sh
+C6C=c6c/build/c6c ROOT=. tests/unit/run.sh     # 本地单跑
+cmake --build build --target unitcheck         # CMake 里跑（check-all / fast 也走它）
+```
