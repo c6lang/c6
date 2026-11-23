@@ -1366,6 +1366,10 @@ static int is_typename_tok(Tok *t)
      * 先比长度，热路径上几乎不花钱。 */
     if (t->len == 7 && memcmp(tok_data(t), "closure", 7) == 0)
         return c6_kw();
+    /* `bf16` 同理：c6 独有的类型关键字，`.c` 里必须能当普通标识符
+     * （`int bf16 = 1;` 这种老代码不断）。 */
+    if (t->len == 4 && memcmp(tok_data(t), "bf16", 4) == 0)
+        return c6_kw();
     {
         u32 sl = t->hash & 255;
         int g = 0;
@@ -5264,6 +5268,7 @@ static void tmpl_mangle(u32 ty, char *out, u32 cap)
     else if (ty == ty_schar()) nm = "schar";
     else if (ty == ty_uchar()) nm = "uchar";
     else if (ty == ty_float()) nm = "float";
+    else if (ty == ty_bf16()) nm = "bf16";
     else if (ty == ty_double()) nm = "double";
     else if (ty == ty_void()) nm = "void";
     if (nm) {
@@ -7517,6 +7522,9 @@ static u32 parse_typespec(void)
         if (PA_ACCEPT_IDENT("int")) { saw_int = 1; continue; }
         if (PA_ACCEPT_IDENT("char")) { base = uns ? ty_uchar() : (nsigned ? ty_schar() : ty_char()); continue; }
         if (PA_ACCEPT_IDENT("float")) { base = ty_float(); continue; }
+        /* bf16 只在 .c6 里是关键字：.c 文件保持纯 C，那边 `bf16` 仍是普通标识符
+         * （老代码拿它当变量名/字段名的不会断）。 */
+        if (c6_kw() && PA_ACCEPT_IDENT("bf16")) { base = ty_bf16(); continue; }
         if (PA_ACCEPT_IDENT("double")) { base = ty_double(); continue; }
         if (PA_IS_IDENT("__attribute__") || PA_IS_IDENT("__attribute")) {
             skip_attributes();
@@ -8775,6 +8783,10 @@ static u8 ir_ty_of(u32 t)
     case TY_FLOAT: return IRT_F32;
     case TY_DOUBLE: return IRT_F64;
     case TY_LDOUBLE: return IRT_F64;
+    /* bf16 的**值**在 IR 里是 f32：内存里 2 字节，一读出来就摊成 f32（见
+     * load_lval），写回去之前按 RNE 舍入（见 store_lval）。这样后端一条
+     * 指令都不用改：所有算术、比较、调用、返回都走现成的 F32/F64 通路。 */
+    case TY_BF16: return IRT_F32;
     case TY_PTR: return IRT_PTR;
     case TY_ARRAY: return IRT_PTR;
     case TY_FUNC: return IRT_PTR;
@@ -8782,10 +8794,114 @@ static u8 ir_ty_of(u32 t)
     }
 }
 
+/* bf16 ↔ f32 的位级转换（值在 IR 里一律 f32，内存里是 u16）。
+ *
+ *   bf16 → f32：位模式左移 16 位（低 16 位补 0）就是精确值——bf16 的指数域和
+ *               尾数高位与 f32 完全对齐，这一步没有舍入。
+ *   f32 → bf16：round-to-nearest-even，和 torch / LLVM 的 fptrunc bfloat 同口径：
+ *               r = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+ *               NaN 单独保住：尾数小的 NaN 加 0x7FFF 会进位成 Inf，所以先判
+ *               「指数全 1 且尾数非 0」，命中取 (u >> 16) | 0x40（安静的 NaN）。
+ *               这里没有 select 指令，用 mask = 0 - c 做无分支选择。
+ *
+ * 两个方向都不开新 IR 操作：常量、移位、位与/或/异或、bitcast 就够，三个后端
+ * 现成支持。 */
+static u32 bf16_expand(u32 bits)
+{
+    u32 k16 = irfn_vreg(&FN);
+    u32 z = irfn_vreg(&FN);
+    u32 sh = irfn_vreg(&FN);
+    u32 f = irfn_vreg(&FN);
+
+    irfn_push(&FN, IR_CONST, IRT_U32, k16, 0, 0, 0, 16);
+    irfn_push(&FN, IR_ZEXT, IRT_U32, z, bits, 0, 0, 0);
+    irfn_push(&FN, IR_SHL, IRT_U32, sh, z, k16, 0, 0);
+    irfn_push(&FN, IR_BITCAST, IRT_F32, f, sh, 0, 0, 0);
+    return f;
+}
+
+/* f32 → bf16 的**位**（u32 低 16 位有效）；store 直接截断写、cast 再 bitcast
+ * 回 f32，两条路共用这一份舍入。 */
+static u32 bf16_round_bits(u32 f)
+{
+    u32 u = irfn_vreg(&FN);         /* f32 的位模式 */
+    u32 k16 = irfn_vreg(&FN);
+    u32 k7f = irfn_vreg(&FN);
+    u32 kff = irfn_vreg(&FN);
+    u32 ke = irfn_vreg(&FN);
+    u32 km = irfn_vreg(&FN);
+    u32 k40 = irfn_vreg(&FN);
+    u32 zero = irfn_vreg(&FN);
+    u32 one = irfn_vreg(&FN);
+    u32 hi = irfn_vreg(&FN);
+    u32 lsb = irfn_vreg(&FN);
+    u32 t1 = irfn_vreg(&FN);
+    u32 t2 = irfn_vreg(&FN);
+    u32 r = irfn_vreg(&FN);
+    u32 ex = irfn_vreg(&FN);
+    u32 mn = irfn_vreg(&FN);
+    u32 c1 = irfn_vreg(&FN);
+    u32 c2 = irfn_vreg(&FN);
+    u32 cnan = irfn_vreg(&FN);
+    u32 mask = irfn_vreg(&FN);
+    u32 ninv = irfn_vreg(&FN);
+    u32 nanr = irfn_vreg(&FN);
+    u32 a1 = irfn_vreg(&FN);
+    u32 a2 = irfn_vreg(&FN);
+    u32 res = irfn_vreg(&FN);
+
+    irfn_push(&FN, IR_CONST, IRT_U32, k16, 0, 0, 0, 16);
+    irfn_push(&FN, IR_CONST, IRT_U32, k7f, 0, 0, 0, 0x7FFFu);
+    irfn_push(&FN, IR_CONST, IRT_U32, kff, 0, 0, 0, 0xFFFFFFFFu);
+    irfn_push(&FN, IR_CONST, IRT_U32, ke, 0, 0, 0, 0x7F800000u);
+    irfn_push(&FN, IR_CONST, IRT_U32, km, 0, 0, 0, 0x007FFFFFu);
+    irfn_push(&FN, IR_CONST, IRT_U32, k40, 0, 0, 0, 0x40u);
+    irfn_push(&FN, IR_CONST, IRT_U32, zero, 0, 0, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U32, one, 0, 0, 0, 1);
+
+    irfn_push(&FN, IR_BITCAST, IRT_U32, u, f, 0, 0, 0);
+    /* RNE：加 0x7FFF + 最低保留位，再右移 16 */
+    irfn_push(&FN, IR_SHR, IRT_U32, hi, u, k16, 0, 0);
+    irfn_push(&FN, IR_AND, IRT_U32, lsb, hi, one, 0, 0);
+    irfn_push(&FN, IR_ADD, IRT_U32, t1, u, k7f, 0, 0);
+    irfn_push(&FN, IR_ADD, IRT_U32, t2, t1, lsb, 0, 0);
+    irfn_push(&FN, IR_SHR, IRT_U32, r, t2, k16, 0, 0);
+    /* NaN：指数全 1 且尾数非 0 → (u>>16)|0x40 */
+    irfn_push(&FN, IR_AND, IRT_U32, ex, u, ke, 0, 0);
+    irfn_push(&FN, IR_CMP, IRT_U32, c1, ex, ke, 0, IRCC_EQ);
+    irfn_setcc(&FN, IRCC_EQ);
+    irfn_push(&FN, IR_AND, IRT_U32, mn, u, km, 0, 0);
+    irfn_push(&FN, IR_CMP, IRT_U32, c2, mn, zero, 0, IRCC_NE);
+    irfn_setcc(&FN, IRCC_NE);
+    irfn_push(&FN, IR_AND, IRT_U32, cnan, c1, c2, 0, 0);
+    /* 无分支选择：mask = 0 - cnan（全 1 / 0） */
+    irfn_push(&FN, IR_SUB, IRT_U32, mask, zero, cnan, 0, 0);
+    irfn_push(&FN, IR_XOR, IRT_U32, ninv, mask, kff, 0, 0);
+    irfn_push(&FN, IR_OR, IRT_U32, nanr, r, k40, 0, 0);
+    irfn_push(&FN, IR_AND, IRT_U32, a1, r, ninv, 0, 0);
+    irfn_push(&FN, IR_AND, IRT_U32, a2, nanr, mask, 0, 0);
+    irfn_push(&FN, IR_OR, IRT_U32, res, a1, a2, 0, 0);
+    return res;
+}
+
+/* cast / 赋值到 bf16：舍入完再摊回 f32——表达式里看到的已经是舍入过的值，
+ * 和 C 的 `(bf16)x` 语义一致（后续若再存一次，舍入是幂等的）。 */
+static u32 bf16_round_val(u32 f)
+{
+    /* 注意：舍入出来的 16 位是 **bf16 的位模式**，要再左移 16 位才是 f32 的值
+     * （直接 bitcast 会得到 0x00003F8D 这种次正规数，存回去就变 0）。 */
+    return bf16_expand(bf16_round_bits(f));
+}
+
 static u32 load_lval(u32 addr, u32 ty)
 {
     u32 d = irfn_vreg(&FN);
 
+    /* bf16：只读 2 字节，再摊成 f32（位模式左移 16 位，无舍入）。 */
+    if (ty_kind(ty) == TY_BF16) {
+        irfn_push(&FN, IR_LOAD, IRT_U16, d, addr, 0, 0, 0);
+        return bf16_expand(d);
+    }
     irfn_push(&FN, IR_LOAD, ir_ty_of(ty), d, addr, 0, 0, 0);
     return d;
 }
@@ -8798,6 +8914,15 @@ static void store_lval(u32 addr, u32 ty, u32 val)
      * 编译器自己编译自己时整个预处理器都读不出 token）。 */
     if (ty_is_agg(ty) || ty_is_array(ty)) {
         irfn_push(&FN, IR_COPY, IRT_U8, addr, val, 0, 0, ty_size(ty));
+        return;
+    }
+    /* bf16：值在 f32 里，舍入成高 16 位再写 2 字节（重复舍入是幂等的）。 */
+    if (ty_kind(ty) == TY_BF16) {
+        u32 bits = bf16_round_bits(val);
+        u32 lo = irfn_vreg(&FN);
+
+        irfn_push(&FN, IR_TRUNC, IRT_U16, lo, bits, 0, 0, 0);
+        irfn_push(&FN, IR_STORE, IRT_U16, addr, lo, 0, 0, 0);
         return;
     }
     irfn_push(&FN, IR_STORE, ir_ty_of(ty), addr, val, 0, 0, 0);
@@ -14888,6 +15013,17 @@ static u32 gen_convert_impl(u32 v, u32 from, u32 to)
     int ft = ty_is_float(to);
     u32 d = 0;
 
+    /* bf16：值在 IR 里是 f32，内存里是 16 位。
+     *   bf16 → 别的类型：值本来就是 f32，按 float 源继续转（double/int 都走
+     *   现成通路）。
+     *   别的类型 → bf16：先转 f32 再 RNE 舍入；结果仍是 f32（舍入后的值），
+     *   这样 `(float)(bf16)x` 能看到舍入效果，存回内存时再舍一次是幂等的。 */
+    if (ty_kind(from) == TY_BF16)
+        return ty_kind(to) == TY_BF16 ? v : gen_convert_impl(v, ty_float(), to);
+    if (ty_kind(to) == TY_BF16)
+        return bf16_round_val(ty_kind(from) == TY_FLOAT ? v
+                                                       : gen_convert_impl(v, from, ty_float()));
+
     /* 显式 cast 里切片转标量没有意义（`(int)s`）：切片是个 16 字节的对象，
      * 转成整数只会拿到它的地址（tests/errors/slice.c6 的 test_slice_to_int）。 */
     if (PA_CAST_CONV && ty_is_slice(from) && !ty_is_slice(to) && in_c6_tu())
@@ -16229,6 +16365,19 @@ static void data_fixup_add(u32 data_off, u32 sym);
 static void data_fixup_add_ex(u32 data_off, u32 sym, i64 add);
 static void code_lbl_fixup_add(u32 data_off, u32 fnseq, u32 lbl);
 static void data_fixup_drop_range(u32 lo, u32 hi);
+
+
+/* 编译期把 f32 位模式按 RNE 舍成 bf16 位模式：口径和运行期的
+ * bf16_round_bits 完全一致（NaN 保持 quiet、不进位越过指数）。
+ * 静态初始化器必须在编译期就落成 2 字节，不能把 f32/double 的低半截写进去。 */
+static u32 bf16_bits_of_f32(u32 u)
+{
+    u32 r = (u32)(((u64)u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+
+    if ((u & 0x7F800000u) == 0x7F800000u && (u & 0x007FFFFFu) != 0)
+        r = (u >> 16) | 0x40u;
+    return r;
+}
 
 
 static void gen_glob_desig_fill(u32 goff, u32 ty, u32 off)
@@ -17590,7 +17739,12 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
                 if (parse_const_u64(&iv))
                     dv = (double)(i64)iv;
             }
-            if (ty_size(ty) == 4) {
+            if (ty_kind(ty) == TY_BF16) {
+                u32 b32 = 0;
+
+                *(float *)&b32 = (float)dv;
+                bits = (u64)bf16_bits_of_f32(b32);
+            } else if (ty_size(ty) == 4) {
                 u32 b32 = 0;
                 float fv = (float)dv;
 
@@ -19586,7 +19740,11 @@ static void gen_one_local(u32 ty, Declarator *d)
     s = sym_add(d->name, d->nlen, ty, SC_LOCAL);
     agg_disp_name(ty_is_ptr(ty) ? ty_target(ty) : ty, udiag_name, sizeof(udiag_name));
     udiag_nlen = (int)strlen(udiag_name);
-    if (ty_is_agg(ty) || ty_is_array(ty)) {
+    /* bf16 和聚合一样**只放内存**：值是 f32、对象是 2 字节，摊在 vreg 槽里
+     * 之后任何一次"取地址再读"（实参、spill、三元）都会按 f32 写 4 字节、
+     * 按 bf16 读 2 字节，读到的是 f32 的低半截（1.5f → 0x0000）。走帧槽以后
+     * 所有读写都经过 load_lval/store_lval 的 2 字节通路，口子只有一个。 */
+    if (ty_is_agg(ty) || ty_is_array(ty) || ty_kind(ty) == TY_BF16) {
         u32 sz = ty_size(ty);
 
         s->slot = frame_slots_for(sz);
@@ -23043,6 +23201,16 @@ static void pa_func_def(Sym *fn, Declarator *d)
             if (d->pconst[i])
                 p->is_const = 1;
                 /* 托管形参是借来的：返回时才加计数；weak 形参要先升级 */
+            if (ty_kind(pty) == TY_BF16) {
+                /* bf16 形参：对象必须真的落在内存里（2 字节）。槽里是 f32 值，
+                 * 直接按 bf16 去读会读到低半截（1.5f 的低 16 位是 0）。 */
+                u32 obj = frame_slots_for(2);
+                u32 addr = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(obj));
+                store_lval(addr, ty_bf16(), slot);
+                slot = obj;
+            }
             if (ty_is_agg(pty) && ty_size(pty) > 0) {
                 /* 聚合形参：收到的其实是个地址。给它一个真正的局部对象槽，
                  * 函数入口处把对象整块拷进来（和调用方的约定配套，见 gen_call）。 */
@@ -24142,7 +24310,12 @@ static void gen_one_global(u32 ty, Declarator *d)
             } else {
                 dv = (double)const_expr();
             }
-            if (ty_size(ty) == 4) {
+            if (ty_kind(ty) == TY_BF16) {
+                u32 b32 = 0;
+
+                *(float *)&b32 = (float)dv;
+                bits = (u64)bf16_bits_of_f32(b32);
+            } else if (ty_size(ty) == 4) {
                 u32 b32 = 0;
                 float fv = (float)dv;
 

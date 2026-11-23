@@ -825,6 +825,12 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
         x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
+    /* 位模式重解释（bf16 的 f32 ↔ u32 靠它）：值在槽里本来就是原始位，整槽搬
+     * 即可。跨宽度的 bitcast 前端不会发，所以这里不需要按类型截断。 */
+    case IR_BITCAST:
+        x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
+        x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
+        return 0;
     case IR_LOAD:
         x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
         x_ld_mem(im, R_RDX, R_RAX, o->type);

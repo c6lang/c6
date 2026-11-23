@@ -78,6 +78,9 @@ c6c_target(tmplcheck ENV C6C=${C6C_BIN} COMMAND ./tests/tmpl-check.sh)
 # c6c/tests/regression-c6c.list）。交付物要能不带 tcc，这批回归就得能只靠 c6c 跑。
 c6c_target(regression-c6c ENV C6C=${C6C_BIN} COMMAND ./tests/regression-c6c.sh)
 c6c_target(bcheck ENV C6C=${C6C_BIN} COMMAND ./tests/bcheck.sh)
+# 原生 bf16：2 字节存储 + RNE 舍入，native / C99 / LLVM 三个后端跑同一份断言；
+# 顺带钉住"`.c` 里 bf16 仍是普通标识符"这条软门控（老代码不能断）。
+c6c_target(bf16check ENV C6C=${C6C_BIN} COMMAND ./tests/bf16-check.sh)
 c6c_target(dbgcheck ENV C6C=${C6C_BIN} COMMAND ./tests/dbgcheck.sh)
 c6c_target(asmcheck ENV C6C=${C6C_BIN} COMMAND ./tests/asmcheck.sh)
 # native 后端直接发机器码的内联汇编回归（rdtsc/wrmsr/cpuid + 固定寄存器

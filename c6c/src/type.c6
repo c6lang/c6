@@ -30,6 +30,11 @@ enum {
      * （TY_CHAR … TY_ULLONG），放进去就自动算整数类型。 */
     TY_I128, TY_U128,
     TY_FLOAT, TY_DOUBLE, TY_LDOUBLE,
+    /* `bf16`：2 字节存储的 bfloat16（8 位指数 + 7 位尾数，指数域与 f32 相同）。
+     * 值在 IR 里一律是 f32（见 parse.c6 的 ir_ty_of），只有内存里是 16 位：
+     * 载入时左移 16 位、存回时按 RNE 舍入。所以它排在浮点组里，参与算术按
+     * float 提升；ty_is_int 的范围判断（TY_CHAR..TY_U128）不受它影响。 */
+    TY_BF16,
     TY_PTR, TY_ARRAY, TY_FUNC, TY_STRUCT, TY_UNION, TY_ENUM,
     TY_CLOSURE,          /* closure RET(params)：单字，指向 {fn, 捕获…} 的堆对象 */
     TY_THREAD,           /* thread：单字，指向 {pthread_t, 闭包} 的堆对象 */
@@ -260,6 +265,8 @@ static u32 ty_u128(void)    { return ty_leaf(TY_U128, 0, 16, 16); }
 static u32 ty_float(void)   { return ty_leaf(TY_FLOAT, 0, 4, 4); }
 static u32 ty_double(void)  { return ty_leaf(TY_DOUBLE, 0, 8, 8); }
 static u32 ty_ldouble(void) { return ty_leaf(TY_LDOUBLE, 0, 16, 16); }
+/* bf16 是**存储类型**：内存里 2 字节，表达式里是 f32（见 parse.c6）。 */
+static u32 ty_bf16(void)    { return ty_leaf(TY_BF16, 0, 2, 2); }
 
 /* typeof：类型已经是 intern 过的 id，重新限定只需要再 intern 一次。
  *
@@ -622,7 +629,7 @@ static int ty_is_float(u32 id)
 {
     u8 k = TY_AT(id)->kind;
 
-    return k == TY_FLOAT || k == TY_DOUBLE || k == TY_LDOUBLE;
+    return k == TY_FLOAT || k == TY_DOUBLE || k == TY_LDOUBLE || k == TY_BF16;
 }
 static int ty_is_ptr(u32 id) { return TY_AT(id)->kind == TY_PTR; }
 static int ty_is_agg(u32 id)
@@ -746,6 +753,7 @@ static int type_selftest(void)
         base[nb].n = "float"; base[nb].id = ty_float(); base[nb].sz = 4; base[nb].al = 4; nb++;
         base[nb].n = "double"; base[nb].id = ty_double(); base[nb].sz = 8; base[nb].al = 8; nb++;
         base[nb].n = "ldouble"; base[nb].id = ty_ldouble(); base[nb].sz = 16; base[nb].al = 16; nb++;
+        base[nb].n = "bf16"; base[nb].id = ty_bf16(); base[nb].sz = 2; base[nb].al = 2; nb++;
         for (i = 0; i < nb; i++)
             if (ty_size(base[i].id) != base[i].sz || ty_align_of(base[i].id) != base[i].al) {
                 printf("type: 失败：%s 是 %u/%u，应为 %u/%u\n", base[i].n,

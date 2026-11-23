@@ -371,7 +371,7 @@ static u32 ob_data_owner(u32 off)
  * 入口别名任一被标记即视为活，和上面入口 stub 的 alive_alias 检查保持一致。 */
 static int sym_off_alive(u8 *mark, u32 o)
 {
-    u32 a;
+    u32 a = 0;
 
     if (o == 0xffffffffu)
         return 0;
@@ -520,7 +520,7 @@ static void obj_dce_stub_dead(void)
              * 死函数，入口写 0xC3 把活函数短路（早期 load_idt 变空操作 → IDT
              * 从不切换 → 早期 #PF 直接 #DF）。同址任一符号被标记就当作活。 */
             {
-                u32 a2;
+                u32 a2 = 0;
                 int alive_alias = 0;
 
                 for (a2 = 0; a2 < X64.nsym; a2++) {

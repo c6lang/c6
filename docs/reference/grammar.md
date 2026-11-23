@@ -884,6 +884,27 @@ typedef Vect@IntVec Grid;
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
 [generics-design.md](../design/generics-design.md)。
 
+### 3.12 bfloat16 标量类型 `bf16`
+
+```
+type-specifier         = "bf16" ;        (* c6 关键字，只在 .c6 里成立 *)
+```
+
+`bf16` 是 c6 独有的标量类型关键字（`.c` 翻译单元里它仍是普通标识符，`int bf16 = 1;`
+照常编译）。它**只占 2 字节存储**，值在表达式里按 `float` 参与运算：
+
+```
+    bf16 a = 1.5;              (* 0x3FC0 *)
+    a = a * 2;                 (* 3.0 *)
+    double d = a;              (* 提升到 double *)
+    bf16 arr[3] = { 0 };       (* 元素 2 字节，sizeof(arr) == 6 *)
+    struct P { char c; bf16 v; };   (* v 的偏移是 2，对齐 2 *)
+```
+
+读写都走 16 位表示：存回内存前按 **round-to-nearest-even** 舍到高 16 位，
+读出来左移 16 位摊成 f32；NaN 一律压成 quiet NaN `0x7FC0`。细节与位模式表见
+[manual/bf16.md](../manual/bf16.md)。
+
 ---
 
 ## 4. 语句

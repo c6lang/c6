@@ -54,6 +54,7 @@ tests2 / c-testsuite 的**编译语料**，以及 c6c 的**差分 oracle**（`bu
 | [manual/](manual/) | 语言手册（一特性一篇） | 现行 | 写代码 |
 | [stdlib.md](stdlib.md) | 标准库设计与 API | 现行 | 用 `std/` |
 | [reference/grammar.md](reference/grammar.md) | 语法规范（EBNF + 重写规则） | 现行 | 查精确语法 |
+| [manual/bf16.md](manual/bf16.md) | `bf16` 标量类型（2 字节存储 + RNE） | 现行 | 存半精度浮点 |
 | [reference/diagnostics.md](reference/diagnostics.md) | 诊断码 C1–C134 | 现行 | 查报错、加检查 |
 | [reference/cli.md](reference/cli.md) | 默认 c6c 的选项速查 + CMake 构建目标 + 版本号来源 | 现行 | 构建、跑测试、发版 |
 | [../c6c/README.md](../c6c/README.md) | c6c 自举编译器总入口 | 现行 | c6c 编译与验收 |

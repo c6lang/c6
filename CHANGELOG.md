@@ -5,6 +5,34 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 0.6.5 — 2026-11-23
+
+### 原生 `bf16` 标量类型（新特性）
+
+c6 新增类型关键字 `bf16`（`.c6` 里成立，`.c` 里仍是普通标识符，老代码不断）。
+它是 bfloat16 **存储**类型：内存里 2 字节、对齐 2，值在表达式里按 `float` 参与
+运算，写回对象时按 round-to-nearest-even 舍到高 16 位（与 torch / LLVM 的
+`fptrunc bfloat` 同口径，NaN 压成 `0x7FC0`、不进位成 `Inf`）。
+
+- **实现刻意不新增 IR op**：`ir_ty_of(TY_BF16) == IRT_F32`，内存访问复用
+  `IRT_U16` 的 `IR_LOAD`/`IR_STORE` + 位运算（`ZEXT`/`SHL`/`SHR`/`AND`/`ADD`/`CMP`/
+  `TRUNC`/`BITCAST`）。三个后端（native / C99 / LLVM）共用同一套 IR，所以后端
+  只需要补 `IR_BITCAST`（native 原先没实现），自举 fixpoint 与 IR 指纹不变。
+- 打通的范围：类型系统与 `sizeof`/对齐、`typedef`、形参/返回值、
+  `load_lval`/`store_lval` 的 16 位读写与 RNE、`gen_convert_impl` 的
+  bf16↔float/double/int 转换、结构体成员/数组元素/联合体、静态与全局初始化器
+  （编译期就舍好写数据段）、比较与算术提升。
+- **局部量只放帧内存**（和聚合一样，不摊进 vreg 槽）：值是 f32、对象是 2 字节，
+  摊在 vreg 里之后任何一次"取地址再读"都会按 f32 写 4 字节、按 bf16 读 2 字节，
+  读到 f32 的低半截（1.5f → 0）。改成帧对象后读写只经过一个口子。
+- 修基线断点：`obj.c6` 两处 `u32 a;` / `u32 a2;` 违反"局部变量必须初始化"
+  （`d701a3a` 引入，`fast` 在本次改动前就红在这里），已补 `= 0`。
+- 验收：新增 `c6c/tests/bf16_main.c6`（一份断言程序）与
+  `c6c/tests/bf16-check.sh`（native / C99 / LLVM 三个后端各跑一遍，再验证
+  "`.c` 里 `bf16` 仍是普通标识符"与"`.c6` 里是类型关键字"），挂到 `fast` 与
+  `check-all-c6c`。文档：[docs/manual/bf16.md](docs/manual/bf16.md)、
+  语法 [docs/reference/grammar.md §3.12](docs/reference/grammar.md)。
+
 ## 0.6.4 — 2026-11-18
 
 ### 移除 c6c 的 libtcc.h 兼容面（破坏性）

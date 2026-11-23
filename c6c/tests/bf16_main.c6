@@ -1,0 +1,447 @@
+/* c6 原生 bf16 的回归程序：存储 2 字节、表达式里按 f32 提升、存回按 RNE 舍入。
+ *
+ * 语义口径与 torch / LLVM 的 bfloat16 一致：
+ *   r = (u + 0x7FFF + ((u >> 16) & 1)) >> 16      （RNE，ties-to-even）
+ *   NaN 一律压成 quiet NaN 0x7FC0                 （不进位、不变成 Inf）
+ * 内存里只有 16 位，所以读出来是 f32（左移 16 展开），写回去先舍到 16 位。
+ *
+ * 这个文件是**普通程序**（有 main），所以 native / C99 / LLVM 三个后端都能跑；
+ * 用法见 c6c/tests/bf16-check.sh。退出码 0 表示全部通过。
+ */
+
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+
+union FB { float f; u32 u; };
+union BB { bf16 b; u16 h; };
+struct Box { char c; bf16 v; double d; };
+struct Nest { bf16 a; struct Box in; bf16 z; };
+
+/* 形参、返回值、隐式提升都要过一遍：bf16 形参在栈上必须是 2 字节对象 */
+static u16 bits_of(bf16 v)
+{
+    union BB u = { 0 };
+
+    u.b = v;
+    return u.h;
+}
+
+static bf16 from_bits(u16 h)
+{
+    union BB u = { 0 };
+
+    u.h = h;
+    return u.b;
+}
+
+static u32 fbits_of(float f)
+{
+    union FB u = { 0 };
+
+    u.f = f;
+    return u.u;
+}
+
+static bf16 g_zero = 0;
+static bf16 g_one = 1.5;
+static bf16 g_neg = -2.5;
+static bf16 g_arr[4] = { 0.0, 1.0, 2.0, 3.0 };
+static struct Box g_box = { 'x', 4.5, 2.0 };
+static struct Nest g_nest = { 1.0, { 'y', 2.5, 3.0 }, 8.0 };
+static bf16 *g_ptr = &g_one;
+
+static int BAD = 0;
+
+static void fail(const char *what, int code)
+{
+    BAD++;
+    printf("FAIL %s: %d\n", what, code);
+}
+
+static void chk_size(void)
+{
+    struct Box b = { 0 };
+
+    if (sizeof(bf16) != 2) {
+        fail("大小与对齐", 1);
+        return;
+    }
+    if (sizeof(struct Box) != 16) {
+        fail("大小与对齐", 2);
+        return;
+    }
+    if ((char *)&b.v - (char *)&b != 2) {
+        fail("大小与对齐", 3);
+        return;
+    }
+    if ((char *)&b.d - (char *)&b != 8) {
+        fail("大小与对齐", 4);
+        return;
+    }
+    if (sizeof(bf16[3]) != 6)
+        fail("大小与对齐", 5);
+}
+
+static void chk_bits(void)
+{
+    u32 z = 0x80000000u;
+    float nz = *(float *)&z;
+
+    if (bits_of(0.0) != 0x0000) {
+        fail("位模式", 1);
+        return;
+    }
+    /* -0 从位模式来：`-0.0f` 字面量在 c6 里现在会被折成 +0（一元负号的老问题，
+     * 与 bf16 无关），所以这里不走字面量 */
+    if (bits_of(nz) != 0x8000) {
+        fail("位模式", 2);
+        return;
+    }
+    if (bits_of(1.0) != 0x3F80) {
+        fail("位模式", 3);
+        return;
+    }
+    if (bits_of(1.5) != 0x3FC0) {
+        fail("位模式", 4);
+        return;
+    }
+    if (bits_of(2.5) != 0x4020) {
+        fail("位模式", 5);
+        return;
+    }
+    if (bits_of(-2.5) != 0xC020) {
+        fail("位模式", 6);
+        return;
+    }
+    if (bits_of(3.25) != 0x4050) {
+        fail("位模式", 7);
+        return;
+    }
+    /* 1/3 = 0x3EAAAAAB → 0x3EAB（torch 同口径） */
+    if (bits_of(1.0 / 3.0) != 0x3EAB) {
+        fail("位模式", 8);
+        return;
+    }
+    if (bits_of(from_bits(0x3F80)) != 0x3F80)
+        fail("位模式", 9);
+}
+
+static void chk_nan_inf(void)
+{
+    u32 uinf = 0x7F800000u;
+    u32 ninf = 0xFF800000u;
+    u32 qnan = 0x7FC00000u;
+    u32 snan = 0x7F800001u;
+
+    if (bits_of(*(float *)&uinf) != 0x7F80) {
+        fail("NaN/Inf", 1);
+        return;
+    }
+    if (bits_of(*(float *)&ninf) != 0xFF80) {
+        fail("NaN/Inf", 2);
+        return;
+    }
+    if (bits_of(*(float *)&qnan) != 0x7FC0) {
+        fail("NaN/Inf", 3);
+        return;
+    }
+    if (bits_of(*(float *)&snan) != 0x7FC0) {
+        fail("NaN/Inf", 4);
+        return;
+    }
+    /* 尾数低位不能被 RNE 进位吃掉（0x7F800001 不能变成 Inf） */
+    if ((bits_of(*(float *)&snan) & 0x7F80) != 0x7F80)
+        fail("NaN/Inf", 5);
+}
+
+static void chk_arith(void)
+{
+    bf16 a = 0;
+    bf16 b = 0;
+    bf16 c = 0;
+
+    a = 1.5;
+    b = 2.5;
+    if (bits_of(a) != 0x3FC0 || bits_of(b) != 0x4020) {
+        fail("局部变量与算术", 1);
+        return;
+    }
+    c = a + b;
+    if (c != 4.0) {
+        fail("局部变量与算术", 2);
+        return;
+    }
+    c = b - a;
+    if (c != 1.0) {
+        fail("局部变量与算术", 3);
+        return;
+    }
+    c = a * b;
+    if (c != 3.75) {
+        fail("局部变量与算术", 4);
+        return;
+    }
+    c = b / a;
+    if (c < 1.66 || c > 1.67) {
+        fail("局部变量与算术", 5);
+        return;
+    }
+    c = -a;
+    if (bits_of(c) != 0xBFC0) {
+        fail("局部变量与算术", 6);
+        return;
+    }
+    c = a;
+    c += 0.5;
+    if (c != 2.0) {
+        fail("局部变量与算术", 7);
+        return;
+    }
+    c = 3;
+    if (c != 3.0)
+        fail("局部变量与算术", 8);
+}
+
+static void chk_cmp(void)
+{
+    bf16 a = 1.5;
+    bf16 b = 2.5;
+
+    if (!(a < b) || a > b || a == b || !(a != b)) {
+        fail("比较与布尔", 1);
+        return;
+    }
+    if (!(a <= a && b >= b)) {
+        fail("比较与布尔", 2);
+        return;
+    }
+    if (!a) {
+        fail("比较与布尔", 3);
+        return;
+    }
+    a = 0;
+    if (a)
+        fail("比较与布尔", 4);
+}
+
+static void chk_conv(void)
+{
+    bf16 v = 1.5;
+    double d = 0;
+    int i = 0;
+    long l = 0;
+    float f = 0;
+
+    d = v;
+    if (d != 1.5) {
+        fail("转换", 1);
+        return;
+    }
+    f = v;
+    if (fbits_of(f) != 0x3FC00000u) {
+        fail("转换", 2);
+        return;
+    }
+    i = 3;
+    v = i;
+    if (v != 3.0) {
+        fail("转换", 3);
+        return;
+    }
+    i = 0;
+    i = v;
+    if (i != 3) {
+        fail("转换", 4);
+        return;
+    }
+    l = 65536;
+    v = l;
+    if (v != 65536.0) {
+        fail("转换", 5);
+        return;
+    }
+    /* 100000 在 bf16 里落到两个相邻值中间偏下：RNE 后是 0x47C3（99840） */
+    l = 100000;
+    v = l;
+    if (bits_of(v) != 0x47C3) {
+        fail("转换", 6);
+        return;
+    }
+    d = 1.0 / 3.0;
+    v = d;
+    if (bits_of(v) != 0x3EAB)
+        fail("转换", 7);
+}
+
+static void chk_param(void)
+{
+    bf16 v = from_bits(0x4020);
+    bf16 x = 1.0;
+    bf16 y = 2.0;
+
+    if (v != 2.5) {
+        fail("形参与返回值", 1);
+        return;
+    }
+    if (bits_of(v) != 0x4020) {
+        fail("形参与返回值", 2);
+        return;
+    }
+    if (bits_of(1.5) != 0x3FC0) {
+        fail("形参与返回值", 3);
+        return;
+    }
+    /* 相邻的 bf16 局部量不能互相踩（对象必须是 2 字节，不是 4/8） */
+    if (bits_of(x) != 0x3F80 || bits_of(y) != 0x4000)
+        fail("形参与返回值", 4);
+}
+
+static void chk_aggr(void)
+{
+    bf16 arr[3] = { 0 };
+    struct Box b = { 'a', 4.5, 1.0 };
+    bf16 *p = 0;
+    bf16 z = 0;
+
+    arr[1] = 3.25;
+    if (bits_of(arr[1]) != 0x4050) {
+        fail("数组/结构体/指针", 1);
+        return;
+    }
+    if (arr[0] != 0 || arr[2] != 0) {
+        fail("数组/结构体/指针", 2);
+        return;
+    }
+    if (bits_of(b.v) != 0x4090) {
+        fail("数组/结构体/指针", 3);
+        return;
+    }
+    b.v = z;
+    if (b.v != 0) {
+        fail("数组/结构体/指针", 4);
+        return;
+    }
+    b.v = arr[1];
+    p = &b.v;
+    if (*p != 3.25) {
+        fail("数组/结构体/指针", 5);
+        return;
+    }
+    *p = 1.5;
+    if (b.v != 1.5) {
+        fail("数组/结构体/指针", 6);
+        return;
+    }
+    if ((char *)(p + 1) - (char *)p != 2)
+        fail("数组/结构体/指针", 7);
+}
+
+static void chk_static(void)
+{
+    static bf16 s_val = 1.0 / 3.0;
+    static bf16 s_arr[2] = { -1.5, 7 };
+    u16 sb = 0;
+
+    if (g_zero != 0) {
+        fail("静态/全局初始化器", 1);
+        return;
+    }
+    if (bits_of(g_one) != 0x3FC0) {
+        fail("静态/全局初始化器", 2);
+        return;
+    }
+    if (bits_of(g_neg) != 0xC020) {
+        fail("静态/全局初始化器", 3);
+        return;
+    }
+    if (g_arr[0] != 0 || g_arr[2] != 2.0 || g_arr[3] != 3.0) {
+        fail("静态/全局初始化器", 4);
+        return;
+    }
+    if (bits_of(g_box.v) != 0x4090 || g_box.c != 'x' || g_box.d != 2.0) {
+        fail("静态/全局初始化器", 5);
+        return;
+    }
+    if (g_nest.a != 1.0 || bits_of(g_nest.in.v) != 0x4020 || g_nest.z != 8.0) {
+        fail("静态/全局初始化器", 6);
+        return;
+    }
+    if (*g_ptr != 1.5) {
+        fail("静态/全局初始化器", 7);
+        return;
+    }
+    if (bits_of(s_val) != 0x3EAB) {
+        fail("静态/全局初始化器", 8);
+        return;
+    }
+    if (bits_of(s_arr[0]) != 0xBFC0 || s_arr[1] != 7.0) {
+        fail("静态/全局初始化器", 9);
+        return;
+    }
+    sb = bits_of(s_arr[1]);
+    if (sb != 0x40E0)
+        fail("静态/全局初始化器", 10);
+}
+
+static void chk_edge(void)
+{
+    /* 0x0001 最小次正规数，0x0080 最小正规数，0x7F7F 最大有限值 */
+    if (from_bits(0x0001) == 0) {
+        fail("位模式边界", 1);
+        return;
+    }
+    if (bits_of(from_bits(0x0001)) != 0x0001) {
+        fail("位模式边界", 2);
+        return;
+    }
+    if (bits_of(from_bits(0x0080)) != 0x0080) {
+        fail("位模式边界", 3);
+        return;
+    }
+    if (bits_of(from_bits(0x7F7F)) != 0x7F7F) {
+        fail("位模式边界", 4);
+        return;
+    }
+    if (from_bits(0x7F80) == from_bits(0x7F7F)) {
+        fail("位模式边界", 5);
+        return;
+    }
+    /* 溢出到 Inf：最大有限值乘 2 已经超出 bf16 的表示范围 */
+    if (bits_of(from_bits(0x7F7F) * 2.0f) != 0x7F80)
+        fail("位模式边界", 6);
+}
+
+static void chk_typedef(void)
+{
+    typedef bf16 half;
+    half h = 2.0;
+
+    if (sizeof(h) != 2 || sizeof(half) != 2) {
+        fail("typedef 与 sizeof", 1);
+        return;
+    }
+    if (h + h != 4.0)
+        fail("typedef 与 sizeof", 2);
+}
+
+int main(void)
+{
+    chk_size();
+    chk_bits();
+    chk_nan_inf();
+    chk_arith();
+    chk_cmp();
+    chk_conv();
+    chk_param();
+    chk_aggr();
+    chk_static();
+    chk_edge();
+    chk_typedef();
+    if (BAD != 0) {
+        printf("bf16: %d failure(s)\n", BAD);
+        return 1;
+    }
+    printf("bf16: all checks passed\n");
+    return 0;
+}
