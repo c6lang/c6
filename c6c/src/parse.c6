@@ -1628,13 +1628,70 @@ static void agg_tab_grow(void)
 
 /* 成员 i 有没有名字？（无名的位域 `unsigned :32;` 在**位置初始化**里不占位，
  * 却有布局意义——tests2/90_struct-init.c 的 test_init_bf） */
+/* 聚合 type id 在成员名表里有没有条目 */
+static int agg_has_entry(u32 ty)
+{
+    u32 j = AGG_HEAD[ty % AGG_NB];
+
+    while (j) {
+        AggInfo *e = &AGG[j - 1];
+
+        if (e->ty == ty)
+            return 1;
+        j = e->next_same;
+    }
+    return 0;
+}
+
+/* 成员名只跟布局走：先剥限定符；剥完得到的那条 id 可能是"结构相同、但没
+ * 登记成员名表"的副本（补全过的聚合在 type.c6 那边不再搬桶，按内容查会落到
+ * 一条新记录上），于是再按 tag 找回**规范**的那条。 */
+static u32 agg_norm(u32 ty)
+{
+    const char *tg = NULL;
+    Sym *ts = NULL;
+    u32 t2 = 0;
+
+    if (!ty || !ty_is_agg(ty))
+        return ty;
+    if (TY_AT(ty)->qual)
+        ty = ty_unqual(ty);
+    if (agg_has_entry(ty))
+        return ty;
+    tg = sym_tag_name(ty);
+    if (!tg) {
+        /* 限定符/同构副本那条 id 没进 TAGNAME 反查表，但 `tag` 序号是照抄的：
+         * 顺着序号找回同一个标签的名字。 */
+        u32 tgid = TY_AT(ty)->tag;
+        u32 i = 0;
+
+        if (tgid) {
+            for (i = 0; i < NTAGNAME; i++) {
+                if (TAGNAME_NM[i] && TAGNAME_TY[i] < 0x7FFFFFFFu
+                    && TY_AT(TAGNAME_TY[i])->tag == tgid) {
+                    tg = TAGNAME_NM[i];
+                    break;
+                }
+            }
+        }
+    }
+    if (!tg)
+        return ty;
+    ts = sym_find_tag(tg, (u32)strlen(tg));
+    if (!ts || !ts->type)
+        return ty;
+    t2 = ts->type;
+    if (TY_AT(t2)->qual)
+        t2 = ty_unqual(t2);
+    return t2;
+}
+
 static int agg_member_named(u32 ty, u32 idx)
 {
     u32 b = 0;
     u32 j = 0;
 
-    if (TY_AT(ty)->qual)
-        ty = ty_unqual(ty);
+    ty = agg_norm(ty);
     b = ty % AGG_NB;
     j = AGG_HEAD[b];
 
@@ -1717,8 +1774,7 @@ static int agg_find_member(u32 ty, const char *name, u32 len)
 {
     u32 j = 0;
 
-    if (TY_AT(ty)->qual)
-        ty = ty_unqual(ty);
+    ty = agg_norm(ty);
     j = AGG_HEAD[ty % AGG_NB];
 
     while (j) {
@@ -1744,8 +1800,7 @@ static int agg_member_is_anon(u32 ty, u32 idx)
 {
     u32 j = 0;
 
-    if (TY_AT(ty)->qual)
-        ty = ty_unqual(ty);
+    ty = agg_norm(ty);
     j = AGG_HEAD[ty % AGG_NB];
 
     while (j) {

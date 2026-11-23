@@ -537,47 +537,6 @@ static u32 ty_agg(const u32 *mem, const u32 *bits, u32 n, int is_union, u32 tag)
                           is_union ? 1u : 0u, tag, mem, n, L.bcopy, L.offs);
 }
 
-/* 从桶里摘掉 id（它的 hash 已经变了，老位置作废）。
- *
- * 线性探测的删除不能只把槽清空——会把后面同一簇里"绕过来"的条目截断。
- * 这里的做法（Knuth 6.4 R）是清空之后把它到下一个空槽之间的整簇重新插一遍。 */
-static void tt_insert_existing(u32 id);
-
-static void tt_unlink(u32 id, u32 oldh)
-{
-    u32 mask = TT.cap - 1;
-    u32 slot = oldh & mask;
-    u32 j = 0;
-
-    while (TT.buckets[slot] != 0xFFFFFFFFu && TT.buckets[slot] != id)
-        slot = (slot + 1) & mask;
-    if (TT.buckets[slot] != id)
-        return;
-    TT.buckets[slot] = 0xFFFFFFFFu;
-    j = (slot + 1) & mask;
-    while (TT.buckets[j] != 0xFFFFFFFFu) {
-        u32 v = TT.buckets[j];
-
-        TT.buckets[j] = 0xFFFFFFFFu;
-        tt_insert_existing(v);
-        j = (j + 1) & mask;
-    }
-}
-
-/* 按 TY_AT(id)->hash 把 id 登记进桶（已经在里面就直接返回）。 */
-static void tt_insert_existing(u32 id)
-{
-    u32 mask = TT.cap - 1;
-    u32 slot = TY_AT(id)->hash & mask;
-
-    while (TT.buckets[slot] != 0xFFFFFFFFu) {
-        if (TT.buckets[slot] == id)
-            return;
-        slot = (slot + 1) & mask;
-    }
-    TT.buckets[slot] = id;
-}
-
 /* 补全一个已经存在的（前置声明出来的）类型 id。
  * `typedef struct X X; ... struct X { … };` 必须让先前那个 id 变成完整类型，
  * 否则所有早先写的 `X *p` 都查不到成员——tcc 的 TCCState 正是这个形状。
@@ -606,12 +565,12 @@ static u32 ty_agg_complete(u32 id, const u32 *mem, const u32 *bits, u32 n, int i
     t->offs = L.offs;
     t->bits = n ? L.bcopy : NULL;
     nbits0 = t->bits ? t->nkid : 0;
-    t->hash = ty_hash(t->kind, t->qual, t->align, t->size, t->nkid, t->a, t->b,
-                      t->tag, t->kids, nbits0, t->bits);
-    if (t->hash != oldh) {
-        tt_unlink(id, oldh);
-        tt_insert_existing(id);
-    }
+    /* 补全改了 size/成员，内容 hash 跟着变，但**不动** t->hash / 桶：搬桶会
+     * 打乱别的类型的探测链（实测把跨 TU 的接口分派搞错——调到的 vtable 槽
+     * 对，结果却是另一个接收者的实现）。`const T g[]` 那种"剥掉限定符要回到
+     * 结构体 id"的需求改由 parse.c6 的 agg_norm()（按 tag 找回规范 id）满足。 */
+    (void)oldh;
+    (void)nbits0;
     return id;
 }
 
