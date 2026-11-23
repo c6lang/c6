@@ -1117,6 +1117,7 @@ static int DEF_DEPTH;      /* 前向声明：块嵌套深度（定义在后面�
 
 static int C6_TU_SEEN;      /* 这个编译单元里有 .c6 文件（主文件就是） */
 
+
 /* 自动挂上的自带运行时（lib/rt.c6）的源文件 id，0 = 还没挂。
  *
  * 它**不参与** C6_TU_SEEN 的判定：运行时是 c6c 自己无条件塞进来的，跟用户
@@ -22251,9 +22252,17 @@ static void gen_stmt(void)
             if (two && pa_is_ch(':'))
                 pa_error("a range yields only an index");
             if (!two && nb >= 1 && pa_is_ch(':')) {
+                u32 rloty = ivty;
+                u32 rhity = 0;
+
+                if (!ty_is_int(bty[0]))
+                    pa_error("the index of a 'foreach' must have an integer type");
                 rlo = iv_lval ? load_lval(base, ivty) : value_of(iv);
                 pa_advance();
                 rhi = value_of(gen_assign());
+                rhity = GEN_TY;
+                if (!ty_is_int(rloty) || !ty_is_int(rhity))
+                    pa_error("range bounds must be integers");
                 is_range = 1;
                 islot = bsl[0];
                 nslot = 0;
@@ -24640,6 +24649,16 @@ static void pa_parse_tu(void)
 {
     u16 decl_file = 0xFFFF;      /* 上一个顶层声明在哪个文件里（MODFIRST 用） */
     int any_decl = 0;
+
+    /* TU 的第一批 token 可能就是头文件里的（`#include` 写在文件开头），那会儿
+     * 还没轮到 .c6 的 token 去做后缀分类，头里的声明会被当成外部 C 头。
+     * 按**主文件后缀**先把这个 TU 的身份定下来（tests/errors/loc.c6 的
+     * test_sizeof_in_header：头里 `int g;` 也要报"必须初始化"）。 */
+    if (PP_TU_MAIN) {
+        size_t n0 = strlen(PP_TU_MAIN);
+
+        C6_TU_SEEN = (n0 > 3 && memcmp(PP_TU_MAIN + n0 - 3, ".c6", 3) == 0) ? 1 : 0;
+    }
 
     while (pa_cur()->kind != TK_EOF) {
         u32 base = 0;

@@ -149,9 +149,16 @@ static int pp_active(void)
     return COND == NULL || COND->active;
 }
 
+/* 这个 TU 的主文件路径（驱动 push 的 dir_index = -1 那一层）。parse.c6 在
+ * TU 开头按它判断"这个 TU 是不是 .c6"——头文件可能是 TU 的第一批 token
+ * （`#include` 写在文件开头），只看第一个 token 所在的文件会误判。 */
+static const char *PP_TU_MAIN;
+
 static void pp_push_file(SrcFile *f, int dir_index)
 {
     Src *s = pp_new_src();
+    if (dir_index < 0 && f)
+        PP_TU_MAIN = f->path;
     s->emark = exp_mark();
     s->up = PP_TOP;
     s->is_file = 1;
