@@ -140,8 +140,11 @@ static void img_copy(Image *im, const char *s, u32 n)
 
 /* 写 ELF 头 + 程序头。单段：从偏移 0 到文件尾，RWX。
  * 单独拆出来是为了让“分块写出”（elf_write_parts）复用同一套字段——
- * 收尾时按 [头][数据段][代码段] 三块直接写，不必先把它们拼成一份连续镜像。 */
-static void elf_hdr_fill(u8 *p, u32 total, u32 entry_off)
+ * 收尾时按 [头][数据段][代码段] 三块直接写，不必先把它们拼成一份连续镜像。
+ *
+ * bss 是“文件尾之后还要多少内存”：p_memsz = p_filesz + bss，内核负责把
+ * 多出来的那段清零。全零的静态存储（BSS）靠它落地，文件里一个字节都不占。 */
+static void elf_hdr_fill(u8 *p, u32 total, u32 entry_off, u32 bss)
 {
     Image h = {0};
     u32 i = 0;
@@ -175,7 +178,8 @@ static void elf_hdr_fill(u8 *p, u32 total, u32 entry_off)
     img_patch16(&h, 62, 0);                             /* e_shstrndx */
 
     /* 程序头：p_type=PT_LOAD、p_flags=R|W|X、p_offset=0、p_vaddr=ELF_BASE_VA、
-     * p_filesz=p_memsz=total、p_align=0x1000。 */
+     * p_filesz=total、p_memsz=total+bss（bss 只在内存里，内核清零）、
+     * p_align=0x1000。 */
     {
         u32 ph = ELF_EHDR;
 
@@ -185,7 +189,7 @@ static void elf_hdr_fill(u8 *p, u32 total, u32 entry_off)
         img_patch64(&h, ph + 16, (u64)ELF_BASE_VA); /* p_vaddr */
         img_patch64(&h, ph + 24, (u64)ELF_BASE_VA); /* p_paddr */
         img_patch64(&h, ph + 32, (u64)total);       /* p_filesz */
-        img_patch64(&h, ph + 40, (u64)total);       /* p_memsz */
+        img_patch64(&h, ph + 40, (u64)total + (u64)bss); /* p_memsz */
         img_patch64(&h, ph + 48, 0x1000);           /* p_align */
     }
 }
@@ -196,7 +200,7 @@ static void elf_write(const char *path, Image *im, u32 hdr, u32 entry_off)
     u32 total = im->n;
     FILE *f = NULL;
 
-    elf_hdr_fill(im->p + hdr, total, entry_off);
+    elf_hdr_fill(im->p + hdr, total, entry_off, 0);
 
     f = fopen(path, "wb");
     if (!f) {
@@ -217,12 +221,12 @@ static void elf_write(const char *path, Image *im, u32 hdr, u32 entry_off)
  * 10.6 MB 是它。文件布局本来就是三段顺序拼接，直接分段 fwrite 结果逐字节
  * 相同，却不必多一份内存。 */
 static void elf_write_parts(const char *path, u8 *hdr, const Image *data, const Image *code,
-                            u32 entry_off)
+                            u32 entry_off, u32 bss)
 {
     u32 total = ELF_HDR + data->n + code->n;
     FILE *f = NULL;
 
-    elf_hdr_fill(hdr, total, entry_off);
+    elf_hdr_fill(hdr, total, entry_off, bss);
 
     f = fopen(path, "wb");
     if (!f) {

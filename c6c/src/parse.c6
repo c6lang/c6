@@ -16,6 +16,9 @@ static int llvm_mode(void);
 static int llvm_open(const char *out);
 static int llvm_finish(const char *out);
 static void be_emit_fn(IrFn *f, u32 func_sym);
+/* -S（文本汇编）后端也算“从数据段逐字节取内容”，BSS 不适用，见 pa_bss_ok()。 */
+static int aso_on(void);
+static int pa_bss_ok(void);
 
 /* 优化 pass 的统一入口：一个函数的 IR 已经降完、还没交给任何后端。
  * -O0 时 ir_optimize() 立即返回，字节行为与优化器引入前完全一致。 */
@@ -1504,6 +1507,15 @@ static void obj_write(const char *path);
 static void pa_set_reloc(int v)
 {
     PA_RELOC = v ? 1 : 0;
+}
+
+/* 全零静态存储能不能挪进 BSS：只有 native 最终 ELF（-o）能这么干。
+ * 其余后端的产物都从 DATA_IMG 取字节——-c 的 ET_REL 要真 ·bss 段、
+ * -S 逐字节打印数据段、C99/LLVM 各发一份数组——零存储必须留在数据段里。 */
+#define PA_BSS_MIN 64
+static int pa_bss_ok(void)
+{
+    return !PA_RELOC && !C99_MODE && !llvm_mode() && !aso_on();
 }
 
 /* 文件作用域 `static` 的**发射名**：拿不到模块前缀那套（static 本来就
@@ -23972,6 +23984,7 @@ static void gen_one_global(u32 ty, Declarator *d)
     int ate_eq = 0;      /* `[] = {…}` 那条路已经把 `=` 吃掉、把体重新压回源栈了 */
     u32 was_min = 0;     /* 收缩时不许低于这个长度（前面那条声明写死了长度时用） */
     u32 goff = 0;        /* 分配好的数据段偏移；初始化器解析期间符号表可能搬家 */
+    u32 gal = 8;         /* 这次分配的（含 __aligned 提升后的）对齐，BSS 要用同一份 */
 
     if (!d->name)
         return;
@@ -24179,6 +24192,7 @@ static void gen_one_global(u32 ty, Declarator *d)
             al = (u32)DECL_ALIGN_REQ;
         if (al > GLOB_MAX_ALIGN)
             GLOB_MAX_ALIGN = al;
+        gal = al;
         s->goff = data_alloc(sz, al);
     }
     DECL_ALIGN_REQ = 0;
@@ -24215,8 +24229,20 @@ static void gen_one_global(u32 ty, Declarator *d)
         s->is_mgd = (u8)(d->mgd_kind == 1 ? 2 : 1);
     if (ty == ty_thread() && PA_TASK_KW == 1)
         pa_error("task 只能在函数里声明");   /* 全局托管量：2 = 弱 */
-    if (!ate_eq && !pa_accept_ch('='))
+    if (!ate_eq && !pa_accept_ch('=')) {
+        /* 静态存储期 + 没有初始化器 = 全零。零块留在数据段里要原样写进
+         * ELF（自举编译器自己的几张大表就有 27 MB），挪到代码段之后的 BSS
+         * 尾巴：文件里一个字节不占，内核按 p_memsz 清零。这里必须还是数据
+         * 段末尾（没有初始化器，就不会有字面量插在后面），才能把这块还给
+         * 后面的分配；TLS 的寻址硬编码了 goff（见 ident_addr），排除。
+         * 小于 PA_BSS_MIN 的不折腾：BSS 区对齐填充可能比它本身还大。 */
+        if (pa_bss_ok() && !PA_TLS && !d->mgd && sz >= PA_BSS_MIN
+            && goff + sz == DATA_IMG.n && (u32)s->val < X64.nsym) {
+            (void)x64_bss_sym(&X64, X64.sym[(u32)s->val].name, sz, gal);
+            DATA_IMG.n = goff;
+        }
         return;
+    }
     if (pa_is_ch('{')) {
         u32 et = ty_is_array(ty) ? ty_target(ty) : 0;
         u32 end_alloc = DATA_IMG.n;
@@ -25878,19 +25904,29 @@ static int pa_finish(const char *out)
             if (X64.sym[i].defined)
                 X64.sym[i].va = ELF_BASE_VA + X64.sym[i].off;   /* VA 跟着偏移走 */
         }
-        data_fixups_apply();
         /* asmblob 跳板是回填阶段才追加到代码尾的（自编译时 144 字节）。
          * 先留死 64 KB 余量，免得 1.5 倍增长为这 144 字节多清 1.4 MB 的页。 */
         img_slack(&CODE_IMG, 64u * 1024u);
         code_len = CODE_IMG.n;      /* 报告的是"源码编出来的代码"，不含跳板 */
         X64.im_base = code_off;
+        /* 顺序（BSS 引入后必须这么卡）：
+         *   1. 先补跳板 —— 代码段最终长度到这一刻才定；
+         *   2. BSS 符号落在代码段之后，现在才能拍 off/va；
+         *   3. 数据段里的绝对地址回填（可能指向 BSS，必须在 2 之后）；
+         *   4. 回填代码里的 rel32。
+         * 以前 data_fixups_apply 在 x64_resolve 之前就够——那时 BSS 符号
+         * 的地址不依赖代码长度。 */
+        x64_resolve_blobs(&X64);
+        x64_bss_layout(&X64, ELF_HDR + DATA_IMG.n + CODE_IMG.n);
+        data_fixups_apply();
         x64_resolve(&X64);
         x64_report_undef();
         {
             /* 头单独放栈上：120 字节 vs 10 MB，这就是整个改动的意思 */
             u8 hdr[ELF_HDR] = {0};
 
-            elf_write_parts(out, hdr, &DATA_IMG, &CODE_IMG, entry_off + code_off);
+            elf_write_parts(out, hdr, &DATA_IMG, &CODE_IMG, entry_off + code_off,
+                            X64.bss_mem);
         }
     }
     if (!PA_QUIET_OUT)
