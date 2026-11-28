@@ -100,13 +100,14 @@ static long c6c_sys6(long nr, long a, long b, long c, long d, long e, long f)
 }
 
 /* ---------- 基本 I/O ---------- */
+/* 逐字节的 C 循环在 c6c 自己出码下要 14 条指令/字节（自举时 strlen 占整个
+ * 编译时间约 18%），改走 src/asmblob.c6 的 __c6_strlen_rep（repne scasb）：
+ * 不越过 NUL，长度按 rcx 反推。 */
+long __c6_strlen_rep(const char *s);
+
 static long c6c_strlen(const char *s)
 {
-    long n = 0;
-
-    while (s[n])
-        n++;
-    return n;
+    return __c6_strlen_rep(s);
 }
 
 long write(long fd, const void *buf, unsigned long n)
@@ -1765,8 +1766,8 @@ void *memmove(void *dst, const void *src, long n)
     long i = 0;
 
     if (d <= s) {
-        for (i = 0; i < n; i++)
-            d[i] = s[i];
+        /* 往前搬：源在目的之前，逐字节和"整块"等价，走快路 */
+        c6c_mem_copy(dst, src, n);
     } else {
         for (i = n - 1; i >= 0; i--)
             d[i] = s[i];
@@ -1774,11 +1775,18 @@ void *memmove(void *dst, const void *src, long n)
     return dst;
 }
 
+void *__c6_memset_rep(void *dst, int c, long n);
+
 void *memset(void *dst, int c, long n)
 {
     char *d = (char *)dst;
     long i = 0;
 
+    /* 8 字节起 rep stosb 就比逐字节循环快（启动开销约十几条指令） */
+    if (n >= 8) {
+        __c6_memset_rep(dst, c, n);
+        return dst;
+    }
     for (i = 0; i < n; i++)
         d[i] = (char)c;
     return dst;
