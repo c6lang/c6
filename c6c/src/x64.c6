@@ -144,6 +144,8 @@ static u32 X64_OPNUM;
 static u32 X64_NVREG;
 static u32 X64_NFN;
 static int X64_OPSTATS_ON = -1;
+/* C6C_DUMP：每个函数都查一次 getenv 太贵（environ 要逐个 strcmp），缓存起来 */
+static int X64_DUMP_ON = -1;
 static void x64_opstats_print(void)
 {
     u32 i = 0;
@@ -2181,7 +2183,9 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
         X64_NVREG += f->nvreg;
         X64_NFN++;
     }
-    if (getenv("C6C_DUMP")) {
+    if (X64_DUMP_ON < 0)
+        X64_DUMP_ON = getenv("C6C_DUMP") != NULL;
+    if (X64_DUMP_ON) {
         u32 q = 0;
 
         fprintf(stderr, "== %s（nparams=%u, variadic=%d, frame=%u）\n", f->name,
