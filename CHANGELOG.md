@@ -7,6 +7,42 @@
 
 ## 未发布
 
+（暂无）
+
+## 0.6.6 — 2026-11-29
+
+### 自举编译进入亚秒级（性能）
+
+c6c 用**自己**编 `c6c/src/c6c.c6` 的耗时从 **3325 ms 降到 955 ms**（5 次中位；
+`perf stat -e instructions:u` 口径 6.3 G → **2.98 G**），自举产物从 31,088,072
+字节降到 **2,225,475**。一路没有新增优化 pass：`-O0` 仍然一个 pass 都不跑，
+三后端共用同一份 IR，字节级 fixpoint / IR 指纹 / 后端差分的前提全不变。
+
+- **x64 后端出码**：帧槽直访（`lea dst,[rbp+槽]` 省基址 load）、比较+分支融合、
+  `movsx`/`movzx`/`movsxd` 单指令扩展、ALU 内存操作数、按需保存 callee-saved、
+  零静态进 BSS + 块内"待定值"（延迟写槽 + 读转发）、无操作拷贝/截断合并、
+  常量直接走立即数（`81 /7 id`、`83 /7 ib`、`mov [slot],imm32`）、
+  `strlen`/`memset`/`memcpy` 走 `rep` 跳板、`memchr` 与哈希函数 8 字节一混。
+- **前端热路径**：`tok_data`/`pa_cur` 退化成宏、`tok_eq_len` 按长度直落比较、
+  `pa_is_ch`/`pa_is_punct`/`pa_is_ident_n` 摊平成单层实现、`gen_postfix` 里
+  二十几串 `__builtin_*`/`__atomic_*` 检查用 `__` 前缀大前提一次筛掉
+  （`tok_eq_len` 由 5.4% 降到 1.9%）、热循环里的 `a || b` / `a && b` 拆成直落 if
+  （C 里它是"一个值"，自举时要落槽再读回，约九条指令）、`C6C_DBG_*` 的 `getenv`
+  结果缓存、标量数组初始化叶子快路（-15%）。
+- **方法与回归保障**：自举产物是 section-less ELF，perf 的函数归属不可信，
+  改成 callgrind + `nm` 反查拿精确的每函数指令数与调用次数；逐轮实测记录在
+  [c6c/docs/selfhost-perf-todo.md](c6c/docs/selfhost-perf-todo.md)，设计见
+  [c6c/docs/selfhost-perf-design.md](c6c/docs/selfhost-perf-design.md)。
+  两条**踩过又退回**的路子（IR 级内联、指针取成员的 LEA 折进 LOAD）连同症状一起
+  记在文档里，避免下一轮重踩。
+- 验收：`-O0` 逐字节 fixpoint 与 `selfhost-O1/O2/O3` 各自的逐字节 fixpoint 全通过；
+  `check-all-c6c`（全部后端差分、c99suite、tcc 语料、用 c6c 编出 tcc 再跑 tests2、
+  第三代 selfhost、c6c 出的 `.o` 链接 vmlinux 并 qemu 启动）全绿。`bench-c6c`
+  实测：native 130 ms（门槛 135）、预处理 58 ms（门槛 120）、峰值内存 33 MB
+  （门槛 40）、线性度 0.62/0.91/0.98（门槛 2.6）都在预算内；只有 `self` 口径
+  156 ms 高于 `thresholds.json` 里那个 100 ms 的**预算值**（那是个预算，
+  `baseline.json` 里没有对应实测；本轮之后它已经比以前低得多）。
+
 ### 单元测试统一到 `tests/unit/`（工程）
 
 - `check-all-c6c` / `fast` 里的 `unit` / `irtest` / `bf16check` 三条微目标合并成

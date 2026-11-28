@@ -31,8 +31,8 @@ typedef uint64_t u64;
 typedef int32_t i32;
 typedef int64_t i64;
 
-/* 发布号跟着仓库根 VERSION 走（c6 0.6.5）。 */
-#define C6C_VERSION "0.6.5"
+/* 发布号跟着仓库根 VERSION 走（c6 0.6.6）。 */
+#define C6C_VERSION "0.6.6"
 
 #include "arena.c6"
 #include "mod.c6"
