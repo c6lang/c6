@@ -148,6 +148,33 @@ static const u8 ASM_MEMCPY_REP[10] = {
     0x48, 0x89, 0xf8, 0xfc, 0x48, 0x89, 0xd1, 0xf3, 0xa4, 0xc3
 };
 
+/* long __c6_strlen_rep(const char *s)：repne scasb 版 strlen。
+ *   48 c7 c1 ff ff ff ff   mov  $-1,%rcx
+ *   31 c0                  xor  %eax,%eax      ; AL = 要找的 0
+ *   f2 ae                  repne scasb        ; 扫到 AL==[rdi]，不越过 NUL
+ *   48 f7 d1               not  %rcx           ; 扫过的字节数（含结尾 0）
+ *   48 8d 41 ff            lea  -1(%rcx),%rax  ; 长度 = 扫过的字节数 - 1
+ *   c3                     ret
+ * 为什么又要一块机器码：C 里那种逐字节循环每个字节要过一次帧槽（实测 14 条
+ * 指令/字节），自举编译时 strlen 独占约 18% 的时间。repne scasb 不会越过 NUL，
+ * 所以不存在"多数几个字节"的跨页读风险（word-at-a-time 版有）。 */
+static const u8 ASM_STRLEN_REP[19] = {
+    0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff, 0x31, 0xc0, 0xf2,
+    0xae, 0x48, 0xf7, 0xd1, 0x48, 0x8d, 0x41, 0xff, 0xc3
+};
+
+/* void *__c6_memset_rep(void *dst, int c, long n)：rep stosb 版 memset。
+ *   48 89 f8   mov %rdi,%rax   ; 返回值 = dst
+ *   40 88 f0   mov %sil,%al    ; 填充字节
+ *   48 89 d1   mov %rdx,%rcx
+ *   fc         cld
+ *   f3 aa      rep stosb
+ *   c3         ret */
+static const u8 ASM_MEMSET_REP[13] = {
+    0x48, 0x89, 0xf8, 0x40, 0x88, 0xf0, 0x48, 0x89, 0xd1, 0xfc, 0xf3, 0xaa,
+    0xc3
+};
+
 #define ASM_REL1(a) { (a), 0 }
 
 /* void __c6_sigrestorer(void)：信号处理函数 `return` 之后内核跳到这里做
@@ -198,6 +225,14 @@ static const AsmBlob ASMBLOBS[] = {
     { "__c6_memcpy_rep", ASM_MEMCPY_REP, 10, 0, { { 0, 0 } },
       ".text\n.globl __c6_memcpy_rep\n__c6_memcpy_rep:\n"
       "\tmov %rdi, %rax\n\tcld\n\tmov %rdx, %rcx\n\trep movsb\n\tret\n" },
+    { "__c6_strlen_rep", ASM_STRLEN_REP, 19, 0, { { 0, 0 } },
+      ".text\n.globl __c6_strlen_rep\n__c6_strlen_rep:\n"
+      "\tmov $-1, %rcx\n\txor %eax, %eax\n\trepne scasb\n\tnot %rcx\n"
+      "\tlea -1(%rcx), %rax\n\tret\n" },
+    { "__c6_memset_rep", ASM_MEMSET_REP, 13, 0, { { 0, 0 } },
+      ".text\n.globl __c6_memset_rep\n__c6_memset_rep:\n"
+      "\tmov %rdi, %rax\n\tmov %sil, %al\n\tmov %rdx, %rcx\n\tcld\n"
+      "\trep stosb\n\tret\n" },
     { "__c6_sigrestorer", ASM_SIGRESTORE, 12, 0, { { 0, 0 } },
       ".text\n.globl __c6_sigrestorer\n__c6_sigrestorer:\n"
       "\tmov $15, %eax\n\tsyscall\n\tint3\n\tnop\n\tnop\n\tnop\n\tnop\n" },

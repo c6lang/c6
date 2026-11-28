@@ -132,6 +132,22 @@ typedef struct X64State {
 
 static X64State X64;
 
+/* 临时统计：C6C_OPSTATS=1 时按 op 累计 IR 条数，收尾一次打印。 */
+static u32 X64_OPN[256];
+static u32 X64_OPNUM;
+static u32 X64_NVREG;
+static u32 X64_NFN;
+static int X64_OPSTATS_ON = -1;
+static void x64_opstats_print(void)
+{
+    u32 i = 0;
+
+    fprintf(stderr, "OPSTAT ops=%u vregs=%u fns=%u\n", X64_OPNUM, X64_NVREG, X64_NFN);
+    for (i = 0; i < 256; i++)
+        if (X64_OPN[i])
+            fprintf(stderr, "OPSTAT %-12s %u\n", ir_name((u8)i), X64_OPN[i]);
+}
+
 static void x_rex(Image *im, int w, int r, int x, int b)
 {
     u8 v = (u8)(0x40 | (w ? 8 : 0) | ((r & 8) ? 4 : 0) | ((x & 8) ? 2 : 0) |
@@ -1131,8 +1147,9 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
         x64_pend_set(st, o->dst);
         return 0;
     case IR_LOAD:
-        x64_pend_flush(st);
-        x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
+        /* 地址很可能就是上一条算出来的（`&a[i]` 的 LEA 后紧跟读）：命中就不用
+         * 再从槽里读地址。x_ld_mem 的 base 和 dst 都是 rax，先读后写。 */
+        (void)x64_pend_take(st, o->a, 1);
         x_ld_mem(im, R_RAX, R_RAX, o->type);
         x64_pend_set(st, o->dst);
         return 0;
@@ -1147,6 +1164,11 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
             }
             x64_pend_drop(st);
             x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->dst));
+        } else if (st->pv == o->dst) {
+            /* 地址正好在 rax 里（上一条刚算完 &a[i]）：只把值读进 rdx 就能存 */
+            x_ld64(im, R_RDX, R_RBP, X64_SLOT(o->a));
+            x_st_mem(im, R_RAX, R_RDX, o->type);
+            return 0;               /* 地址继续留在 rax 里待定 */
         } else {
             x64_pend_flush(st);
             x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->dst));    /* 地址 */
@@ -1854,6 +1876,20 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     u8 *use = 0;           /* 每 vreg 的读次数（饱和到 2；CMP 融合用） */
     u32 *slots = 0;        /* vreg -> 纯帧槽偏移 | 状态位 */
 
+    if (X64_OPSTATS_ON < 0)
+        X64_OPSTATS_ON = getenv("C6C_OPSTATS") != NULL;
+    if (X64_OPSTATS_ON) {
+        u32 q = 0;
+
+        for (q = 0; q < f->n; q++) {
+            u8 op = f->ops[q].op;
+
+            X64_OPN[op]++;
+            X64_OPNUM++;
+        }
+        X64_NVREG += f->nvreg;
+        X64_NFN++;
+    }
     if (getenv("C6C_DUMP")) {
         u32 q = 0;
 

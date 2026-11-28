@@ -25921,6 +25921,8 @@ static int pa_finish(const char *out)
         data_fixups_apply();
         x64_resolve(&X64);
         x64_report_undef();
+        if (X64_OPSTATS_ON > 0)
+            x64_opstats_print();
         {
             /* 头单独放栈上：120 字节 vs 10 MB，这就是整个改动的意思 */
             u8 hdr[ELF_HDR] = {0};
