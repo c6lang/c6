@@ -103,6 +103,7 @@ typedef struct X64State {
     u32 nslot;              /* 已分配的槽数 */
     u32 va_bytes;           /* 变参函数：帧底 48 字节寄存器保存区 */
     u32 va_lbl;             /* va_arg 用的后端私有标签号（从高往低取） */
+    u8 need_saved;          /* 本函数是否真的要用/保存 callee-saved 寄存器 */
 } X64State;
 
 static X64State X64;
@@ -154,6 +155,22 @@ static void x_mov_ri64(Image *im, int dst, u64 v)
     img_u64(im, v);
 }
 
+/* 小常量：0 用 xor（2 字节），32 位以内的值用 mov r32, imm32（5 字节，
+ * 写 r32 自动零扩到 64 位，和原来 movabs 的零扩语义一致）；只有真正
+ * 需要 64 位的值才走 10 字节的 movabs。 */
+static void x_mov_ri_small(Image *im, int dst, u64 v)
+{
+    if (v == 0) {
+        x_rex(im, 0, dst, 0, dst);
+        img_u8(im, 0x31);
+        x_modrm(im, 3, dst, dst);
+    } else if (v <= 0xffffffffu) {
+        x_mov_ri32(im, dst, (u32)v);
+    } else {
+        x_mov_ri64(im, dst, v);
+    }
+}
+
 /* ALU r64, r64：op 是 x86 的 opcode 低位（01=add 29=sub 21=and 09=or 31=xor 39=cmp） */
 static void x_alu_rr64(Image *im, u8 op, int dst, int src)
 {
@@ -169,6 +186,20 @@ static void x_alu_ri64(Image *im, u8 ext, int dst, u32 v)
     img_u8(im, 0x81);
     x_modrm(im, 3, ext, dst);
     img_u32(im, v);
+}
+
+/* ALU r64, imm：0..127 走 83 /ext ib（比 81 /ext id 少 3 字节）。
+ * 83 的立即数按有符号 8 位符号扩展，所以只对 0..127 用这条路。 */
+static void x_alu_ri64_opt(Image *im, u8 ext, int dst, u32 v)
+{
+    if (v <= 0x7fu) {
+        x_rex(im, 1, 0, 0, dst);
+        img_u8(im, 0x83);
+        x_modrm(im, 3, ext, dst);
+        img_u8(im, v);
+    } else {
+        x_alu_ri64(im, ext, dst, v);
+    }
 }
 
 /* 访存指令的字节顺序：REX / opcode / ModRM / SIB / disp32 */
@@ -221,10 +252,9 @@ static int ir_type_signed(u8 t)
     return t == IRT_I8 || t == IRT_I16 || t == IRT_I32 || t == IRT_I64;
 }
 
-/* reg <- [base]（按 IR 类型宽度，符号/零扩展成 64 位） */
-/* reg <- [base]（按 IR 类型宽度，符号/零扩展成 64 位）。
+/* reg <- [base+disp]（按 IR 类型宽度，符号/零扩展成 64 位）。
  * 8/16 位用 0F B6/B7（零扩）和 0F BE/BF（符号扩），32 位用 8B/63。 */
-static void x_ld_mem(Image *im, int reg, int base, u8 type)
+static void x_ld_mem_at(Image *im, int reg, int base, u32 disp, u8 type)
 {
     int need_sib = ((base & 7) == 4);
     u8 op2 = 0xB6;
@@ -249,10 +279,10 @@ static void x_ld_mem(Image *im, int reg, int base, u8 type)
         x_modrm(im, 2, reg, need_sib ? 4 : base);
         if (need_sib)
             x_sib(im, 0, 4, base);
-        img_u32(im, 0);
+        img_u32(im, disp);
         return;
     default:
-        x_memop(im, 0x8B, reg, base, 0);
+        x_memop(im, 0x8B, reg, base, disp);
         return;
     }
     x_rex(im, (ir_type_size(type) == 8 || ir_type_signed(type)) ? 1 : 0, reg, 0, base);
@@ -261,7 +291,13 @@ static void x_ld_mem(Image *im, int reg, int base, u8 type)
     x_modrm(im, 2, reg, need_sib ? 4 : base);
     if (need_sib)
         x_sib(im, 0, 4, base);
-    img_u32(im, 0);
+    img_u32(im, disp);
+}
+
+/* reg <- [base]（disp 0 的常用形态） */
+static void x_ld_mem(Image *im, int reg, int base, u8 type)
+{
+    x_ld_mem_at(im, reg, base, 0, type);
 }
 
 /* 帧槽地址：第 n 个槽在 rbp-16*(n+1) */
@@ -363,6 +399,15 @@ static void x_shift_cl(Image *im, int ext, int reg)
     x_modrm(im, 3, ext, reg);
 }
 
+/* shl/shr/sar r64, imm8：C1 /ext ib（原来常量移位也要 movabs rcx,imm + 用 cl） */
+static void x_shift_imm(Image *im, int ext, int reg, u32 n)
+{
+    x_rex(im, 1, 0, 0, reg);
+    img_u8(im, 0xC1);
+    x_modrm(im, 3, ext, reg);
+    img_u8(im, n & 0x3fu);
+}
+
 static void x_movsb(Image *im)
 {
     img_u8(im, 0xF3);
@@ -375,14 +420,20 @@ static void x_stosb(Image *im)
     img_u8(im, 0xAA);
 }
 
-/* [base] <- reg（按宽度截断） */
-/* 按 IR 类型宽度写内存。注意 1 字节要用 0x88（mov r/m8, r8）：
+/* [base+disp] <- reg（按宽度截断）
+ * 按 IR 类型宽度写内存。注意 1 字节要用 0x88（mov r/m8, r8）：
  * 0x89 在无 REX.W 时是 32 位写，会把后面的字节一起清掉（踩过一次）。 */
-static void x_st_mem(Image *im, int base, int reg, u8 type)
+static void x_st_mem_at(Image *im, int base, u32 disp, int reg, u8 type)
 {
     int w = (int)ir_type_size(type);
 
-    x_memop_w(im, w == 1 ? 0x88 : 0x89, reg, base, 0, w);
+    x_memop_w(im, w == 1 ? 0x88 : 0x89, reg, base, disp, w);
+}
+
+/* [base] <- reg（disp 0 的常用形态） */
+static void x_st_mem(Image *im, int base, int reg, u8 type)
+{
+    x_st_mem_at(im, base, 0, reg, type);
 }
 
 static void x_ld64(Image *im, int reg, int base, u32 disp)
@@ -393,6 +444,100 @@ static void x_ld64(Image *im, int reg, int base, u32 disp)
 static void x_st64(Image *im, int base, u32 disp, int reg)
 {
     x_memop(im, 0x89, reg, base, disp);
+}
+
+/* ---- 局部变量直接访存 ------------------------------------------------------
+ * 前端把每个标量局部量表示成“先 IR_ADDR 取槽地址，再 IR_LOAD/IR_STORE”。
+ * 只要地址只被紧邻的那一条访存指令用掉，就不必真把地址算出来：直接从
+ * [rbp+disp] 读写。下面几个助手是这条快捷路径的编码原语。
+ */
+/* reg <- [rbp+disp]，宽度按 IR 类型 */
+static void x_ld_slot(Image *im, int reg, u32 disp, u8 type)
+{
+    x_ld_mem_at(im, reg, R_RBP, disp, type);
+}
+
+/* [rbp+disp] <- reg，宽度按 IR 类型 */
+static void x_st_slot(Image *im, u32 disp, int reg, u8 type)
+{
+    x_st_mem_at(im, R_RBP, disp, reg, type);
+}
+
+/* imul r64, [base+disp]：0F AF /r */
+static void x_imul_rm64(Image *im, int dst, int base, u32 disp)
+{
+    int need_sib = ((base & 7) == 4);
+
+    x_rex(im, 1, dst, 0, base);
+    img_u8(im, 0x0F);
+    img_u8(im, 0xAF);
+    x_modrm(im, 2, dst, need_sib ? 4 : base);
+    if (need_sib)
+        x_sib(im, 0, 4, base);
+    img_u32(im, disp);
+}
+
+/* imul r64, r/m64, imm32：69 /r id（乘小常量时省一次 load） */
+static void x_imul_ri64(Image *im, int dst, int src, u32 v)
+{
+    x_rex(im, 1, dst, 0, src);
+    img_u8(im, 0x69);
+    x_modrm(im, 3, dst, src);
+    img_u32(im, v);
+}
+
+/* [base+disp] <- imm32（width 4/8；width 8 时 32 位立即数按有符号扩展） */
+static void x_mov_mem_imm32(Image *im, int base, u32 disp, u32 v, int width)
+{
+    int need_sib = ((base & 7) == 4);
+
+    if (width == 2)
+        img_u8(im, 0x66);
+    x_rex(im, width == 8, 0, 0, base);
+    img_u8(im, 0xC7);
+    x_modrm(im, 2, 0, need_sib ? 4 : base);
+    if (need_sib)
+        x_sib(im, 0, 4, base);
+    img_u32(im, disp);
+    img_u32(im, v);
+}
+
+/* cmp qword [base+disp], imm8（IR_BR 直接拿槽里的条件值比 0） */
+static void x_cmp_mem_imm8(Image *im, int base, u32 disp, u8 v)
+{
+    int need_sib = ((base & 7) == 4);
+
+    x_rex(im, 1, 0, 0, base);
+    img_u8(im, 0x83);
+    x_modrm(im, 2, 7, need_sib ? 4 : base);
+    if (need_sib)
+        x_sib(im, 0, 4, base);
+    img_u32(im, disp);
+    img_u8(im, v);
+}
+
+/* 把 reg 的低 width 字节按 is_signed 扩展到 64 位。原来用
+ * movabs rcx,64-width; shl; sar 三条，任何宽度都能用一条 movsx/movzx
+ * 或 movsxd 完成。 */
+static void x_extend_self(Image *im, int reg, int width, int is_signed)
+{
+    if (width >= 8)
+        return;
+    if (width == 4) {
+        if (is_signed) {
+            x_rex(im, 1, reg, 0, reg);              /* movsxd r64, r/m32 */
+            img_u8(im, 0x63);
+            x_modrm(im, 3, reg, reg);
+        } else {
+            x_mov_rr32(im, reg, reg);               /* mov r32, r/m32（自动零扩） */
+        }
+        return;
+    }
+    x_rex(im, 1, reg, 0, reg);                      /* movsx/movzx r64, r/m8|r/m16 */
+    img_u8(im, 0x0F);
+    img_u8(im, width == 1 ? (is_signed ? 0xBE : 0xB6)
+                          : (is_signed ? 0xBF : 0xB7));
+    x_modrm(im, 3, reg, reg);
 }
 
 static void x_push(Image *im, int reg)
@@ -667,20 +812,26 @@ static void x64_func_begin(X64State *st, const char *name, u32 nslot)
         st->cur_gen = 1;
     }
     /* 序言：rbp 必须保持在入口 rsp-8（原样），否则第 7 个起栈传形参的
-     * [rbp+16+i*8] 读取全错。callee-saved 寄存器改压在**帧槽下方**：
+     * [rbp+16+i*8] 读取全错。callee-saved 寄存器只在**真的会用到**时才压栈：
+     * 当前出码只用 rax/rcx/rdx/rsi/rdi/r8/r11 和 xmm0/xmm1，rbx/r12-r15 只有
+     * 函数内内联汇编才可能碰。无内联汇编的函数把 5 个 push 和一个对齐 dummy
+     * 全省掉（小函数/热调用点省得最多）；有内联汇编时保留老行为。
      *   push rbp; mov rbp,rsp; sub rsp,frame;
-     *   push rbx,r12,r13,r14,r15,rax(dummy) —— 共 48 字节，rsp%16 回到 0。
-     * 内核 head_64.S 把 boot_params 放在 r15 跨 C 调用，必须保留。 */
+     *   [push rbx,r12,r13,r14,r15,rax(dummy) —— 共 48 字节，rsp%16 不变]
+     * 内核 head_64.S 把 boot_params 放在 r15 跨 C 调用；我们不写它，它自然
+     * 就是保留的。 */
     x_push(st->im, R_RBP);
     x_mov_rr64(st->im, R_RBP, R_RSP);
     if (st->frame)
         x_alu_ri64(st->im, 5, R_RSP, st->frame);   /* 81 /5 = sub */
-    x_push(st->im, R_RAX);                         /* 对齐填充（dummy） */
-    x_push(st->im, R_RBX);
-    x_push(st->im, R_R12);
-    x_push(st->im, R_R13);
-    x_push(st->im, R_R14);
-    x_push(st->im, R_R15);
+    if (st->need_saved) {
+        x_push(st->im, R_RAX);                     /* 对齐填充（dummy） */
+        x_push(st->im, R_RBX);
+        x_push(st->im, R_R12);
+        x_push(st->im, R_R13);
+        x_push(st->im, R_R14);
+        x_push(st->im, R_R15);
+    }
 }
 
 /* 给已经编好的东西再挂一个名字（同一个 off/va）：
@@ -814,14 +965,16 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
         x64_label(st, o->a);
         return 0;
     case IR_CONST:
-        x_mov_ri64(im, R_RAX, (u64)o->imm);
+        x_mov_ri_small(im, R_RAX, (u64)o->imm);
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
     case IR_CONSTK:                 /* 64 位字面量：值在函数常量池里 */
-        x_mov_ri64(im, R_RAX, st->fn->kpool[o->imm]);
+        x_mov_ri_small(im, R_RAX, st->fn->kpool[o->imm]);
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
     case IR_MOV:
+        if (o->dst == o->a)
+            return 0;               /* 自己搬自己：整条省掉 */
         x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
@@ -894,27 +1047,16 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
     case IR_SEXT:
     case IR_ZEXT:
     case IR_TRUNC: {
-        u32 bits = (u32)ir_type_size(o->type) * 8;
-        u32 sh = 0;
+        int width = (int)ir_type_size(o->type);
         /* TRUNC 到窄类型时高位怎么补由**目标类型**的有符号性定：
          * `(unsigned int)x` 必须零扩展（踩过：一律符号扩展，0x80000000 变负数） */
         int uns = (o->type == IRT_U8 || o->type == IRT_U16 || o->type == IRT_U32
                    || o->type == IRT_U64 || o->type == IRT_PTR);
+        int sign = !(o->op == IR_ZEXT || (o->op == IR_TRUNC && uns));
 
         x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
-        if (bits >= 64) {
-            /* 不用动 */
-        } else if (o->op == IR_ZEXT || (o->op == IR_TRUNC && uns)) {
-            sh = 64 - bits;
-            x_mov_ri64(im, R_RCX, (u64)sh);            /* shl rax, sh; shr rax, sh */
-            x_shift_cl(im, 4, R_RAX);
-            x_shift_cl(im, 5, R_RAX);
-        } else {
-            sh = 64 - bits;
-            x_mov_ri64(im, R_RCX, (u64)sh);            /* shl rax, sh; sar rax, sh */
-            x_shift_cl(im, 4, R_RAX);
-            x_shift_cl(im, 7, R_RAX);
-        }
+        /* 一条 movsx/movzx/movsxd 取代原来的 movabs rcx,64-width + shl + sar/shr */
+        x_extend_self(im, R_RAX, width, sign);
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
     }
@@ -948,8 +1090,10 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
         else if (o->op == IR_XOR)
             op = 0x31;
         x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
-        x_ld64(im, R_RCX, R_RBP, X64_SLOT(o->b));
-        x_alu_rr64(im, op, R_RAX, R_RCX);
+        /* 第二个操作数直接在帧槽里当内存操作数：省一条 load。
+         * 注意方向位：x_memop 的 r/m 是内存，所以用 op|2（01→03 等），
+         * 得到的是 `add rax,[b]` 而不是 `add [b],rax`。 */
+        x_memop(im, (u8)(op | 2), R_RAX, R_RBP, X64_SLOT(o->b));
         x_st64(im, R_RBP, X64_SLOT(o->dst), R_RAX);
         return 0;
     }
@@ -1132,14 +1276,16 @@ img_u8(im, 0x48);                           /* xor rsi, rdx */
     case IR_RET:
         if (o->type != IRT_VOID)
             x_ld64(im, R_RAX, R_RBP, X64_SLOT(o->a));
-        /* 逆序恢复序言压在帧下方的 r15,r14,r13,r12,rbx；
-         * 再用 add rsp,8 跳过 dummy（不能 pop rax，会毁返回值）。 */
-        x_pop(im, R_R15);
-        x_pop(im, R_R14);
-        x_pop(im, R_R13);
-        x_pop(im, R_R12);
-        x_pop(im, R_RBX);
-        x_alu_ri64(im, 0, R_RSP, 8);   /* 00 /0 = add rsp,8，跳 dummy */
+        /* 只有序言真压过 callee-saved 才需要逆序恢复；没压过就直接
+         * leave（rsp=rbp; pop rbp）返回，小函数 / 热调用点省掉 6 条。 */
+        if (st->need_saved) {
+            x_pop(im, R_R15);
+            x_pop(im, R_R14);
+            x_pop(im, R_R13);
+            x_pop(im, R_R12);
+            x_pop(im, R_RBX);
+            x_alu_ri64(im, 0, R_RSP, 8);   /* 00 /0 = add rsp,8，跳 dummy */
+        }
         x_leave(im);                  /* rsp=rbp; pop rbp -> rsp 指向返回地址 */
         x_ret(im);
         return 0;
@@ -1386,6 +1532,130 @@ static void aout_compile(X64State *st, IrFn *f, u32 func_sym);
 static void aout_write(const char *path);
 static int aout_had_error(void);
 
+/* 本函数里有没有函数内内联汇编（IR_COMMENT 的最高位是 asmx 的机器码标记）。
+ * 有就保留 callee-saved 的压栈/恢复：asmx 可能按约束用 rbx/r12-r15；没有
+ * 的话当前出码只用 caller-saved，压栈纯属白付。 */
+static int x64_fn_has_asm(IrFn *f)
+{
+    u32 i = 0;
+
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_COMMENT && (f->ops[i].imm & AX_MARK))
+            return 1;
+    return 0;
+}
+
+/* 每个 vreg 被读几次。口径与 ir_dce 一致：STORE/COPY/MEMCPY/MEMSET 的 dst
+ * 是“写到哪”的地址输入，也算一次读；ALLOCA/MEMSET 的 a 是后端真读的。
+ * 融合只在“地址/比较结果恰好只被紧邻的一条指令用一次”时做，因此这个计数
+ * 是保守的：多算一次只会让优化放弃，不会把还要用的值消掉。 */
+static u32 *x64_use_counts(IrFn *f)
+{
+    u32 *use = 0;
+    u32 i = 0;
+
+    if (!f->nvreg)
+        return NULL;
+    use = malloc((size_t)f->nvreg * sizeof(u32));
+    if (!use)
+        return NULL;
+    memset(use, 0, (size_t)f->nvreg * sizeof(u32));
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        if ((o->op == IR_STORE || o->op == IR_COPY
+             || o->op == IR_MEMCPY || o->op == IR_MEMSET)
+            && o->dst < f->nvreg)
+            use[o->dst]++;
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < f->nvreg)
+            use[o->a]++;
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < f->nvreg)
+            use[o->b]++;
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < f->nvreg)
+            use[o->c]++;
+        if ((o->op == IR_ALLOCA || o->op == IR_MEMSET) && o->a < f->nvreg)
+            use[o->a]++;
+    }
+    return use;
+}
+
+/* 真正定义 dst 的 op：STORE/COPY/MEMCPY/MEMSET 的 dst 是地址输入，不算定义。 */
+static int x64_defs_dst(u8 op)
+{
+    if (!(IR_FIELDS[op] & IRF_DST))
+        return 0;
+    return !(op == IR_STORE || op == IR_COPY || op == IR_MEMCPY
+             || op == IR_MEMSET);
+}
+
+/* 找出“纯帧槽地址”临时量：只由一条 ADDR 定义、并且所有读都只作为
+ * LOAD/STORE 的地址。这样的地址值不必物化，ADDR 整条省掉，用到它的
+ * 访存直接走 [rbp+disp]。返回 malloc 的 vreg->disp 数组（0 = 不是纯槽）。
+ *
+ * 这个分析对跨基本块/跨函数调用也成立：地址是当前帧里的常量，只要它
+ * 没被当成值传给别处，任何时刻直接 [rbp+disp] 都等价。 */
+static u32 *x64_slot_addrs(IrFn *f)
+{
+    u32 *disp = 0;
+    u32 *defs = 0;
+    u8 *bad = 0;
+    u32 i = 0;
+
+    if (!f->nvreg)
+        return NULL;
+    disp = malloc((size_t)f->nvreg * sizeof(u32));
+    defs = malloc((size_t)f->nvreg * sizeof(u32));
+    bad = malloc((size_t)f->nvreg);
+    if (!disp || !defs || !bad) {
+        free(disp);
+        free(defs);
+        free(bad);
+        return NULL;
+    }
+    memset(disp, 0, (size_t)f->nvreg * sizeof(u32));
+    memset(defs, 0, (size_t)f->nvreg * sizeof(u32));
+    memset(bad, 0, (size_t)f->nvreg);
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        if (o->op == IR_ADDR && !(o->flags & 3) && o->a == 0
+            && o->dst < f->nvreg) {
+            defs[o->dst]++;
+            if (defs[o->dst] == 1)
+                disp[o->dst] = (u32)o->imm;
+        } else if (x64_defs_dst(o->op) && o->dst < f->nvreg) {
+            defs[o->dst]++;
+            bad[o->dst] = 1;
+        }
+        /* A/B/C 里的普通读；LOAD 的 a 是允许的地址读 */
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < f->nvreg) {
+            if (o->op != IR_LOAD)
+                bad[o->a] = 1;
+        }
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < f->nvreg)
+            bad[o->b] = 1;
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < f->nvreg)
+            bad[o->c] = 1;
+        /* dst 是地址输入的几种 op：只有 STORE 的地址可以直接访存 */
+        if (o->dst < f->nvreg
+            && (o->op == IR_COPY || o->op == IR_MEMCPY || o->op == IR_MEMSET))
+            bad[o->dst] = 1;
+        /* 这两个的 a 不是普通操作数，但后端真的会读它 */
+        if ((o->op == IR_ALLOCA || o->op == IR_MEMSET) && o->a < f->nvreg)
+            bad[o->a] = 1;
+    }
+    for (i = 0; i < f->nvreg; i++)
+        if (defs[i] != 1 || bad[i])
+            disp[i] = 0;
+    free(defs);
+    free(bad);
+    return disp;
+}
+
 static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
 {
     u32 dbg_fn = 0xffffffffu;
@@ -1395,6 +1665,8 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     u32 arg_v[64] = {0};   /* SysV：前 6 个走寄存器，其余压栈 */
     u32 narg = 0;
     u32 k = 0;
+    u32 *use = 0;          /* 每 vreg 的读次数（ADDR/CMP 融合用） */
+    u32 *slots = 0;        /* vreg -> 纯帧槽偏移（地址不物化） */
 
     if (getenv("C6C_DUMP")) {
         u32 q = 0;
@@ -1414,6 +1686,9 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     st->fn = f;
     st->va_bytes = f->is_variadic ? X64_VA_BYTES : 0;
     st->va_lbl = X64_MAXLBL;
+    st->need_saved = (u8)x64_fn_has_asm(f);
+    use = x64_use_counts(f);
+    slots = x64_slot_addrs(f);
     if (X64_DBG && X64_NDBGFN < X64_DBGFN_MAX) {
         dbg_fn = X64_NDBGFN++;
         X64_DBGFN[dbg_fn].name = f->name;
@@ -1449,7 +1724,71 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             X64_DBGFN[dbg_fn].nlines = X64_NDBGLN - X64_DBGFN[dbg_fn].lstart;
         }
         o = f->ops[i];
+        /* 纯槽地址的所有用法都变成直接访存了：这条 ADDR 不用发码 */
+        if (slots && o.op == IR_ADDR && o.dst < f->nvreg && slots[o.dst])
+            continue;
         switch (o.op) {
+        case IR_LOAD: {
+            u32 ad = (slots && o.a < f->nvreg) ? slots[o.a] : 0;
+
+            if (ad) {
+                x_ld_slot(st->im, R_RAX, ad, o.type);
+                x_st64(st->im, R_RBP, X64_SLOT(o.dst), R_RAX);
+                break;
+            }
+            if (x64_emit_ir(st, &o) < 0) {
+                fprintf(stderr, "c6c: IR op %u (%s) 在 x86-64 后端未实现\n", o.op,
+                        ir_name(o.op));
+                exit(1);
+            }
+            break;
+        }
+        case IR_STORE: {
+            u32 ad = (slots && o.dst < f->nvreg) ? slots[o.dst] : 0;
+
+            if (ad) {
+                x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
+                x_st_slot(st->im, ad, R_RAX, o.type);
+                break;
+            }
+            if (x64_emit_ir(st, &o) < 0) {
+                fprintf(stderr, "c6c: IR op %u (%s) 在 x86-64 后端未实现\n", o.op,
+                        ir_name(o.op));
+                exit(1);
+            }
+            break;
+        }
+        case IR_ADDR: {
+            IrOp *nx = (i + 1 < f->n) ? &f->ops[i + 1] : NULL;
+
+            /* 局部量访问的常见形态：ADDR 算槽地址 → 紧邻的 LOAD/STORE 用它。
+             * 地址只被这一条用掉时（use==1），地址根本不用物化：直接对
+             * [rbp+disp] 读写。flags 0 且 a==0 才是“纯帧槽地址”；imm 必须
+             * 落在本函数槽位范围内（-16*(n+1) 的编码）。 */
+            if (use && !(o.flags & 3) && o.a == 0 && o.dst < f->nvreg
+                && use[o.dst] == 1 && (o.imm & 15u) == 0
+                && ((0u - o.imm) / 16u) >= 1u
+                && ((0u - o.imm) / 16u - 1u) < f->nvreg && nx) {
+                if (nx->op == IR_LOAD && nx->a == o.dst) {
+                    x_ld_slot(st->im, R_RAX, o.imm, nx->type);
+                    x_st64(st->im, R_RBP, X64_SLOT(nx->dst), R_RAX);
+                    i++;
+                    break;
+                }
+                if (nx->op == IR_STORE && nx->dst == o.dst && nx->a != o.dst) {
+                    x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(nx->a));
+                    x_st_slot(st->im, o.imm, R_RAX, nx->type);
+                    i++;
+                    break;
+                }
+            }
+            if (x64_emit_ir(st, &o) < 0) {
+                fprintf(stderr, "c6c: IR op %u (%s) 在 x86-64 后端未实现\n", o.op,
+                        ir_name(o.op));
+                exit(1);
+            }
+            break;
+        }
         case IR_CALLI: {
             /* 间接调用：目标指针放 r11（arg 加载只用 rdi/rsi/rdx/rcx/r8/r9 和 rax） */
             u32 k = 0;
@@ -1537,6 +1876,24 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             u8 setcc = 0;
             u8 jcc = 0;
 
+            /* 比较结果只喂给紧邻的 IR_BR：直接 cmp + jcc，不落 0/1 标志槽。
+             * 典型收益是 `if/while` 每条件省 setcc/movzx/store/load/test 五条。
+             * 浮点要走 ucomis + NaN 特判，留给下面的老路径。 */
+            if (use && o.type != IRT_F32 && o.type != IRT_F64
+                && i + 1 < f->n && f->ops[i + 1].op == IR_BR
+                && f->ops[i + 1].a == o.dst && o.dst < f->nvreg
+                && use[o.dst] == 1) {
+                IrOp br = f->ops[i + 1];
+
+                x64_cc(o.flags, &setcc, &jcc);
+                x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
+                x_memop(st->im, 0x3B, R_RAX, R_RBP, X64_SLOT(o.b));  /* cmp rax,[b] */
+                x64_branch(st, (int)jcc, br.b);       /* 条件真 → b */
+                x64_branch(st, -1, br.c);             /* 条件假 → c */
+                i++;
+                break;
+            }
+
             if (o.type == IRT_F32 || o.type == IRT_F64) {
                 /* ucomiss/ucomisd 之后 CF/ZF 的语义与无符号比较一致：
                  * 有序比较就用 ULT/ULE/UGT/UGE 那组 setcc（NaN 自然得 0）。 */
@@ -1579,8 +1936,7 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             }
             x64_cc(o.flags, &setcc, &jcc);
             x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
-            x_ld64(st->im, R_RCX, R_RBP, X64_SLOT(o.b));
-            x_alu_rr64(st->im, 0x39, R_RAX, R_RCX);       /* cmp rax, rcx */
+            x_memop(st->im, 0x3B, R_RAX, R_RBP, X64_SLOT(o.b));   /* cmp rax, [b] */
             img_u8(st->im, 0x0F);                          /* setcc al */
             img_u8(st->im, setcc);
             x_modrm(st->im, 3, 0, R_RAX);
@@ -1595,44 +1951,40 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             u8 jcc = 0;
 
             x64_cc(IRCC_NE, &setcc, &jcc);
-            x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
-            img_u8(st->im, 0x48);                          /* test rax, rax */
-            img_u8(st->im, 0x85);
-            x_modrm(st->im, 3, R_RAX, R_RAX);
+            if (o.a < f->nvreg) {
+                /* 条件值就在帧槽里：cmp qword [slot],0 直接置标志，
+                 * 省掉 load + test（原先每个分支都多一条 load）。 */
+                x_cmp_mem_imm8(st->im, R_RBP, X64_SLOT(o.a), 0);
+            } else {
+                x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
+                img_u8(st->im, 0x48);                      /* test rax, rax */
+                img_u8(st->im, 0x85);
+                x_modrm(st->im, 3, R_RAX, R_RAX);
+            }
             x64_branch(st, (int)jcc, o.b);                 /* jne 真 */
             x64_branch(st, -1, o.c);                       /* jmp 假 */
             break;
         }
         case IR_MUL:
             x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
-            x_ld64(st->im, R_RCX, R_RBP, X64_SLOT(o.b));
-            img_u8(st->im, 0x48);                          /* imul rax, rcx */
-            img_u8(st->im, 0x0F);
-            img_u8(st->im, 0xAF);
-            x_modrm(st->im, 3, R_RAX, R_RCX);
+            x_imul_rm64(st->im, R_RAX, R_RBP, X64_SLOT(o.b));
             x_st64(st->im, R_RBP, X64_SLOT(o.dst), R_RAX);
             break;
         case IR_DIV:
         case IR_MOD:
             x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
-            x_ld64(st->im, R_RCX, R_RBP, X64_SLOT(o.b));
             img_u8(st->im, 0x48);                          /* cqto */
             img_u8(st->im, 0x99);
-            img_u8(st->im, 0x48);                          /* idiv rcx */
-            img_u8(st->im, 0xF7);
-            x_modrm(st->im, 3, 7, R_RCX);
+            x_memop(st->im, 0xF7, 7, R_RBP, X64_SLOT(o.b));   /* idiv [b] */
             x_st64(st->im, R_RBP, X64_SLOT(o.dst), o.op == IR_MOD ? R_RDX : R_RAX);
             break;
         case IR_UDIV:
         case IR_UMOD:
             x_ld64(st->im, R_RAX, R_RBP, X64_SLOT(o.a));
-            x_ld64(st->im, R_RCX, R_RBP, X64_SLOT(o.b));
             img_u8(st->im, 0x48);                          /* xor rdx,rdx */
             img_u8(st->im, 0x31);
             x_modrm(st->im, 3, 2, R_RDX);
-            img_u8(st->im, 0x48);                          /* div rcx */
-            img_u8(st->im, 0xF7);
-            x_modrm(st->im, 3, 6, R_RCX);
+            x_memop(st->im, 0xF7, 6, R_RBP, X64_SLOT(o.b));   /* div [b] */
             x_st64(st->im, R_RBP, X64_SLOT(o.dst), o.op == IR_UMOD ? R_RDX : R_RAX);
             break;
         case IR_SHL:
@@ -1729,4 +2081,6 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     x64_func_end(st);
     if (dbg_fn != 0xffffffffu)
         X64_DBGFN[dbg_fn].end = st->im->n;
+    free(slots);
+    free(use);
 }

@@ -91,4 +91,12 @@
 - [x] 用户选择“暂停并保留现状”：不再做 x64 后端寄存器分配等大改。
 - [x] 代码改动已全部回退，worktree 只保留设计与实验记录文档。
 - [x] 当前基线门禁全绿：O0 身份、O1/O2/O3 fixpoint、tests/run.sh 全通过。
-- [ ] 若未来重启：从 x64 后端栈槽复用 / 寄存器分配的详细设计开始。
+## 后续（2026-11-28）：先做不改 IR/ABI 的后端窥孔
+
+- [x] 纯帧槽地址不物化：`ADDR` 只喂 `LOAD`/`STORE` 时直接 `[rbp+disp]`
+- [x] `CMP`+`BR` 融合、`BR` 直接 `cmp qword [slot],0`
+- [x] ALU/MUL/DIV/CMP 内存操作数、小常量、单指令 `movsx`/`movzx`/`movsxd`
+- [x] 无内联汇编的函数按需保存 callee-saved（省 5 push/pop + dummy）
+- [x] 微基准：`main` 指令数 loop 123→67 / fib 47→26 / call 123→66 /
+      branch 174→97 / mem 203→122；耗时 1.17–1.56×；`-O0..-O3` fixpoint 全绿
+- [ ] 仍未做：线性扫描寄存器分配 / 栈槽复用（收益最大的部分，P2-2b 主体）
