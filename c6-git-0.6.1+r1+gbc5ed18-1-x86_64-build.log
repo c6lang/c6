@@ -1,0 +1,62 @@
+-- The C compiler identification is GNU 16.2.1
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- c6 0.6.1: ext=ON, libtcc.so, prefix=/usr, tccdir=/usr/lib/tcc, CTest 用例 114 个（门禁 110 / aux 4）
+-- Configuring done (0.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /build/c6-git/src/c6/build
+[  0%] tcc: 检查并同步 config.mak / config.h / config.texi
+-- tcc: 同步 config.mak
+-- tcc: 同步 config.h
+-- tcc: 同步 config.texi
+-- tcc: 配置变化，清理旧目标文件
+[  0%] Built target tcc-config
+[ 50%] tcc: 构建 c6 / libtcc.so / libtcc1.a（EXTRA-DEFS=-DC6_EXT）
+tcc-doc.texi:25: warning: no HTML cross-references entry found for `dir'
+[ 50%] Built target tcc-build
+[100%] Built target c6
+[100%] c6c: 用 /build/c6-git/src/c6/tcc/c6 编出自举编译器 (c6c/build/c6c)
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:49:
+/build/c6-git/src/c6/c6c/src/macro.c6:204: warning: assignment discards qualifiers from pointer target type
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:52:
+/build/c6-git/src/c6/c6c/src/parse.c6:3289: warning: AGG_CAP0 redefined
+[100%] Built target c6c
+[  0%] c6c: 编出嵌入库 libc6c.a / libc6c.so（宿主 C 编译器，-DC6C_NO_MAIN）
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:49,
+                 from /build/c6-git/src/c6/c6c/src/c6c-lib.c6:14:
+/build/c6-git/src/c6/c6c/src/macro.c6: In function ‘macro_save_push’:
+/build/c6-git/src/c6/c6c/src/macro.c6:204:31: warning: passing argument 2 of ‘tok_syn’ discards ‘const’ qualifier from pointer target type [-Wdiscarded-qualifiers]
+  204 |     Tok t = tok_syn(TK_IDENT, name, (u32)strlen(name), NULL, 0);
+      |                               ^~~~
+/build/c6-git/src/c6/c6c/src/macro.c6:157:36: note: expected ‘char *’ but argument is of type ‘const char *’
+  157 | static Tok tok_syn(int kind, char *text, u32 len, SrcFile *at, u32 off)
+      |                              ~~~~~~^~~~
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:52:
+/build/c6-git/src/c6/c6c/src/parse.c6: At top level:
+/build/c6-git/src/c6/c6c/src/parse.c6:3289:9: warning: ‘AGG_CAP0’ redefined
+ 3289 | #define AGG_CAP0 64
+      |         ^~~~~~~~
+/build/c6-git/src/c6/c6c/src/parse.c6:1361:9: note: this is the location of the previous definition
+ 1361 | #define AGG_CAP0 1024
+      |         ^~~~~~~~
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:49,
+                 from /build/c6-git/src/c6/c6c/src/c6c-lib.c6:14:
+/build/c6-git/src/c6/c6c/src/macro.c6: In function ‘macro_save_push’:
+/build/c6-git/src/c6/c6c/src/macro.c6:204:31: warning: passing argument 2 of ‘tok_syn’ discards ‘const’ qualifier from pointer target type [-Wdiscarded-qualifiers]
+  204 |     Tok t = tok_syn(TK_IDENT, name, (u32)strlen(name), NULL, 0);
+      |                               ^~~~
+/build/c6-git/src/c6/c6c/src/macro.c6:157:36: note: expected ‘char *’ but argument is of type ‘const char *’
+  157 | static Tok tok_syn(int kind, char *text, u32 len, SrcFile *at, u32 off)
+      |                              ~~~~~~^~~~
+In file included from /build/c6-git/src/c6/c6c/src/c6c.c6:52:
+/build/c6-git/src/c6/c6c/src/parse.c6: At top level:
+/build/c6-git/src/c6/c6c/src/parse.c6:3289:9: warning: ‘AGG_CAP0’ redefined
+ 3289 | #define AGG_CAP0 64
+      |         ^~~~~~~~
+/build/c6-git/src/c6/c6c/src/parse.c6:1361:9: note: this is the location of the previous definition
+ 1361 | #define AGG_CAP0 1024
+      |         ^~~~~~~~
+[100%] Built target c6c-lib

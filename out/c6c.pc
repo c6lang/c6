@@ -1,0 +1,16 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+bindir=${prefix}/bin
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: c6c
+Description: c6c - self-hosted compiler written in c6 (embeddable libc6c)
+URL: https://github.com/c6lang/c6
+Version: 0.6.4
+Libs: -L${libdir} -lc6c
+Libs.private: -lm -ldl -lpthread
+Cflags: -I${includedir}
+
+# 变量：pkgconf --variable=c6c c6c
+c6c=${bindir}/c6c

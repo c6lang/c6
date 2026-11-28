@@ -1,0 +1,17 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+bindir=${prefix}/bin
+libdir=${prefix}/lib
+includedir=${prefix}/include
+tccdir=${prefix}/lib/tcc
+
+Name: c6lib
+Description: c6lib - c6c embeddable compiler (c6_* API)
+URL: https://github.com/c6lang/c6
+Version: 0.6.4
+Libs: -L${libdir} -lc6c
+Libs.private: -lm -ldl -lpthread
+Cflags: -I${includedir}
+
+# 变量：pkgconf --variable=c6 c6 / pkgconf --variable=tccdir c6
+c6=${bindir}/c6

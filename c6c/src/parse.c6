@@ -18289,6 +18289,26 @@ static u32 init_leaf_walk(u32 ty, u32 off, u32 bits, u32 boff, int collect)
         u32 esz = ty_size(et);
 
         n = ty_array_n(ty);
+        /* 标量元素数组走快路：c6c 自己的大静态表（关键字表、类型表、符号
+         * 初始值）基本都是"标量数组"，逐个递归要发一次真调用 + 几个查询
+         * 函数；这里直接按步长把叶子填进 LF_*，省掉每元素的递归与调用。
+         * -O0 剖析里 init_leaf_walk 占 10.5%，大头就在这。 */
+        if (!ty_is_agg(et) && !ty_is_array(et)) {
+            if (collect) {
+                if ((u32)n > INIT_LF_MAX - LF_N) {
+                    LF_TRUNC = 1;
+                    return 1;
+                }
+                for (i = 0; i < n; i++) {
+                    LF_OFF[LF_N] = off + i * esz;
+                    LF_TY[LF_N] = et;
+                    LF_BITS[LF_N] = 0;
+                    LF_BOFF[LF_N] = 0;
+                    LF_N++;
+                }
+            }
+            return n;
+        }
         for (i = 0; i < n; i++)
             cnt += init_leaf_walk(et, off + i * esz, 0, 0, collect);
         return cnt;
