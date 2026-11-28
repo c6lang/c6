@@ -252,3 +252,60 @@ c6c 自举编出的 c6c 是 9.91 G 条（**4.71×**），IPC 都是 1.6 左右�
 7.7%、符号表 4%、x64 后端 8%。要么在**最热的几个调用点**定点内联（不能全
 展开），要么把 token 的关键字/punct 分类在词法阶段算好、谓词退化成一次整型
 比较 —— 后者要动 Tok 结构和 340 个 `TOK_EQ` 点，得单独一轮做。
+
+## 第八轮（2026-12-03）：剖析换口径 + 两处"少一条指令"的死路
+
+**A. 拿到可信的剖析数据（方法本身是本轮最大的产出）**
+
+自举产物是 section-less ELF，perf 按符号归属的百分比**不可信**：`pa_cur_slow`
+被算成 0.91%，而 callgrind 数出来的真实调用次数是 **13 次**。可用的口径是：
+
+    valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+        /tmp/c6c_ld -fsyntax-only lib/rt.c6        # 小输入，避免 brk 溢出
+    nm -n --defined-only /tmp/c6c_ld                # callgrind 只给地址，自己反查
+
+跑 `src/c6c.c6` 会让 valgrind 撞 brk 上限（"brk segment overflow"），
+`-o`/`-c` 也跑不动；`-fsyntax-only` 一个中等文件（rt.c6，3.35 亿条）能跑完，
+比例结构与自举那一趟一致。得到的**精确**数字（rt.c6，自举编译器）：
+
+| 项目 | 每函数指令 | 调用次数 | 占比 |
+|---|---:|---:|---:|
+| pa_is_ident_n | 44 | 471,973 | 6.28% |
+| tok_eq_len | 36 | 428,480 | 4.57% |
+| x64_analyze | — | 430 | 4.17% |
+| init_leaf_walk | — | 334 | 3.72% |
+| pa_is_punct | 67 | 170,540 | 3.42% |
+| lex_next | 250 | 44,058 | 3.27% |
+| c6c_mem_copy | 57 | 179,048 | 3.04% |
+| memchr | 540 | 18,837 | 3.03% |
+| pa_accept_ch | 54 | 171,846 | 2.78% |
+
+一个 token 平均要过 **36 次 token 谓词调用**（472+428+231+172+171+114 千次
+/ 44 千 token）。表达式优先级链（gen_assign→…→gen_postfix 共 14 层）
+占 gen_assign 的 **15%**（132M 里 50M 是每层的穿透开销）。
+
+**B. 两处死路（都没有留下代码）**
+
+- [x] 延迟 lea：`lea dst,base,disp` + 紧接着的 `load dst` 折成一条
+      `mov rax,[rbp+槽(base)+disp]`（理论上省 2 条）。压栈试了：
+      自举产物**编不出任何东西**（"没有 main"）。逐点打印折叠处出的机器码
+      （`movzx eax,word [rbp-0xf54]`）**完全正确**，把快路关掉只留状态机仍然坏。
+- [x] `lea rax,[rbp+槽(base)+disp]` 直接代替「load 基址 + `lea rax,[rax+disp]`」：
+      数学上完全等价，**也坏**。
+- [x] 对照：把 `x64_pend_take` 换成 `flush + 显式 load + lea`（语义一模一样）
+      则是好的 —— 说明问题不在 pend 状态机，而在**代码长度/偏移一变**就踩到
+      的某个东西（字节级 fixpoint 不报，但产物编不动）。下一轮要查这个的话，
+      先看 rel32/label 回填和 `x64_label_next` 的跳转省略是不是对长度敏感。
+- [x] 顺手把 `x64_compile` 里每函数一次的 `getenv("C6C_DUMP")` 缓存掉
+      （自举 3.428 → 3.413 G 指令，-14.7 M，约 -0.4%）；**墙钟 1077 → 1056 ms**
+
+**C. 下一步的着力点（按本轮实测）**
+
+- 谓词族仍是 19%：36 次/ token × 40~60 条。要动就得让「token 分类」变成
+  O(1) —— 在词法阶段给每个 token 算一个关键字/标点 id，`TOK_EQ` 与
+  `pa_is_*` 退化成一次整型比较。这要动 Tok 结构和 340 个 TOK_EQ 点。
+- 优先级链 15%：14 层函数穿透可以改成一张优先级表 + 一个 climb 循环
+  （每个操作数省掉 10 层左右的 pa_cur/谓词）。**注意**：任何改代码长度的
+  改动都要按本轮 §B 的经验做完整的自举验证，不能只看 fixpoint。
+- 后端 `x64_analyze` 4.2% + `x64_alias_pass` 2% + `init_leaf_walk` 3.7%：
+  都是整趟扫描，可以合并成一趟（todo 里挂了很久）。
