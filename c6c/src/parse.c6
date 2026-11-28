@@ -953,7 +953,11 @@ C6C_INLINE int pa_is_ch(int ch)
 {
     Tok *t = pa_cur();
 
-    if (t->kind != TK_PUNCT || t->len != 1)
+    /* `a || b` 在 C 里是**一个值**：自举时它要落一条槽再读回来比较（约九条
+     * 指令）。这里拆成两条 if，短路语义一样，生成的是两条直接跳转。 */
+    if (t->kind != TK_PUNCT)
+        return 0;
+    if (t->len != 1)
         return 0;
     return (u8)tok_data(t)[0] == (u8)(ch & 0xFF);
 }
@@ -964,10 +968,14 @@ C6C_INLINE int pa_is_punct(const char *s)
     const char *d = NULL;
     u32 i = 0;
 
-    if (t->kind != TK_PUNCT || t->len == 0)
+    if (t->kind != TK_PUNCT)
+        return 0;
+    if (t->len == 0)
         return 0;
     d = tok_data(t);
-    if (d[0] != s[0] || s[t->len] != 0)
+    if (d[0] != s[0])
+        return 0;
+    if (s[t->len] != 0)
         return 0;
     for (i = 1; i < t->len; i++)
         if (d[i] != s[i])
@@ -981,7 +989,9 @@ C6C_INLINE int pa_is_ident_n(const char *s, u32 n)
     const char *d = NULL;
     u32 i = 0;
 
-    if (t->kind != TK_IDENT || t->len != n)
+    if (t->kind != TK_IDENT)
+        return 0;
+    if (t->len != n)
         return 0;
     d = tok_data(t);
     if (n == 1)
@@ -1005,7 +1015,9 @@ C6C_INLINE int pa_is_ident(const char *s)
 {
     Tok *t = pa_cur();
 
-    return t->kind == TK_IDENT && tok_eq(t, s);
+    if (t->kind != TK_IDENT)
+        return 0;
+    return tok_eq(t, s);
 }
 
 C6C_INLINE int pa_accept_punct(const char *s)
@@ -1033,7 +1045,11 @@ C6C_INLINE int pa_accept_ch(int ch)
 {
     Tok *t = pa_cur();
 
-    if (t->kind != TK_PUNCT || t->len != 1 || (u8)tok_data(t)[0] != (u8)(ch & 0xFF))
+    if (t->kind != TK_PUNCT)
+        return 0;
+    if (t->len != 1)
+        return 0;
+    if ((u8)tok_data(t)[0] != (u8)(ch & 0xFF))
         return 0;
     pa_advance();
     return 1;
@@ -1262,10 +1278,9 @@ static int in_c6_tu(void)
  * .c6 里才有特殊含义。`.c` 是**纯 C99**（README 明说没有 -std=c6），这些词
  * 在那里必须是普通标识符：`int shared = 1;`、`struct S { int own; };`、
  * `s.weak++`、`s.try` 全都要编得过。所有认这几个词的地方都先过这一道。 */
-static int c6_kw(void)
-{
-    return in_c6_tu();
-}
+/* 27 个调用点，每个 token 都要问一遍：一层薄函数也是十條指令的建帧/拆帧，
+ * 直接用宏接到 in_c6_tu 上。 */
+#define c6_kw() in_c6_tu()
 
 static Tok *PA_ERR_AT;
 static void pa_error(const char *fmt, ...)
@@ -11478,9 +11493,20 @@ static u32 gen_postfix(void)
 {
     Tok *t = pa_cur();
     u32 v = 0;
+    /* 函数体中间那二十几串 `__builtin_*` / `__atomic_*` / `__sync_*` /
+     * `__FUNCTION__` 检查，每个标识符都要从头过一遍（五十来次 TOK_EQ，
+     * 一次自举就是上千万次调用）。它们全以 `__` 开头：先花三条指令把大
+     * 多数标识符筛掉，整段直接跳过。`_Generic` 是这一段里唯一的例外。 */
+    int is_dunder = 0;
 
     /* 默认不是空指针常量：只有字面量 0（和它的指针强转）会重新置 1 */
     E_NPC = 0;
+    if (t->kind == TK_IDENT && t->len > 1) {
+        const char *dn = tok_data(t);
+
+        if (dn[0] == '_' && dn[1] == '_')
+            is_dunder = 1;
+    }
 
     if (t->kind == TK_NUM && is_float_lit(tok_data(t), t->len)) {
         int is32 = 0;
@@ -11657,6 +11683,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(addr);
     }
+    if (is_dunder || TOK_EQ(t, "_Generic")) {
     if (TOK_EQ(t, "__builtin_syscall")) {
         /* __builtin_syscall(nr, a1..a6)：FreeBSD 风格，最多 6 个参数 */
         u32 d = 0;
@@ -12789,6 +12816,7 @@ static u32 gen_postfix(void)
         v = gen_str_from(FN.name ? FN.name : "", FN.name ? (u32)strlen(FN.name) : 0);
         return gen_postfix_ops(v);
     }
+    }   /* 结束 __ 前缀大前提 */
     if (t->kind == TK_IDENT) {
         Sym *s = sym_find(tok_data(t), t->len);
         int break_qualified = 1;
@@ -13737,8 +13765,12 @@ static u32 gen_unary(void)
 {
     /* GNU 的 `__real__ z` / `__imag__ z`：取复数的实部/虚部。C99 里没有直接
      * 取分量的语法（那是 <complex.h> 的 creal/cimag，属于库），但这两个是
-     * gcc 扩展，几乎所有复数代码都在用，实现起来就是一次分量 load。 */
-    if (PA_IS_IDENT("__real__") || PA_IS_IDENT("__imag__")) {
+     * gcc 扩展，几乎所有复数代码都在用，实现起来就是一次分量 load。
+     * 两个关键字都以 `__` 开头：先按首字节筛一下，每个一元表达式省两次
+     * 真调用（gen_unary 是自举时调用次数排第二的函数）。 */
+    if (pa_cur()->kind == TK_IDENT && pa_cur()->len > 1
+        && tok_data(pa_cur())[0] == '_'
+        && (PA_IS_IDENT("__real__") || PA_IS_IDENT("__imag__"))) {
         int imag = PA_IS_IDENT("__imag__");
         u32 cv = 0;
         u32 cty = 0;
@@ -13783,7 +13815,10 @@ static u32 gen_unary(void)
      * 就是 `char *`，所以两者一样：把字面量拼成 printf 格式串、把 `{名字}`
      * 换成实参，调一次 snprintf 进栈上缓冲。**只支持 `{标识符}` 形式的洞**
      * （表达式要能重入词法器，那是另一件事），够 tests/ 里的用法了。 */
-    if ((PA_IS_IDENT("f") && pa_peek(1) && pa_peek(1)->kind == TK_STR)
+    /* `f"…"` 只可能是单字符标识符 `f`：先就地量一下，省掉一次调用 */
+    if ((pa_cur()->kind == TK_IDENT && pa_cur()->len == 1
+         && tok_data(pa_cur())[0] == 'f'
+         && pa_peek(1) && pa_peek(1)->kind == TK_STR)
         || (pa_is_ch('@') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && TOK_EQ(pa_peek(1), "f") && pa_peek(2) && pa_peek(2)->kind == TK_STR)) {
         char fmt[512] = {0};

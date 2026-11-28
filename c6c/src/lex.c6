@@ -154,7 +154,7 @@ static u32 tok_hash(const char *p, u32 n)
     while (i + 8 <= n) {
         u64 w = 0;
 
-        memcpy(&w, p + i, 8);
+        w = *(const unsigned long *)(const void *)(p + i);   /* 非对齐读，见 sym.c6 */
         h = (h ^ w) * 0x100000001b3ULL;
         i += 8;
     }
@@ -308,7 +308,9 @@ static const u8 LEX_SKIP_TAB[256] = {
 
 /* 只有空格和制表符（最常见的空白）：一次跳完一整段，别在 lex_skip 里
  * 一个字符一个字符地过分支。 */
-static const u8 LEX_SP_TAB[256] = {[' '] = 1, ['\t'] = 1};
+static const u8 LEX_SP_TAB[256] = {
+    [' '] = 1, ['\t'] = 1, ['\v'] = 1, ['\f'] = 1, ['\r'] = 1
+};
 
 /* 块注释扫描：tcc.c 的注释有两百多万字节，原来那个逐字节的
  * "while (d[p] && !(d[p] == '*' && d[p+1] == '/')) p++;" 在 profile 里占 2%。
@@ -455,11 +457,6 @@ static void lex_skip(Lex *L, Tok *t)
         }
         if (c == '\\' && d[L->pos + 1] == '\r' && d[L->pos + 2] == '\n') {
             L->pos += 3;
-            t->flags |= TF_SPACE;
-            continue;
-        }
-        if (c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r') {
-            L->pos++;
             t->flags |= TF_SPACE;
             continue;
         }

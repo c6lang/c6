@@ -1884,12 +1884,21 @@ static void x64_count_use(X64State *st, IrFn *f)
         u8 fm = IR_FIELDS[o->op];
         u8 lm = IR_LABELS[o->op];
 
-        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < nv && use[o->a] < 2)
-            use[o->a]++;
-        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < nv && use[o->b] < 2)
-            use[o->b]++;
-        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < nv && use[o->c] < 2)
-            use[o->c]++;
+        if (fm & IRF_A)
+            if (!(lm & IRF_A))
+                if (o->a < nv)
+                    if (use[o->a] < 2)
+                        use[o->a]++;
+        if (fm & IRF_B)
+            if (!(lm & IRF_B))
+                if (o->b < nv)
+                    if (use[o->b] < 2)
+                        use[o->b]++;
+        if (fm & IRF_C)
+            if (!(lm & IRF_C))
+                if (o->c < nv)
+                    if (use[o->c] < 2)
+                        use[o->c]++;
         if ((o->op == IR_STORE || o->op == IR_COPY || o->op == IR_MEMCPY
              || o->op == IR_MEMSET)
             && o->dst < nv && use[o->dst] < 2)
@@ -1988,7 +1997,15 @@ static void x64_alias_pass(X64State *st, IrFn *f)
         /* vreg 0 是"没有这个操作数"的哨兵（IR_ADDR.a / IR_LEA.b 等）：它也可以
          * 是某个局部量的槽号，但绝不能把 0 改成别的 vreg，否则所有哨兵都会
          * 变成真操作数（54_goto 的症状就是字符串地址被加了个局部变量）。 */
-        if (d == 0 || o->a == 0 || d >= nv || o->a >= nv || d == o->a)
+        if (d == 0)
+            continue;
+        if (o->a == 0)
+            continue;
+        if (d >= nv)
+            continue;
+        if (o->a >= nv)
+            continue;
+        if (d == o->a)
             continue;
         root = al[o->a];
         if (o->op == IR_MOV)
@@ -2093,12 +2110,21 @@ static void x64_analyze(X64State *st, IrFn *f)
             if (k < nv)
                 st->an_addr[k] = 1;
         }
-        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < nv && use[o->a] < 2)
-            use[o->a]++;
-        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < nv && use[o->b] < 2)
-            use[o->b]++;
-        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < nv && use[o->c] < 2)
-            use[o->c]++;
+        if (fm & IRF_A)
+            if (!(lm & IRF_A))
+                if (o->a < nv)
+                    if (use[o->a] < 2)
+                        use[o->a]++;
+        if (fm & IRF_B)
+            if (!(lm & IRF_B))
+                if (o->b < nv)
+                    if (use[o->b] < 2)
+                        use[o->b]++;
+        if (fm & IRF_C)
+            if (!(lm & IRF_C))
+                if (o->c < nv)
+                    if (use[o->c] < 2)
+                        use[o->c]++;
         if ((o->op == IR_STORE || o->op == IR_COPY
              || o->op == IR_MEMCPY || o->op == IR_MEMSET)
             && o->dst < nv && use[o->dst] < 2)

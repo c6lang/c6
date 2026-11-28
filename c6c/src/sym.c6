@@ -82,7 +82,10 @@ static u32 sym_hash_str(const char *s, u32 len)
     while (i + 8 <= len) {
         u64 w = 0;
 
-        memcpy(&w, s + i, 8);
+        /* 直接读 8 个字节：`memcpy(&w, p, 8)` 在自举产物里是一次**真调用**
+         * （c6c 不内联），每次哈希白花四十来条指令。目标平台就是小端
+         * x86-64，非对齐 8 字节读是允许的（rt.c6 的 memcpy 自己也这么干）。 */
+        w = *(const unsigned long *)(const void *)(s + i);
         h = (h ^ w) * 0x100000001b3ULL;
         i += 8;
     }
@@ -162,9 +165,14 @@ static Sym *sym_find_raw(const char *name, u32 len, int ns)
     u32 b = h & (SYM_NBUCKET - 1);
     Sym *p = SYM_BUCKET[b];
 
-    for (; p; p = p->next)
-        if (p->hash == h && p->len == len && sym_name_eq(p->name, name, len))
+    for (; p; p = p->next) {
+        if (p->hash != h)
+            continue;
+        if (p->len != len)
+            continue;
+        if (sym_name_eq(p->name, name, len))
             return p;
+    }
     return NULL;
 }
 
@@ -251,10 +259,16 @@ static Sym *sym_find_def(const char *name, u32 len)
     u32 b = h & (SYM_NBUCKET - 1);
     Sym *p = SYM_BUCKET[b];
 
-    for (; p; p = p->next)
-        if (p->hash == h && p->len == len && sym_name_eq(p->name, name, len)
-            && !p->tls_ref)
+    for (; p; p = p->next) {
+        if (p->hash != h)
+            continue;
+        if (p->len != len)
+            continue;
+        if (p->tls_ref)
+            continue;
+        if (sym_name_eq(p->name, name, len))
             return p;
+    }
     return NULL;
 }
 

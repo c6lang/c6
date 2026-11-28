@@ -3158,7 +3158,7 @@ void *memchr(const void *s, int c, unsigned long n)
     pat = (unsigned long)k;
     pat = pat * 0x0101010101010101UL;
     while (n - i >= 8) {
-        memcpy(&w, p + i, 8);
+        w = *(const unsigned long *)(const void *)(p + i);   /* 非对齐读 */
         w ^= pat;
         if (((w - 0x0101010101010101UL) & ~w & 0x8080808080808080UL) != 0)
             break;
