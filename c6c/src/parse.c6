@@ -60,11 +60,24 @@ static u32 NDEF;
 static u32 DEF_CAP;
 static int PA_DEFER_EMIT;   /* =1 时延迟发射（kernel DCE=2） */
 
+/* C6C_* 调试开关的缓存：getenv 每次都要线性扫 environ（自举剖析里 getenv
+ * 一条就占 3%，其中大半是 strlen），而进程里没有人 setenv，所以第一次
+ * 问到就把结论定下来。第一个 `if (x < 0)` 之后只剩一次全局 load。 */
+static int PA_DEFER_V = -1;
+static int PA_DBG_MGDST = -1;
+static int PA_DBG_AGG = -1;
+static int PA_DBG_SELF = -1;
+static int PA_DBG_DF = -1;
+static int PA_DBG_TASK = -1;
+
 static int pa_defer_enabled(void)
 {
-    const char *v = getenv("C6C_KERNEL_DCE");
+    if (PA_DEFER_V < 0) {
+        const char *v = getenv("C6C_KERNEL_DCE");
 
-    return v && v[0] == '2';
+        PA_DEFER_V = (v && v[0] == '2') ? 1 : 0;
+    }
+    return PA_DEFER_V;
 }
 
 static void def_fn_add(const IrFn *f, u32 sym, u32 alias_sym)
@@ -293,11 +306,15 @@ static void mgdst_add(u32 ty, const u8 *idx, const u8 *kind, const u8 *cnt, u32 
      * 翻译单元（tests/tu/*.c6）有自己的 id 空间之外的文件归属 —— 记下
      * 定义所在文件，环检查才分得清「单元内成环」和「跨翻译单元成环」。 */
     MGDST_FILE[k] = (u16)(file > 0xFFFFu ? 0xFFFFu : file);
-    if (getenv("C6C_DBG_MGDST"))
+    if (PA_DBG_MGDST < 0)
+        PA_DBG_MGDST = getenv("C6C_DBG_MGDST") != NULL;
+    if (PA_DBG_MGDST)
         fprintf(stderr, "[mgdst] ty=%u n=%u\n", (unsigned)ty, (unsigned)n);
     MGDST_N[k] = 0;                 /* 同一个类型会增量登记，最后一次为准 */
     for (j = 0; j < n && MGDST_N[k] < MGDST_FLD; j++) {
-        if (getenv("C6C_DBG_MGDST"))
+        if (PA_DBG_MGDST < 0)
+            PA_DBG_MGDST = getenv("C6C_DBG_MGDST") != NULL;
+        if (PA_DBG_MGDST)
             fprintf(stderr, "  [mgdst] idx=%u kind=%u cnt=%u\n",
                     (unsigned)idx[j], (unsigned)kind[j], (unsigned)cnt[j]);
         MGDST_IDX[k][MGDST_N[k]] = idx[j];
@@ -897,18 +914,18 @@ C6C_INLINE Tok *pa_peek(int k)
     return pa_peek_slow(k);
 }
 
-C6C_INLINE Tok *pa_cur(void)
+/* 窗口里有当前 token 就直接给指针（一条 load + 一次判断）。慢路只在窗口
+ * 空掉的时候走：pa_fill(1) 重新拉，再退到 EOF 哨兵。338 个调用点、动态调用
+ * 千万级，做成宏把建帧/拆帧省掉；实参没有副作用，重复求值也安全。 */
+static Tok *pa_cur_slow(void)
 {
-    Tok *t = PA_CURP;
-
-    if (t)
-        return t;
     pa_fill(1);
-    t = PA_CURP;
-    if (t)
-        return t;
+    if (PA_CURP)
+        return PA_CURP;
     return pa_peek(0);
 }
+
+#define pa_cur() (PA_CURP ? PA_CURP : pa_cur_slow())
 
 static void pa_advance(void)
 {
@@ -5133,7 +5150,9 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
         TY_PACK = save_pk2;
         TY_ALIGN = save_al2;
     }
-    if (getenv("C6C_DBG_AGG"))
+    if (PA_DBG_AGG < 0)
+        PA_DBG_AGG = getenv("C6C_DBG_AGG") != NULL;
+    if (PA_DBG_AGG)
         fprintf(stderr, "       [dbg] struct ty=%u members=%u\n",
                 (unsigned)ty, (unsigned)n);
     agg_names_set(ty, names, lens, n);
@@ -12910,7 +12929,9 @@ static u32 gen_postfix(void)
             if (agg_find_promoted(METHOD_SELF_TY, tok_data(t), t->len, &mty4, &moff4)) {
                 Sym *pself = sym_find("self", 4);
 
-                if (getenv("C6C_DBG_SELF"))
+                if (PA_DBG_SELF < 0)
+                    PA_DBG_SELF = getenv("C6C_DBG_SELF") != NULL;
+                if (PA_DBG_SELF)
                     fprintf(stderr, "[self] %.*s self_ty=%u mty=%u off=%u size=%u\n",
                             (int)t->len, tok_data(t), (unsigned)METHOD_SELF_TY,
                             (unsigned)mty4, (unsigned)moff4, (unsigned)ty_size(mty4));
@@ -20356,7 +20377,9 @@ static void mgd_defer_push(u32 slot_v)
 
     if (NDF >= DEFER_MAX)
         return;
-    if (getenv("C6C_DBG_DF"))
+    if (PA_DBG_DF < 0)
+        PA_DBG_DF = getenv("C6C_DBG_DF") != NULL;
+    if (PA_DBG_DF)
         fprintf(stderr, "[df] mgd slot=%u depth=%d\n", (unsigned)slot_v, DEF_DEPTH);
     start = FN.n;
     /* 退出时要放的是**那个槽里此刻的值**，不是声明时的快照——`@Tree l =
@@ -23289,7 +23312,9 @@ static void pa_func_def(Sym *fn, Declarator *d)
         CUR_RET_TY = ty_ptr(tty);
         if (NTASKTY < TASK_TY_MAX)
             TASK_TY[NTASKTY++] = tty;
-        if (getenv("C6C_DBG_TASK"))
+        if (PA_DBG_TASK < 0)
+            PA_DBG_TASK = getenv("C6C_DBG_TASK") != NULL;
+        if (PA_DBG_TASK)
             fprintf(stderr, "[reg] tty=%u n=%d\n", tty, (int)NTASKTY);
         if (CUR_FALLIBLE) {
             u32 e1 = irfn_vreg(&FN);

@@ -52,10 +52,10 @@ typedef struct Tok {
  * `file_by_id(t->file)->data + t->off` —— 两条互相依赖的 load 加一个分支，
  * 在 profile 里占 4% 的指令。现在只有一条 load（NULL 只会出现在临时清零的
  * EOF 哨兵上，那种 token 的 len 恒为 0）。 */
-C6C_INLINE const char *tok_data(const Tok *t)
-{
-    return t->syn ? t->syn : "";
-}
+/* 宏而不是函数：自举时 c6c 不内联，一次调用 20 条指令（含建帧/拆帧），
+ * 而体本身只有一条 load。调用点 266 个、动态调用千万级，改成宏后单次
+ * 只剩「取 t->syn + 判空」，profile 里 tok_data 的 5% 直接消失。 */
+#define tok_data(t) ((t)->syn ? (t)->syn : "")
 
 C6C_INLINE int tok_eq(const Tok *t, const char *s)
 {

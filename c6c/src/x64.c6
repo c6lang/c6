@@ -118,6 +118,8 @@ typedef struct X64State {
     u32 *an_type;           /* vreg 定义指令的 IR 类型（判“截断是不是空操作”） */
     u8 *an_defop;           /* vreg 的定义 op 码（判“这个值是不是已经规范位宽”） */
     u32 *an_alias;          /* vreg 的规范名：无操作拷贝/截断合并到源头 */
+    u32 *an_imm;            /* vreg 的值：只被一条 CONST 定义过、且能当 imm32 用时 */
+    u8 *an_immok;           /* 上一条有效（1 = 可当立即数用） */
     u32 an_cap;
     u32 an_nv;              /* 本函数 vreg 数（an_one/an_use 的有效长度） */
     u8 an_ready;
@@ -546,6 +548,29 @@ static void x64_pend_set(X64State *st, u32 v)
 static int x64_pend_dead(X64State *st, u32 v)
 {
     return st->an_ready && v < st->an_nv && st->an_one[v] && st->an_use[v] == 1;
+}
+
+/* v 是不是“只定义过一次的常量、而且能当 imm32 用”？是的话写回值。
+ * 自举时的热点全是标量常量比较（`t->kind != TK_PUNCT`、`n == 1`），
+ * 让比较/算术直接用立刻数能省掉 const 的 mov + 写槽 + 读回三条。 */
+static int x64_imm_of(X64State *st, u32 v, u32 *out)
+{
+    if (!st->an_ready || v >= st->an_nv || !st->an_immok[v] || !st->an_one[v])
+        return 0;
+    *out = st->an_imm[v];
+    return 1;
+}
+
+/* cmp rax, <操作数 b>：b 是能当立即数用的常量就直接 imm 形式（81 /7 id 或
+ * 83 /7 ib），不再从 b 的帧槽里读一条。 */
+static void x64_cmp_operand(X64State *st, u32 b)
+{
+    u32 iv = 0;
+
+    if (x64_imm_of(st, b, &iv))
+        x_alu_ri64_opt(st->im, 7, R_RAX, iv);
+    else
+        x_memop(st->im, 0x3B, R_RAX, R_RBP, X64_SLOT(b));
 }
 
 /* 认领 rax 里的待定值 v，准备让本指令覆盖 rax（clobber=1）或只读它（0）。
@@ -1107,6 +1132,7 @@ static u32 asmx_flush(X64State *st, u32 idx);
 static int x64_emit_ir(X64State *st, const IrOp *o)
 {
     Image *im = st->im;
+    u32 iv = 0;
 
     switch (o->op) {
     case IR_NOP:
@@ -1127,6 +1153,13 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
         x64_label(st, o->a);
         return 0;
     case IR_CONST:
+        /* 值能当 imm32 用：直接 mov qword [rbp+disp], imm32 写进帧槽，一步到位。
+         * 不碰 rax，所以 rax 里的待定值不必冲回槽、后面也不用再读一次。 */
+        if (st->an_ready && o->dst < st->an_nv && st->an_immok[o->dst]
+            && st->an_one[o->dst] && st->pv != o->dst) {
+            x_mov_mem_imm32(im, R_RBP, X64_SLOT(o->dst), st->an_imm[o->dst], 8);
+            return 0;
+        }
         x64_pend_flush(st);
         x_mov_ri_small(im, R_RAX, (u64)o->imm);
         x64_pend_set(st, o->dst);
@@ -1139,6 +1172,13 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
     case IR_MOV:
         if (o->dst == o->a)
             return 0;               /* 自己搬自己：整条省掉 */
+        /* 源是能当 imm32 用的常量：直接写目标的帧槽，省掉一次读+一次写，
+         * 那条 const 自己也就成了死代码（见下面的常量跳过规则）。 */
+        if (x64_imm_of(st, o->a, &iv)) {
+            x64_pend_flush(st);
+            x_mov_mem_imm32(im, R_RBP, X64_SLOT(o->dst), iv, 8);
+            return 0;
+        }
         (void)x64_pend_take(st, o->a, 0);
         x64_pend_set(st, o->dst);
         return 0;
@@ -1272,16 +1312,28 @@ static int x64_emit_ir(X64State *st, const IrOp *o)
     case IR_OR:
     case IR_XOR: {
         u8 op = 0x01;   /* add */
+        u8 ext = 0;     /* 立即数形式的 /ext：add=0 or=1 and=4 sub=5 xor=6 */
+        u32 iv = 0;
 
-        if (o->op == IR_SUB)
+        if (o->op == IR_SUB) {
             op = 0x29;
-        else if (o->op == IR_AND)
+            ext = 5;
+        } else if (o->op == IR_AND) {
             op = 0x21;
-        else if (o->op == IR_OR)
+            ext = 4;
+        } else if (o->op == IR_OR) {
             op = 0x09;
-        else if (o->op == IR_XOR)
+            ext = 1;
+        } else if (o->op == IR_XOR) {
             op = 0x31;
+            ext = 6;
+        }
         (void)x64_pend_take(st, o->a, 1);
+        if (x64_imm_of(st, o->b, &iv)) {
+            x_alu_ri64_opt(im, ext, R_RAX, iv);         /* add rax, imm32 */
+            x64_pend_set(st, o->dst);
+            return 0;
+        }
         /* 第二个操作数直接在帧槽里当内存操作数：省一条 load。
          * 注意方向位：x_memop 的 r/m 是内存，所以用 op|2（01→03 等），
          * 得到的是 `add rax,[b]` 而不是 `add [b],rax`。 */
@@ -1754,6 +1806,8 @@ static int x64_analyze_reserve(X64State *st, u32 n)
     u32 *ty = 0;
     u8 *dop = 0;
     u32 *al = 0;
+    u32 *im = 0;
+    u8 *iok = 0;
 
     if (n <= st->an_cap)
         return 1;
@@ -1788,6 +1842,14 @@ static int x64_analyze_reserve(X64State *st, u32 n)
     if (!al)
         return 0;
     st->an_alias = al;
+    im = realloc(st->an_imm, (size_t)cap * sizeof(u32));
+    if (!im)
+        return 0;
+    st->an_imm = im;
+    iok = realloc(st->an_immok, (size_t)cap);
+    if (!iok)
+        return 0;
+    st->an_immok = iok;
     st->an_cap = cap;
     return 1;
 }
@@ -1847,6 +1909,59 @@ static int x64_canon_def(u8 op)
         || op == IR_ZEXT || op == IR_TRUNC;
 }
 
+static int x64_ty_unsign(u8 t)
+{
+    return t == IRT_U8 || t == IRT_U16 || t == IRT_U32 || t == IRT_U64
+        || t == IRT_PTR;
+}
+
+/* 这条 TRUNC/SEXT/ZEXT 是不是空操作？原来只认「目标类型 == 源的类型」，
+ * 于是 `t->kind != 5`（u16 成员比常量）里那两条 trunc 一条都合并不掉：
+ * 源头是 u16 的 LOAD，目标是 i64，类型永远不相同。可实际上寄存器里的值
+ * 已经是目标要的东西了 —— LOAD 已经按自己的类型 movzx/movsx 到 64 位。
+ *
+ * 形式化：设源类型 S、目标类型 T。寄存器里是 V = extend_S(raw)，目标要的是
+ * W = extend_T(truncate_{|T|}(V))。两者恒等当且仅当
+ *   |S| > |T|            → 不成立（真丢了高位）
+ *   |S| == |T|           → 符号性必须相同
+ *   |S| <  |T|           → 只有「有符号源 → 无符号目标」不成立（源是负数时
+ *                          高位全是 1，目标的零扩展会清掉它们），其余都成立
+ * 另外 8 字节的常量（imm 就是完整 64 位值）扩到 8 字节目标恒等。
+ * 前提仍是「源头真按自己的类型规范化过」= x64_canon_def。 */
+static int x64_ext_noop(u32 sty, u8 dop, u32 tty)
+{
+    int ss = (int)ir_type_size((u8)sty);
+    int ts = (int)ir_type_size((u8)tty);
+    int su = x64_ty_unsign((u8)sty) ? 1 : 0;
+    int tu = x64_ty_unsign((u8)tty) ? 1 : 0;
+
+    if (dop == IR_CONST || dop == IR_CONSTK) {
+        /* 常量的 imm 就是完整的 64 位值：8 字节目标直接就是规范形式 */
+        return ss == 8 && ts == 8;
+    }
+    if (!x64_canon_def(dop))
+        return 0;
+    if (ss > ts)
+        return 0;
+    if (ss == ts)
+        return su == tu;
+    return !(su == 0 && tu == 1);
+}
+
+/* 一个能当 imm32 用的常量（值 = (i64)(int)v）是否已经等于它转成 tty 之后的
+ * 规范形式？是的话那条 TRUNC/SEXT/ZEXT 就是空操作，可以直接并到常量上，
+ * 后面的比较/算术也就能改成立即数形式。 */
+static int x64_const_fits(u32 v, u32 tty)
+{
+    int ts = (int)ir_type_size((u8)tty);
+
+    if (ts >= 8)
+        return 1;                    /* 存的就是 64 位符号扩展值，恒等 */
+    if (ts == 4)
+        return x64_ty_unsign((u8)tty) ? ((i64)(int)v >= 0) : 1;
+    return 0;                        /* 更窄的目标真要截断，留给老路 */
+}
+
 static void x64_alias_pass(X64State *st, IrFn *f)
 {
     u32 nv = f->nvreg;
@@ -1878,8 +1993,14 @@ static void x64_alias_pass(X64State *st, IrFn *f)
             noop = (ty[o->a] == o->type);
         else if (o->op == IR_BITCAST)
             noop = 1;
-        else if (o->op == IR_TRUNC || o->op == IR_SEXT || o->op == IR_ZEXT)
-            noop = (root < nv && ty[root] == o->type && x64_canon_def(dop[root]));
+else if (o->op == IR_TRUNC || o->op == IR_SEXT || o->op == IR_ZEXT) {
+                noop = (root < nv && x64_ext_noop(ty[root], dop[root], o->type));
+                /* 常量：值本身就已经是目标类型的样子（`const i32 5` 转 i64 还是 5），
+                 * 这条扩展/截断也是空操作。合并掉之后比较/算术就能直接吃立即数。 */
+                if (!noop && root < nv && dop[root] == IR_CONST && st->an_immok[root]
+                    && x64_const_fits(st->an_imm[root], o->type))
+                    noop = 1;
+            }
         if (!noop)
             continue;
         if (root == 0 || root >= nv)
@@ -1936,6 +2057,7 @@ static void x64_analyze(X64State *st, IrFn *f)
         memset(st->an_addr, 0, (size_t)nv);
         memset(st->an_type, 0, (size_t)nv * sizeof(u32));
         memset(st->an_defop, 0, (size_t)nv);
+        memset(st->an_immok, 0, (size_t)nv);
         st->an_nv = nv;
     }
     for (i = 0; i < f->n; i++) {
@@ -1951,6 +2073,15 @@ static void x64_analyze(X64State *st, IrFn *f)
         if (x64_defs_dst(o->op) && o->dst < nv) {
             st->an_type[o->dst] = o->type;
             st->an_defop[o->dst] = o->op;
+            /* 常量立即数形式：只有「整条指令就是一条 CONST、值能当 imm32
+             * 用（有符号扩展后等价）」才登记。多次定义时后一条会清掉标记，
+             * 读点上还要 an_one 兜底（只定义一次才算真常量）。 */
+            if (o->op == IR_CONST && (u64)o->imm == (u64)(i64)(int)o->imm) {
+                st->an_imm[o->dst] = (u32)o->imm;
+                st->an_immok[o->dst] = 1;
+            } else {
+                st->an_immok[o->dst] = 0;
+            }
         }
         /* 帧槽被当地址取过（IR_ADDR 的 imm 落在哪个槽里）就不能把住在这个槽
          * 里的 vreg 合并到别处去。槽是 16 字节，imm<0 时槽号 = (-imm-1)/16。 */
@@ -2179,6 +2310,25 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
                     break;
                 }
             }
+            /* 常量只喂一条算术/比较（`x == 5`、`i + 1`）：这条 const 干脆不发，
+             * 下一条直接用 imm 形式（x64_imm_of 认得出它），省掉 mov+写槽+读回。 */
+            if (o.op == IR_CONST && use && o.dst < f->nvreg && use[o.dst] == 1
+                && i + 1 < f->n && st->an_ready && o.dst < st->an_nv
+                && st->an_immok[o.dst] && st->an_one[o.dst]) {
+                u32 k = i + 1;
+                IrOp *nx = NULL;
+
+                while (k < f->n && f->ops[k].op == IR_NOP)
+                    k++;                 /* 被合并掉的截断/扩展已经变 NOP */
+                nx = (k < f->n) ? &f->ops[k] : NULL;
+                if (nx && nx->a != o.dst
+                    && ((nx->b == o.dst
+                         && (nx->op == IR_CMP || nx->op == IR_ADD || nx->op == IR_SUB
+                             || nx->op == IR_AND || nx->op == IR_OR
+                             || nx->op == IR_XOR))
+                        || nx->op == IR_MOV))
+                    break;               /* 这条不发码，下一条自己用 imm 形式 */
+            }
             if (x64_emit_ir(st, &o) < 0) {
                 fprintf(stderr, "c6c: IR op %u (%s) 在 x86-64 后端未实现\n", o.op,
                         ir_name(o.op));
@@ -2294,7 +2444,7 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
 
                 x64_cc(o.flags, &setcc, &jcc);
                 (void)x64_pend_take(st, o.a, 1);
-                x_memop(st->im, 0x3B, R_RAX, R_RBP, X64_SLOT(o.b));  /* cmp rax,[b] */
+                x64_cmp_operand(st, o.b);
                 if (br.b == br.c) {
                     /* 两边同一个目标：条件本身是废的 */
                     if (!x64_label_next(f, i + 2, br.b))
@@ -2354,7 +2504,7 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             }
             x64_cc(o.flags, &setcc, &jcc);
             (void)x64_pend_take(st, o.a, 1);
-            x_memop(st->im, 0x3B, R_RAX, R_RBP, X64_SLOT(o.b));   /* cmp rax, [b] */
+            x64_cmp_operand(st, o.b);
             img_u8(st->im, 0x0F);                          /* setcc al */
             img_u8(st->im, setcc);
             x_modrm(st->im, 3, 0, R_RAX);
