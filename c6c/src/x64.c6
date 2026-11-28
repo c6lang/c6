@@ -114,6 +114,10 @@ typedef struct X64State {
     u32 *an_slot;
     u8 *an_use;
     u8 *an_one;             /* vreg 恰好只被定义一次（延迟写槽时判死用） */
+    u8 *an_addr;            /* vreg 的帧槽被当成地址取用过（不能搬走） */
+    u32 *an_type;           /* vreg 定义指令的 IR 类型（判“截断是不是空操作”） */
+    u8 *an_defop;           /* vreg 的定义 op 码（判“这个值是不是已经规范位宽”） */
+    u32 *an_alias;          /* vreg 的规范名：无操作拷贝/截断合并到源头 */
     u32 an_cap;
     u32 an_nv;              /* 本函数 vreg 数（an_one/an_use 的有效长度） */
     u8 an_ready;
@@ -1746,6 +1750,10 @@ static int x64_analyze_reserve(X64State *st, u32 n)
     u32 *s = 0;
     u8 *u = 0;
     u8 *one = 0;
+    u8 *ad = 0;
+    u32 *ty = 0;
+    u8 *dop = 0;
+    u32 *al = 0;
 
     if (n <= st->an_cap)
         return 1;
@@ -1764,6 +1772,22 @@ static int x64_analyze_reserve(X64State *st, u32 n)
     if (!one)
         return 0;
     st->an_one = one;
+    ad = realloc(st->an_addr, (size_t)cap);
+    if (!ad)
+        return 0;
+    st->an_addr = ad;
+    ty = realloc(st->an_type, (size_t)cap * sizeof(u32));
+    if (!ty)
+        return 0;
+    st->an_type = ty;
+    dop = realloc(st->an_defop, (size_t)cap);
+    if (!dop)
+        return 0;
+    st->an_defop = dop;
+    al = realloc(st->an_alias, (size_t)cap * sizeof(u32));
+    if (!al)
+        return 0;
+    st->an_alias = al;
     st->an_cap = cap;
     return 1;
 }
@@ -1773,6 +1797,120 @@ static int x64_analyze_reserve(X64State *st, u32 n)
  * 纯槽，其余位是帧槽偏移（偏移 4 字节对齐，低 2 位空着）；2 = 不能优化。
  * 地址分析对跨基本块/跨函数调用也成立：地址是当前帧里的常量，只要它没被
  * 当成值传给别处，任何时刻直接 [rbp+disp] 都等价。 */
+/* 无操作拷贝/截断合并。
+ *
+ * 前端为每个表达式临时量都发一跳（`MOV dst a`、`TRUNC dst a`），其中很大
+ * 一部分在语义上是空操作：MOV 且类型相同、BITCAST（纯位重解释，后端本来
+ * 就整槽搬 8 字节）、TRUNC/SEXT/ZEXT 且目标类型就是源的定义类型。把这些
+ * dst 直接合并到源头，后面所有读点改读源头，整条指令连同它的写槽一起消失。
+ *
+ * 安全条件（缺一不可）：dst 只定义一次、dst 的帧槽没被取过地址；源头
+ * （合并后的规范名）同样只定义一次、槽没被取过地址、而且不是"纯槽地址"
+ * 那种不发码的 vreg。重写之后读次数要重算（读点已经搬到源头），否则
+ * CMP+BR 融合和"只读一次就不写回"的判据会用到旧数据。 */
+static void x64_count_use(X64State *st, IrFn *f)
+{
+    u32 nv = f->nvreg;
+    u32 i = 0;
+    u8 *use = st->an_use;
+
+    memset(use, 0, (size_t)nv);
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < nv && use[o->a] < 2)
+            use[o->a]++;
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < nv && use[o->b] < 2)
+            use[o->b]++;
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < nv && use[o->c] < 2)
+            use[o->c]++;
+        if ((o->op == IR_STORE || o->op == IR_COPY || o->op == IR_MEMCPY
+             || o->op == IR_MEMSET)
+            && o->dst < nv && use[o->dst] < 2)
+            use[o->dst]++;
+        if ((o->op == IR_ALLOCA || o->op == IR_MEMSET) && o->a < nv
+            && use[o->a] < 2)
+            use[o->a]++;
+    }
+}
+
+/* 这条指令产生的窄类型值是不是已经是规范位宽（I32 = 符号扩展、U32 = 零扩展）？
+ * 只有这些定义指令会真发一条 movsx/movzx/movsxd：LOAD 按类型宽度、CALL/CALLI
+ * 走 narrow_ret、SEXT/ZEXT/TRUNC 本身就发扩展。CONST 和算术指令都不规范化
+ * （`const I32 0xFFFFFFFF` 在槽里是零扩展的，得靠后面那条 TRUNC 补符号位），
+ * 所以它们后面跟着的 TRUNC 绝不是空操作。 */
+static int x64_canon_def(u8 op)
+{
+    return op == IR_LOAD || op == IR_CALL || op == IR_CALLI || op == IR_SEXT
+        || op == IR_ZEXT || op == IR_TRUNC;
+}
+
+static void x64_alias_pass(X64State *st, IrFn *f)
+{
+    u32 nv = f->nvreg;
+    u32 i = 0;
+    u32 v = 0;
+    u32 *al = st->an_alias;
+    u32 *ty = st->an_type;
+    u8 *dop = st->an_defop;
+    u8 *one = st->an_one;
+    u8 *ad = st->an_addr;
+    u32 *sl = st->an_slot;
+
+    for (v = 0; v < nv; v++)
+        al[v] = v;
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u32 d = o->dst;
+        u32 root = 0;
+        int noop = 0;
+
+        /* vreg 0 是"没有这个操作数"的哨兵（IR_ADDR.a / IR_LEA.b 等）：它也可以
+         * 是某个局部量的槽号，但绝不能把 0 改成别的 vreg，否则所有哨兵都会
+         * 变成真操作数（54_goto 的症状就是字符串地址被加了个局部变量）。 */
+        if (d == 0 || o->a == 0 || d >= nv || o->a >= nv || d == o->a)
+            continue;
+        root = al[o->a];
+        if (o->op == IR_MOV)
+            noop = (ty[o->a] == o->type);
+        else if (o->op == IR_BITCAST)
+            noop = 1;
+        else if (o->op == IR_TRUNC || o->op == IR_SEXT || o->op == IR_ZEXT)
+            noop = (root < nv && ty[root] == o->type && x64_canon_def(dop[root]));
+        if (!noop)
+            continue;
+        if (root == 0 || root >= nv)
+            continue;
+        if (!one[d] || ad[d] || !one[root] || ad[root] || (sl[root] & 1u))
+            continue;
+        al[d] = root;
+    }
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        u8 fm = IR_FIELDS[o->op];
+        u8 lm = IR_LABELS[o->op];
+
+        if ((fm & IRF_A) && !(lm & IRF_A) && o->a < nv)
+            o->a = al[o->a];
+        if ((fm & IRF_B) && !(lm & IRF_B) && o->b < nv)
+            o->b = al[o->b];
+        if ((fm & IRF_C) && !(lm & IRF_C) && o->c < nv)
+            o->c = al[o->c];
+        if ((fm & IRF_DST) && o->dst < nv)
+            o->dst = al[o->dst];
+        /* 合并之后自己赋自己：整条不用发码，连读次数都不该再算它 */
+        if ((o->op == IR_MOV || o->op == IR_BITCAST || o->op == IR_TRUNC
+             || o->op == IR_SEXT || o->op == IR_ZEXT)
+            && o->dst == o->a)
+            o->op = IR_NOP;
+    }
+    x64_count_use(st, f);
+    /* 合并可能让某个 vreg 只剩一条定义（另一条被 NOP 掉了），one[] 跟着更新：
+     * 已经不需要精确，保守地用"还有没有读到"来定——多算一个写回不影响正确性。 */
+}
+
 static void x64_analyze(X64State *st, IrFn *f)
 {
     u32 nv = f->nvreg;
@@ -1790,6 +1928,9 @@ static void x64_analyze(X64State *st, IrFn *f)
         memset(slot, 0, (size_t)nv * sizeof(u32));
         memset(use, 0, (size_t)nv);
         memset(st->an_one, 1, (size_t)nv);
+        memset(st->an_addr, 0, (size_t)nv);
+        memset(st->an_type, 0, (size_t)nv * sizeof(u32));
+        memset(st->an_defop, 0, (size_t)nv);
         st->an_nv = nv;
     }
     for (i = 0; i < f->n; i++) {
@@ -1802,6 +1943,18 @@ static void x64_analyze(X64State *st, IrFn *f)
         if (!slot)
             continue;
         /* 读次数（饱和到 2）：地址输入的 dst 也算一次读 */
+        if (x64_defs_dst(o->op) && o->dst < nv) {
+            st->an_type[o->dst] = o->type;
+            st->an_defop[o->dst] = o->op;
+        }
+        /* 帧槽被当地址取过（IR_ADDR 的 imm 落在哪个槽里）就不能把住在这个槽
+         * 里的 vreg 合并到别处去。槽是 16 字节，imm<0 时槽号 = (-imm-1)/16。 */
+        if (o->op == IR_ADDR && !(o->flags & 3) && (int)o->imm < 0) {
+            u32 k = (u32)(-(int)o->imm - 1) / 16u;
+
+            if (k < nv)
+                st->an_addr[k] = 1;
+        }
         if ((fm & IRF_A) && !(lm & IRF_A) && o->a < nv && use[o->a] < 2)
             use[o->a]++;
         if ((fm & IRF_B) && !(lm & IRF_B) && o->b < nv && use[o->b] < 2)
@@ -1847,8 +2000,10 @@ static void x64_analyze(X64State *st, IrFn *f)
         if ((o->op == IR_ALLOCA || o->op == IR_MEMSET) && o->a < nv)
             slot[o->a] = 2;
     }
-    if (slot)
+    if (slot) {
+        x64_alias_pass(st, f);
         st->an_ready = 1;
+    }
     st->need_saved = (u8)need_asm;
 }
 
