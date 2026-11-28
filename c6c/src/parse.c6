@@ -939,28 +939,57 @@ static void pa_advance(void)
     PA_CURP = PA_HAVE > 0 ? &PA_BUF[PA_HEAD] : NULL;
 }
 
-/* 单字符标点：`pa_is_punct("}")` 这一类占全部标点判断的九成二（550/597 个
- * 调用点）。走字符串版要先 load 首字节、再查 s[t->len] 是不是 0、最后还要进
- * tok_eq 循环，二十条指令才能说一句“不是”；单字符版只要 kind / len / 首字节
- * 三条判断，十亿级调用次数下这笔差值是实打实的。调用点统一换成 pa_is_ch。 */
+/* ---- 最热的三个 token 谓词 ----------------------------------------------
+ * 自举剖析里 pa_is_ch / pa_is_punct / pa_is_ident_n / tok_eq_len 四个合起来
+ * 占 19%：自举时 C6C_INLINE 退化成 `static inline`，c6c 不内联，所以每层都是
+ * 一次真调用（建帧 + 拆帧 + 参数搬运约十条指令），而这三个谓词被调用两千万
+ * 次 —— 光把**嵌套的那一层**调用摊平（pa_is_punct → tok_eq、pa_is_ident_n →
+ * tok_eq_len 全改成函数体里就地比较），就少两千万次调用。
+ *
+ * 不改成宏：调用点有 700 多个，宏展开会把每个调用者都撑大十条指令，实测
+ * 反而慢 4%（I-cache 换不来那点指令数）。所以这里只做"一层实现 + 瘦函数体"。
+ * 动态字符串版本留给 pa_expect_punct 一处。 */
 C6C_INLINE int pa_is_ch(int ch)
 {
     Tok *t = pa_cur();
-    const char *d = NULL;
 
     if (t->kind != TK_PUNCT || t->len != 1)
         return 0;
-    d = tok_data(t);
-    return (u8)d[0] == (u8)(ch & 0xFF);
+    return (u8)tok_data(t)[0] == (u8)(ch & 0xFF);
 }
 
-/* 同上：名字是固定字面量，长度编译期已知，先比 t->len 再比字节。
- * 调用点由脚本统一换成 PA_IS_IDENT / PA_ACCEPT_IDENT。 */
+C6C_INLINE int pa_is_punct(const char *s)
+{
+    Tok *t = pa_cur();
+    const char *d = NULL;
+    u32 i = 0;
+
+    if (t->kind != TK_PUNCT || t->len == 0)
+        return 0;
+    d = tok_data(t);
+    if (d[0] != s[0] || s[t->len] != 0)
+        return 0;
+    for (i = 1; i < t->len; i++)
+        if (d[i] != s[i])
+            return 0;
+    return 1;
+}
+
 C6C_INLINE int pa_is_ident_n(const char *s, u32 n)
 {
     Tok *t = pa_cur();
+    const char *d = NULL;
+    u32 i = 0;
 
-    return t->kind == TK_IDENT && tok_eq_len(t, s, n);
+    if (t->kind != TK_IDENT || t->len != n)
+        return 0;
+    d = tok_data(t);
+    if (n == 1)
+        return (u8)d[0] == (u8)s[0];
+    for (i = 0; i < n; i++)
+        if ((u8)s[i] != (u8)d[i])
+            return 0;
+    return 1;
 }
 
 C6C_INLINE int pa_accept_ident_n(const char *s, u32 n)
@@ -970,29 +999,6 @@ C6C_INLINE int pa_accept_ident_n(const char *s, u32 n)
         return 1;
     }
     return 0;
-}
-
-#define PA_IS_IDENT(lit) pa_is_ident_n((lit), (u32)(sizeof(lit) - 1))
-#define PA_ACCEPT_IDENT(lit) pa_accept_ident_n((lit), (u32)(sizeof(lit) - 1))
-
-C6C_INLINE int pa_accept_ch(int ch)
-{
-    if (pa_is_ch(ch)) {
-        pa_advance();
-        return 1;
-    }
-    return 0;
-}
-
-C6C_INLINE int pa_is_punct(const char *s)
-{
-    Tok *t = pa_cur();
-
-    /* 先比首字节和长度，绝大多数不匹配的调用一步就否掉（profiler 里这条
-     * 判断占 9.9%，是全编译器最热的谓词之一）。 */
-    if (t->kind != TK_PUNCT || t->len == 0 || tok_data(t)[0] != s[0] || s[t->len] != 0)
-        return 0;
-    return tok_eq(t, s);
 }
 
 C6C_INLINE int pa_is_ident(const char *s)
@@ -1018,6 +1024,19 @@ C6C_INLINE int pa_accept_ident(const char *s)
         return 1;
     }
     return 0;
+}
+
+#define PA_IS_IDENT(lit) pa_is_ident_n((lit), (u32)(sizeof(lit) - 1))
+#define PA_ACCEPT_IDENT(lit) pa_accept_ident_n((lit), (u32)(sizeof(lit) - 1))
+
+C6C_INLINE int pa_accept_ch(int ch)
+{
+    Tok *t = pa_cur();
+
+    if (t->kind != TK_PUNCT || t->len != 1 || (u8)tok_data(t)[0] != (u8)(ch & 0xFF))
+        return 0;
+    pa_advance();
+    return 1;
 }
 
 static void pa_dbg_counts(void);
