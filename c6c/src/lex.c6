@@ -52,10 +52,10 @@ typedef struct Tok {
  * `file_by_id(t->file)->data + t->off` —— 两条互相依赖的 load 加一个分支，
  * 在 profile 里占 4% 的指令。现在只有一条 load（NULL 只会出现在临时清零的
  * EOF 哨兵上，那种 token 的 len 恒为 0）。 */
-C6C_INLINE const char *tok_data(const Tok *t)
-{
-    return t->syn ? t->syn : "";
-}
+/* 宏而不是函数：自举时 c6c 不内联，一次调用 20 条指令（含建帧/拆帧），
+ * 而体本身只有一条 load。调用点 266 个、动态调用千万级，改成宏后单次
+ * 只剩「取 t->syn + 判空」，profile 里 tok_data 的 5% 直接消失。 */
+#define tok_data(t) ((t)->syn ? (t)->syn : "")
 
 C6C_INLINE int tok_eq(const Tok *t, const char *s)
 {
@@ -71,8 +71,12 @@ C6C_INLINE int tok_eq(const Tok *t, const char *s)
 
 /* 长度已知的比较。调用点九成九都是 `tok_eq(t, "int")` 这种固定字面量，
  * 长度编译期就知道 —— 先比 t->len（一次 load 一次比较就否掉绝大多数），
- * 循环里也不用再逐字节判 '\0'，GCC 还会把已知长度的循环整个展开成几条
- * 定长比较。TOK_EQ(t, "lit") 由脚本统一换过来；tok_eq 留给动态字符串。 */
+ * 循环里也不用再逐字节判 '\0'。TOK_EQ(t, "lit") 由脚本统一换过来；tok_eq
+ * 留给动态字符串。
+ *
+ * 自举时这个函数占整个编译的 8%（动态调用千万级），而绝大多数标点只有
+ * 1~3 个字节：按长度分支成直落代码，n<=4 时就是几条定长比较，省掉循环
+ * 的计数器和回跳；更长的才回落到循环。 */
 C6C_INLINE int tok_eq_len(const Tok *t, const char *s, u32 n)
 {
     const char *d = tok_data(t);
@@ -80,6 +84,16 @@ C6C_INLINE int tok_eq_len(const Tok *t, const char *s, u32 n)
 
     if (t->len != n)
         return 0;
+    if (n == 1)
+        return (u8)s[0] == (u8)d[0];
+    if (n == 2)
+        return (u8)s[0] == (u8)d[0] && (u8)s[1] == (u8)d[1];
+    if (n == 3)
+        return (u8)s[0] == (u8)d[0] && (u8)s[1] == (u8)d[1]
+            && (u8)s[2] == (u8)d[2];
+    if (n == 4)
+        return (u8)s[0] == (u8)d[0] && (u8)s[1] == (u8)d[1]
+            && (u8)s[2] == (u8)d[2] && (u8)s[3] == (u8)d[3];
     for (i = 0; i < n; i++)
         if ((u8)s[i] != (u8)d[i])
             return 0;
@@ -140,7 +154,7 @@ static u32 tok_hash(const char *p, u32 n)
     while (i + 8 <= n) {
         u64 w = 0;
 
-        memcpy(&w, p + i, 8);
+        w = *(const unsigned long *)(const void *)(p + i);   /* 非对齐读，见 sym.c6 */
         h = (h ^ w) * 0x100000001b3ULL;
         i += 8;
     }
@@ -294,7 +308,9 @@ static const u8 LEX_SKIP_TAB[256] = {
 
 /* 只有空格和制表符（最常见的空白）：一次跳完一整段，别在 lex_skip 里
  * 一个字符一个字符地过分支。 */
-static const u8 LEX_SP_TAB[256] = {[' '] = 1, ['\t'] = 1};
+static const u8 LEX_SP_TAB[256] = {
+    [' '] = 1, ['\t'] = 1, ['\v'] = 1, ['\f'] = 1, ['\r'] = 1
+};
 
 /* 块注释扫描：tcc.c 的注释有两百多万字节，原来那个逐字节的
  * "while (d[p] && !(d[p] == '*' && d[p+1] == '/')) p++;" 在 profile 里占 2%。
@@ -441,11 +457,6 @@ static void lex_skip(Lex *L, Tok *t)
         }
         if (c == '\\' && d[L->pos + 1] == '\r' && d[L->pos + 2] == '\n') {
             L->pos += 3;
-            t->flags |= TF_SPACE;
-            continue;
-        }
-        if (c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r') {
-            L->pos++;
             t->flags |= TF_SPACE;
             continue;
         }

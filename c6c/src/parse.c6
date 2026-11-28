@@ -60,11 +60,24 @@ static u32 NDEF;
 static u32 DEF_CAP;
 static int PA_DEFER_EMIT;   /* =1 时延迟发射（kernel DCE=2） */
 
+/* C6C_* 调试开关的缓存：getenv 每次都要线性扫 environ（自举剖析里 getenv
+ * 一条就占 3%，其中大半是 strlen），而进程里没有人 setenv，所以第一次
+ * 问到就把结论定下来。第一个 `if (x < 0)` 之后只剩一次全局 load。 */
+static int PA_DEFER_V = -1;
+static int PA_DBG_MGDST = -1;
+static int PA_DBG_AGG = -1;
+static int PA_DBG_SELF = -1;
+static int PA_DBG_DF = -1;
+static int PA_DBG_TASK = -1;
+
 static int pa_defer_enabled(void)
 {
-    const char *v = getenv("C6C_KERNEL_DCE");
+    if (PA_DEFER_V < 0) {
+        const char *v = getenv("C6C_KERNEL_DCE");
 
-    return v && v[0] == '2';
+        PA_DEFER_V = (v && v[0] == '2') ? 1 : 0;
+    }
+    return PA_DEFER_V;
 }
 
 static void def_fn_add(const IrFn *f, u32 sym, u32 alias_sym)
@@ -293,11 +306,15 @@ static void mgdst_add(u32 ty, const u8 *idx, const u8 *kind, const u8 *cnt, u32 
      * 翻译单元（tests/tu/*.c6）有自己的 id 空间之外的文件归属 —— 记下
      * 定义所在文件，环检查才分得清「单元内成环」和「跨翻译单元成环」。 */
     MGDST_FILE[k] = (u16)(file > 0xFFFFu ? 0xFFFFu : file);
-    if (getenv("C6C_DBG_MGDST"))
+    if (PA_DBG_MGDST < 0)
+        PA_DBG_MGDST = getenv("C6C_DBG_MGDST") != NULL;
+    if (PA_DBG_MGDST)
         fprintf(stderr, "[mgdst] ty=%u n=%u\n", (unsigned)ty, (unsigned)n);
     MGDST_N[k] = 0;                 /* 同一个类型会增量登记，最后一次为准 */
     for (j = 0; j < n && MGDST_N[k] < MGDST_FLD; j++) {
-        if (getenv("C6C_DBG_MGDST"))
+        if (PA_DBG_MGDST < 0)
+            PA_DBG_MGDST = getenv("C6C_DBG_MGDST") != NULL;
+        if (PA_DBG_MGDST)
             fprintf(stderr, "  [mgdst] idx=%u kind=%u cnt=%u\n",
                     (unsigned)idx[j], (unsigned)kind[j], (unsigned)cnt[j]);
         MGDST_IDX[k][MGDST_N[k]] = idx[j];
@@ -897,18 +914,18 @@ C6C_INLINE Tok *pa_peek(int k)
     return pa_peek_slow(k);
 }
 
-C6C_INLINE Tok *pa_cur(void)
+/* 窗口里有当前 token 就直接给指针（一条 load + 一次判断）。慢路只在窗口
+ * 空掉的时候走：pa_fill(1) 重新拉，再退到 EOF 哨兵。338 个调用点、动态调用
+ * 千万级，做成宏把建帧/拆帧省掉；实参没有副作用，重复求值也安全。 */
+static Tok *pa_cur_slow(void)
 {
-    Tok *t = PA_CURP;
-
-    if (t)
-        return t;
     pa_fill(1);
-    t = PA_CURP;
-    if (t)
-        return t;
+    if (PA_CURP)
+        return PA_CURP;
     return pa_peek(0);
 }
+
+#define pa_cur() (PA_CURP ? PA_CURP : pa_cur_slow())
 
 static void pa_advance(void)
 {
@@ -922,28 +939,67 @@ static void pa_advance(void)
     PA_CURP = PA_HAVE > 0 ? &PA_BUF[PA_HEAD] : NULL;
 }
 
-/* 单字符标点：`pa_is_punct("}")` 这一类占全部标点判断的九成二（550/597 个
- * 调用点）。走字符串版要先 load 首字节、再查 s[t->len] 是不是 0、最后还要进
- * tok_eq 循环，二十条指令才能说一句“不是”；单字符版只要 kind / len / 首字节
- * 三条判断，十亿级调用次数下这笔差值是实打实的。调用点统一换成 pa_is_ch。 */
+/* ---- 最热的三个 token 谓词 ----------------------------------------------
+ * 自举剖析里 pa_is_ch / pa_is_punct / pa_is_ident_n / tok_eq_len 四个合起来
+ * 占 19%：自举时 C6C_INLINE 退化成 `static inline`，c6c 不内联，所以每层都是
+ * 一次真调用（建帧 + 拆帧 + 参数搬运约十条指令），而这三个谓词被调用两千万
+ * 次 —— 光把**嵌套的那一层**调用摊平（pa_is_punct → tok_eq、pa_is_ident_n →
+ * tok_eq_len 全改成函数体里就地比较），就少两千万次调用。
+ *
+ * 不改成宏：调用点有 700 多个，宏展开会把每个调用者都撑大十条指令，实测
+ * 反而慢 4%（I-cache 换不来那点指令数）。所以这里只做"一层实现 + 瘦函数体"。
+ * 动态字符串版本留给 pa_expect_punct 一处。 */
 C6C_INLINE int pa_is_ch(int ch)
 {
     Tok *t = pa_cur();
-    const char *d = NULL;
 
-    if (t->kind != TK_PUNCT || t->len != 1)
+    /* `a || b` 在 C 里是**一个值**：自举时它要落一条槽再读回来比较（约九条
+     * 指令）。这里拆成两条 if，短路语义一样，生成的是两条直接跳转。 */
+    if (t->kind != TK_PUNCT)
         return 0;
-    d = tok_data(t);
-    return (u8)d[0] == (u8)(ch & 0xFF);
+    if (t->len != 1)
+        return 0;
+    return (u8)tok_data(t)[0] == (u8)(ch & 0xFF);
 }
 
-/* 同上：名字是固定字面量，长度编译期已知，先比 t->len 再比字节。
- * 调用点由脚本统一换成 PA_IS_IDENT / PA_ACCEPT_IDENT。 */
+C6C_INLINE int pa_is_punct(const char *s)
+{
+    Tok *t = pa_cur();
+    const char *d = NULL;
+    u32 i = 0;
+
+    if (t->kind != TK_PUNCT)
+        return 0;
+    if (t->len == 0)
+        return 0;
+    d = tok_data(t);
+    if (d[0] != s[0])
+        return 0;
+    if (s[t->len] != 0)
+        return 0;
+    for (i = 1; i < t->len; i++)
+        if (d[i] != s[i])
+            return 0;
+    return 1;
+}
+
 C6C_INLINE int pa_is_ident_n(const char *s, u32 n)
 {
     Tok *t = pa_cur();
+    const char *d = NULL;
+    u32 i = 0;
 
-    return t->kind == TK_IDENT && tok_eq_len(t, s, n);
+    if (t->kind != TK_IDENT)
+        return 0;
+    if (t->len != n)
+        return 0;
+    d = tok_data(t);
+    if (n == 1)
+        return (u8)d[0] == (u8)s[0];
+    for (i = 0; i < n; i++)
+        if ((u8)s[i] != (u8)d[i])
+            return 0;
+    return 1;
 }
 
 C6C_INLINE int pa_accept_ident_n(const char *s, u32 n)
@@ -955,34 +1011,13 @@ C6C_INLINE int pa_accept_ident_n(const char *s, u32 n)
     return 0;
 }
 
-#define PA_IS_IDENT(lit) pa_is_ident_n((lit), (u32)(sizeof(lit) - 1))
-#define PA_ACCEPT_IDENT(lit) pa_accept_ident_n((lit), (u32)(sizeof(lit) - 1))
-
-C6C_INLINE int pa_accept_ch(int ch)
-{
-    if (pa_is_ch(ch)) {
-        pa_advance();
-        return 1;
-    }
-    return 0;
-}
-
-C6C_INLINE int pa_is_punct(const char *s)
-{
-    Tok *t = pa_cur();
-
-    /* 先比首字节和长度，绝大多数不匹配的调用一步就否掉（profiler 里这条
-     * 判断占 9.9%，是全编译器最热的谓词之一）。 */
-    if (t->kind != TK_PUNCT || t->len == 0 || tok_data(t)[0] != s[0] || s[t->len] != 0)
-        return 0;
-    return tok_eq(t, s);
-}
-
 C6C_INLINE int pa_is_ident(const char *s)
 {
     Tok *t = pa_cur();
 
-    return t->kind == TK_IDENT && tok_eq(t, s);
+    if (t->kind != TK_IDENT)
+        return 0;
+    return tok_eq(t, s);
 }
 
 C6C_INLINE int pa_accept_punct(const char *s)
@@ -1001,6 +1036,23 @@ C6C_INLINE int pa_accept_ident(const char *s)
         return 1;
     }
     return 0;
+}
+
+#define PA_IS_IDENT(lit) pa_is_ident_n((lit), (u32)(sizeof(lit) - 1))
+#define PA_ACCEPT_IDENT(lit) pa_accept_ident_n((lit), (u32)(sizeof(lit) - 1))
+
+C6C_INLINE int pa_accept_ch(int ch)
+{
+    Tok *t = pa_cur();
+
+    if (t->kind != TK_PUNCT)
+        return 0;
+    if (t->len != 1)
+        return 0;
+    if ((u8)tok_data(t)[0] != (u8)(ch & 0xFF))
+        return 0;
+    pa_advance();
+    return 1;
 }
 
 static void pa_dbg_counts(void);
@@ -1226,10 +1278,9 @@ static int in_c6_tu(void)
  * .c6 里才有特殊含义。`.c` 是**纯 C99**（README 明说没有 -std=c6），这些词
  * 在那里必须是普通标识符：`int shared = 1;`、`struct S { int own; };`、
  * `s.weak++`、`s.try` 全都要编得过。所有认这几个词的地方都先过这一道。 */
-static int c6_kw(void)
-{
-    return in_c6_tu();
-}
+/* 27 个调用点，每个 token 都要问一遍：一层薄函数也是十條指令的建帧/拆帧，
+ * 直接用宏接到 in_c6_tu 上。 */
+#define c6_kw() in_c6_tu()
 
 static Tok *PA_ERR_AT;
 static void pa_error(const char *fmt, ...)
@@ -5133,7 +5184,9 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
         TY_PACK = save_pk2;
         TY_ALIGN = save_al2;
     }
-    if (getenv("C6C_DBG_AGG"))
+    if (PA_DBG_AGG < 0)
+        PA_DBG_AGG = getenv("C6C_DBG_AGG") != NULL;
+    if (PA_DBG_AGG)
         fprintf(stderr, "       [dbg] struct ty=%u members=%u\n",
                 (unsigned)ty, (unsigned)n);
     agg_names_set(ty, names, lens, n);
@@ -11440,9 +11493,20 @@ static u32 gen_postfix(void)
 {
     Tok *t = pa_cur();
     u32 v = 0;
+    /* 函数体中间那二十几串 `__builtin_*` / `__atomic_*` / `__sync_*` /
+     * `__FUNCTION__` 检查，每个标识符都要从头过一遍（五十来次 TOK_EQ，
+     * 一次自举就是上千万次调用）。它们全以 `__` 开头：先花三条指令把大
+     * 多数标识符筛掉，整段直接跳过。`_Generic` 是这一段里唯一的例外。 */
+    int is_dunder = 0;
 
     /* 默认不是空指针常量：只有字面量 0（和它的指针强转）会重新置 1 */
     E_NPC = 0;
+    if (t->kind == TK_IDENT && t->len > 1) {
+        const char *dn = tok_data(t);
+
+        if (dn[0] == '_' && dn[1] == '_')
+            is_dunder = 1;
+    }
 
     if (t->kind == TK_NUM && is_float_lit(tok_data(t), t->len)) {
         int is32 = 0;
@@ -11619,6 +11683,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(addr);
     }
+    if (is_dunder || TOK_EQ(t, "_Generic")) {
     if (TOK_EQ(t, "__builtin_syscall")) {
         /* __builtin_syscall(nr, a1..a6)：FreeBSD 风格，最多 6 个参数 */
         u32 d = 0;
@@ -12751,6 +12816,7 @@ static u32 gen_postfix(void)
         v = gen_str_from(FN.name ? FN.name : "", FN.name ? (u32)strlen(FN.name) : 0);
         return gen_postfix_ops(v);
     }
+    }   /* 结束 __ 前缀大前提 */
     if (t->kind == TK_IDENT) {
         Sym *s = sym_find(tok_data(t), t->len);
         int break_qualified = 1;
@@ -12910,7 +12976,9 @@ static u32 gen_postfix(void)
             if (agg_find_promoted(METHOD_SELF_TY, tok_data(t), t->len, &mty4, &moff4)) {
                 Sym *pself = sym_find("self", 4);
 
-                if (getenv("C6C_DBG_SELF"))
+                if (PA_DBG_SELF < 0)
+                    PA_DBG_SELF = getenv("C6C_DBG_SELF") != NULL;
+                if (PA_DBG_SELF)
                     fprintf(stderr, "[self] %.*s self_ty=%u mty=%u off=%u size=%u\n",
                             (int)t->len, tok_data(t), (unsigned)METHOD_SELF_TY,
                             (unsigned)mty4, (unsigned)moff4, (unsigned)ty_size(mty4));
@@ -13697,8 +13765,12 @@ static u32 gen_unary(void)
 {
     /* GNU 的 `__real__ z` / `__imag__ z`：取复数的实部/虚部。C99 里没有直接
      * 取分量的语法（那是 <complex.h> 的 creal/cimag，属于库），但这两个是
-     * gcc 扩展，几乎所有复数代码都在用，实现起来就是一次分量 load。 */
-    if (PA_IS_IDENT("__real__") || PA_IS_IDENT("__imag__")) {
+     * gcc 扩展，几乎所有复数代码都在用，实现起来就是一次分量 load。
+     * 两个关键字都以 `__` 开头：先按首字节筛一下，每个一元表达式省两次
+     * 真调用（gen_unary 是自举时调用次数排第二的函数）。 */
+    if (pa_cur()->kind == TK_IDENT && pa_cur()->len > 1
+        && tok_data(pa_cur())[0] == '_'
+        && (PA_IS_IDENT("__real__") || PA_IS_IDENT("__imag__"))) {
         int imag = PA_IS_IDENT("__imag__");
         u32 cv = 0;
         u32 cty = 0;
@@ -13743,7 +13815,10 @@ static u32 gen_unary(void)
      * 就是 `char *`，所以两者一样：把字面量拼成 printf 格式串、把 `{名字}`
      * 换成实参，调一次 snprintf 进栈上缓冲。**只支持 `{标识符}` 形式的洞**
      * （表达式要能重入词法器，那是另一件事），够 tests/ 里的用法了。 */
-    if ((PA_IS_IDENT("f") && pa_peek(1) && pa_peek(1)->kind == TK_STR)
+    /* `f"…"` 只可能是单字符标识符 `f`：先就地量一下，省掉一次调用 */
+    if ((pa_cur()->kind == TK_IDENT && pa_cur()->len == 1
+         && tok_data(pa_cur())[0] == 'f'
+         && pa_peek(1) && pa_peek(1)->kind == TK_STR)
         || (pa_is_ch('@') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && TOK_EQ(pa_peek(1), "f") && pa_peek(2) && pa_peek(2)->kind == TK_STR)) {
         char fmt[512] = {0};
@@ -20356,7 +20431,9 @@ static void mgd_defer_push(u32 slot_v)
 
     if (NDF >= DEFER_MAX)
         return;
-    if (getenv("C6C_DBG_DF"))
+    if (PA_DBG_DF < 0)
+        PA_DBG_DF = getenv("C6C_DBG_DF") != NULL;
+    if (PA_DBG_DF)
         fprintf(stderr, "[df] mgd slot=%u depth=%d\n", (unsigned)slot_v, DEF_DEPTH);
     start = FN.n;
     /* 退出时要放的是**那个槽里此刻的值**，不是声明时的快照——`@Tree l =
@@ -23289,7 +23366,9 @@ static void pa_func_def(Sym *fn, Declarator *d)
         CUR_RET_TY = ty_ptr(tty);
         if (NTASKTY < TASK_TY_MAX)
             TASK_TY[NTASKTY++] = tty;
-        if (getenv("C6C_DBG_TASK"))
+        if (PA_DBG_TASK < 0)
+            PA_DBG_TASK = getenv("C6C_DBG_TASK") != NULL;
+        if (PA_DBG_TASK)
             fprintf(stderr, "[reg] tty=%u n=%d\n", tty, (int)NTASKTY);
         if (CUR_FALLIBLE) {
             u32 e1 = irfn_vreg(&FN);

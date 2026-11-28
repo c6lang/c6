@@ -580,8 +580,11 @@ static void irfn_push(IrFn *f, u8 op, u8 type, u32 dst, u32 a, u32 b, u32 c, u32
     o.c = c;
     o.imm = imm;
     f->ops[f->n++] = o;
-    if (IR_LINES && f->lines)
-        f->lines[f->n - 1] = f->cur_line;
+    /* `IR_LINES && f->lines` 是一个**值**：拆成两条 if，热路径少九条指令
+     * （每条 IR 都要过这里，自举一次三十多万次）。 */
+    if (IR_LINES)
+        if (f->lines)
+            f->lines[f->n - 1] = f->cur_line;
 }
 
 static void irfn_setcc(IrFn *f, u8 cc)

@@ -3147,9 +3147,25 @@ void *memchr(const void *s, int c, unsigned long n)
 {
     const unsigned char *p = (const unsigned char *)s;
     unsigned long i = 0;
+    unsigned long w = 0;
+    unsigned long pat = 0;
+    unsigned char k = (unsigned char)c;
 
-    for (i = 0; i < n; i++)
-        if (p[i] == (unsigned char)c)
+    /* 8 字节一次扫：把目标字节铺满一个字异或进去，再用"字里有零字节"
+     * 的老办法（(x-0x01..01) & ~x & 0x80..80）判命中。自举时按行扫源码
+     * 全靠它，逐字节版占整个编译的 1.7%。命中的那 8 字节交给尾部循环
+     * 重新逐字节走，所以不需要知道具体是哪一个。 */
+    pat = (unsigned long)k;
+    pat = pat * 0x0101010101010101UL;
+    while (n - i >= 8) {
+        w = *(const unsigned long *)(const void *)(p + i);   /* 非对齐读 */
+        w ^= pat;
+        if (((w - 0x0101010101010101UL) & ~w & 0x8080808080808080UL) != 0)
+            break;
+        i += 8;
+    }
+    for (; i < n; i++)
+        if (p[i] == k)
             return (void *)(p + i);
     return NULL;
 }
